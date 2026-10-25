@@ -54,11 +54,28 @@ SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_u (uid INT, k SMALLINT NULL, l
 INSERT INTO dbo.rs_u SELECT value, CASE WHEN value = 10 THEN NULL WHEN value > 10 THEN value - 10 ELSE value END,
   ''u'' + CAST(value AS VARCHAR), CASE WHEN value % 4 = 0 THEN NULL ELSE value * 10 END FROM GENERATE_SERIES(1, 12);');
 
+# rs_s holds strings chosen to break every shortcut: case ('a'/'A'), trailing spaces ('a '), a control
+# character after a prefix ('a' + CHAR(1)), an accent, a NULL, a non-BMP character, and VARCHAR beside
+# NVARCHAR. The database collation is case-insensitive, so the server's OWN `s = 'a'` matches 5 rows where
+# DuckDB matches 2 — a rendering that leaned on the server's comparison could not pass §10.
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_s;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_s (id INT, s VARCHAR(20) NULL, n NVARCHAR(20) NULL);
+INSERT INTO dbo.rs_s VALUES (1, ''a'', N''a''), (2, ''A'', N''A''), (3, ''a '', N''a ''), (4, ''a'' + CHAR(1), N''b''),
+  (5, ''e'', N''é''), (6, NULL, NULL), (7, ''a'', N''a''), (8, ''b'', N''𝄞''), (9, ''A '', N''a'');');
+
 statement ok
 SELECT fabricator_refresh_cache('db');
 
 statement ok
 SELECT fabricator_refresh_cache('rp');
+
+query I
+SELECT * FROM fabricator_query('db', 'SELECT COUNT(*) AS c FROM dbo.rs_s WHERE s = ''a''');
+----
+5
 
 # ═══ §1  Routing — pushed ═════════════════════════════════════════════════════════════════════════════
 
@@ -104,8 +121,9 @@ EXPLAIN SELECT max(s) FROM rp.dbo.rs_t;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
+# a string ORDER BY key and a string min / max: neither can be made to sort as DuckDB does (§10)
 query II
-EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE s = 's1';
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE s > 's1';
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -133,9 +151,10 @@ EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE t < 300;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
-# an expression, a plain projection over ONE table (the scan already pushes its filter)
+# division (DuckDB's `/` is float division), a plain projection over ONE table (the scan already pushes its
+# filter)
 query II
-EXPLAIN SELECT sum(id + 1) FROM rp.dbo.rs_t;
+EXPLAIN SELECT sum(id / 2) FROM rp.dbo.rs_t;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -151,7 +170,7 @@ EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_t GROUP BY s ORDER BY s;
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
 query II
-EXPLAIN SELECT DISTINCT a.k FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k;
+EXPLAIN SELECT DISTINCT ON (k) k FROM rp.dbo.rs_t;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -166,10 +185,6 @@ EXPLAIN SELECT count(*) FROM rp.dbo.rs_t JOIN rp.dbo.rs_u USING (k);
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
-query II
-EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.s = b.label;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
 
 # an UNQUALIFIED name both tables have is ambiguous: declined, so DuckDB reports it rather than the server
 # picking one
@@ -629,11 +644,281 @@ SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_t b ON a.id = b.id;
 ----
 300
 
-# a string join key stays local and still answers
+# a string join key — no rs_t.s value is a label
 query I
 SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.s = b.label;
 ----
 0
+
+# ═══ §10  Strings: equality, grouping, DISTINCT, count(DISTINCT), joins — exact, never folded ═══════════
+# Rendered as `(s + N'|') COLLATE Latin1_General_100_BIN2`: the binary collation removes case and accent
+# folding, the sentinel defeats ANSI padding ('a' = 'a ' on SQL Server, in every collation).
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_s WHERE s = 'a';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_s WHERE s = 'a';
+----
+2
+
+query I
+SELECT count(*) FROM db.dbo.rs_s WHERE s = 'a';
+----
+2
+
+# <> keeps no NULL and separates 'a ' and 'A' from 'a'
+query I
+SELECT count(*) FROM rp.dbo.rs_s WHERE s <> 'a';
+----
+6
+
+query I
+SELECT count(*) FROM db.dbo.rs_s WHERE s <> 'a';
+----
+6
+
+query I
+SELECT count(*) FROM rp.dbo.rs_s WHERE n = 'a ' OR n = '𝄞' OR n = 'é';
+----
+3
+
+query I
+SELECT count(*) FROM db.dbo.rs_s WHERE n = 'a ' OR n = '𝄞' OR n = 'é';
+----
+3
+
+# GROUP BY a string: every distinct value its own group, the value returned whole (sentinel stripped)
+query II
+EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_s GROUP BY s;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (
+  (SELECT s, count(*), sum(id) FROM rp.dbo.rs_s GROUP BY s EXCEPT ALL SELECT s, count(*), sum(id) FROM db.dbo.rs_s GROUP BY s)
+  UNION ALL
+  (SELECT s, count(*), sum(id) FROM db.dbo.rs_s GROUP BY s EXCEPT ALL SELECT s, count(*), sum(id) FROM rp.dbo.rs_s GROUP BY s));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT s, count(*) FROM rp.dbo.rs_s GROUP BY s);
+----
+8
+
+# the trailing space survives the round trip
+query IT
+SELECT count(*), max(length(s)) FROM (SELECT s FROM rp.dbo.rs_s GROUP BY s) WHERE s = 'a ' OR s = 'A ';
+----
+2	2
+
+# HAVING on a grouped string
+query I
+SELECT count(*) FROM (SELECT s FROM rp.dbo.rs_s GROUP BY s HAVING s = 'a' OR s = 'a ');
+----
+2
+
+query I
+SELECT count(DISTINCT s) FROM rp.dbo.rs_s;
+----
+7
+
+query II
+SELECT count(DISTINCT s), count(DISTINCT n) FROM rp.dbo.rs_s;
+----
+7	6
+
+query II
+SELECT count(DISTINCT s), count(DISTINCT n) FROM db.dbo.rs_s;
+----
+7	6
+
+# a VARCHAR = NVARCHAR join, case- and padding-exact
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_s a JOIN rp.dbo.rs_s b ON a.s = b.n;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+SELECT a.id, b.id FROM rp.dbo.rs_s a JOIN rp.dbo.rs_s b ON a.s = b.n ORDER BY a.id, b.id;
+----
+1	1
+1	7
+1	9
+2	2
+3	3
+7	1
+7	7
+7	9
+8	4
+
+query II
+SELECT a.id, b.id FROM db.dbo.rs_s a JOIN db.dbo.rs_s b ON a.s = b.n ORDER BY a.id, b.id;
+----
+1	1
+1	7
+1	9
+2	2
+3	3
+7	1
+7	7
+7	9
+8	4
+
+# ordering, < / > and min / max over strings stay local and still answer
+query II
+EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_s GROUP BY s ORDER BY s;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query T
+SELECT max(s) FROM rp.dbo.rs_s;
+----
+e
+
+# ⚠ a DuckDB collation changes what equality means; the server is not told, so nothing string-shaped pushes
+statement ok
+SET default_collation = 'nocase';
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_s WHERE s = 'a';
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_s WHERE s = 'a';
+----
+3
+
+statement ok
+RESET default_collation;
+
+# ═══ §11  DISTINCT — rendered as GROUP BY, so strings take the exact key too ═════════════════════════════
+
+query II
+EXPLAIN SELECT DISTINCT s FROM rp.dbo.rs_s;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM ((SELECT DISTINCT s, n FROM rp.dbo.rs_s EXCEPT ALL SELECT DISTINCT s, n FROM db.dbo.rs_s)
+  UNION ALL (SELECT DISTINCT s, n FROM db.dbo.rs_s EXCEPT ALL SELECT DISTINCT s, n FROM rp.dbo.rs_s));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT s FROM rp.dbo.rs_s);
+----
+8
+
+# (an expression in a DISTINCT list stays local; the answer is still DuckDB's)
+query II rowsort
+SELECT DISTINCT k, d IS NULL FROM rp.dbo.rs_t WHERE k IS NULL;
+----
+NULL	0
+NULL	1
+
+query II
+SELECT DISTINCT a.k, b.uid FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k ORDER BY b.uid LIMIT 3;
+----
+1	1
+2	2
+3	3
+
+# ═══ §12  Integer arithmetic ══════════════════════════════════════════════════════════════════════════
+# Computed in BIGINT on the server, typed as DuckDB types it (the widest column operand).
+
+query II
+EXPLAIN SELECT k * 10 + 1 AS g, sum(id * 2) FROM rp.dbo.rs_t GROUP BY k;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (
+  (SELECT k * 10 + 1 AS g, sum(id * 2), min(id - k), max(-id) FROM rp.dbo.rs_t WHERE id + 1 > 0 AND id < 1000 GROUP BY k
+   EXCEPT ALL SELECT k * 10 + 1 AS g, sum(id * 2), min(id - k), max(-id) FROM db.dbo.rs_t WHERE id + 1 > 0 AND id < 1000 GROUP BY k)
+  UNION ALL
+  (SELECT k * 10 + 1 AS g, sum(id * 2), min(id - k), max(-id) FROM db.dbo.rs_t WHERE id + 1 > 0 AND id < 1000 GROUP BY k
+   EXCEPT ALL SELECT k * 10 + 1 AS g, sum(id * 2), min(id - k), max(-id) FROM rp.dbo.rs_t WHERE id + 1 > 0 AND id < 1000 GROUP BY k));
+----
+0
+
+query II
+SELECT u.uid * 100 + t.k AS key, t.id FROM rp.dbo.rs_t t JOIN rp.dbo.rs_u u ON t.k = u.k ORDER BY t.id * -1 LIMIT 2;
+----
+606	2147483647
+505	2147483646
+
+query II
+SELECT u.uid * 100 + t.k AS key, t.id FROM db.dbo.rs_t t JOIN db.dbo.rs_u u ON t.k = u.k ORDER BY t.id * -1 LIMIT 2;
+----
+606	2147483647
+505	2147483646
+
+# the result TYPES are DuckDB's: SMALLINT + 1 stays SMALLINT, INTEGER * INTEGER INTEGER, with BIGINT BIGINT
+query II
+EXPLAIN CREATE TEMP TABLE ar_x AS SELECT k + 1 AS a, k * id AS b, id - b AS c, sum(id * 2) AS s FROM rp.dbo.rs_t
+  WHERE id < 1000 GROUP BY k, id, b;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+CREATE TEMP TABLE ar_rp AS SELECT k + 1 AS a, k * id AS b, id - b AS c, sum(id * 2) AS s FROM rp.dbo.rs_t WHERE id < 1000
+  GROUP BY k, id, b;
+
+statement ok
+CREATE TEMP TABLE ar_db AS SELECT k + 1 AS a, k * id AS b, id - b AS c, sum(id * 2) AS s FROM db.dbo.rs_t WHERE id < 1000
+  GROUP BY k, id, b;
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE ar_db) ORDER BY column_name;
+----
+a	SMALLINT
+b	INTEGER
+c	BIGINT
+s	HUGEINT
+
+query I
+SELECT count(*) FROM (
+  (SELECT column_name, column_type FROM (DESCRIBE ar_rp) EXCEPT ALL SELECT column_name, column_type FROM (DESCRIBE ar_db))
+  UNION ALL
+  (SELECT column_name, column_type FROM (DESCRIBE ar_db) EXCEPT ALL SELECT column_name, column_type FROM (DESCRIBE ar_rp)));
+----
+0
+
+# ⚠ THE ACCEPTED DIVERGENCE, pinned so a change to it is noticed: a ROW-LEVEL intermediate that overflows
+# DuckDB's type (id * 2 is an INTEGER, and id reaches 2^31 - 1) is an error locally, while the server computes
+# in BIGINT and answers. Error against answer — never two different answers.
+statement error
+SELECT sum(id * 2) FROM db.dbo.rs_t;
+----
+<REGEX>:.*Overflow.*
+
+query I
+SELECT sum(id * 2) FROM rp.dbo.rs_t;
+----
+8589934288
+
+# a FINAL value outside DuckDB's type is DuckDB's own error on both paths: the server computes it, the
+# wrapper's CAST refuses
+statement error
+SELECT max(id * 2) FROM rp.dbo.rs_t;
+----
+<REGEX>:.*(Overflow|out of range).*
+
+statement error
+SELECT max(id * 2) FROM db.dbo.rs_t;
+----
+<REGEX>:.*(Overflow|out of range).*
+
+# a constant wider than its columns keeps DuckDB's widening, so it stays local
+query II
+EXPLAIN SELECT sum(id + 5000000000) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
 
 # ═══ §6  DML keeps its own paths ══════════════════════════════════════════════════════════════════════
 # The remote optimizer would also take DELETE / UPDATE nodes; this catalog refuses them, so the plan-less
@@ -650,4 +935,4 @@ DELETE FROM rp.dbo.rs_t WHERE id = 1;
 1
 
 statement ok
-SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_t; DROP TABLE dbo.rs_u;');
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_t; DROP TABLE dbo.rs_u; DROP TABLE dbo.rs_s;');

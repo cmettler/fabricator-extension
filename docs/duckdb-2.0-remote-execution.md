@@ -468,5 +468,44 @@ the LEFT join's unmatched rows). ⚠ One SURVIVES, by construction: removing the
 today, because `fabricator_query` delivers rows in the server's order. The re-sort is insurance against an
 ordering DuckDB does not promise across a subquery, not something any query can currently observe.
 
-**Not done:** string keys under a binary collation (the capability doc already reports it), booleans,
-`count(DISTINCT)`, DISTINCT, expressions in select/ORDER BY, and a warehouse profile.
+### 4.3 Strings, DISTINCT, count(DISTINCT) and integer arithmetic — BUILT (2026-10-25)
+
+**Strings compare exactly, and only for equality.** Every string comparison key is
+`(s + N'|') COLLATE Latin1_General_100_BIN2`:
+
+- the forced binary collation removes case and accent folding whatever the COLUMN's collation is (the rig's
+  database is case-insensitive: the server's own `s = 'a'` matches 5 rows where DuckDB matches 2);
+- the appended sentinel defeats T-SQL's ANSI padding, under which `'a' = 'a '` in every collation, binary ones
+  included;
+- `+ N'|'` makes the key NVARCHAR, so a VARCHAR column in any code page converts losslessly and a VARCHAR =
+  NVARCHAR join compares one representation. `Latin1_General_100_BIN2` exists since SQL Server 2008, unlike the
+  `_UTF8` collations.
+
+That covers `=`, `<>` (as `NOT (… = …)`, which keeps DuckDB's NULL semantics), GROUP BY, DISTINCT,
+`count(DISTINCT)` and join keys. A grouped string must be selected as its GROUP BY expression in T-SQL, so it
+travels WITH the sentinel and the wrapper strips it with `left(x, -1)` (measured: drops exactly one character,
+non-BMP included). ⚠ **Ordering cannot be made exact** on SQL Server 2008+: padding still decides `'a'` against
+`'a' + CHAR(1)` (DuckDB: shorter first; SQL Server: the space it pads with is larger), and UTF-16 code-unit order
+is not code-point order beyond U+FFFF. So strings never sort, use `<`/`>`, or feed `min`/`max` here. And while
+DuckDB's own `default_collation` is set (or a column carries a DuckDB collation), nothing string-shaped pushes:
+DuckDB's equality has changed and the server is not told.
+
+**DISTINCT is GROUP BY every select item**, rendered that way so strings take the same key.
+
+**Integer arithmetic** (`+ - *`, unary minus) over SMALLINT/INTEGER/BIGINT columns and integer constants, anywhere
+a column may appear (select items, sort keys, aggregate arguments, comparisons). DuckDB keeps the WIDEST column
+operand's type (measured: `INTEGER + INTEGER` is INTEGER, `SMALLINT + 1` SMALLINT, `INTEGER - BIGINT` BIGINT); a
+constant that does not fit that type would have widened it, so it stays local. The server computes in BIGINT and
+the wrapper casts to DuckDB's type, so a FINAL value out of range is still DuckDB's error. ⚠ An INTERMEDIATE
+overflow is not: `sum(id * 2)` with id near 2^31 errors locally (INTEGER) and is answered by the server — the
+error-against-answer divergence the DML shortcut already accepts, pinned in the gate so a change is noticed.
+
+Gate `verify_remote_select_mssql` 262 -> 373 (§10 strings over adversarial data — case, trailing spaces, a
+control character after a prefix, an accent, NULL, a non-BMP character, VARCHAR beside NVARCHAR; §11 DISTINCT;
+§12 arithmetic incl. result types through a CTAS). Mutants, each killed: the sentinel removed and the binary
+collation removed (both at the first `s = 'a'` row: 3 and 5 matches where 2 are right), `default_collation`
+ignored, the grouped string not selected as its key, arithmetic always typed BIGINT, the constant-fit check
+removed.
+
+**Not done:** string ORDER BY / min / max (would need the `_UTF8` collations of SQL Server 2019+ and a
+varbinary key), booleans, division, decimal arithmetic, expressions in GROUP BY, and a warehouse profile.

@@ -1438,7 +1438,9 @@ case "$TIER" in
         #   `FROM (DESCRIBE …)` is never pushed, so a DESCRIBE comparison was vacuous (a mutant survived it).
         # 2026-10-25: 3880 -> 4054. verify_remote_select_mssql 88 -> 262: ORDER BY / LIMIT (NULL order rendered
         #   explicitly, re-sorted locally), HAVING, and INNER / LEFT joins within the catalog.
-        : "${MIN_ASSERTIONS:=4054}"
+        # 2026-10-25: 4054 -> 4165. verify_remote_select_mssql 262 -> 373: exact string equality / GROUP BY / DISTINCT /
+        #   count(DISTINCT) / joins (binary collation + sentinel), DISTINCT as GROUP BY, integer arithmetic.
+        : "${MIN_ASSERTIONS:=4165}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

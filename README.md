@@ -289,22 +289,28 @@ ONE T-SQL statement, so only its result leaves the server; `EXPLAIN` shows `Fabr
 `Fabricator Scan`. What is pushed:
 
 - one table, or `INNER` / `LEFT JOIN`s of them `ON` column equalities and comparisons;
-- `count(*)`, `count(col)`, `min`, `max`, `sum` over integer and decimal columns, `GROUP BY` plain columns, and
-  `HAVING` over those aggregates — over one table it must aggregate or group (the scan already pushes a
-  plain filter), with a join a plain projection is pushed too;
-- `WHERE` / `ON` / `HAVING` of comparisons with constants or between two columns, `AND`/`OR`/`NOT`,
+- `count(*)`, `count([DISTINCT] col)`, `min`, `max`, `sum` over integer and decimal columns, `GROUP BY` plain
+  columns, `DISTINCT`, and `HAVING` over those aggregates — over one table it must aggregate, group or be
+  `DISTINCT` (the scan already pushes a plain filter), with a join a plain projection is pushed too;
+- integer `+ - *` over SMALLINT/INTEGER/BIGINT columns and constants, anywhere a column may appear;
+- `WHERE` / `ON` / `HAVING` of comparisons with constants or between two values, `AND`/`OR`/`NOT`,
   `IS [NOT] NULL`;
+- strings: `=` and `<>`, `GROUP BY`, `DISTINCT`, `count(DISTINCT)` and string join keys — compared exactly as
+  DuckDB does (case-, accent- and trailing-space-sensitive) whatever the column's collation;
 - `ORDER BY` columns, aggregates, select aliases and positions, with `LIMIT` / `OFFSET`. DuckDB's NULL order
   (including `SET default_null_order`) is reproduced on the server, and the result is sorted again locally.
 
 Everything else runs exactly as before, and nothing pushed may answer differently: result types and column
 names are DuckDB's own, and a shape whose T-SQL meaning could differ is not pushed — comparing, grouping or
-sorting strings (collation, trailing spaces), floats, timestamps, `avg`, a constant that does not convert
-exactly to the other side's type (`int_col > 1.5`), `DISTINCT`, `FULL`/`SEMI`/`ANTI`/`USING` joins, an
-unqualified column name two joined tables share, and subqueries. A branch of `UNION`/`EXCEPT` is pushed on
+ordering strings (`ORDER BY`, `<`, `>`, `min`/`max` — SQL Server cannot be made to sort like DuckDB), any string
+comparison while a DuckDB `default_collation` is set, floats, timestamps, `avg`, division, a constant that does
+not convert exactly to the other side's type (`int_col > 1.5`), `DISTINCT ON`, `FULL`/`SEMI`/`ANTI`/`USING`
+joins, an unqualified column name two joined tables share, and subqueries. A branch of `UNION`/`EXCEPT` is pushed on
 its own; a subquery joined to a local table is not (DuckDB pushes only whole nodes). The one accepted
-difference: an integer `sum` past 10^38 raises an overflow on the server, where DuckDB's own sum would still
-answer up to about 1.7 x 10^38. Box SQL Server only (ignored on a Fabric/Synapse warehouse); read once at
+differences are both an error on one side and an answer on the other, never two answers: an integer `sum`
+past 10^38 overflows on the server (DuckDB's would answer up to about 1.7 x 10^38), and integer arithmetic
+whose INTERMEDIATE value overflows DuckDB's type (`int_col * 2` near 2^31) errors in DuckDB but is answered
+by the server, which computes in BIGINT — a final value out of range still errors. Box SQL Server only (ignored on a Fabric/Synapse warehouse); read once at
 ATTACH. `FABRICATOR_DUMP_REMOTE=1` prints each decision and the T-SQL sent.
 
 On a **Fabric** SQL endpoint the catalog also gains a `fabric` schema of platform functions, which need no
