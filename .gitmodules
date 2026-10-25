@@ -11,10 +11,16 @@
 #
 # ⚠ `branch = main` matters ONLY to `git submodule update --remote`, which would move the pin to the
 # CURRENT upstream tip. An ordinary `git submodule update` uses the recorded sha. Bump deliberately.
+#
+# ⚠⚠ TEMPORARILY ON THE FORK AGAIN (2026-10-25): fabricator-patches-v4 = the upstream pin 987a0ce + ONE commit,
+# System.Threading.Tasks.Extensions 4.6.0 -> 4.6.3 in the two Delta projects. Without it every fresh restore fails
+# with NU1605: System.Text.Json 9.* resolves 9.0.22, whose System.IO.Pipelines 9.0.22 is missing on nuget.org.
+# Cut off the PIN, not upstream/main, so no unswept EW bump rides along. Back to clast-project/main once upstream
+# carries the bump (or the missing packages appear).
 [submodule "engineered-wood"]
 	path = engineered-wood
-	url = https://github.com/clast-project/engineered-wood.git
-	branch = main
+	url = https://github.com/cmettler/engineered-wood.git
+	branch = fabricator-patches-v4
 [submodule "DuckDB.ExtensionKit"]
 	path = DuckDB.ExtensionKit
 	url = https://github.com/Giorgi/DuckDB.ExtensionKit.git
