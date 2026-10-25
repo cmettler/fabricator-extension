@@ -36,6 +36,8 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/common/enums/logical_operator_type.hpp"
 #include "duckdb/common/printer.hpp"
@@ -786,8 +788,34 @@ static optional_ptr<LogicalGet> FindExactScan(LogicalOperator &child, TableCatal
 		return nullptr;
 	}
 	if (get.table_filters.HasFilters()) {
-		DmlTrace("rowid path: filters were erased into the scan");
-		return nullptr; // a filter erased into the scan would be invisible here, so never skip past one
+		// The scan claimed these filters (a provider that applies them exactly — Delta's native read — lets
+		// DuckDB ERASE them from the FILTER above), so they are part of the WHERE and must reach the predicate.
+		// Each becomes an expression over a column ref to THIS scan and goes through the same strict serializer
+		// as the rest; an optional/dynamic join-filter wrapper does not render, which sends the statement to the
+		// rowid path — never a predicate missing a part. SQL Server's scan never erases, so it is unaffected.
+		if (filters != &no_filters) { // the FILTER's own conjuncts first (never iterate the vector being filled)
+			for (auto &f : *filters) {
+				no_filters.push_back(f->Copy());
+			}
+		}
+		auto &column_ids = get.GetColumnIds();
+		for (auto &entry : get.table_filters) {
+			auto idx = entry.GetIndex();
+			if (idx.GetIndex() >= column_ids.size()) {
+				DmlTrace("rowid path: a scan filter on an unknown column");
+				return nullptr;
+			}
+			auto &col = column_ids[idx.GetIndex()];
+			if (!col.HasPrimaryIndex() || col.HasChildren() || col.IsVirtualColumn() ||
+			    col.GetPrimaryIndex() >= get.returned_types.size()) {
+				DmlTrace("rowid path: a scan filter on a virtual or nested column");
+				return nullptr;
+			}
+			BoundColumnRefExpression ref(get.returned_types[col.GetPrimaryIndex()],
+			                             ColumnBinding(get.table_index, idx));
+			no_filters.push_back(entry.Filter().ToExpression(ref));
+		}
+		filters = &no_filters;
 	}
 	return &get;
 }
@@ -823,16 +851,36 @@ static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context,
 		return nullptr;
 	}
 	auto &entry = op.table.Cast<FabricatorTableEntry>();
+	// Asked BEFORE the predicate is rendered, because what counts as exact and which columns may appear are
+	// the provider's answer. One crossing, cached per entry after the first DELETE/UPDATE.
+	auto &caps = entry.DmlCapabilities();
+	if (!caps.delete_where) {
+		DmlTrace("rowid path: the table does not support predicate DELETE");
+		return nullptr;
+	}
+	if (caps.delete_where_autocommit_only && !context.transaction.IsAutoCommit()) {
+		// The provider's predicate statement cannot see this transaction's pending writes (Delta: the
+		// engine deletes against the BASE snapshot), so inside BEGIN … COMMIT the rowid path keeps
+		// read-your-writes.
+		DmlTrace("rowid path: explicit transaction");
+		return nullptr;
+	}
 	string json;
 	vector<Value> constants;
-	if (!FabricatorSerializeExactFilter(*get, *filters, json, constants)) {
+	vector<string> referenced;
+	if (!FabricatorSerializeExactFilter(*get, *filters, json, constants, caps.exact_strings, &referenced)) {
 		DmlTrace("rowid path: the predicate does not render exactly");
 		return nullptr;
 	}
-	// Asked LAST: it is the one crossing on this path (cached per entry after the first DELETE/UPDATE).
-	if (!entry.DmlCapabilities().delete_where) {
-		DmlTrace("rowid path: the table does not support predicate DELETE");
-		return nullptr;
+	if (caps.restrict_delete_columns) {
+		for (auto &col : referenced) {
+			if (caps.delete_where_columns.find(col) == caps.delete_where_columns.end()) {
+				// Delta: a column the provider cannot decide a whole file on (not a partition column, and no
+				// statistics opt-in) — the native rowid scan is the faster path for it.
+				DmlTrace("rowid path: column " + col + " is not one the provider deletes by");
+				return nullptr;
+			}
+		}
 	}
 	string spec = json.empty() ? "{}" : "{\"filter\":" + json + "}";
 	DmlTrace("delete-where: " + spec);

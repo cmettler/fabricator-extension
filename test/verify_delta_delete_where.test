@@ -1,0 +1,450 @@
+# name: test/verify_delta_delete_where.test
+# description: A Delta DELETE whose predicate engineered-wood can decide PER FILE runs as one engineered-wood
+#              predicate delete (#506) instead of the rowid scan: a predicate over partition columns alone
+#              removes whole files WITHOUT READING them, and under the ATTACH option `delete_trusts_statistics`
+#              so does a file whose statistics prove every row matches. Everything else keeps the rowid path,
+#              which reads natively and only the predicate's columns. Autocommit only.
+#
+#              ⚠⚠ §2 and §3 ARE DIFFERENTIALS and the reason the suite exists: a DELETE has no re-application
+#              above it, so a predicate rendered weaker than the user's deletes rows nobody named. The same
+#              sequence runs on two identical tables, one with the shortcut and one with
+#              `fabricator_dml_pushdown = false` (the rowid path, the reference oracle); every count and the final
+#              contents must agree. Covered: NULL semantics (`<>` keeps a NULL, IS DISTINCT FROM deletes it),
+#              IS NULL, strings (equality AND range — Delta compares bytes, like DuckDB), DATE, DECIMAL, IN, OR.
+#
+#              ⚠ §1's routing rows keep the differentials from passing VACUOUSLY: a build where the shortcut never
+#              fires agrees with the oracle perfectly. §4 and §5 prove "without reading" directly — the data file
+#              is overwritten with garbage, the rowid path fails on it (the control), the shortcut does not.
+#
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dw' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+# id 1..60; n NULL when id % 7 = 0, else id % 5; region NULL when id % 13 = 0; three partition columns of three
+# types (VARCHAR, INTEGER, DATE). np_* are unpartitioned, written in THREE inserts so they have three files with
+# disjoint id ranges (1-20, 21-40, 41-60) — what lets a statistics proof cover a whole file.
+
+statement ok
+CREATE TABLE lake.main.dw_on (id INTEGER, n INTEGER, amount DECIMAL(10,2), d DATE, s VARCHAR, region VARCHAR, yr INTEGER, dd DATE) PARTITIONED BY (region, yr, dd);
+
+statement ok
+CREATE TABLE lake.main.dw_off (id INTEGER, n INTEGER, amount DECIMAL(10,2), d DATE, s VARCHAR, region VARCHAR, yr INTEGER, dd DATE) PARTITIONED BY (region, yr, dd);
+
+statement ok
+INSERT INTO lake.main.dw_on SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 5 END, i * 1.25, DATE '2026-01-01' + i::INTEGER, 's' || (i % 4), CASE WHEN i % 13 = 0 THEN NULL ELSE ['EU','US','APAC','EU'][i % 4 + 1] END, 2020 + i % 3, DATE '2026-01-01' + (i % 2)::INTEGER FROM range(1, 61) t(i);
+
+statement ok
+INSERT INTO lake.main.dw_off SELECT * FROM lake.main.dw_on;
+
+statement ok
+CREATE TABLE lake.main.np_on (id INTEGER, n INTEGER, amount DECIMAL(10,2), d DATE, s VARCHAR);
+
+statement ok
+CREATE TABLE lake.main.np_off (id INTEGER, n INTEGER, amount DECIMAL(10,2), d DATE, s VARCHAR);
+
+statement ok
+INSERT INTO lake.main.np_on SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 5 END, i * 1.25, DATE '2026-01-01' + i::INTEGER, 's' || (i % 4) FROM range(1, 21) t(i);
+
+statement ok
+INSERT INTO lake.main.np_on SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 5 END, i * 1.25, DATE '2026-01-01' + i::INTEGER, 's' || (i % 4) FROM range(21, 41) t(i);
+
+statement ok
+INSERT INTO lake.main.np_on SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 5 END, i * 1.25, DATE '2026-01-01' + i::INTEGER, 's' || (i % 4) FROM range(41, 61) t(i);
+
+statement ok
+INSERT INTO lake.main.np_off SELECT * FROM lake.main.np_on;
+
+# The same root again, with statistics trusted. Attached AFTER the tables exist (discovery is at ATTACH).
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/dw' AS lt (TYPE fabricator, PROVIDER 'delta', delete_trusts_statistics true);
+
+# ═══ §1  Routing ═══════════════════════════════════════════════════════════════════════════════════════
+
+# Partition columns only — VARCHAR included (Delta compares strings exactly as DuckDB does).
+query II
+EXPLAIN DELETE FROM lake.main.dw_on WHERE region = 'EU' AND yr = 2021;
+----
+physical_plan	<REGEX>:.*Fabricator Delete Where.*
+
+# A data column: the rowid path (no statistics trusted), and the shortcut operator is ABSENT.
+query II
+EXPLAIN DELETE FROM lake.main.dw_on WHERE n > 3;
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# ONE data-column conjunct sends the whole statement to the rowid path.
+query II
+EXPLAIN DELETE FROM lake.main.dw_on WHERE region = 'EU' AND n > 3;
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# An unpartitioned table without the opt-in has nothing to decide per file: the rowid path.
+query II
+EXPLAIN DELETE FROM lake.main.np_on WHERE id > 55;
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# With the opt-in, any exact predicate takes the shortcut on a deletion-vector table.
+query II
+EXPLAIN DELETE FROM lt.main.np_on WHERE id > 55 AND s = 's1';
+----
+physical_plan	<REGEX>:.*Fabricator Delete Where.*
+
+# Inside BEGIN … COMMIT engineered-wood would delete against the BASE snapshot, blind to this transaction's own
+# writes — so the rowid path, which reads them.
+statement ok
+BEGIN;
+
+query II
+EXPLAIN DELETE FROM lake.main.dw_on WHERE region = 'EU';
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+statement ok
+ROLLBACK;
+
+# ═══ §2  Differential — partition predicates ══════════════════════════════════════════════════════════
+# Each step runs on dw_on with the shortcut and on dw_off with the kill switch; the counts must agree.
+
+# P1: `<>` must keep the NULL-region rows (they are deleted only by IS DISTINCT FROM / IS NULL below).
+query I
+DELETE FROM lake.main.dw_on WHERE dd = DATE '2026-01-02' AND region <> 'US';
+----
+14
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.dw_off WHERE dd = DATE '2026-01-02' AND region <> 'US';
+----
+14
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# P2: IS DISTINCT FROM is TRUE for a NULL region.
+query I
+DELETE FROM lake.main.dw_on WHERE region IS DISTINCT FROM 'APAC' AND yr = 2022;
+----
+11
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.dw_off WHERE region IS DISTINCT FROM 'APAC' AND yr = 2022;
+----
+11
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+DELETE FROM lake.main.dw_on WHERE region IS NULL;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.dw_off WHERE region IS NULL;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# A string RANGE and a BETWEEN.
+query I
+DELETE FROM lake.main.dw_on WHERE region > 'B' AND yr BETWEEN 2021 AND 2021;
+----
+8
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.dw_off WHERE region > 'B' AND yr BETWEEN 2021 AND 2021;
+----
+8
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+DELETE FROM lake.main.dw_on WHERE yr IN (2020) AND region = 'APAC';
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.dw_off WHERE yr IN (2020) AND region = 'APAC';
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+SELECT count(*) FROM lake.main.dw_on;
+----
+19
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lake.main.dw_on EXCEPT ALL SELECT * FROM lake.main.dw_off)
+  UNION ALL (SELECT * FROM lake.main.dw_off EXCEPT ALL SELECT * FROM lake.main.dw_on));
+----
+0
+
+# ═══ §3  Differential — any column, statistics trusted ═══════════════════════════════════════════════
+
+query I
+DELETE FROM lt.main.np_on WHERE id > 55;
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.np_off WHERE id > 55;
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# `<>` on a column holding NULLs: a NULL n is unknown, so it is NOT deleted.
+query I
+DELETE FROM lt.main.np_on WHERE n <> 2;
+----
+39
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.np_off WHERE n <> 2;
+----
+39
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+DELETE FROM lt.main.np_on WHERE amount BETWEEN 10.00 AND 20.00;
+----
+2
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.np_off WHERE amount BETWEEN 10.00 AND 20.00;
+----
+2
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+DELETE FROM lt.main.np_on WHERE d < DATE '2026-01-10' OR s = 's3';
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.np_off WHERE d < DATE '2026-01-10' OR s = 's3';
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+DELETE FROM lt.main.np_on WHERE n IS NULL;
+----
+4
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.np_off WHERE n IS NULL;
+----
+4
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+SELECT count(*) FROM lake.main.np_on;
+----
+5
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lake.main.np_on EXCEPT ALL SELECT * FROM lake.main.np_off)
+  UNION ALL (SELECT * FROM lake.main.np_off EXCEPT ALL SELECT * FROM lake.main.np_on));
+----
+0
+
+# ═══ §4  A partition is removed WITHOUT READING its files ═════════════════════════════════════════════
+# column_mapping 'none' so the partition directories are named `p=<value>` and the files can be found.
+
+statement ok
+CREATE TABLE lake.main.pc (id INTEGER, p VARCHAR) PARTITIONED BY (p) WITH (column_mapping='none');
+
+statement ok
+INSERT INTO lake.main.pc SELECT i, ['a','b'][i % 2 + 1] FROM range(20) t(i);
+
+# Overwrite partition a's data file with something that is not parquet.
+query I
+SELECT sum(fabricator_host_exec('COPY (SELECT ''garbage'' AS x) TO ''' || file || ''' (FORMAT csv)'))
+FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/dw/pc/p=a/*.parquet');
+----
+1
+
+# The control: the rowid path has to read the file, and it is unreadable.
+statement ok
+SET fabricator_dml_pushdown = false;
+
+statement error
+DELETE FROM lake.main.pc WHERE p = 'a';
+----
+too small to be a Parquet file
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# The shortcut never opens it: the count comes from the log, the file leaves the table unread.
+query I
+DELETE FROM lake.main.pc WHERE p = 'a';
+----
+10
+
+query II
+SELECT p, count(*) FROM lake.main.pc GROUP BY p ORDER BY p;
+----
+b	10
+
+# ═══ §5  A file whose statistics prove every row matches is removed WITHOUT READING it ════════════════
+
+statement ok
+CREATE TABLE lake.main.sc (id INTEGER, v VARCHAR) WITH (column_mapping='none');
+
+statement ok
+INSERT INTO lake.main.sc SELECT i, 'v' || i FROM range(1, 21) t(i);
+
+statement ok
+INSERT INTO lake.main.sc SELECT i, 'v' || i FROM range(21, 41) t(i);
+
+statement ok
+INSERT INTO lake.main.sc SELECT i, 'v' || i FROM range(41, 61) t(i);
+
+statement ok
+SELECT fabricator_refresh_cache('lt');
+
+# Overwrite the file holding ids 41..60, found by its footer statistics.
+query I
+SELECT sum(fabricator_host_exec('COPY (SELECT ''garbage'' AS x) TO ''' || file_name || ''' (FORMAT csv)'))
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/dw/sc/*.parquet')
+WHERE path_in_schema = 'id' AND stats_min_value = '41';
+----
+1
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+statement error
+DELETE FROM lt.main.sc WHERE id > 40;
+----
+too small to be a Parquet file
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# Without the opt-in the same DELETE is the rowid path and fails the same way: the proof is the opt-in's.
+statement error
+DELETE FROM lake.main.sc WHERE id > 40;
+----
+too small to be a Parquet file
+
+query I
+DELETE FROM lt.main.sc WHERE id > 40;
+----
+20
+
+query I
+SELECT count(*) FROM lake.main.sc;
+----
+40
+
+# ═══ §6  An explicit transaction keeps read-your-writes ═══════════════════════════════════════════════
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.pc VALUES (100, 'b');
+
+query I
+DELETE FROM lake.main.pc WHERE p = 'b';
+----
+11
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.pc;
+----
+0
+
+# ═══ §7  Where the shortcut cannot win, it is not offered ════════════════════════════════════════════
+
+# The change data feed needs the deleted rows, so every file is read anyway.
+statement ok
+CREATE TABLE lake.main.cdf (id INTEGER, p VARCHAR) PARTITIONED BY (p) WITH (change_data_feed=true);
+
+statement ok
+INSERT INTO lake.main.cdf VALUES (1, 'a'), (2, 'b');
+
+query II
+EXPLAIN DELETE FROM lake.main.cdf WHERE p = 'a';
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# Without deletion vectors a partially matching file cannot be deleted from, so the opt-in does not apply.
+statement ok
+CREATE TABLE lake.main.nodv (id INTEGER) WITH (deletion_vectors=false);
+
+statement ok
+INSERT INTO lake.main.nodv SELECT i FROM range(10) t(i);
+
+statement ok
+SELECT fabricator_refresh_cache('lt');
+
+query II
+EXPLAIN DELETE FROM lt.main.nodv WHERE id > 5;
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+query I
+DELETE FROM lt.main.nodv WHERE id > 5;
+----
+4

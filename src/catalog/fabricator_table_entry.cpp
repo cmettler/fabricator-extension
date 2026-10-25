@@ -66,8 +66,10 @@ public:
 	// Strict refuses every approximation the scan mode makes on purpose — a dropped AND conjunct, string /
 	// blob / uuid / float / temporal comparisons (collation, trailing-space, trailing-zero-byte and precision
 	// semantics all differ on SQL Server), struct paths — and requires each column ref to name THIS scan.
-	FilterSerializer(LogicalGet &get, vector<Value> &constants, bool string_order_pushable, bool strict = false)
-	    : get_(get), constants_(constants), string_order_pushable_(string_order_pushable), strict_(strict) {
+	FilterSerializer(LogicalGet &get, vector<Value> &constants, bool string_order_pushable, bool strict = false,
+	                 bool exact_strings = false, vector<string> *referenced = nullptr)
+	    : get_(get), constants_(constants), string_order_pushable_(string_order_pushable), strict_(strict),
+	      exact_strings_(exact_strings), referenced_(referenced) {
 	}
 
 	// Returns true and fills `out` (a JSON object) + `sql` (an equivalent DuckDB SQL predicate, literals
@@ -252,6 +254,7 @@ private:
 			}
 			name = get_.names[oci.GetPrimaryIndex()].GetIdentifierName();
 			type = e.GetReturnType();
+			Reference(name);
 			return true;
 		}
 		if (e.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
@@ -275,7 +278,14 @@ private:
 		}
 		name = get_.names[table_col].GetIdentifierName();
 		type = ref.GetReturnType();
+		Reference(name);
 		return true;
+	}
+
+	void Reference(const string &name) {
+		if (referenced_) {
+			referenced_->push_back(name);
+		}
 	}
 
 	// Resolve a column ref OR a struct_extract(...) chain over one to its provider column PATH
@@ -383,7 +393,7 @@ private:
 	// VARCHAR push only the positive-equality shapes.
 	bool SafeForType(const char *cmp, const LogicalType &type) const {
 		if (strict_) {
-			return ExactType(type);
+			return Exact(type);
 		}
 		if (type.id() != LogicalTypeId::VARCHAR) {
 			return true; // numeric / temporal / bool / blob / uuid: exact
@@ -420,6 +430,12 @@ private:
 		default:
 			return false;
 		}
+	}
+
+	// The allow-list as THIS provider sees it: a provider whose string comparison is DuckDB's own (byte order,
+	// no collation, no trailing-space rule — Delta) admits VARCHAR too (`exact_strings`, from table_dml_info).
+	bool Exact(const LogicalType &type) const {
+		return ExactType(type) || (exact_strings_ && type.id() == LogicalTypeId::VARCHAR);
 	}
 
 	idx_t AddConstant(const Value &v) {
@@ -524,7 +540,7 @@ private:
 			if (!ColumnPath(*op.GetChildren()[0], path, coltype)) {
 				return false;
 			}
-			if (strict_ && !ExactType(coltype)) {
+			if (strict_ && !Exact(coltype)) {
 				return false;
 			}
 			vector<Value> values;
@@ -652,7 +668,7 @@ private:
 		if (coltype.id() == LogicalTypeId::VARCHAR && !string_order_pushable_) {
 			return false; // string range: collation-dependent ordering, not superset-safe (unless byte-ordered)
 		}
-		if (strict_ && !ExactType(coltype)) {
+		if (strict_ && !Exact(coltype)) {
 			return false;
 		}
 		if (lower.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
@@ -700,6 +716,8 @@ private:
 	vector<Value> &constants_;
 	bool string_order_pushable_;
 	bool strict_;
+	bool exact_strings_;
+	vector<string> *referenced_;
 };
 
 } // namespace
@@ -793,10 +811,12 @@ void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, Fu
 }
 
 bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Expression>> &filters, string &json,
-                                    vector<Value> &constants) {
+                                    vector<Value> &constants, bool exact_strings, vector<string> *referenced) {
 	json.clear();
 	constants.clear();
-	FilterSerializer ser(get, constants, /*string_order_pushable=*/false, /*strict=*/true);
+	// exact_strings: the provider orders strings by bytes, so a string RANGE (BETWEEN) is exact as well.
+	FilterSerializer ser(get, constants, /*string_order_pushable=*/exact_strings, /*strict=*/true, exact_strings,
+	                     referenced);
 	vector<string> parts;
 	for (auto &f : filters) {
 		string js, cs;

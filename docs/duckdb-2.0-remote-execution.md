@@ -290,6 +290,58 @@ differential's second statement: SET values read without the projection-map rema
 the wrong column), and the bridge running an UPDATE spec as a DELETE (the v94 bump's reason, see
 [abi-history.md](abi-history.md) §v94).
 
+### 2.6 DELETE on Delta — BUILT (2026-10-25, no ABI change)
+
+The same plan-less `PlanDelete`, with engineered-wood's predicate delete (`DeltaTransaction.DeleteAsync(Predicate)`,
+clast-project/engineered-wood #506, in our pin since `e598d1d`) as the provider statement. Gate
+`verify_delta_delete_where` (106, hermetic), three mutants each killed at its own row.
+
+**Where it wins, and therefore where it is offered.** engineered-wood decides a file WITHOUT READING IT in two
+cases: a predicate over partition columns alone (every row shares the file's partition values), and — with
+`DeltaTableOptions.DeleteTrustsStatistics` — a file whose statistics prove every row matches. A file it cannot
+decide it reads with its OWN parquet reader, every column, where the rowid path reads natively and only the
+predicate's columns. So the shortcut is not "every exact predicate" (that would make partial deletes slower):
+
+| table / predicate | path |
+|---|---|
+| predicate on partition columns only (any table, DV or not) | shortcut — whole files removed unread |
+| any column, ATTACH `delete_trusts_statistics true`, deletion vectors on | shortcut — statistics-proven files unread, the rest read by engineered-wood |
+| any other column | rowid path |
+| change data feed on | rowid path (the feed needs the deleted rows; every file would be read anyway) |
+| inside `BEGIN … COMMIT` | rowid path (engineered-wood deletes against the BASE snapshot, blind to the transaction's own writes) |
+
+The opt-in is off by default, as in Spark: a wrong bound costs a skipped read when pruning but DELETED ROWS here,
+and two of our own write paths are known to have produced such bounds (the truncated-max native stats before
+their fix, and inverted decimal statistics from the codec writer before EW #398).
+
+**How the host learns it — three additive keys on `table_dml_info`, no ABI bump.** `delete_where_autocommit_only`,
+`delete_where_columns` (the only columns a shortcut predicate may name; absent = any) and `exact_strings` (VARCHAR
+joins the strict allow-list: Delta compares UTF-8 bytes with no collation and no trailing-space rule, which is
+DuckDB's default). The managed side reads them from an INTERNAL `IDeleteWhereShape`, so the public plugin contract
+is unchanged. ⚠ The capability doc is cached per catalog entry, so it is asked BEFORE the predicate is rendered now
+(what counts as exact is the provider's answer) — one crossing per entry, as before.
+
+**⚠⚠ THE FINDING THAT MADE IT WORK AT ALL: Delta's WHERE is ERASED INTO THE SCAN.** The first build never fired:
+`FindExactScan` refused any scan with `table_filters`, a guard written for SQL Server, whose scan never claims a
+filter. Delta's native read does (`filter_pushdown`), so DuckDB removes the FILTER operator and the predicate lives
+only in `LogicalGet::table_filters`. Each table filter now becomes an expression again
+(`TableFilter::ToExpression` over a column ref to the scan) and goes through the same strict serializer; a join
+filter's optional/dynamic wrapper does not render, which sends the statement to the rowid path. SQL Server is
+unaffected (no table filters, the old path).
+
+**The predicate is rebuilt EXACTLY** (`DeltaFilterBuilder.BuildExact`): no AND child is dropped (the pruning
+builder drops unmappable ones on purpose), `IS NOT DISTINCT FROM v` is `=`, `IS DISTINCT FROM v` is
+`<> v OR IS NULL` (a NULL row must be deleted; `<>` alone would leave it unknown), DATE constants map to
+`DateOnly`, and anything unrenderable THROWS — a failed statement, never other rows.
+
+**"Without reading" is proven, not inferred.** §4/§5 overwrite a data file with garbage: the rowid path fails on it
+(*"too small to be a Parquet file"* — the control that the file really is unreadable), the shortcut deletes the
+partition / the statistics-proven file anyway, with the right count from the log.
+
+⚠ **An observation the proof surfaced, NOT fixed:** the rowid path's scan for `p = 'c'` read the file of partition
+`a`, i.e. the DELETE-shaped native scan did not prune partitions by its own filter. Worth a look on its own — it
+is a cost every rowid DELETE pays.
+
 ## 3. Scan-side 2.0 features worth adopting (mostly for Delta)
 
 | feature | API | who uses it | value for us |

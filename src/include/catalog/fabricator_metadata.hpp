@@ -85,6 +85,16 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle);
 struct FabricatorDmlCapabilities {
 	bool delete_where = false;
 	bool update_where = false;
+	//! The shortcut only in an autocommit statement; an explicit transaction keeps the rowid path. A provider
+	//! whose predicate statement cannot see the transaction's own pending writes declares it (Delta).
+	bool delete_where_autocommit_only = false;
+	//! When set, a predicate DELETE may reference ONLY these columns (Delta: its partition columns, whose
+	//! files are removed whole without being read); any other column keeps the rowid path. Unset = any.
+	bool restrict_delete_columns = false;
+	case_insensitive_set_t delete_where_columns;
+	//! VARCHAR compares exactly as DuckDB does (byte order, no collation, no trailing-space rule), so a string
+	//! comparison may join the exact allow-list. SQL Server leaves this off.
+	bool exact_strings = false;
 };
 //! Absent key / malformed doc / an older bridge all read as false — the rowid path, which is safe.
 FabricatorDmlCapabilities FetchDmlCapabilities(FabricatorHandle table);

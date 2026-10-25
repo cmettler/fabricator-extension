@@ -34,8 +34,34 @@ namespace Fabricator.Bridge;
 internal sealed class DeltaFilterBuilder
 {
     private readonly IReadOnlyList<object?> _values;
+    private readonly bool _exact;
 
-    public DeltaFilterBuilder(IReadOnlyList<object?> values) => _values = values;
+    public DeltaFilterBuilder(IReadOnlyList<object?> values) : this(values, exact: false) { }
+
+    private DeltaFilterBuilder(IReadOnlyList<object?> values, bool exact)
+    {
+        _values = values;
+        _exact = exact;
+    }
+
+    /// <summary>
+    /// The EXACT twin, for a predicate DELETE (<see cref="DeltaCatalog.DeleteWhere"/>): the predicate engineered-wood
+    /// evaluates IS the user's — nothing re-checks a delete — so no node may be dropped, an <c>and</c> keeps every
+    /// child or fails, and whatever cannot be rendered THROWS rather than widening. <c>null</c> = every row.
+    /// </summary>
+    /// <remarks>The host sends only what its strict serializer rendered exactly (one shape per node, constants of
+    /// the column's own type), so a throw here means the two sides disagree about a shape — a loud failure of the
+    /// statement, never a different set of rows.</remarks>
+    public static Predicate BuildExact(FilterNode? node, IReadOnlyList<object?> values)
+    {
+        if (node is null)
+        {
+            return Expressions.True;
+        }
+        return new DeltaFilterBuilder(values, exact: true).Build(node)
+            ?? throw new System.NotSupportedException(
+                "fabricator: this DELETE predicate has no exact Delta form (node '" + node.Op + "')");
+    }
 
     /// <summary>Maps the node to a predicate, or null if it can't be safely pushed.</summary>
     public Predicate? Build(FilterNode? node) => node?.Op switch
@@ -56,11 +82,16 @@ internal sealed class DeltaFilterBuilder
     private static string? RefName(FilterNode node) =>
         node.Path is { Count: > 0 } p ? string.Join(".", p) : node.Col;
 
-    // AND: keep the pushable children (dropping unpushable ones still yields a superset).
+    // AND: keep the pushable children (dropping unpushable ones still yields a superset). EXACT: every child or
+    // nothing — a dropped conjunct would delete rows the user did not name.
     private Predicate? BuildAnd(FilterNode node)
     {
-        var parts = (node.Children ?? new List<FilterNode>())
-            .Select(Build).Where(p => p is not null).Select(p => p!).ToArray();
+        var built = (node.Children ?? new List<FilterNode>()).Select(Build).ToArray();
+        if (_exact && (built.Length == 0 || built.Any(p => p is null)))
+        {
+            return null;
+        }
+        var parts = built.Where(p => p is not null).Select(p => p!).ToArray();
         return parts.Length == 0 ? null : Expressions.And(parts);
     }
 
@@ -92,9 +123,23 @@ internal sealed class DeltaFilterBuilder
             return null;
         }
         var value = _values[idx];
-        if (value is null || Lit(value) is not { } lit)
+        if (value is null || Lit(value, _exact) is not { } lit)
         {
             return null; // null constant (host emits is_null separately) or unmappable type
+        }
+        if (_exact)
+        {
+            // The two null-safe comparisons, exact against a NON-null constant (the host never sends a null
+            // one): NOT DISTINCT is plain equality, and DISTINCT is also TRUE for a NULL row — which `<>` alone
+            // would leave unknown, i.e. not deleted.
+            if (node.Cmp == "is_not_distinct")
+            {
+                return Expressions.Equal(col, lit);
+            }
+            if (node.Cmp == "is_distinct")
+            {
+                return Expressions.Or(Expressions.NotEqual(col, lit), Expressions.IsNull(col));
+            }
         }
         // All comparisons push for any type, INCLUDING strings: Parquet min/max statistics are byte-ordered
         // (UTF-8 binary), which matches DuckDB's default binary string comparison — so byte-order pruning is a
@@ -122,7 +167,7 @@ internal sealed class DeltaFilterBuilder
         var lits = new List<LiteralValue>(idxs.Count);
         foreach (var i in idxs)
         {
-            if (i < 0 || i >= _values.Count || _values[i] is not { } v || Lit(v) is not { } lit)
+            if (i < 0 || i >= _values.Count || _values[i] is not { } v || Lit(v, _exact) is not { } lit)
             {
                 return null;
             }
@@ -133,8 +178,12 @@ internal sealed class DeltaFilterBuilder
 
     /// <summary>Maps a CLR constant (as read by <see cref="ArrowValueReader"/>) to an engineered-wood literal,
     /// or null if its type isn't safely pushable here.</summary>
-    private static LiteralValue? Lit(object value) => value switch
+    private static LiteralValue? Lit(object value, bool exact) => value switch
     {
+        // A DATE constant arrives as a DateTime at midnight (ArrowValueReader's Date32). EXACT mode only: the
+        // row evaluator compares a calendar date against a date column directly, while the pruning path keeps
+        // temporal literals out until their stats pairing is settled (see the class remarks).
+        System.DateTime d when exact && d.TimeOfDay == System.TimeSpan.Zero => LiteralValue.Of(System.DateOnly.FromDateTime(d)),
         bool b => (LiteralValue?)LiteralValue.Of(b),
         sbyte v => LiteralValue.Of((int)v),
         short v => LiteralValue.Of((int)v),

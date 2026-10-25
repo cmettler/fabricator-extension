@@ -95,7 +95,7 @@ internal sealed class DeltaTableDefinition : ITable
 /// replay the <c>_delta_log</c> ONCE (measured: 195 s of 291 s in redundant snapshot builds on a Fabric
 /// table at v1850) — see the sharing rules on <see cref="TryGetOpen"/>.</para>
 /// </summary>
-internal sealed class DeltaTableBinding : ITableBinding
+internal sealed class DeltaTableBinding : ITableBinding, IDeleteWhereShape
 {
     /// <summary>Memoized form: created by <see cref="DeltaTransaction.GetOrCreate"/>; the catalog comes from
     /// the owner. <c>Path</c> is mutable for the created-table RENAME re-key
@@ -564,6 +564,26 @@ internal sealed class DeltaTableBinding : ITableBinding
 
     /// <inheritdoc/>
     public IReadOnlyList<FileStatistics>? PartitionStatistics() => Catalog.PartitionStatistics(Path, _at);
+
+    // The predicate-DELETE shape (DescribeDeleteShortcut): read once per binding, because the capability
+    // answer asks for the yes/no and the column list in the same call.
+    private (bool Supported, IReadOnlyList<string>? Columns)? _deleteShape;
+    private (bool Supported, IReadOnlyList<string>? Columns) DeleteShortcutShape =>
+        _deleteShape ??= Catalog.DescribeDeleteShortcut(Path, _at);
+
+    /// <inheritdoc/>
+    public bool SupportsDeleteWhere => DeleteShortcutShape.Supported;
+
+    /// <inheritdoc/>
+    public long DeleteWhere(FilterNode? filter, IArrowArrayStream? filterValues) =>
+        Catalog.DeleteWhere(SchemaName ?? string.Empty, TableName ?? string.Empty, Path, filter, filterValues);
+
+    bool IDeleteWhereShape.DeleteWhereAutocommitOnly => true;
+
+    IReadOnlyList<string>? IDeleteWhereShape.DeleteWhereColumns => DeleteShortcutShape.Columns;
+
+    // Delta compares strings by their UTF-8 bytes with no collation — DuckDB's own default.
+    bool IDeleteWhereShape.ExactStrings => true;
 
     /// <inheritdoc/>
     /// <remarks>Empty, and unlike the row count above this one is a genuine ABSENCE rather than an omission:

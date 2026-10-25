@@ -1424,6 +1424,74 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>What decides whether a predicate DELETE may skip the rowid scan: the table's partition columns and
+    /// configuration, at LATEST (a DELETE always writes against latest).</summary>
+    internal readonly record struct DeleteShape(
+        IReadOnlyList<string> PartitionColumns, IReadOnlyDictionary<string, string> Config);
+
+    public static DeleteShape GetDeleteShape(nint opener, string path)
+        => GetDeleteShapeAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<DeleteShape> GetDeleteShapeAsync(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        try
+        {
+            var meta = table.CurrentSnapshot.Metadata;
+            var cfg = meta.Configuration is null
+                ? new Dictionary<string, string>()
+                : meta.Configuration.ToDictionary(kv => kv.Key, kv => kv.Value);
+            return new DeleteShape(meta.PartitionColumns.ToArray(), cfg);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// A predicate DELETE run by engineered-wood (#506): files the predicate cannot match are skipped on their
+    /// statistics, a predicate over partition columns alone removes whole files WITHOUT READING them, and under
+    /// <paramref name="trustStatistics"/> so does a file whose statistics prove every row matches. Anything else
+    /// it does read — with its own parquet reader, all columns — which is why the host only routes predicates
+    /// that can be decided per file (see <see cref="DeltaCatalog.DeleteWhere"/>).
+    /// </summary>
+    /// <remarks>One commit, through a transaction rather than the autocommit <c>DeleteAsync</c> so an ATTACH
+    /// that asks for <c>serializable</c> is honoured; a table that declares its own level wins either way
+    /// (engineered-wood reads <c>delta.isolationLevel</c> and never weakens it).</remarks>
+    public static long DeleteWhere(nint opener, string path, Predicate predicate, bool trustStatistics,
+                                   bool serializable, CancellationToken ct)
+        => DeleteWhereAsync(opener, path, predicate, trustStatistics, serializable, ct).GetAwaiter().GetResult();
+
+    private static async Task<long> DeleteWhereAsync(nint opener, string path, Predicate predicate,
+                                                     bool trustStatistics, bool serializable, CancellationToken ct)
+    {
+        using var interrupt = new InterruptScope(opener, ct);
+        var token = interrupt.Token;
+        var fs = TableFileSystems.Create(opener, path);
+        var options = DeltaWriter.Options() with { DeleteTrustsStatistics = trustStatistics };
+        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
+        try
+        {
+            // `await using`: a delete that does not commit has already written its deletion vectors (and change
+            // files), and disposal takes them back.
+            await using var txn = table.StartTransaction(serializable ? IsolationLevel.Serializable : null);
+            long deleted = await txn.DeleteAsync(predicate, token).ConfigureAwait(false);
+            await txn.CommitAsync(token).ConfigureAwait(false);
+            MemoryProbe.Mark("delta delete: predicate delete committed", deleted);
+            return deleted;
+        }
+        catch (DeltaConflictException ex)
+        {
+            throw ConcurrentModification("DELETE", ex);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     /// <summary>
     /// The table's live row count, summed from the LOG: every <c>add</c> carries <c>stats.numRecords</c> and
     /// every deletion vector carries its own <c>cardinality</c>, so this opens no data file and reads no

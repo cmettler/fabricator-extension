@@ -620,6 +620,23 @@ used, and `SET fabricator_dml_pushdown = false` turns it off. ⚠ One difference
 integer expression whose intermediate result overflows the column type fails on the row-id path (DuckDB keeps
 the type) and may succeed on the shortcut (SQL Server may widen) — never two different successful results.
 
+On a **Delta** table the same shortcut hands the DELETE to the Delta engine, which can drop whole data files
+**without reading them** — when the WHERE names only the table's **partition columns** (strings included: Delta
+compares bytes, exactly as DuckDB does):
+
+```sql
+DELETE FROM lake.main.events WHERE region = 'EU' AND day < DATE '2026-01-01';   -- partition columns: files removed unread
+```
+
+With the ATTACH option `delete_trusts_statistics true` the shortcut also takes predicates on **any** column of a
+table with deletion vectors, and removes every file whose min/max statistics prove all its rows match —
+useful for a clustered (`SORTED BY`) table, where most files lie entirely inside or outside a range. It is off
+by default, as in Spark: a file is then deleted on its statistics' word, so a writer that recorded a wrong
+bound (an older truncated string maximum, say) would cost rows the predicate does not match. A file the
+statistics cannot decide is read by the Delta engine itself, all columns. Everything else — other columns
+without the option, the change data feed on, any statement inside `BEGIN … COMMIT` — keeps the row-id path,
+which reads natively and only the columns it needs.
+
 `UPDATE … SET col = DEFAULT` is not supported — write the default value explicitly.
 
 ### Loading a Fabric Warehouse with `COPY INTO` (opt-in)
@@ -4448,6 +4465,7 @@ principal wins even if `PROVIDER` says something else:
 | Statistics → optimizer: **row count summed from the log** (`numRecords` per file minus each deletion vector's cardinality — no data file or DV file is read, and it is exact) | ✅ (no per-column NDV — a Delta `add` records min/max/nullCount but no distinct count) |
 | `CREATE TABLE` / `INSERT` / CTAS / COPY (streaming bulk via the standard write path) | ✅ |
 | `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
+| `DELETE` on partition columns (or, with `delete_trusts_statistics`, any column) removes whole files **without reading them** | ✅ |
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
 | **Table options in DDL**: `CREATE … WITH (…)`, `ALTER TABLE … SET (…)`, `ALTER TABLE … RESET (…)` — persisted write tuning that governs every later write | ✅ |
 | Multi-schema: `schemas 'onelevel'` (= `schemas true`; local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
@@ -4793,7 +4811,9 @@ blooms automatically, see [above](#partitioning--write-tuning)), `deletion_vecto
 `in_commit_timestamps true` (in-protocol monotonic timestamps for Spark/Fabric interop — `AT (TIMESTAMP)`
 also resolves without it via the always-on commit timestamp), `native_read true` / `native_write true`
 (DuckDB's own Parquet reader/writer for data files), `isolation_level 'write_serializable'|'serializable'`.
-Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (above).
+Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (above). One more, ATTACH only:
+`delete_trusts_statistics true` (a DELETE may remove files on their statistics without reading them — see
+[INSERT / UPDATE / DELETE](#insert--update--delete)).
 
 #### Changing a table's write settings — `ALTER TABLE … SET / RESET`
 

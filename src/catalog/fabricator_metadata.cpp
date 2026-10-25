@@ -250,6 +250,19 @@ FabricatorDmlCapabilities FetchDmlCapabilities(FabricatorHandle table) {
 	if (auto *root = guard.Root()) {
 		caps.delete_where = yyjson_get_bool(yyjson_obj_get(root, "delete_where"));
 		caps.update_where = yyjson_get_bool(yyjson_obj_get(root, "update_where"));
+		caps.delete_where_autocommit_only = yyjson_get_bool(yyjson_obj_get(root, "delete_where_autocommit_only"));
+		caps.exact_strings = yyjson_get_bool(yyjson_obj_get(root, "exact_strings"));
+		auto *cols = yyjson_obj_get(root, "delete_where_columns");
+		if (yyjson_is_arr(cols)) {
+			caps.restrict_delete_columns = true;
+			size_t idx, max;
+			yyjson_val *col;
+			yyjson_arr_foreach(cols, idx, max, col) {
+				if (yyjson_is_str(col)) {
+					caps.delete_where_columns.insert(yyjson_get_str(col));
+				}
+			}
+		}
 	}
 	return caps;
 }

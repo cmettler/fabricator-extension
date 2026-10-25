@@ -203,7 +203,7 @@ case "$TIER" in
         # 85 since 2026-10-24: verify_delta_partition_stats, engine-doubled (+2 runs) — COUNT(*)/MIN/MAX
         # answered from the Delta log (ABI v95). Each answer is asserted twice, from metadata and with
         # `fabricator_partition_stats = false`, so the switch-off leg is the oracle for the other.
-        : "${MIN_SUITES:=85}"
+        : "${MIN_SUITES:=86}"   # 2026-10-25: +verify_delta_delete_where
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -948,7 +948,10 @@ case "$TIER" in
         #   scan): an inlined CTE referenced twice failed "Failed to find function fabricator_scan()" on every
         #   provider. ⚠ Only the ORDER BY … LIMIT shape is inlined; a count(*) join stays materialized and
         #   never copies, so §7 pins the inlined plan with EXPLAIN before trusting any answer.
-        : "${MIN_ASSERTIONS:=10634}"
+        # 2026-10-25: 10634 -> 10740. verify_delta_delete_where (106, new): the Delta predicate DELETE through
+        #   engineered-wood (#506) — routing, two differentials against the rowid path, and the files-are-never-
+        #   opened proofs (a partition and a statistics-proven file overwritten with garbage, deleted anyway).
+        : "${MIN_ASSERTIONS:=10740}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

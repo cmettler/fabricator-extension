@@ -297,6 +297,10 @@ public sealed class DeltaCatalog : IProviderCatalog
     // by DuckDB's native parquet writer (COPY … TO … FORMAT parquet) instead of engineered-wood's codec; the
     // _delta_log commit stays in engineered-wood. Opt-in (default off); DELETE/UPDATE rewrites are a later slice.
     private readonly bool _nativeWrite;
+    // ATTACH `delete_trusts_statistics` (default false, engineered-wood's DeleteTrustsStatistics): a predicate
+    // DELETE may remove a file UNREAD when its statistics prove every row matches. Off by default, as in Spark:
+    // a wrong bound costs a skipped read when pruning but DELETED ROWS here.
+    private readonly bool _deleteTrustsStatistics;
     // ATTACH option `column_mapping 'name'|'id'|'none'` (default NAME — Fabric-T-SQL-endpoint-compatible;
     // the endpoint rejects id-mode tables): tables CREATED in this catalog enable Delta
     // column mapping — physical column names (col-<guid>) decoupled from logical names, so a later RENAME/DROP
@@ -528,6 +532,7 @@ public sealed class DeltaCatalog : IProviderCatalog
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
         _nativeRead = ParseBoolOption(optionsJson, "native_read", nativeDefaults.Read);
         _nativeWrite = ParseBoolOption(optionsJson, "native_write", nativeDefaults.Write);
+        _deleteTrustsStatistics = ParseBoolOption(optionsJson, "delete_trusts_statistics");
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
         _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
         _copyDisposition = ParseStringOption(optionsJson, "copy_disposition");
@@ -5132,6 +5137,80 @@ public sealed class DeltaCatalog : IProviderCatalog
         return ids;
     }
 
+    /// <summary>
+    /// Whether a DELETE on <paramref name="path"/> may skip the rowid scan, and which columns its predicate may
+    /// name (null = any). Asked ONCE per catalog entry, when the first DELETE against it is planned.
+    /// </summary>
+    /// <remarks>
+    /// <para>engineered-wood decides a file WITHOUT READING IT in two cases: a predicate over partition columns
+    /// alone (every row of a file shares the file's partition values), and — with
+    /// <c>delete_trusts_statistics</c> — a file whose statistics prove every row matches. A file it cannot
+    /// decide it reads with its own parquet reader, every column, where the rowid path reads natively and only
+    /// the predicate's columns. So the shortcut is offered exactly where it can win:</para>
+    /// <list type="bullet">
+    /// <item>partition columns only, on any table — whole files, no statistics trusted;</item>
+    /// <item>any column, only under the opt-in and only with deletion vectors (without them a partially matching
+    /// file cannot be deleted from at all, and engineered-wood refuses);</item>
+    /// <item>never with the change data feed on: the feed needs the deleted rows, so every file is read anyway.</item>
+    /// </list>
+    /// <para>⚠ Cached for the entry's life, so the shape is the one at the first DELETE; a later
+    /// <c>ALTER</c> rebuilds the entry, a property change through <c>set_tblproperties</c> is picked up on the
+    /// next refresh. A stale answer cannot widen what is deleted — it only picks the path.</para>
+    /// </remarks>
+    internal (bool Supported, IReadOnlyList<string>? Columns) DescribeDeleteShortcut(string path, TableAt? at)
+    {
+        if (at is not null)
+        {
+            return (false, null); // a time-travel reference is not a DML target
+        }
+        DeltaReader.DeleteShape shape;
+        try
+        {
+            shape = DeltaReader.GetDeleteShape(Opener(), path);
+        }
+        catch (Exception ex)
+        {
+            // Unknown is not "supported": the rowid path is always correct.
+            _log.LogDebug(ex, "delta delete shortcut {Path}: shape unknown, rowid path", path);
+            return (false, null);
+        }
+        if (EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(shape.Config))
+        {
+            return (false, null);
+        }
+        if (_deleteTrustsStatistics && DeltaReader.IsDeletionVectorsEnabled(shape.Config))
+        {
+            return (true, null);
+        }
+        return shape.PartitionColumns.Count > 0 ? (true, shape.PartitionColumns) : (false, null);
+    }
+
+    /// <summary>
+    /// DELETE … WHERE as ONE engineered-wood predicate delete (ABI v93 <c>table_dml_where</c>), with no rowid
+    /// scan. The host sends it only in autocommit and only with a predicate its strict serializer rendered
+    /// exactly over the columns <see cref="DescribeDeleteShortcut"/> allowed; the predicate is rebuilt
+    /// EXACTLY (<see cref="DeltaFilterBuilder.BuildExact"/>) — nothing re-checks a delete.
+    /// </summary>
+    internal long DeleteWhere(string schemaName, string tableName, string path, FilterNode? filter,
+                              IArrowArrayStream? filterValues)
+    {
+        if (IsExplicitTxn(AmbientTransaction.Current))
+        {
+            // The host never routes one here (delete_where_autocommit_only); engineered-wood deletes against
+            // the BASE snapshot, so this transaction's pending writes would be invisible to it.
+            filterValues?.Dispose();
+            throw new InvalidOperationException(
+                "fabricator: a Delta predicate DELETE runs only in autocommit (the rowid path serves transactions)");
+        }
+        InvalidateReadCache();
+        var predicate = DeltaFilterBuilder.BuildExact(filter, ReadFilterValues(filterValues));
+        var opener = Opener();
+        bool serializable = EffectiveSerializable(path);
+        _log.LogInformation("delta delete-where {Schema}.{Table}: {Predicate} trust_statistics={Trust} serializable={Ser}",
+            schemaName, tableName, predicate, _deleteTrustsStatistics, serializable);
+        return DeltaReader.DeleteWhere(opener, path, predicate, _deleteTrustsStatistics, serializable, default);
+    }
+
     public long ExecuteDelete(IReadOnlyList<string> schemaPath, string tableName, IArrowArrayStream keys)
     {
         // The LEAF of the path, for the log lines and the messages below — the DIRECTORY is resolved
@@ -6125,6 +6204,7 @@ public sealed class DeltaCatalog : IProviderCatalog
                 new KeyValuePair<string, string>("root", _root),
                 new KeyValuePair<string, string>("native_read", _nativeRead ? "true" : "false"),
                 new KeyValuePair<string, string>("native_write", _nativeWrite ? "true" : "false"),
+                new KeyValuePair<string, string>("delete_trusts_statistics", _deleteTrustsStatistics ? "true" : "false"),
                 new KeyValuePair<string, string>("onelake", FabricLakehouse.IsOneLake(_root) ? "true" : "false"),
             }),
             // The `delta` function namespace — every Delta catalog, every root kind. These replaced the

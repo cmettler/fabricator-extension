@@ -3,6 +3,7 @@
 // See LICENSE in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.Json;
@@ -223,7 +224,9 @@ internal sealed class TableSession
         return Encoding.UTF8.GetString(buffer.ToArray());
     }, at ?? _at);
 
-    /// <summary>The <c>table_dml_info</c> answer (ABI v93): <c>{"delete_where": bool}</c>.</summary>
+    /// <summary>The <c>table_dml_info</c> answer (ABI v93): <c>{"delete_where": bool, "update_where": bool}</c>,
+    /// plus — for a binding that is an <see cref="IDeleteWhereShape"/> — the three keys that narrow when the host
+    /// may take the DELETE shortcut (additive, no ABI change: an older host ignores them).</summary>
     internal string DmlInfoJson() => With(t =>
     {
         using var buffer = new MemoryStream();
@@ -232,6 +235,20 @@ internal sealed class TableSession
             json.WriteStartObject();
             json.WriteBoolean("delete_where", t.SupportsDeleteWhere);
             json.WriteBoolean("update_where", t.SupportsUpdateWhere);
+            if (t is IDeleteWhereShape shape && t.SupportsDeleteWhere)
+            {
+                json.WriteBoolean("delete_where_autocommit_only", shape.DeleteWhereAutocommitOnly);
+                json.WriteBoolean("exact_strings", shape.ExactStrings);
+                if (shape.DeleteWhereColumns is { } columns)
+                {
+                    json.WriteStartArray("delete_where_columns");
+                    foreach (var column in columns)
+                    {
+                        json.WriteStringValue(column);
+                    }
+                    json.WriteEndArray();
+                }
+            }
             json.WriteEndObject();
         }
         return Encoding.UTF8.GetString(buffer.ToArray());
@@ -256,4 +273,25 @@ internal sealed class TableSession
         }
         return With(t => t.DeleteWhere(spec.Filter, filterValues));
     }
+}
+
+/// <summary>
+/// Narrows WHEN the host takes a binding's predicate DELETE (<see cref="ITableBinding.DeleteWhere"/>), for a
+/// provider whose predicate statement is not equivalent to the rowid path everywhere. Internal on purpose: the
+/// public contract keeps the plain yes/no, and only a built-in provider has needed more so far.
+/// </summary>
+internal interface IDeleteWhereShape
+{
+    /// <summary>Only in an autocommit statement. True when the predicate statement cannot see the
+    /// transaction's own pending writes (Delta deletes against the base snapshot).</summary>
+    bool DeleteWhereAutocommitOnly { get; }
+
+    /// <summary>The only columns a shortcut predicate may name; null = any. Delta: its partition columns, whose
+    /// files are removed whole without being read — a predicate on any other column is faster on the native
+    /// rowid scan, unless statistics are trusted.</summary>
+    IReadOnlyList<string>? DeleteWhereColumns { get; }
+
+    /// <summary>The provider compares strings exactly as DuckDB does (byte order, no collation, no trailing-space
+    /// rule), so a VARCHAR comparison is exact.</summary>
+    bool ExactStrings { get; }
 }

@@ -33,8 +33,11 @@ void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, Fu
 //! FilterNode JSON (+ the constants it references by index) iff EVERY conjunct renders EXACTLY — no dropped
 //! conjunct, an exact-type allow-list, no struct paths, every column ref naming `get`. Returns false on the
 //! first thing it cannot render exactly; true with an empty `json` means "no predicate".
+//! `exact_strings` admits VARCHAR (a provider whose string comparison is DuckDB's own); `referenced`, when given,
+//! receives every column the predicate names.
 bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Expression>> &filters, string &json,
-                                    vector<Value> &constants);
+                                    vector<Value> &constants, bool exact_strings = false,
+                                    vector<string> *referenced = nullptr);
 //! One UPDATE … SET value under the same exact rule (ABI v94): a value-node JSON tree whose constants are
 //! APPENDED to `constants`, so the predicate and every SET value share one value batch. False = not exact.
 bool FabricatorSerializeExactValue(LogicalGet &get, const Expression &value, string &json, vector<Value> &constants);
