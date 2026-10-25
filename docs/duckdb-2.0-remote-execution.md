@@ -587,7 +587,7 @@ files straight from the repo) → T-SQL executed on SQL Server → compared with
 | string `min`/`max` | both | declared under `extension:fabricator:functions_string`; `StringFromKey(MIN(StringKey(x)))` |
 | unary minus, `//`, `%` declined | to_substrait | `negate`, `divide`, `modulus` (DuckDB truncates toward zero, like T-SQL) |
 
-**Measured, 67 queries: 52 identical, 11 same values with `DECIMAL(38,0)` for HUGEINT (the pushdown wrapper casts
+**Measured, 67 queries (68 since §3.9): 52 identical, 11 same values with `DECIMAL(38,0)` for HUGEINT (the pushdown wrapper casts
 to DuckDB's bound types), 1 within one ulp, 1 declined by the producer (window), 1 by the emitter (`extract:date`),
 1 error on both sides — and 0 wrong answers.**
 
@@ -600,7 +600,50 @@ to DuckDB's bound types), 1 within one ulp, 1 declined by the producer (window),
   (error) matches.
 - ⚠ **Performance not measured**: every string comparison now goes through the key expression, which no index
   seek and possibly no columnstore segment elimination can use. A sargable prefilter (`raw = literal AND key =
-  key`, a superset that is exact once combined) is the obvious next step for equality.
+  key`, a superset that is exact once combined) is the obvious next step for equality. → BUILT, §3.10.
+
+### 3.9 Date parts as Substrait `extract` (2026-10-25)
+
+Upstream to_substrait sent `year(d)` as a function `year` registered as `extract:date`, which no consumer that
+follows the spec resolves (the emitter declined it). Now (`[FABRICATOR-PATCH: OFFER-READY]`, offerable upstream):
+the component goes out as the spec's upper-case enum, plus the indexing enum for counting components, and the
+compound name carries each enum as `req` — `extract:req_date`, `extract:req_req_date`, also for `pts` (timestamp)
+and `pt` (time). `RegisterDeclaredFunction` registers a name the catalog cannot derive (it matches on argument
+types, and an enum is not one).
+
+| DuckDB | component | indexing |
+|---|---|---|
+| `year`, `isoyear` | `YEAR`, `ISO_YEAR` | — |
+| `quarter`, `month`, `day`/`dayofmonth`, `dayofyear` | as named | `ONE` |
+| `week`/`weekofyear` | `ISO_WEEK` | `ONE` |
+| `isodow` / `dayofweek` | `MONDAY_DAY_OF_WEEK` / `SUNDAY_DAY_OF_WEEK` | `ONE` / `ZERO` |
+| `hour`, `minute`, `second` | as named | — |
+
+- ⚠ **Declined on purpose: `millisecond`/`microsecond`** — DuckDB counts them from the last full MINUTE
+  (`second * 1000 + ms`), Substrait from the last second; `decade`/`century`/`millennium` have no component.
+- Measured: `date_part`, a query over every date component and one over the time components — identical; the
+  millisecond query declines. ⚠ The time query only checks midnight values (no timestamp column in the data).
+
+### 3.10 An indexable prefilter for string equality — measured (2026-10-25, user-asked)
+
+The §3.6 key is an expression, so `key(col) = key('x')` can never seek an index. Equality now renders as
+`(col = 'x') AND (key(col) = key('x'))` (and `col IN ('a','b') AND key IN (…)`):
+
+- the first conjunct is the column WITHOUT the query's binary collation, i.e. under its own, which its indexes
+  are built in; a literal of printable ASCII goes out non-Unicode (`'x'`, not `N'x'`) so a `varchar` column is not
+  converted; casts to `nvarchar(max)` are looked through (they do not change a value);
+- it is a **superset** of exact equality (identical strings are equal under every collation), so it may only be
+  ANDed with the key, never stand alone; `<>` and the ordering comparisons get no prefilter (a superset of `<>` is
+  not useful, and order under the column's collation is not DuckDB's);
+- emitted only when one side is a plain column reference and the other a column or a literal.
+
+**Measured on a 200 000-row table with indexes on `varchar(40)` (SQL collation), `nvarchar(40)` and a UTF-8
+`varchar`: all eight shapes — `=` on each type, a non-ASCII literal, `IN` on varchar and nvarchar, a literal with
+a trailing space and one differing in case — are an `Index Seek` + residual `Filter`, and the answers are exact
+(0 rows for the padded and the case-different literal, where the collation alone would say 1). Control, the key
+alone: `Index Scan`, 518 ms against 0 ms.** The 68-query correctness set is unchanged: 0 wrong answers.
+
+- ⚠ Not measured: columnstore segment elimination on strings (the prefilter is what makes it possible at all).
 
 ## 4. Order of work
 

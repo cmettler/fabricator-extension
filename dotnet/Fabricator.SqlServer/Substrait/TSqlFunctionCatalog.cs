@@ -431,6 +431,26 @@ internal static class TSqlFunctionCatalog
 
     private static SType SameAsFirst(SType[] t) => t.Length > 0 ? t[0] : SType.Unknown;
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] String equality with an indexable superset in front of the exact key
+    /// comparison, when one side is a plain column: <c>col = 'x' AND key(col) = key('x')</c>. The first conjunct
+    /// lets SQL Server seek an index or eliminate segments; the second makes the answer exact.
+    /// </summary>
+    private static string Indexable(TSqlCall c, string exact)
+    {
+        if (!c.T(0).IsStringLike || !c.T(1).IsStringLike)
+        {
+            return exact;
+        }
+        string? left = TSqlEmitter.IndexableString(c.V(0));
+        string? right = TSqlEmitter.IndexableString(c.V(1));
+        if (left == null || right == null || (!TSqlEmitter.IsColumnReference(left) && !TSqlEmitter.IsColumnReference(right)))
+        {
+            return exact;
+        }
+        return $"(({left} = {right}) AND {exact})";
+    }
+
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Argument <paramref name="i"/>, a string as its exact key.</summary>
     private static string K(TSqlCall c, int i) => c.T(i).IsStringLike ? TSqlEmitter.StringKey(c.V(i)) : c.V(i);
 
@@ -582,10 +602,8 @@ internal static class TSqlFunctionCatalog
         // shorter string with spaces, and binary values with zeros, before comparing.
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] ...except that a string compares by its exact key (K), so neither padding nor
         // case nor UTF-16 order changes the answer; see TSqlEmitter.StringKey.
-        foreach (var (name, op) in new[] { ("equal", "="), ("not_equal", "<>") })
-        {
-            Condition(ComparisonUrn, name, op, "INFIX", c => $"({K(c, 0)} {op} {K(c, 1)})", V("any_any"));
-        }
+        Condition(ComparisonUrn, "equal", "=", "INFIX", c => Indexable(c, $"({K(c, 0)} = {K(c, 1)})"), V("any_any"));
+        Condition(ComparisonUrn, "not_equal", "<>", "INFIX", c => $"({K(c, 0)} <> {K(c, 1)})", V("any_any"));
         foreach (var (name, op) in new[] { ("lt", "<"), ("lte", "<="), ("gt", ">"), ("gte", ">=") })
         {
             Condition(ComparisonUrn, name, op, "INFIX", c => Ordered(c, $"({K(c, 0)} {op} {K(c, 1)})"), V("any_any"));

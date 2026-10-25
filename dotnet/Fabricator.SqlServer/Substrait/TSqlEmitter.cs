@@ -1053,6 +1053,45 @@ internal sealed class TSqlEmitter
     internal static string StringKey(string value)
         => $"(REPLACE(REPLACE(CONVERT(varchar(max), ({value}) COLLATE Latin1_General_100_BIN2_UTF8), CHAR(1), CHAR(1) + CHAR(2)), CHAR(0), CHAR(1) + CHAR(1)) + CHAR(0))";
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A rendered string column or literal in the form an index can use: the
+    /// column without the query collation (so it compares under its own, which its indexes are built in), a
+    /// literal of printable ASCII as a non-Unicode literal (so a varchar column is not converted, which would
+    /// rule out a seek). Null for anything else. Compared with <c>=</c>, two of these give a SUPERSET of exact
+    /// equality — byte-equal strings are equal under every collation — so it may only ever be ANDed with the
+    /// exact key comparison, never stand alone.
+    /// </summary>
+    internal static string? IndexableString(string rendered)
+    {
+        const string suffix = " COLLATE " + BinaryCollation;
+        if (!rendered.EndsWith(suffix, StringComparison.Ordinal))
+        {
+            return null;
+        }
+        string raw = rendered.Substring(0, rendered.Length - suffix.Length);
+        // a cast to nvarchar(max) does not change a string's value: look through it
+        const string castHead = "CAST(", castTail = " AS nvarchar(max))";
+        if (raw.StartsWith(castHead, StringComparison.Ordinal) && raw.EndsWith(castTail, StringComparison.Ordinal))
+        {
+            return IndexableString(raw.Substring(castHead.Length, raw.Length - castHead.Length - castTail.Length));
+        }
+        if (s_unicodeLiteral.IsMatch(raw))
+        {
+            string body = raw.Substring(2, raw.Length - 3);
+            return body.All(ch => ch >= 0x20 && ch < 0x7F) ? "'" + body + "'" : raw;
+        }
+        return s_columnReference.IsMatch(raw) ? raw : null;
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex s_unicodeLiteral =
+        new(@"^N'(?:[^']|'')*'$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    private static readonly System.Text.RegularExpressions.Regex s_columnReference =
+        new(@"^\[[^\]]+\]\.\[(?:[^\]]|\]\])*\]$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Whether a rendered value is a plain column reference.</summary>
+    internal static bool IsColumnReference(string? raw) => raw != null && s_columnReference.IsMatch(raw);
+
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The string a <see cref="StringKey"/> was made from.</summary>
     internal static string StringFromKey(string key)
         => $"CONVERT(nvarchar(max), REPLACE(REPLACE(LEFT({key}, LEN({key}) - 1), CHAR(1) + CHAR(1), CHAR(0)), CHAR(1) + CHAR(2), CHAR(1)))";
@@ -1136,7 +1175,15 @@ internal sealed class TSqlEmitter
         // T-SQL's IN is three-valued, like Substrait's.
         if (value.Type.IsStringLike) // [FABRICATOR-PATCH: OURS-BY-DESIGN] strings compare by their exact key
         {
-            return SqlExpr.Condition($"({StringKey(value.Value)} IN ({string.Join(", ", options.Select(o => StringKey(o.Value)))}))", props);
+            string exact = $"({StringKey(value.Value)} IN ({string.Join(", ", options.Select(o => StringKey(o.Value)))}))";
+            // [FABRICATOR-PATCH: OURS-BY-DESIGN] an indexable superset first (see IndexableString)
+            string? column = IndexableString(value.Value);
+            var literals = options.Select(o => IndexableString(o.Value)).ToList();
+            if (IsColumnReference(column) && literals.All(l => l != null && !IsColumnReference(l)))
+            {
+                exact = $"({column} IN ({string.Join(", ", literals)}) AND {exact})";
+            }
+            return SqlExpr.Condition(exact, props);
         }
         return SqlExpr.Condition($"({value.Value} IN ({string.Join(", ", options.Select(o => o.Value))}))", props);
     }
