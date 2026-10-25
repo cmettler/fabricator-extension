@@ -1111,6 +1111,12 @@ pass-through `PhysicalOperator`, fires once even above a UNION). Possible future
     (`filter_json`+constants, `native_filter_sql`, `top_n`, `order_by_json`, `at_unit`/`at_value`) so
     two differently-pushed scans of ONE table cannot collapse either; identical scans still dedup, which
     for a remote provider is a real win. Gate `verify_delta_subplan_dedup` (36), mutation-tested.
+  - **⚠ SUPERSEDED 2026-10-25 — the deserializer IS REACHABLE NOW.** A plan COPY (DuckDB inlines a CTE
+    referenced twice by serialize + deserialize) hit exactly the lookup failure below, so every such CTE over a
+    fabricator table failed. A zero-argument `fabricator_scan()` stub is registered beside the named-source
+    overload, carries both callbacks, and refuses a direct call at bind; the deserializer replaces it with the
+    real scan, rebuilt AT THE SERIALIZED VERSION. Gate `verify_delta_subplan_dedup` §7. The paragraph below is
+    the record of why it was unreachable:
   - **`PRAGMA verify_serializer` does NOT work on a fabricator catalog scan, and never did.**
     `LogicalGet::Deserialize` calls `FunctionSerializer::DeserializeBase` UNCONDITIONALLY (before it
     checks has_serialize), resolving the function BY NAME against `TABLE_FUNCTION_ENTRY`; the catalog

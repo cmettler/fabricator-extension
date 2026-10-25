@@ -764,22 +764,29 @@ static void FabricatorScanSerialize(Serializer &serializer, const optional_ptr<F
 // they would on a fresh bind — the same reason DuckDB's own TableScanDeserialize re-looks-up the entry.
 // Only the pushed spec is restored from the payload.
 //
-// NOTE this is currently UNREACHABLE, and it must still exist. `FunctionSerializer::Serialize` only
-// emits the bind data when `HasSerializationCallbacks()` holds, which requires BOTH callbacks — so
-// without this function the serialize half above would never run and the dedup collision would return.
-// But a full plan deserialization cannot reach it either: `LogicalGet::Deserialize` calls
-// `FunctionSerializer::DeserializeBase` UNCONDITIONALLY (before it looks at has_serialize), and that
-// resolves the function BY NAME against TABLE_FUNCTION_ENTRY. The catalog scan is not a registered
-// catalog function — it is handed out by GetScanFunction — so the lookup fails with "Failed to find
-// function fabricator_scan()". `PRAGMA verify_serializer` therefore does not work on a fabricator
-// catalog scan; that predates this change (DeserializeBase ran the same way when has_serialize was
-// false) and is unrelated to it. Making it work would mean registering a zero-arg `fabricator_scan`
-// catalog function, which would also make it user-callable — not done. Kept correct-if-reached so that
-// whenever that lookup does resolve, this rebuilds a working scan rather than a half-initialized one.
-static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+// REACHED BY EVERY PLAN COPY, which DuckDB makes by serializing and deserializing
+// (`LogicalOperator::Copy`) — e.g. when it INLINES a CTE that is referenced twice. `LogicalGet::Deserialize`
+// first resolves the function BY NAME against TABLE_FUNCTION_ENTRY, and the catalog scan is not a
+// catalog function (GetScanFunction hands it out) — so until the zero-argument `fabricator_scan()` stub
+// was registered (CatalogScanStub) that lookup failed with "Failed to find function fabricator_scan()" and
+// such a CTE could not be planned at all. The stub carries these callbacks; this one replaces it with the
+// real scan of the named table.
+//
+// The AT clause is restored BEFORE the rebuild, because the rebuild describes the table and must describe
+// the requested version, not latest (the serialized returned_types are of that version).
+static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserializer,
+                                                          TableFunction &function) {
 	auto catalog = deserializer.ReadProperty<string>(100, "catalog");
 	auto schema = deserializer.ReadProperty<string>(101, "schema");
 	auto table = deserializer.ReadProperty<string>(102, "table");
+	// the payload is read in field order, so the spec is read before the rebuild and applied after it
+	auto filter_json = deserializer.ReadProperty<string>(103, "filter_json");
+	auto filter_constants = deserializer.ReadProperty<vector<Value>>(104, "filter_constants");
+	auto native_filter_sql = deserializer.ReadProperty<string>(105, "native_filter_sql");
+	auto top_n = deserializer.ReadProperty<decltype(fabricator::ArrowStreamBindData::top_n)>(106, "top_n");
+	auto order_by_json = deserializer.ReadProperty<string>(107, "order_by_json");
+	auto at_unit = deserializer.ReadProperty<string>(108, "at_unit");
+	auto at_value = deserializer.ReadProperty<string>(109, "at_value");
 
 	auto &context = deserializer.Get<ClientContext &>();
 	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
@@ -793,31 +800,54 @@ static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserial
 	}
 
 	unique_ptr<FunctionData> bind_data;
-	function = fabricator_entry->GetScanFunction(context, bind_data);
+	function = fabricator_entry->RebuildScanFunction(context, bind_data, at_unit, at_value);
 	auto &data = bind_data->Cast<fabricator::ArrowStreamBindData>();
-
-	deserializer.ReadProperty(103, "filter_json", data.filter_json);
-	deserializer.ReadProperty(104, "filter_constants", data.filter_constants);
-	deserializer.ReadProperty(105, "native_filter_sql", data.native_filter_sql);
-	deserializer.ReadProperty(106, "top_n", data.top_n);
-	deserializer.ReadProperty(107, "order_by_json", data.order_by_json);
-	deserializer.ReadProperty(108, "at_unit", data.at_unit);
-	deserializer.ReadProperty(109, "at_value", data.at_value);
+	data.filter_json = std::move(filter_json);
+	data.filter_constants = std::move(filter_constants);
+	data.native_filter_sql = std::move(native_filter_sql);
+	data.top_n = top_n;
+	data.order_by_json = std::move(order_by_json);
 	return bind_data;
 }
 
+static unique_ptr<FunctionData> FabricatorScanStubBind(ClientContext &, TableFunctionBindInput &,
+                                                       vector<LogicalType> &, vector<string> &) {
+	throw BinderException("fabricator_scan() is internal: it names the scan of an attached fabricator table and "
+	                      "cannot be called directly; use fabricator_scan('<source>') for a named source");
+}
+
+TableFunction FabricatorTableEntry::CatalogScanStub() {
+	// Same name, no arguments, and the catalog scan's callbacks: exactly what a serialized catalog scan
+	// is looked up by. Only `deserialize` is ever used from it — it replaces the stub with the real scan.
+	TableFunction stub("fabricator_scan", {}, fabricator::ArrowStreamScan, FabricatorScanStubBind,
+	                   fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	stub.serialize = FabricatorScanSerialize;
+	stub.deserialize = FabricatorScanDeserialize;
+	return stub;
+}
+
 TableFunction FabricatorTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
-	return BuildScanFunction(context, bind_data, nullptr);
+	return BuildScanFunction(context, bind_data, string(), string());
 }
 
 // Time-travel overload: DuckDB binds `FROM t AT (...)` and hands us the bound clause via the lookup info.
 TableFunction FabricatorTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
                                                   const EntryLookupInfo &lookup_info) {
-	return BuildScanFunction(context, bind_data, lookup_info.GetAtClause());
+	auto at_clause = lookup_info.GetAtClause();
+	if (!at_clause) {
+		return BuildScanFunction(context, bind_data, string(), string());
+	}
+	return BuildScanFunction(context, bind_data, at_clause->Unit(),
+	                         at_clause->GetValue().ToString());
+}
+
+TableFunction FabricatorTableEntry::RebuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+                                                        const string &at_unit, const string &at_value) {
+	return BuildScanFunction(context, bind_data, at_unit, at_value);
 }
 
 TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
-                                                    optional_ptr<BoundAtClause> at_clause) {
+                                                    const string &at_unit, const string &at_value) {
 	auto data = make_uniq<fabricator::ArrowStreamBindData>();
 	auto table_handle = table_handle_;
 	// The managed side builds the provider SELECT for the whole table.
@@ -864,10 +894,8 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	};
 	// Time travel: record `FROM t AT (...)` (a bind-time constant) so the scan spec carries it to the
 	// provider (SQL Server: FOR SYSTEM_TIME AS OF for "timestamp"; "version" is rejected managed-side).
-	if (at_clause) {
-		data->at_unit = at_clause->Unit();
-		data->at_value = at_clause->GetValue().ToString();
-	}
+	data->at_unit = at_unit;
+	data->at_value = at_value;
 
 	// ⚠ THE BLOCK ABOVE MUST STAY ABOVE the schema_factory below, which bakes the AT clause into the probe
 	// spec. It used to sit ~20 lines further down, so the probe was built while at_unit was still empty and
