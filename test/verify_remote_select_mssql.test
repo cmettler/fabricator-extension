@@ -44,6 +44,16 @@ INSERT INTO dbo.rs_t SELECT CASE WHEN value = 300 THEN 2147483647 WHEN value = 2
   CASE WHEN value % 17 = 0 THEN NULL ELSE DATEADD(day, value % 50, ''2026-01-01'') END,
   ''s'' + CAST(value % 4 AS VARCHAR), value / 3.0 FROM GENERATE_SERIES(1, 300);');
 
+# rs_u is the join partner: k 1..9 once, plus k 1 and 2 a second time (multiplicity) and one NULL k; k 7..9
+# have no partner in rs_t (LEFT joins); w is NULL for every fourth row.
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_u;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_u (uid INT, k SMALLINT NULL, label VARCHAR(10), w INT NULL);
+INSERT INTO dbo.rs_u SELECT value, CASE WHEN value = 10 THEN NULL WHEN value > 10 THEN value - 10 ELSE value END,
+  ''u'' + CAST(value AS VARCHAR), CASE WHEN value % 4 = 0 THEN NULL ELSE value * 10 END FROM GENERATE_SERIES(1, 12);');
+
 statement ok
 SELECT fabricator_refresh_cache('db');
 
@@ -123,17 +133,7 @@ EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE t < 300;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
-# ORDER BY / LIMIT, HAVING, an expression, a plain projection
-query II
-EXPLAIN SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k ORDER BY k;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-query II
-EXPLAIN SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 10;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
+# an expression, a plain projection over ONE table (the scan already pushes its filter)
 query II
 EXPLAIN SELECT sum(id + 1) FROM rp.dbo.rs_t;
 ----
@@ -144,11 +144,39 @@ EXPLAIN SELECT id FROM rp.dbo.rs_t WHERE id > 5;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
-# a self-join (two references): not a single table
+# a string sort key (collation), DISTINCT
 query II
-EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_t b ON a.id = b.id;
+EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_t GROUP BY s ORDER BY s;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT DISTINCT a.k FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# a FULL join, a USING join, a string join key
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a FULL JOIN rp.dbo.rs_u b ON a.k = b.k;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t JOIN rp.dbo.rs_u USING (k);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.s = b.label;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# an UNQUALIFIED name both tables have is ambiguous: declined, so DuckDB reports it rather than the server
+# picking one
+statement error
+SELECT k, count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k GROUP BY k;
+----
+<REGEX>:.*mbiguous.*
 
 # ═══ §3  The differential: pushed (rp) and existing (db) agree, row for row ═══════════════════════════
 
@@ -326,6 +354,287 @@ SELECT count(*) FROM rp.dbo.rs_t WHERE id = 100000;
 ----
 0
 
+# ═══ §7  ORDER BY / LIMIT ════════════════════════════════════════════════════════════════════════════
+# The server applies the order and the limit (only LIMIT rows travel); the wrapper sorts again, because a
+# subquery carries no ordering guarantee. Every ordered result is asserted on BOTH catalogs in order.
+#
+# ⚠ THE NULL CASES ARE THE LOAD-BEARING ONES, and they use LIMIT on purpose: T-SQL puts NULLs FIRST for ASC
+# and has no NULLS FIRST/LAST, while DuckDB's default is NULLS LAST. Without the explicit NULL rank the server
+# would pick a different SET of rows — the local re-sort cannot repair a row that never arrived.
+
+query II
+EXPLAIN SELECT k, count(*) AS c FROM rp.dbo.rs_t GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+SELECT k, count(*) AS c FROM rp.dbo.rs_t GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+0	39
+1	39
+2	39
+
+query II
+SELECT k, count(*) AS c FROM db.dbo.rs_t GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+0	39
+1	39
+2	39
+
+# ASC: NULL group last (DuckDB's default) — the NULL group must NOT be among the three
+query II
+SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k ORDER BY k LIMIT 3;
+----
+0	39
+1	39
+2	39
+
+query II
+SELECT k, count(*) FROM db.dbo.rs_t GROUP BY k ORDER BY k LIMIT 3;
+----
+0	39
+1	39
+2	39
+
+# DESC: NULLs still last under DuckDB's default; T-SQL would put them last for DESC anyway
+query II
+SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k ORDER BY k DESC LIMIT 3;
+----
+6	39
+5	39
+4	39
+
+query II
+SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k ORDER BY k NULLS FIRST LIMIT 3;
+----
+NULL	27
+0	39
+1	39
+
+query II
+SELECT k, count(*) FROM db.dbo.rs_t GROUP BY k ORDER BY k NULLS FIRST LIMIT 3;
+----
+NULL	27
+0	39
+1	39
+
+# OFFSET, an ORDER BY position, and a key that is not in the select list
+query II
+SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k ORDER BY k LIMIT 2 OFFSET 3;
+----
+3	39
+4	39
+
+query III
+SELECT k, count(*), max(d) FROM rp.dbo.rs_t GROUP BY k ORDER BY 3 DESC, 1 LIMIT 4;
+----
+0	39	2026-02-19
+2	39	2026-02-19
+3	39	2026-02-19
+4	39	2026-02-19
+
+query I
+SELECT k FROM rp.dbo.rs_t GROUP BY k ORDER BY sum(id) DESC LIMIT 2;
+----
+5
+6
+
+query I
+SELECT k FROM db.dbo.rs_t GROUP BY k ORDER BY sum(id) DESC LIMIT 2;
+----
+5
+6
+
+# ⚠ An ALIAS wins over a column of the same name: `k` here is count(*), `id` is the k column.
+query II
+SELECT k AS id, count(*) AS k FROM rp.dbo.rs_t WHERE id < 100 GROUP BY k ORDER BY k, id LIMIT 3;
+----
+NULL	22
+0	32
+4	32
+
+query II
+SELECT k AS id, count(*) AS k FROM db.dbo.rs_t WHERE id < 100 GROUP BY k ORDER BY k, id LIMIT 3;
+----
+NULL	22
+0	32
+4	32
+
+# the session's default NULL order is honoured, not assumed
+statement ok
+SET default_null_order = 'nulls_first';
+
+query II
+SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k ORDER BY k LIMIT 2;
+----
+NULL	27
+0	39
+
+statement ok
+RESET default_null_order;
+
+# a LIMIT without ORDER BY (TOP): which groups is arbitrary on both engines, so only the count is asserted
+query I
+SELECT count(*) FROM (SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k LIMIT 5);
+----
+5
+
+# ═══ §8  HAVING ══════════════════════════════════════════════════════════════════════════════════════
+
+query II
+EXPLAIN SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 30;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (
+  (SELECT k, count(*), sum(id) FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 30 AND sum(id) > 0
+   EXCEPT ALL SELECT k, count(*), sum(id) FROM db.dbo.rs_t GROUP BY k HAVING count(*) > 30 AND sum(id) > 0)
+  UNION ALL
+  (SELECT k, count(*), sum(id) FROM db.dbo.rs_t GROUP BY k HAVING count(*) > 30 AND sum(id) > 0
+   EXCEPT ALL SELECT k, count(*), sum(id) FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 30 AND sum(id) > 0));
+----
+0
+
+# an aggregate only in HAVING, a group column in HAVING, and a HUGEINT sum compared past INT
+query I
+SELECT count(*) FROM (
+  (SELECT k FROM rp.dbo.rs_t GROUP BY k HAVING (k > 2 OR k IS NULL) AND max(d) IS NOT NULL AND sum(id) < 3000000000
+   EXCEPT ALL SELECT k FROM db.dbo.rs_t GROUP BY k HAVING (k > 2 OR k IS NULL) AND max(d) IS NOT NULL AND sum(id) < 3000000000)
+  UNION ALL
+  (SELECT k FROM db.dbo.rs_t GROUP BY k HAVING (k > 2 OR k IS NULL) AND max(d) IS NOT NULL AND sum(id) < 3000000000
+   EXCEPT ALL SELECT k FROM rp.dbo.rs_t GROUP BY k HAVING (k > 2 OR k IS NULL) AND max(d) IS NOT NULL AND sum(id) < 3000000000));
+----
+0
+
+# a HAVING constant that does not convert exactly to the aggregate's type stays local
+query II
+EXPLAIN SELECT k FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 38.5;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (SELECT k FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 38.5);
+----
+7
+
+# ═══ §9  Joins within the catalog ════════════════════════════════════════════════════════════════════
+
+query II
+EXPLAIN SELECT u.k, count(*), sum(t.id) FROM rp.dbo.rs_t t JOIN rp.dbo.rs_u u ON t.k = u.k GROUP BY u.k;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_t b ON a.id = b.id;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# a plain projection is worth pushing once there is a join
+query II
+EXPLAIN SELECT u.label, t.id FROM rp.dbo.rs_t t JOIN rp.dbo.rs_u u ON t.k = u.k WHERE t.id >= 0 AND t.id <= 3;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# INNER, grouped by the right side: duplicates on the right multiply, a NULL key matches nothing
+query I
+SELECT count(*) FROM (
+  (SELECT u.k, count(*), sum(t.id), count(u.w) FROM rp.dbo.rs_t t JOIN rp.dbo.rs_u u ON t.k = u.k GROUP BY u.k
+   EXCEPT ALL SELECT u.k, count(*), sum(t.id), count(u.w) FROM db.dbo.rs_t t JOIN db.dbo.rs_u u ON t.k = u.k GROUP BY u.k)
+  UNION ALL
+  (SELECT u.k, count(*), sum(t.id), count(u.w) FROM db.dbo.rs_t t JOIN db.dbo.rs_u u ON t.k = u.k GROUP BY u.k
+   EXCEPT ALL SELECT u.k, count(*), sum(t.id), count(u.w) FROM rp.dbo.rs_t t JOIN rp.dbo.rs_u u ON t.k = u.k GROUP BY u.k));
+----
+0
+
+# 39 rows per k in rs_t; k 1 and 2 twice in rs_u, k 3..6 once, k 0 and NULL nowhere: 2*78 + 4*39
+query I
+SELECT sum(c) FROM (SELECT count(*) AS c FROM rp.dbo.rs_t t JOIN rp.dbo.rs_u u ON t.k = u.k GROUP BY u.k);
+----
+312
+
+# LEFT, with a constant in ON (it filters the RIGHT side, not the result) and WHERE on the left
+query II
+SELECT u.uid, count(t.id) FROM rp.dbo.rs_u u LEFT JOIN rp.dbo.rs_t t ON u.k = t.k AND t.id < 0 GROUP BY u.uid ORDER BY u.uid;
+----
+1	20
+2	20
+3	19
+4	19
+5	19
+6	19
+7	0
+8	0
+9	0
+10	0
+11	20
+12	20
+
+query II
+SELECT u.uid, count(t.id) FROM db.dbo.rs_u u LEFT JOIN db.dbo.rs_t t ON u.k = t.k AND t.id < 0 GROUP BY u.uid ORDER BY u.uid;
+----
+1	20
+2	20
+3	19
+4	19
+5	19
+6	19
+7	0
+8	0
+9	0
+10	0
+11	20
+12	20
+
+# a pushed projection (VARCHAR passes through), ordered
+query TI
+SELECT u.label, t.id FROM rp.dbo.rs_t t JOIN rp.dbo.rs_u u ON t.k = u.k WHERE t.id >= 0 AND t.id <= 3 ORDER BY t.id, u.uid;
+----
+u3	0
+u4	1
+u5	2
+u6	3
+
+query TI
+SELECT u.label, t.id FROM db.dbo.rs_t t JOIN db.dbo.rs_u u ON t.k = u.k WHERE t.id >= 0 AND t.id <= 3 ORDER BY t.id, u.uid;
+----
+u3	0
+u4	1
+u5	2
+u6	3
+
+# three tables, WHERE across them, a self-join, and an unqualified name only one table has
+query I
+SELECT count(*) FROM (
+  (SELECT a.k, count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k JOIN rp.dbo.rs_t c ON c.id = a.id
+     WHERE uid > 3 AND (b.w IS NULL OR c.amount > 10) GROUP BY a.k
+   EXCEPT ALL SELECT a.k, count(*) FROM db.dbo.rs_t a JOIN db.dbo.rs_u b ON a.k = b.k JOIN db.dbo.rs_t c ON c.id = a.id
+     WHERE uid > 3 AND (b.w IS NULL OR c.amount > 10) GROUP BY a.k)
+  UNION ALL
+  (SELECT a.k, count(*) FROM db.dbo.rs_t a JOIN db.dbo.rs_u b ON a.k = b.k JOIN db.dbo.rs_t c ON c.id = a.id
+     WHERE uid > 3 AND (b.w IS NULL OR c.amount > 10) GROUP BY a.k
+   EXCEPT ALL SELECT a.k, count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k JOIN rp.dbo.rs_t c ON c.id = a.id
+     WHERE uid > 3 AND (b.w IS NULL OR c.amount > 10) GROUP BY a.k));
+----
+0
+
+query II
+EXPLAIN SELECT a.k, count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k JOIN rp.dbo.rs_t c ON c.id = a.id
+  WHERE uid > 3 AND (b.w IS NULL OR c.amount > 10) GROUP BY a.k;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_t b ON a.id = b.id;
+----
+300
+
+# a string join key stays local and still answers
+query I
+SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.s = b.label;
+----
+0
+
 # ═══ §6  DML keeps its own paths ══════════════════════════════════════════════════════════════════════
 # The remote optimizer would also take DELETE / UPDATE nodes; this catalog refuses them, so the plan-less
 # shortcut (ABI v93) still runs them and still reports DuckDB's affected-row count.
@@ -341,4 +650,4 @@ DELETE FROM rp.dbo.rs_t WHERE id = 1;
 1
 
 statement ok
-SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_t;');
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_t; DROP TABLE dbo.rs_u;');

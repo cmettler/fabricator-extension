@@ -1436,7 +1436,9 @@ case "$TIER" in
         #   2.0's remote optimizer pushing a single-table aggregate as one T-SQL statement, differential against
         #   the existing path. ⚠ Its §4 compares result TYPES through a CTAS, not DESCRIBE: a query inside
         #   `FROM (DESCRIBE …)` is never pushed, so a DESCRIBE comparison was vacuous (a mutant survived it).
-        : "${MIN_ASSERTIONS:=3880}"
+        # 2026-10-25: 3880 -> 4054. verify_remote_select_mssql 88 -> 262: ORDER BY / LIMIT (NULL order rendered
+        #   explicitly, re-sorted locally), HAVING, and INNER / LEFT joins within the catalog.
+        : "${MIN_ASSERTIONS:=4054}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

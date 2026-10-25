@@ -427,6 +427,46 @@ own overflow), strings treated as exact (§2, line 92), and the outer cast remov
 first SURVIVED: §4 compared `DESCRIBE` output, which never reaches the optimizer, so both sides described the
 local path. It now compares the types of CTAS tables, whose queries are pushed.
 
-**Not done, and what would come next:** ORDER BY / LIMIT (T-SQL's TOP and NULL ordering), HAVING, joins inside
-the catalog, booleans, `count(DISTINCT)`, and a warehouse profile. Each is a rendering rule plus a
-differential row; none needs a new mechanism.
+### 4.2 ORDER BY / LIMIT, HAVING and joins within the catalog — BUILT (2026-10-25)
+
+The renderer was first restructured around ONE typer: every FROM table is a SCOPE with a T-SQL alias
+(`[t0]`, `[t1]`, …), `ResolveColumn` finds exactly one scope for a column, `RenderValue` renders a column or an
+aggregate with the type DuckDB would give it, and one `RenderPredicate` serves WHERE, join ON and HAVING.
+
+- **Grouping is per position.** A plain column in the select list, HAVING or ORDER BY must be a GROUP BY column;
+  a column in WHERE or ON is evaluated before grouping and may be any column. ⚠ The first build applied the
+  grouping rule everywhere and declined every grouped query with a WHERE on another column — the existing
+  routing row caught it.
+- **ORDER BY binds like DuckDB:** an integer is a 1-based output position, a bare name that is a select ALIAS is
+  that item (an alias wins over a column of the same name — `SELECT k AS id, count(*) AS k … ORDER BY k` sorts
+  by the count), anything else is a column or an aggregate. Direction and NULL placement are DuckDB's own
+  resolution (`DBConfig::ResolveOrder` / `ResolveNullOrder`), so `SET default_null_order` is honoured.
+- **NULL order is rendered, not assumed.** T-SQL has no `NULLS FIRST/LAST` and puts NULLs first for ASC; each key
+  becomes `CASE WHEN k IS NULL THEN r ELSE 1-r END, k`. It matters because of LIMIT: with the server's own NULL
+  placement a different SET of rows comes back, which no local re-sort can repair.
+- **Order is applied twice.** The server sorts with `OFFSET … FETCH` (or `TOP` with no ORDER BY), so only the
+  needed rows travel; the keys come back as hidden columns and the wrapper sorts again, because a subquery
+  carries no ordering guarantee in DuckDB. Every wrapper reference is QUALIFIED with the function's alias so a
+  user alias can never shadow a server column.
+- **HAVING** re-renders the aggregate (T-SQL cannot name a select alias there); a constant must convert
+  losslessly to the aggregate's DuckDB type (`count(*) > 38.5` stays local; an integer sum compares as
+  `DECIMAL(38,0)`).
+- **Joins:** INNER and LEFT, REGULAR, with an ON condition — no FULL/SEMI/ANTI/ASOF/NATURAL/USING/implicit cross
+  join. Column-to-column comparisons need the same family (numbers with numbers, dates with dates; both
+  engines compare two numbers in the wider type). An UNQUALIFIED name two tables share is declined, so DuckDB
+  reports the ambiguity itself rather than the server picking one. With a join a plain projection is pushed
+  too (VARCHAR passes through — only comparing, grouping and sorting strings depends on collation). The
+  decline path re-qualifies EVERY base table of the tree.
+
+Gate `verify_remote_select_mssql` 88 -> 262: ordered results asserted row for row on both catalogs (the NULL
+cases under LIMIT), the alias-over-column rule, `default_null_order`, HAVING and join differentials (duplicate
+keys, a NULL key, unmatched keys under LEFT, three tables, a self-join), and the refusals. Mutants: the NULL
+rank removed (killed at the ASC-NULLS-LAST LIMIT row — the server returned the NULL group among the top three),
+aliases ignored in ORDER BY (killed at §7's first routing row), an ambiguous column resolved to one table
+(killed at the ambiguity row — the query then answered instead of erroring), LEFT rendered as INNER (killed at
+the LEFT join's unmatched rows). ⚠ One SURVIVES, by construction: removing the local re-sort changes nothing
+today, because `fabricator_query` delivers rows in the server's order. The re-sort is insurance against an
+ordering DuckDB does not promise across a subquery, not something any query can currently observe.
+
+**Not done:** string keys under a binary collation (the capability doc already reports it), booleans,
+`count(DISTINCT)`, DISTINCT, expressions in select/ORDER BY, and a warehouse profile.
