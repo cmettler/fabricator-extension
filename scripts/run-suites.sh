@@ -889,7 +889,11 @@ case "$TIER" in
         #   Mutants: removing the host_query flag dies at the mixed-type row, removing the
         #   fabricator_scan flag dies at the publish() row. The host_exec flag is UNGATED (one column,
         #   so only the empty projection differs) and the suite says so rather than implying coverage.
-        : "${MIN_ASSERTIONS:=10040}"
+        # 2026-10-26: 10040 -> 10142, backports from the 2.0 line: verify_delta_statistics +17 (BOOLEAN bounds, and a
+        #   pin that 1.5.6 rounds a truncated string max up), verify_delta_batched_read +18 and
+        #   verify_delta_clustered_optimize +13 per engine leg (Spark-named materialized row ids),
+        #   verify_delta_subplan_dedup +41 (a catalog scan survives a plan copy; an inlined CTE was an INTERNAL Error).
+        : "${MIN_ASSERTIONS:=10142}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -953,7 +957,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=60}"
+        : "${MIN_SUITES:=61}"   # 2026-10-26: +verify_rowid_timestamps_mssql (backport)
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1326,7 +1330,9 @@ case "$TIER" in
         #   adding an input leaves every call site untouched; typed is easier to call but its signature
         #   moves with the decision table. The answer is asserted BYTE-IDENTICAL on the scalar pair,
         #   which is what makes `input` a delivery choice rather than a second semantics.
-        : "${MIN_ASSERTIONS:=3572}"
+        # 2026-10-26: 3572 -> 3594. verify_rowid_timestamps_mssql (22, new, backported from 2.0): rowid DML binds a
+        #   timestamp as the column's declared type (a datetime2 key used to match nothing).
+        : "${MIN_ASSERTIONS:=3594}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
