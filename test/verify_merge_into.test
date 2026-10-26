@@ -600,3 +600,32 @@ SELECT version, operation FROM lake.delta.snapshots('main.oplbl1') ORDER BY vers
 1	WRITE
 2	UPDATE
 3	WRITE
+
+# ═══ A target outside the default schema ════════════════════════════════════════════════════════════════
+# The NOT MATCHED INSERT leg builds its own insert target, and it once left the schema PATH empty. An empty
+# path reaches the provider as schema '', which only happens to work for the default schema — every table
+# above is in `main` — so a MERGE into any other schema failed at the INSERT.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/mergeschemas' AS slake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                                              schemas 'onelevel');
+
+statement ok
+CREATE SCHEMA slake.s1;
+
+statement ok
+CREATE TABLE slake.s1.mt AS SELECT * FROM (VALUES (1, 10), (2, 20)) v(id, v);
+
+query I
+MERGE INTO slake.s1.mt AS t USING (VALUES (2, 22), (3, 33)) AS s(id, v) ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v);
+----
+2
+
+query II
+SELECT id, v FROM slake.s1.mt ORDER BY id;
+----
+1	10
+2	22
+3	33

@@ -200,6 +200,47 @@ statement ok
 DROP TABLE IF EXISTS db.dbo.fabricator_mck;
 
 # ==============================================================================================
+# 5b. A target outside the default schema. The NOT MATCHED INSERT leg builds its own insert target, and it once
+#     left the schema PATH empty: an empty path reaches a provider as schema '', which resolves to the default
+#     schema, so every section above (all in dbo) passed while a MERGE into any other schema failed with
+#     "schema '' does not exist".
+# ==============================================================================================
+
+statement ok
+SELECT fabricator_exec('db', 'IF SCHEMA_ID(''fmerge'') IS NULL EXEC(''CREATE SCHEMA fmerge'')');
+
+statement ok
+SELECT fabricator_exec('db', 'IF OBJECT_ID(''fmerge.fabricator_mschema'') IS NOT NULL DROP TABLE fmerge.fabricator_mschema;
+  CREATE TABLE fmerge.fabricator_mschema (id INT PRIMARY KEY, v INT);
+  INSERT INTO fmerge.fabricator_mschema VALUES (1, 10), (2, 20)');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+query I
+MERGE INTO db.fmerge.fabricator_mschema AS t USING (VALUES (2, 22), (3, 33)) AS s(id, v) ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v);
+----
+2
+
+query II
+SELECT id, v FROM db.fmerge.fabricator_mschema ORDER BY id;
+----
+1	10
+2	22
+3	33
+
+# Control: the inserted row went to the target's own schema, not to a same-named table anywhere else.
+query I
+SELECT * FROM fabricator_query('db', 'SELECT COUNT(*) FROM sys.tables WHERE name = ''fabricator_mschema''');
+----
+1
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE fmerge.fabricator_mschema; DROP SCHEMA fmerge');
+
+# ==============================================================================================
 # 6. MERGE ... RETURNING is refused rather than silently dropping the returning list.
 # ==============================================================================================
 

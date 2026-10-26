@@ -957,7 +957,10 @@ case "$TIER" in
         # 2026-10-26: 10751 -> 10765. Buffered DML on a table without deletion vectors is staged copy-on-write
         #   (engineered-wood #525): verify_merge_into §11 and verify_delta_catalog_transactions §7 assert the results
         #   where they asserted the old refusal.
-        : "${MIN_ASSERTIONS:=10765}"
+        # 2026-10-26: 10765 -> 10785. verify_merge_into 235 -> 245 per engine leg: a MERGE whose NOT MATCHED INSERT
+        #   targets a non-default schema (the insert leg once sent an EMPTY schema path, and Delta then wrote the
+        #   row into a new table under main).
+        : "${MIN_ASSERTIONS:=10785}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -1473,7 +1476,9 @@ case "$TIER" in
         #   copy-on-write at COMMIT): verify_mssql_external_txn 62 -> 111, and the two suites whose "refused in a
         #   transaction" DELETE row now asserts the ROLLBACK — verify_mssql_external_delete 43 -> 45,
         #   verify_mssql_s3_polybase 267 -> 268.
-        : "${MIN_ASSERTIONS:=4409}"
+        # 2026-10-26: 4409 -> 4421. verify_merge_into_mssql 106 -> 118: the same MERGE into a non-default schema
+        #   (SQL Server failed it with "Cannot access destination table '[].[t]'").
+        : "${MIN_ASSERTIONS:=4421}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

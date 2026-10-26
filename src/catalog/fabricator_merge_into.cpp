@@ -35,6 +35,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "catalog/fabricator_catalog.hpp"
+#include "catalog/fabricator_schema_entry.hpp"
 #include "catalog/fabricator_table_entry.hpp"
 #include "dml/fabricator_insert.hpp"
 #include "dml/fabricator_modify.hpp"
@@ -105,6 +106,12 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 
 		FabricatorInsertTarget target;
 		target.returning = false; // MERGE ... RETURNING is refused below.
+		// ⚠⚠ THE PATH, NOT ONLY THE LEAF (ABI v92). The UPDATE/DELETE legs above get this from
+		// FabricatorBuildModifyTarget; this leg hand-builds its target and was missed when paths landed, so
+		// `schema_path` stayed EMPTY -- and an empty path is not a loud failure: the managed contract's
+		// default widening maps Count == 0 to string.Empty, so every provider (nesting or not) saw
+		// `schema '' does not exist` from complete_bulk on a MERGE with a NOT MATCHED INSERT.
+		target.schema_path = op.table.schema.Cast<FabricatorSchemaEntry>().SchemaPathStrings();
 		target.schema_name = op.table.schema.name.GetIdentifierName();
 		target.table_name = op.table.name.GetIdentifierName();
 		target.columns = op.table.GetColumns().GetColumnNames();
