@@ -1,0 +1,277 @@
+# name: test/verify_mssql_external_txn.test
+# description: INSERT into a SQL Server EXTERNAL TABLE over Delta on S3 inside an explicit DuckDB transaction.
+#              The rows are written as data files at statement time and the Delta commit waits for COMMIT; a
+#              ROLLBACK discards them and deletes the files. Before, such an INSERT was refused ("autocommit
+#              only").
+#
+#              ⚠ What it does NOT give: SQL Server reads committed storage, so the transaction's own INSERTs are
+#              invisible through the external table until COMMIT (§1 pins that). DELETE/UPDATE stay autocommit
+#              only — buffering them needs deletion vectors, which SQL Server's Delta reader refuses (§4). A
+#              parquet external table stays autocommit only too: a file is visible the moment it exists.
+#              Needs the docker SQL Server + MinIO (service tier).
+# group: [fabricator]
+
+require fabricator
+
+require httpfs
+
+require parquet
+
+require-env MSSQL_TESTDB_DSN
+
+require-env FABRICATOR_S3_ENDPOINT
+
+require-env FABRICATOR_S3_SQL_ENDPOINT
+
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = false;
+
+statement ok
+CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
+                        ENDPOINT '${FABRICATOR_S3_ENDPOINT}', URL_STYLE 'path', REGION 'us-east-1',
+                        USE_SSL true);
+
+statement ok
+ATTACH 's3://fabricator/exttxn' AS xt (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
+                                       deletion_vectors false, column_mapping 'none', SECRET minio_s3);
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS sqldb (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = ''##MS_DatabaseMasterKey##'')
+     CREATE MASTER KEY ENCRYPTION BY PASSWORD = ''Arrow_Net_123!MK''');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = ''s3_dc'')
+     CREATE DATABASE SCOPED CREDENTIAL s3_dc WITH IDENTITY = ''S3 Access Key'',
+       SECRET = ''miniouser:miniosecret123''');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = ''s3_ds'')
+     CREATE EXTERNAL DATA SOURCE s3_ds WITH (LOCATION = ''s3://${FABRICATOR_S3_SQL_ENDPOINT}/'',
+       CREDENTIAL = s3_dc)');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = ''DeltaFileFormat'')
+     CREATE EXTERNAL FILE FORMAT DeltaFileFormat WITH (FORMAT_TYPE = DELTA)');
+
+# ═══ §0  Two Delta tables under ONE root (one transient catalog serves both), three rows each ═════════════
+
+statement ok
+DROP TABLE IF EXISTS xt.main.e1;
+
+statement ok
+DROP TABLE IF EXISTS xt.main.e2;
+
+statement ok
+CREATE TABLE xt.main.e1 AS SELECT i::BIGINT AS id, 'v' || i AS v FROM range(1, 4) t(i);
+
+statement ok
+CREATE TABLE xt.main.e2 AS SELECT i::BIGINT AS id, 'w' || i AS v FROM range(1, 4) t(i);
+
+statement ok
+SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.s3_exttxn1'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_exttxn1');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.s3_exttxn2'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_exttxn2');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'CREATE EXTERNAL TABLE dbo.s3_exttxn1 (id BIGINT, v VARCHAR(20))
+  WITH (LOCATION = ''/fabricator/exttxn/e1'', DATA_SOURCE = s3_ds, FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'CREATE EXTERNAL TABLE dbo.s3_exttxn2 (id BIGINT, v VARCHAR(20))
+  WITH (LOCATION = ''/fabricator/exttxn/e2'', DATA_SOURCE = s3_ds, FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.exttxn_side'') IS NOT NULL DROP TABLE dbo.exttxn_side;
+  CREATE TABLE dbo.exttxn_side (id INT)');
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
+----
+3
+
+# ═══ §1  COMMIT: two INSERTs into one table + one into another — each table gets ONE Delta commit ═════════
+
+statement ok
+CREATE TABLE log_before AS SELECT count(*) AS n FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (10, 'x10'), (11, 'x11');
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (12, 'x12');
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn2 VALUES (20, 'y20');
+
+# No read-your-writes: SQL Server reads committed storage, and nothing is committed yet.
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
+----
+3
+
+# ...and nothing reached the Delta log either: the data files exist, the commit does not.
+query I
+SELECT count(*) - (SELECT n FROM log_before) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+----
+0
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
+----
+6
+
+query I
+SELECT string_agg(v, ',' ORDER BY id) FROM sqldb.dbo.s3_exttxn1 WHERE id >= 10;
+----
+x10,x11,x12
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn2;
+----
+4
+
+# ONE commit for the two INSERTs into e1 (per-statement commits would have made it two).
+query I
+SELECT count(*) - (SELECT n FROM log_before) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+----
+1
+
+# SQL Server's own reader agrees, not only the external table.
+query I
+SELECT * FROM fabricator_query('sqldb',
+  'SELECT COUNT(*) FROM OPENROWSET(BULK ''/fabricator/exttxn/e1'', FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+6
+
+# ═══ §2  ROLLBACK: nothing committed, and the data files written for the INSERT are deleted again ═══════
+
+statement ok
+CREATE TABLE files_before AS SELECT count(*) AS n FROM glob('s3://fabricator/exttxn/e1/*.parquet');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (30, 'x30'), (31, 'x31');
+
+# Positive control: the INSERT really wrote a data file before the ROLLBACK, or "deleted again" proves nothing.
+query I
+SELECT (SELECT count(*) FROM glob('s3://fabricator/exttxn/e1/*.parquet')) > (SELECT n FROM files_before);
+----
+true
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
+----
+6
+
+query I
+SELECT count(*) - (SELECT n FROM log_before) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+----
+1
+
+query I
+SELECT (SELECT count(*) FROM glob('s3://fabricator/exttxn/e1/*.parquet')) = (SELECT n FROM files_before);
+----
+true
+
+# ═══ §3  With SQL Server's own changes: both roll back together; both commit (Delta first, then SQL Server) ═
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sqldb.dbo.exttxn_side VALUES (1);
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (40, 'x40');
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM sqldb.dbo.exttxn_side), (SELECT count(*) FROM sqldb.dbo.s3_exttxn1);
+----
+0	6
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sqldb.dbo.exttxn_side VALUES (1);
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (40, 'x40');
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM sqldb.dbo.exttxn_side), (SELECT count(*) FROM sqldb.dbo.s3_exttxn1);
+----
+1	7
+
+# ═══ §4  DELETE / UPDATE stay autocommit only (a buffered delete would need a deletion vector) ═══════════
+
+statement ok
+BEGIN;
+
+statement error
+DELETE FROM sqldb.dbo.s3_exttxn1 WHERE id = 40;
+----
+cannot roll back with an explicit transaction
+
+statement ok
+ROLLBACK;
+
+# The refused statement aborted the transaction; nothing changed.
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
+----
+7
+
+# ═══ §5  Autocommit INSERT is unchanged: one statement, one commit ════════════════════════════════════════
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (50, 'x50');
+
+query I
+SELECT count(*) - (SELECT n FROM log_before) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+----
+3
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
+----
+8
+
+# ═══ teardown: the external tables and the side table are catalog objects on the shared TestDB ═══════════
+
+statement ok
+SELECT fabricator_exec('sqldb', 'DROP EXTERNAL TABLE dbo.s3_exttxn1');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'DROP EXTERNAL TABLE dbo.s3_exttxn2');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'DROP TABLE dbo.exttxn_side');

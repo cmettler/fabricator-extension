@@ -5104,8 +5104,22 @@ DELETE FROM sqldb.dbo.dim WHERE id = 1;
 The identity column is the only sound bridge between SQL Server's scan (which produces identity values) and
 the Delta writer (which resolves them back to physical rowids via a pruned scan) — it is snapshot-independent
 and PolyBase-visible, unlike Delta's off-schema `_metadata.row_id`. `DROP TABLE` on a detected external table
-emits `DROP EXTERNAL TABLE` (metadata-only; the storage data stays). Storage writes are their own commit, so
-they are autocommit-only (rejected inside an explicit transaction). Full design:
+emits `DROP EXTERNAL TABLE` (metadata-only; the storage data stays).
+
+**Transactions.** Inside `BEGIN … COMMIT`, an `INSERT` into an external **Delta** table writes its data files
+right away and makes the Delta commit at `COMMIT`, one commit per table; `ROLLBACK` deletes the files again. Three
+things to know:
+
+- SQL Server reads committed storage, so the transaction does not see its own INSERTs through the external table
+  until `COMMIT`.
+- The Delta side commits first, then SQL Server. If the Delta commit fails, both roll back; if SQL Server's commit
+  fails after that, the Delta rows stay. Several external tables commit one after the other, not atomically.
+- `DELETE` / `UPDATE` on an external table, an `INSERT` into a **parquet** external table and
+  `CREATE TABLE … WITH (location=…)` stay autocommit-only and are refused inside a transaction. A buffered delete
+  would need a deletion vector, which SQL Server's Delta reader refuses, and a parquet file is visible the moment
+  it exists.
+
+Full design:
 [`docs/create-table-with-options.md`](docs/create-table-with-options.md).
 
 ## Power BI / DAX provider

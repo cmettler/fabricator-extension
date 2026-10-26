@@ -154,7 +154,8 @@ Built 2026-07-19 as planned. Notes from the build:
   invalidated on DROP/CREATE/replace through the catalog.
 - Explicitness tracking: `BeginTransaction(isExplicit)` now records explicit txn ids (the ambient id
   is set by `set_active_txn` immediately before — verified in `fabricator_transaction.cpp`); the
-  external INSERT rejects inside an explicit transaction.
+  external INSERT rejected inside an explicit transaction until 2026-10-26 (see
+  §INSERT inside an explicit transaction).
 - `DROP TABLE` on a detected external table emits `DROP EXTERNAL TABLE` (OBJECT_ID-guarded for
   IF EXISTS); `INSERT … RETURNING` rejects (no OUTPUT INSERTED rows on the storage path).
 - Test conventions: an exec-created external table needs `fabricator_refresh_cache` before catalog
@@ -447,7 +448,8 @@ DELETE on an external table cannot run at all). `UPDATE` keeps the old rule — 
   re-evaluation removed, `val > 5 AND name <> 'n1'` deleted 20 rows instead of 5.
 - VARCHAR is exact here (`exact_strings` for an external Delta table only): the Delta engine compares bytes, not SQL
   Server's collation. An ordinary SQL Server table keeps VARCHAR on the rowid path.
-- Autocommit only, like every external write; the explicit-transaction refusal is the same `GuardExternalDml`.
+- Autocommit only, like external DELETE/UPDATE generally (an INSERT can wait for COMMIT since 2026-10-26, a delete
+  cannot — see §INSERT inside an explicit transaction); the explicit-transaction refusal is `GuardExternalDml`.
 - ⚠ Through the EXTERNAL TABLE, SQL Server reads a Delta partition column as NULL (Microsoft's documented
   limitation; `OPENROWSET` reads it correctly). Pinned in the gate.
 
@@ -455,3 +457,30 @@ Gate `verify_mssql_external_delete` (43, service): routing, a twin-table differe
 SQL Server reading the result (OPENROWSET and the external table), the raw log holding no deletion vector (with a
 control that the log was read), and the two refusals (explicit transaction; a predicate that does not translate).
 One mutant (no re-evaluation) killed at the data-predicate row.
+
+## INSERT inside an explicit transaction (2026-10-26)
+
+Inside `BEGIN … COMMIT` an INSERT into an external **Delta** table no longer refuses. `ExternalDeltaSession`
+(Fabricator.Delta) keeps one transient delta catalog per storage root for the life of the SQL Server transaction,
+each in an explicit Delta transaction: the INSERT writes its data files at statement time and parks the actions,
+the SQL Server catalog's `EndTransaction` commits them (one Delta commit per table) or rolls them back (the files are
+deleted). C#-only, no ABI change.
+
+- **Order at COMMIT: Delta first, then SQL Server.** A failed Delta commit rolls the SQL Server transaction back
+  too. The reverse cannot be undone: if SQL Server's commit fails after the Delta commit, the Delta rows stay.
+  Several tables commit one after the other (Delta has no cross-table transaction).
+- **No read-your-writes.** SQL Server reads committed storage, so the transaction's own INSERTs are invisible through
+  the external table until COMMIT. Pinned in the gate.
+- **Still autocommit only:** DELETE/UPDATE (`GuardExternalDml`) — a buffered delete needs deletion vectors
+  (`EnsureBufferedDmlEligible` refuses without them), and a materialized vector makes SQL Server's reader fail with
+  19726; an INSERT into a **parquet** external table — the file is visible the moment it exists; and the CETAS-analog
+  `CREATE TABLE … WITH (location=…)`. Lifting the DELETE/UPDATE refusal needs a copy-on-write staging verb in
+  engineered-wood (`DeltaTransaction` stages deletes only as deletion vectors today).
+- A catalog teardown without COMMIT/ROLLBACK rolls the session back (`SqlServerTransaction.Dispose`).
+
+Gate `verify_mssql_external_txn` (62, service): two INSERTs into one table become one Delta commit, nothing reaches
+the log before COMMIT, SQL Server (external table and OPENROWSET) reads the result, ROLLBACK deletes the written
+files (with a control that a file was written), SQL Server's own changes roll back and commit with it, and the
+DELETE refusal. Two mutants: committing at the statement dies at "nothing reached the log"; a ROLLBACK that discards
+nothing dies at the file count. `verify_mssql_s3_polybase` (263 → 267) now asserts the ROLLBACK where it pinned the
+old refusal, and pins the parquet refusal.

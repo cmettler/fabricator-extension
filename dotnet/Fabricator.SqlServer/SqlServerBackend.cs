@@ -1083,10 +1083,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         /// <summary>
         /// Explicit user BEGIN..COMMIT (v60 is_explicit; the ambient id is set by set_active_txn right
         /// before begin_transaction). Consulted by the external-table INSERT/DML routing and the session
-        /// tag: a storage-side write commits its own Delta commit / parquet PUT and cannot roll back with
-        /// the SQL catalog's transaction, so it is rejected inside an explicit transaction (autocommit
-        /// only). Was a second id-keyed dictionary (`_explicitTxns`) before slice 4a put it ON the
-        /// transaction.
+        /// tag: inside an explicit transaction an INSERT into an external Delta table parks its Delta commit
+        /// until COMMIT (<see cref="External"/>), while a parquet INSERT and an external DELETE/UPDATE are
+        /// refused (autocommit only). Was a second id-keyed dictionary (`_explicitTxns`) before slice 4a put
+        /// it ON the transaction.
         /// </summary>
         public bool IsExplicit { get; set; }
 
@@ -1122,6 +1122,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         public readonly object ExecGate = new();
 
         /// <summary>
+        /// INSERTs into external Delta tables inside this explicit transaction: data files written, the Delta
+        /// commits parked until COMMIT. Created on the first such INSERT; null otherwise.
+        /// </summary>
+        public ExternalDeltaSession? External;
+
+        /// <summary>
         /// Commit/roll back the provider transaction (no-op if no write ever pinned one) and release the
         /// connection. Called once, after removal from the manager; fields are nulled so a later
         /// best-effort <see cref="Dispose"/> (catalog teardown) cannot double-commit.
@@ -1151,7 +1157,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             }
         }
 
-        public void Dispose() => Complete(commit: false);
+        public void Dispose()
+        {
+            External?.Rollback();
+            External = null;
+            Complete(commit: false);
+        }
     }
 
     /// <summary>Records that the ambient transaction has written <paramref name="tableName"/>, so a later
@@ -1208,7 +1219,36 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     {
         // Remove BEFORE Complete — the manager's ordering contract (nothing can resolve a transaction that
         // is mid-completion, the read-state-after-remove class of bug made structural).
-        _txns.Remove(txnId)?.Complete(commit);
+        var txn = _txns.Remove(txnId);
+        if (txn is null)
+        {
+            return;
+        }
+        var external = txn.External;
+        txn.External = null;
+        if (external is not null)
+        {
+            if (!commit)
+            {
+                external.Rollback();
+            }
+            else
+            {
+                // The Delta side commits FIRST: if it fails, nothing is committed anywhere and SQL Server rolls
+                // back too. The reverse failure (Delta committed, SQL Server's commit fails) cannot be undone —
+                // the two are not one atomic transaction.
+                try
+                {
+                    external.Commit();
+                }
+                catch
+                {
+                    txn.Complete(commit: false);
+                    throw;
+                }
+            }
+        }
+        txn.Complete(commit);
     }
 
     /// <summary>Is <paramref name="txnId"/> an explicit user BEGIN..COMMIT transaction? False for
@@ -3553,8 +3593,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         return null;
     }
 
-    // Storage-side DML shares the INSERT's semantics: statement-atomic (its own Delta commit), so an
-    // explicit DuckDB transaction can't wrap it.
+    // Storage-side DELETE/UPDATE is statement-atomic (its own Delta commit). Unlike an INSERT it cannot wait
+    // for COMMIT: buffering a delete needs deletion vectors, which SQL Server's Delta reader refuses (19726).
     private void GuardExternalDml(string schemaName, string tableName, string verb)
     {
         if (IsExplicitTxn(AmbientTransaction.Current))
@@ -3569,12 +3609,15 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     private long ExternalTableInsert(ExternalTableInfo ext, string schemaName, string tableName,
                                      IArrowArrayStream data, bool checkConstraints, long txnId)
     {
-        if (IsExplicitTxn(txnId))
+        bool isExplicit = IsExplicitTxn(txnId);
+        bool isDelta = string.Equals((ext.FormatType ?? string.Empty).Trim(), "DELTA", StringComparison.OrdinalIgnoreCase);
+        if (isExplicit && !isDelta)
         {
+            // A parquet file is visible to SQL Server the moment it exists, so it cannot wait for COMMIT.
             throw new NotSupportedException(
-                $"INSERT into external table {schemaName}.{tableName} writes directly to its storage "
-                + "(its own Delta commit / parquet file) and cannot roll back with an explicit "
-                + "transaction — COMMIT first (autocommit only).");
+                $"INSERT into the parquet external table {schemaName}.{tableName} writes a file SQL Server "
+                + "reads immediately and cannot roll back with an explicit transaction — COMMIT first "
+                + "(autocommit only).");
         }
         var uri = ExternalTableRouting.ComposeStorageUri(ext.DataSourceLocation, ext.TableLocation)
             ?? throw new NotSupportedException(
@@ -3591,6 +3634,17 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         switch ((ext.FormatType ?? string.Empty).Trim().ToUpperInvariant())
         {
             case "DELTA":
+                if (isExplicit)
+                {
+                    // The Delta commit waits for the DuckDB COMMIT (EndTransaction); a ROLLBACK discards the files.
+                    var state = _txns.GetOrCreate(txnId);
+                    ExternalDeltaSession session;
+                    lock (state)
+                    {
+                        session = state.External ??= new ExternalDeltaSession(txnId);
+                    }
+                    return ExternalTableRouting.AppendDelta(uri, data, checkConstraints, txnId, session);
+                }
                 return ExternalTableRouting.AppendDelta(uri, data, checkConstraints, txnId);
             case "PARQUET":
                 return ExternalTableRouting.AppendParquet(uri, data);

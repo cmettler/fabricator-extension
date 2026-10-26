@@ -1018,7 +1018,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=63}"   # 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete
+        : "${MIN_SUITES:=64}"   # 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1462,7 +1462,11 @@ case "$TIER" in
         # 2026-10-26: 4248 -> 4291. verify_mssql_external_delete (43, new): DELETE through a PolyBase external Delta
         #   table with NO identity column — a twin-table differential, SQL Server reading the result, and no deletion
         #   vector in the log (one would make every later SQL Server read fail with 19726).
-        : "${MIN_ASSERTIONS:=4291}"
+        # 2026-10-26: 4291 -> 4357. verify_mssql_external_txn (62, new): INSERT into an external Delta table inside
+        #   BEGIN..COMMIT — one Delta commit per table at COMMIT, ROLLBACK deletes the written files. And
+        #   verify_mssql_s3_polybase 263 -> 267: its old "refused in a transaction" INSERT row now asserts the
+        #   ROLLBACK, plus the parquet INSERT that stays refused.
+        : "${MIN_ASSERTIONS:=4357}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

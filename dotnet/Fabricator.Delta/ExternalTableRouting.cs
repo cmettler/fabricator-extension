@@ -27,7 +27,9 @@ namespace Fabricator.Bridge;
 ///
 /// <para><b>Semantics</b>: statement-atomic — the Delta append is parked per (txn, table) inside the
 /// transient catalog and flushed as ONE Delta commit at the end of this call; a parquet PUT completes
-/// atomically. It does NOT join a surrounding explicit DuckDB transaction (the caller guards).</para>
+/// atomically. Inside an explicit DuckDB transaction a Delta append goes through an
+/// <see cref="ExternalDeltaSession"/> instead and commits with the transaction; everything else here does not
+/// join one (the caller guards).</para>
 /// </summary>
 public static class ExternalTableRouting
 {
@@ -121,6 +123,20 @@ public static class ExternalTableRouting
         {
             catalog.Dispose();
         }
+    }
+
+    /// <summary>
+    /// The explicit-transaction form of <see cref="AppendDelta(string, IArrowArrayStream, bool, long)"/>: the rows
+    /// are written as data files now, and the Delta commit waits for <see cref="ExternalDeltaSession.Commit"/>.
+    /// </summary>
+    public static long AppendDelta(string tableUri, IArrowArrayStream data, bool checkConstraints, long txnId,
+                                   ExternalDeltaSession session)
+    {
+        var uri = tableUri.TrimEnd('/');
+        var (root, leaf) = SplitTable(uri);
+        Log.LogInformation("external delta append (deferred to COMMIT): {Uri} (root={Root}, table={Leaf})",
+            uri, root, leaf);
+        return session.Append(root, leaf, data, checkConstraints, txnId);
     }
 
     // ---- CREATE ... WITH (location=..., table_type=...) — the CETAS-analog client-side write (slice B) ---

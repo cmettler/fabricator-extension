@@ -434,17 +434,21 @@ SELECT count(*) FROM plake.main.ins;
 statement ok
 SELECT fabricator_exec('sqldb', 'DROP TABLE dbo.s3_ins_src');
 
-# guard: the storage write is its own Delta commit — it cannot join an explicit DuckDB transaction
+# inside an explicit DuckDB transaction the Delta commit waits for COMMIT, so a ROLLBACK leaves nothing
+# (the full behaviour is verify_mssql_external_txn)
 statement ok
 BEGIN;
 
-statement error
+statement ok
 INSERT INTO sqldb.dbo.s3_delta_ins VALUES (101, 'txnrow');
-----
-cannot roll back with an explicit
 
 statement ok
 ROLLBACK;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_delta_ins WHERE id = 101;
+----
+0
 
 # guard: INSERT ... RETURNING has no OUTPUT INSERTED rows on the storage path
 statement error
@@ -492,6 +496,18 @@ query I
 SELECT count(*) >= 1 FROM sqldb.dbo.s3_pq_ins WHERE name = 'pqseed';
 ----
 true
+
+# a parquet file is visible the moment it exists, so a parquet INSERT cannot wait for COMMIT: refused
+statement ok
+BEGIN;
+
+statement error
+INSERT INTO sqldb.dbo.s3_pq_ins VALUES (201, 'pqtxn');
+----
+cannot roll back with an explicit transaction
+
+statement ok
+ROLLBACK;
 
 # ---- 6c. DROP TABLE on a detected external table routes to DROP EXTERNAL TABLE (metadata-only) ----
 statement ok
