@@ -76,6 +76,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | CHECK constraints, non-literal DEFAULTs | ❌ (use `fabricator_exec`) |
 | **S3 external tables** | `INSERT` into a detected SQL Server S3 **Delta/Parquet** external table → routed to storage | ✅ |
 | | Identity-keyed `UPDATE` / `DELETE` on an S3 Delta external table | ✅ |
+| | `DELETE … WHERE <exact predicate>` on an external Delta table **without** an identity column | ✅ |
 | | `CREATE TABLE … WITH (location=…, table_type='DELTA'\|'PARQUET') [AS …]` — write + auto-provision the external table | ✅ |
 | **Tx** | BEGIN / COMMIT / ROLLBACK (connection pinning, read-your-writes) | ✅ |
 | **Functions** | `fabricator_query`, `fabricator_exec`, `fabricator_refresh_cache`, `fabricator_invalidate_cache`, `fabricator_version` | ✅ |
@@ -4969,9 +4970,13 @@ that external table removes only the metadata, never the data.
 
 **Writing through the external table.** SQL Server external tables are read-only to SQL Server itself, but
 this extension serves `INSERT`/`UPDATE`/`DELETE` against one by writing directly to the storage it points
-at, while SQL Server keeps serving the reads. `UPDATE`/`DELETE` need a row identity, and an external table
-has no SQL-side key — so give the Delta table an **identity column** (`id BIGINT AS (0)`), which is a real,
-readable data column and becomes the rowid:
+at, while SQL Server keeps serving the reads. A `DELETE` whose WHERE translates exactly (comparisons, `IN`,
+`BETWEEN`, `IS [NOT] NULL`, `AND`/`OR` — strings included, since the Delta table compares them) needs nothing more:
+it runs against the storage directly — a predicate on partition columns removes whole files unread, any other is
+evaluated row by row and deleted copy-on-write, so no deletion vector is written and SQL Server can keep reading
+the table. Everything else — an `UPDATE`, or a `DELETE` whose WHERE does not translate (a function call, a
+subquery) — needs a row identity, and an external table has no SQL-side key; give the Delta table an **identity
+column** (`id BIGINT AS (0)`), which is a real, readable data column and becomes the rowid:
 
 ```sql
 CREATE TABLE lake.main.iddml (id BIGINT AS (0), name VARCHAR, val INTEGER);  -- on the Delta catalog

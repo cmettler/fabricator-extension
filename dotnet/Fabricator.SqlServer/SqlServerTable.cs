@@ -382,7 +382,7 @@ SELECT s.name, o.name, c.name, dc.definition
     /// ambient scan routing (SqlServerScanRoute — pinned/pooled/drained/snapshot stays the routing's
     /// business) and delegates every resolution to the catalog's typed cores. Caller-owned; holds nothing
     /// to dispose.</summary>
-    private sealed class SqlServerTableBinding : ITableBinding
+    private sealed class SqlServerTableBinding : ITableBinding, IDeleteWhereShape
     {
         private readonly SqlServerCatalog _catalog;
         private readonly SqlServerTableDefinition _definition;
@@ -441,7 +441,18 @@ SELECT s.name, o.name, c.name, dc.definition
 
         /// <inheritdoc/>
         public bool SupportsUpdateWhere =>
-            _catalog.SupportsDeleteWhereCore(_definition.SchemaName, _definition.TableName);
+            _catalog.SupportsUpdateWhereCore(_definition.SchemaName, _definition.TableName);
+
+        // An explicit transaction still plans the shortcut: an external table's DeleteWhere then refuses with the
+        // autocommit-only message (GuardExternalDml), which says more than the rowid path's missing-key error.
+        bool IDeleteWhereShape.DeleteWhereAutocommitOnly => false;
+
+        IReadOnlyList<string>? IDeleteWhereShape.DeleteWhereColumns => null;
+
+        // An external Delta table's DELETE is evaluated by the Delta engine (bytes, no collation), so its strings
+        // are exact; an ordinary table's are compared by SQL Server's collation and are not.
+        bool IDeleteWhereShape.ExactStrings =>
+            _catalog.IsExternalDeltaCore(_definition.SchemaName, _definition.TableName);
 
         /// <inheritdoc/>
         public long UpdateWhere(IReadOnlyList<SetAssignment> set, FilterNode? filter, IArrowArrayStream? filterValues) =>

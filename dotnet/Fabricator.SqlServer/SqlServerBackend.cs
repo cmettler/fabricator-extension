@@ -2416,7 +2416,18 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// plain T-SQL statement against it fails. <see cref="DetectExternalTable"/> is cached and answers null at once on a
     /// warehouse engine, so this costs at most one probe per table, at the first DELETE planned.</summary>
     internal bool SupportsDeleteWhereCore(string schemaName, string tableName) =>
+        DetectExternalTable(schemaName, tableName) is not { } ext || IsRoutableDelta(ext);
+
+    /// <summary>The UPDATE twin keeps the old rule: an external table's UPDATE goes by identity or not at all.</summary>
+    internal bool SupportsUpdateWhereCore(string schemaName, string tableName) =>
         DetectExternalTable(schemaName, tableName) is null;
+
+    /// <summary>An external table whose storage is a Delta table this process can write (s3:// or adls://).</summary>
+    internal bool IsExternalDeltaCore(string schemaName, string tableName) =>
+        DetectExternalTable(schemaName, tableName) is { } ext && IsRoutableDelta(ext);
+
+    private static bool IsRoutableDelta(ExternalTableInfo ext) =>
+        ext.IsDelta && ext.StorageUri is not null && ExternalTableRouting.CanRoute;
 
     /// <summary>One <c>DELETE FROM [s].[t] WHERE …</c> for an EXACT predicate (ABI v93) — no scan, no rowid.
     /// Same connection routing (the transaction's pinned connection via BeginWrite), the same interrupt scope
@@ -2427,8 +2438,32 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// named. The returned count is SqlClient's, which — exactly like the rowid path's — includes rows a
     /// trigger affected.</remarks>
     internal long DeleteWhereCore(string schemaName, string tableName, FilterNode? filter,
-                                  IArrowArrayStream? filterValues) =>
-        DmlWhereCore(schemaName, tableName, null, filter, filterValues);
+                                  IArrowArrayStream? filterValues)
+    {
+        // An external Delta table: the predicate runs against its STORAGE — no identity column needed, which is
+        // what the rowid path needs (and what a table SQL Server reads through PolyBase usually lacks).
+        if (DetectExternalTable(schemaName, tableName) is { } ext)
+        {
+            try
+            {
+                if (!IsRoutableDelta(ext))
+                {
+                    throw new NotSupportedException(
+                        $"fabricator: DELETE on external table {schemaName}.{tableName} is not supported "
+                        + "(only an external DELTA table on s3:// or adls:// can be written)");
+                }
+                GuardExternalDml(schemaName, tableName, "DELETE FROM");
+            }
+            catch
+            {
+                filterValues?.Dispose();
+                throw;
+            }
+            RecordTouch(schemaName, tableName, schemaChanged: false);
+            return ExternalTableRouting.DeleteWhere(ext.StorageUri!, filter, filterValues);
+        }
+        return DmlWhereCore(schemaName, tableName, null, filter, filterValues);
+    }
 
     /// <summary>One <c>UPDATE [s].[t] SET … WHERE …</c> for exact trees (ABI v94) — no scan, no rowid. Same
     /// routing, interrupt scope and parameter rule as <see cref="DeleteWhereCore"/>; the SET values are rendered

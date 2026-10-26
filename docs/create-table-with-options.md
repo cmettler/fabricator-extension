@@ -424,6 +424,34 @@ Each slice ships independently; commit per slice (session convention).
 `table_type='ICEBERG'` (no writer); CETAS-by-SQL-Server (SQL exporting parquet itself — our client-side
 write is strictly more capable, Delta included); UPDATE/DELETE on external tables WITHOUT an identity
 column (position rowids are snapshot-bound and can't bridge the two systems — slice D's identity key is
-the only sound bridge; use a direct Delta ATTACH otherwise); UPDATE/DELETE on PARQUET-format external
+the only sound bridge; use a direct Delta ATTACH otherwise — ⚠ SUPERSEDED for a DELETE with an exact predicate,
+which needs no bridge because it is evaluated on the storage side: see "DELETE without an identity column" below);
+UPDATE/DELETE on PARQUET-format external
 tables (no log, no DML semantics); reading external tables via storage instead of SQL Server (reads stay
 SQL-side by design); `location` on the Delta provider; deltars participation.
+
+## DELETE without an identity column — BUILT 2026-10-26 (no ABI change)
+
+Before, an external Delta table without a Delta identity column had no rowid, and every DELETE was refused with
+the rowid path's *"requires a primary key or unique index"*. Now the plan-less predicate DELETE (ABI v93) reaches
+an external table too: `SupportsDeleteWhereCore` answers yes for a routable external DELTA table, and
+`DeleteWhereCore` sends the predicate to `ExternalTableRouting.DeleteWhere` instead of to SQL Server (where a
+DELETE on an external table cannot run at all). `UPDATE` keeps the old rule — by identity or not at all.
+
+- **Partition columns only** → engineered-wood's predicate delete (#506): whole files removed unread, no deletion
+  vector.
+- **Anything else** → a scan of the transient Delta catalog for the predicate's columns + the transient rowid, the
+  predicate RE-EVALUATED exactly with engineered-wood's row evaluator, then the delta provider's own rowid DELETE —
+  copy-on-write on a table without deletion vectors, so it stays protocol 1.0 and SQL Server keeps reading it.
+  ⚠ The re-evaluation is LOAD-BEARING, not defensive: the scan's pushed filter is only a superset. MEASURED with the
+  re-evaluation removed, `val > 5 AND name <> 'n1'` deleted 20 rows instead of 5.
+- VARCHAR is exact here (`exact_strings` for an external Delta table only): the Delta engine compares bytes, not SQL
+  Server's collation. An ordinary SQL Server table keeps VARCHAR on the rowid path.
+- Autocommit only, like every external write; the explicit-transaction refusal is the same `GuardExternalDml`.
+- ⚠ Through the EXTERNAL TABLE, SQL Server reads a Delta partition column as NULL (Microsoft's documented
+  limitation; `OPENROWSET` reads it correctly). Pinned in the gate.
+
+Gate `verify_mssql_external_delete` (43, service): routing, a twin-table differential against the rowid path,
+SQL Server reading the result (OPENROWSET and the external table), the raw log holding no deletion vector (with a
+control that the log was read), and the two refusals (explicit transaction; a predicate that does not translate).
+One mutant (no re-evaluation) killed at the data-predicate row.

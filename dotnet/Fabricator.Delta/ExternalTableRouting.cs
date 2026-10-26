@@ -262,6 +262,144 @@ public static class ExternalTableRouting
         }
     }
 
+    /// <summary>
+    /// DELETE … WHERE on an external Delta table WITHOUT an identity column (the usual case for a table SQL Server
+    /// reads through PolyBase). The host sends it only with a predicate its strict serializer rendered EXACTLY.
+    /// </summary>
+    /// <remarks>
+    /// <para>A predicate over partition columns alone goes to engineered-wood's predicate delete, which removes whole
+    /// files without reading them (no deletion vector, so a protocol-1.0 table stays SQL-Server-readable).</para>
+    /// <para>Anything else: a pruned scan of the predicate's columns plus the transient rowid, the predicate
+    /// re-evaluated EXACTLY on every returned row with engineered-wood's row evaluator (the scan's pushed filter
+    /// is only a superset), and the matching rows deleted by the delta provider's own rowid DELETE — copy-on-write
+    /// on a table without deletion vectors, which keeps it readable by SQL Server (a materialized deletion vector
+    /// would not: 19726).</para>
+    /// </remarks>
+    public static long DeleteWhere(string tableUri, FilterNode? filter, IArrowArrayStream? filterValues)
+    {
+        // Materialize the one-row constants batch FIRST: an imported C stream left to the GC finalizer outlives the
+        // host's struct (the rule DeleteByIdentity follows), and both branches below need the values again.
+        RecordBatch? constants = null;
+        if (filterValues is not null)
+        {
+            using (filterValues)
+            {
+                constants = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+        }
+        var values = new List<object?>();
+        if (constants is not null)
+        {
+            for (int i = 0; i < constants.ColumnCount; i++)
+            {
+                values.Add(ArrowValueReader.ReadScalar(constants.Column(i), 0));
+            }
+        }
+        var predicate = DeltaFilterBuilder.BuildExact(filter, values);
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        CollectColumns(filter, referenced);
+
+        var (root, leaf) = SplitTable(tableUri);
+        var catalog = (DeltaCatalog)ProviderRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
+        try
+        {
+            var path = catalog.TablePath("main", leaf);
+            var (supported, columns) = catalog.DescribeDeleteShortcut(path, null);
+            if (supported && columns is not null && referenced.IsSubsetOf(columns))
+            {
+                Log.LogInformation("external delta DELETE {Uri}: partition predicate {Predicate}, files removed unread",
+                    tableUri, predicate);
+                long removed = catalog.DeleteWhere("main", leaf, path, filter,
+                    constants is null ? null : new InMemoryArrayStream(constants.Schema, new[] { constants }));
+                catalog.CommitTransaction();
+                return removed;
+            }
+
+            var rowIds = MatchingRowIds(catalog, leaf, filter, constants, predicate, referenced);
+            Log.LogInformation("external delta DELETE {Uri}: {Predicate} matched {Rows} row(s)",
+                tableUri, predicate, rowIds.Count);
+            if (rowIds.Count == 0)
+            {
+                return 0;
+            }
+            var builder = new Int64Array.Builder().Reserve(rowIds.Count);
+            foreach (var rid in rowIds)
+            {
+                builder.Append(rid);
+            }
+            var keySchema = new Schema(
+                new[] { new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: false) }, null);
+            var batch = new RecordBatch(keySchema, new IArrowArray[] { builder.Build() }, rowIds.Count);
+            long n = catalog.ExecuteDelete("main", leaf, new InMemoryArrayStream(keySchema, new[] { batch }));
+            catalog.CommitTransaction(); // autocommit DELETE commits directly; this is the parked-state backstop
+            return n;
+        }
+        catch
+        {
+            try { catalog.RollbackTransaction(); } catch { /* discard-only backstop */ }
+            throw;
+        }
+        finally
+        {
+            catalog.Dispose();
+        }
+    }
+
+    private static void CollectColumns(FilterNode? node, HashSet<string> into)
+    {
+        if (node is null)
+        {
+            return;
+        }
+        if (node.Path is { Count: > 0 } p)
+        {
+            into.Add(p[0]);
+        }
+        else if (node.Col is { } c)
+        {
+            into.Add(c);
+        }
+        foreach (var child in node.Children ?? new List<FilterNode>())
+        {
+            CollectColumns(child, into);
+        }
+    }
+
+    // The rows the predicate is TRUE for (SQL three-valued logic: NULL is not a match), as transient rowids.
+    private static List<long> MatchingRowIds(DeltaCatalog catalog, string leaf, FilterNode? filter,
+                                             RecordBatch? constants, EngineeredWood.Expressions.Predicate predicate,
+                                             HashSet<string> referenced)
+    {
+        var columns = new List<string>(referenced) { DeltaCatalog.RowIdColumn };
+        var spec = new ScanSpec { Columns = columns, Filter = filter };
+        var evaluator = new EngineeredWood.Expressions.Arrow.ArrowRowEvaluator();
+        var ids = new List<long>();
+        using var scan = catalog.ScanTable("main", leaf, JsonSerializer.Serialize(spec),
+            constants is null ? null : new InMemoryArrayStream(constants.Schema, new[] { constants }));
+        RecordBatch? b;
+        while ((b = scan.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
+        {
+            using (b)
+            {
+                int ridIdx = b.Schema.GetFieldIndex(DeltaCatalog.RowIdColumn);
+                if (ridIdx < 0)
+                {
+                    throw new InvalidOperationException("external-table DML: the delta scan did not return the rowid column.");
+                }
+                var rid = (Int64Array)b.Column(ridIdx);
+                var mask = evaluator.EvaluatePredicate(predicate, b);
+                for (int i = 0; i < b.Length; i++)
+                {
+                    if (!mask.IsNull(i) && mask.GetValue(i) == true && rid.GetValue(i) is { } id)
+                    {
+                        ids.Add(id);
+                    }
+                }
+            }
+        }
+        return ids;
+    }
+
     /// <summary>UPDATE keyed by identity values: <paramref name="data"/> is the DuckDB update stream
     /// (<paramref name="setColumnCount"/> SET columns ++ ONE trailing identity key column). Each key resolves
     /// to its transient rowid (unresolved ⇒ NULL ⇒ the delta update skips the row — concurrently deleted

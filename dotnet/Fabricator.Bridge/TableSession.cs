@@ -278,9 +278,10 @@ internal sealed class TableSession
 /// <summary>
 /// Narrows WHEN the host takes a binding's predicate DELETE (<see cref="ITableBinding.DeleteWhere"/>), for a
 /// provider whose predicate statement is not equivalent to the rowid path everywhere. Internal on purpose: the
-/// public contract keeps the plain yes/no, and only a built-in provider has needed more so far.
+/// public PLUGIN contract (Fabricator.Abstractions) keeps the plain yes/no; this lives in the Bridge, which only the
+/// built-in providers reference.
 /// </summary>
-internal interface IDeleteWhereShape
+public interface IDeleteWhereShape
 {
     /// <summary>Only in an autocommit statement. True when the predicate statement cannot see the
     /// transaction's own pending writes (Delta deletes against the base snapshot).</summary>

@@ -1,0 +1,222 @@
+# name: test/verify_mssql_external_delete.test
+# description: DELETE through a SQL Server EXTERNAL TABLE over Delta on S3 (PolyBase) WITHOUT an identity column.
+#              Before, such a table had no rowid and every DELETE was refused ("requires a primary key or unique
+#              index"). Now an EXACT predicate runs against the table's storage: a predicate on partition columns
+#              removes whole files unread (engineered-wood #506); any other is evaluated row by row on a scan of
+#              the predicate's columns and deleted copy-on-write — no deletion vector, so SQL Server can still read
+#              the table (a materialized vector would make every later read fail with 19726).
+#
+#              ⚠ §2 is a DIFFERENTIAL: the same deletes run on a twin Delta table through the Delta catalog with the
+#              predicate shortcut off (the rowid path, the oracle); contents must agree. §3 is what makes the change
+#              matter: SQL Server itself reads the result. Needs the docker SQL Server + MinIO (service tier).
+# group: [fabricator]
+
+require fabricator
+
+require httpfs
+
+require parquet
+
+require json
+
+require-env MSSQL_TESTDB_DSN
+
+require-env FABRICATOR_S3_ENDPOINT
+
+require-env FABRICATOR_S3_SQL_ENDPOINT
+
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = false;
+
+statement ok
+CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
+                        ENDPOINT '${FABRICATOR_S3_ENDPOINT}', URL_STYLE 'path', REGION 'us-east-1',
+                        USE_SSL true);
+
+# Protocol 1.0 tables (no deletion vectors, no column mapping): what SQL Server's Delta reader accepts.
+statement ok
+ATTACH 's3://fabricator/extdel' AS xl (TYPE fabricator, PROVIDER 'delta', READ_ONLY false,
+                                       deletion_vectors false, column_mapping 'none', SECRET minio_s3);
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS sqldb (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = ''##MS_DatabaseMasterKey##'')
+     CREATE MASTER KEY ENCRYPTION BY PASSWORD = ''Arrow_Net_123!MK''');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.database_scoped_credentials WHERE name = ''s3_dc'')
+     CREATE DATABASE SCOPED CREDENTIAL s3_dc WITH IDENTITY = ''S3 Access Key'',
+       SECRET = ''miniouser:miniosecret123''');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = ''s3_ds'')
+     CREATE EXTERNAL DATA SOURCE s3_ds WITH (LOCATION = ''s3://${FABRICATOR_S3_SQL_ENDPOINT}/'',
+       CREDENTIAL = s3_dc)');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = ''DeltaFileFormat'')
+     CREATE EXTERNAL FILE FORMAT DeltaFileFormat WITH (FORMAT_TYPE = DELTA)');
+
+# ═══ §0  Two identical tables, NO identity column; ex is reached through SQL Server, tw is the twin ═════
+# id 1..30; val NULL when id % 7 = 0; name 'n' || id % 4; p partition ('a' / 'b' / 'c').
+
+statement ok
+DROP TABLE IF EXISTS xl.main.ex;
+
+statement ok
+DROP TABLE IF EXISTS xl.main.tw;
+
+statement ok
+CREATE TABLE xl.main.ex (id BIGINT, name VARCHAR, val INTEGER, p VARCHAR) PARTITIONED BY (p);
+
+statement ok
+CREATE TABLE xl.main.tw (id BIGINT, name VARCHAR, val INTEGER, p VARCHAR) PARTITIONED BY (p);
+
+statement ok
+INSERT INTO xl.main.ex SELECT i, 'n' || (i % 4), CASE WHEN i % 7 = 0 THEN NULL ELSE i % 10 END, ['a','b','c'][i % 3 + 1] FROM range(1, 31) t(i);
+
+statement ok
+INSERT INTO xl.main.tw SELECT * FROM xl.main.ex;
+
+statement ok
+SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.s3_extdel'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_extdel');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'CREATE EXTERNAL TABLE dbo.s3_extdel (id BIGINT, name VARCHAR(20), val INT, p VARCHAR(5))
+   WITH (LOCATION = ''/fabricator/extdel/ex'', DATA_SOURCE = s3_ds, FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+# ═══ §1  Routing: an exact predicate takes the predicate DELETE, with no identity anywhere ═════════════
+
+query II
+EXPLAIN DELETE FROM sqldb.dbo.s3_extdel WHERE val > 5 AND name <> 'n1';
+----
+physical_plan	<REGEX>:.*Fabricator Delete Where.*
+
+# ═══ §2  Differential against the twin (rowid path on the Delta catalog) ═════════════════════════════
+
+# A partition predicate: whole files removed.
+query I
+DELETE FROM sqldb.dbo.s3_extdel WHERE p = 'c';
+----
+10
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM xl.main.tw WHERE p = 'c';
+----
+10
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# A data predicate with a string (exact: the Delta engine compares bytes) and NULL semantics (`<>` keeps NULL).
+query I
+DELETE FROM sqldb.dbo.s3_extdel WHERE val > 5 AND name <> 'n1';
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM xl.main.tw WHERE val > 5 AND name <> 'n1';
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+DELETE FROM sqldb.dbo.s3_extdel WHERE val IS NULL OR id IN (1, 2);
+----
+4
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM xl.main.tw WHERE val IS NULL OR id IN (1, 2);
+----
+4
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM xl.main.ex EXCEPT ALL SELECT * FROM xl.main.tw)
+  UNION ALL (SELECT * FROM xl.main.tw EXCEPT ALL SELECT * FROM xl.main.ex));
+----
+0
+
+# ═══ §3  SQL Server still reads it: no deletion vector was written ═════════════════════════════════════
+
+query I
+SELECT count(*) FROM xl.main.ex;
+----
+11
+
+query I
+SELECT * FROM fabricator_query('sqldb',
+  'SELECT count(*) AS n FROM OPENROWSET(BULK ''/fabricator/extdel/ex'', FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+11
+
+# Through the EXTERNAL TABLE (not OPENROWSET), SQL Server reads a Delta PARTITION column as NULL — a documented
+# Microsoft limitation, not ours — so the comparison leaves `p` out, and the NULLs are pinned separately.
+query I
+SELECT count(*) FROM ((SELECT id, name, val FROM sqldb.dbo.s3_extdel EXCEPT ALL SELECT id, name, val FROM xl.main.ex)
+  UNION ALL (SELECT id, name, val FROM xl.main.ex EXCEPT ALL SELECT id, name, val FROM sqldb.dbo.s3_extdel));
+----
+0
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_extdel WHERE p IS NOT NULL;
+----
+0
+
+# The control for the check below: the log IS read, and it does hold add actions.
+query I
+SELECT count(*) > 0 FROM read_text('s3://fabricator/extdel/ex/_delta_log/*.json') WHERE content LIKE '%"add"%';
+----
+true
+
+# The raw log text: not one action carries a deletion vector (a JSON schema inferred from it has no such key at all).
+query I
+SELECT count(*) FROM read_text('s3://fabricator/extdel/ex/_delta_log/*.json') WHERE content LIKE '%deletionVector%';
+----
+0
+
+# ═══ §4  What is still refused ════════════════════════════════════════════════════════════════════════
+
+# Storage-side DML cannot join an explicit transaction (its own Delta commit).
+statement ok
+BEGIN;
+
+statement error
+DELETE FROM sqldb.dbo.s3_extdel WHERE p = 'a';
+----
+cannot roll back with an explicit
+
+statement ok
+ROLLBACK;
+
+# A predicate that does not render exactly needs a rowid, which this table does not have.
+statement error
+DELETE FROM sqldb.dbo.s3_extdel WHERE lower(name) = 'n2';
+----
+primary key or unique index
+
+statement ok
+SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.s3_extdel'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_extdel');
