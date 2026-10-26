@@ -1,0 +1,82 @@
+# DuckDB `main` canary: builds this branch against DuckDB's development branch and runs the hermetic suites.
+#
+# DuckDB's `main` is the next release (2.1 as of 2026-10), not a bugfix line — those are the vX.Y-<name>
+# branches this repo mirrors. Nothing ships from `main`, so it gets no branch here. This job only reports
+# early when an upstream change breaks our build or a suite, so the next port arrives piece by piece
+# instead of all at once on release day. A red run blocks nothing.
+#
+# It moves two pins for the run and changes nothing in the repo: the duckdb submodule to the tip of
+# DuckDB's `main`, and httpfs to the sha DuckDB's own CI uses there (an httpfs built for 2.0 need not
+# compile against `main`). Both shas go into the run summary.
+#
+# A `schedule` runs only on the repository's DEFAULT branch, from that branch's copy of this file.
+
+name: duckdb-main-canary
+
+on:
+  schedule:
+    # Mondays 04:41 UTC — an odd minute, away from the top of the hour.
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duckdb-main-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    name: linux_amd64 vs duckdb main
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `true`, not `recursive` — see extension.yml.
+          submodules: true
+
+      - name: Move duckdb to main, httpfs to DuckDB's own pin there
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C duckdb fetch --depth 1 origin main
+          git -C duckdb checkout --quiet FETCH_HEAD
+          duckdb_sha=$(git -C duckdb rev-parse HEAD)
+          httpfs_sha=$(sed -n 's/.*GIT_TAG[[:space:]]\+\([0-9a-f]\{40\}\).*/\1/p' duckdb/.github/config/extensions/httpfs.cmake | head -1)
+          if [ -z "$httpfs_sha" ]; then
+            echo "::error::could not read the httpfs pin from duckdb/.github/config/extensions/httpfs.cmake"
+            exit 1
+          fi
+          sed -i "/duckdb-httpfs/{n;s/GIT_TAG [0-9a-f]\{40\}/GIT_TAG $httpfs_sha/}" extension_config.cmake
+          grep -q "GIT_TAG $httpfs_sha" extension_config.cmake
+          version=$(cat duckdb/scripts/ci/release_version.txt 2>/dev/null || echo '?')
+          {
+            echo "### DuckDB main canary"
+            echo "- duckdb: \`$duckdb_sha\` (release_version $version)"
+            echo "- httpfs: \`$httpfs_sha\`"
+            echo "- fabricator: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: ./.github/actions/build-extension
+        with:
+          triplet: x64-linux
+          platform: linux_amd64
+
+      - name: Run the hermetic suites
+        shell: bash
+        env:
+          UNITTEST: build/release/test/unittest
+        run: scripts/run-suites.sh hermetic
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-build-logs
+          path: |
+            build/release/CMakeFiles/*.log
+            build/release/CMakeCache.txt
+          if-no-files-found: ignore

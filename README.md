@@ -5226,8 +5226,11 @@ git submodule update --init          # NOT --recursive — see engineered-wood b
   the single-file distribution artifact; nothing else in the repo references it, so a normal build works
   without it.
 
-This repo's default branch is **`v1.5-variegata`**, matching DuckDB's own name for the 1.5 release line;
-the `duckdb` pin moves tag by tag within that line. (`main` is reserved for tracking duckdb `main`.)
+Branches mirror DuckDB's release lines and carry their names. The default branch is **`v2.0-cyanoptera`**
+(DuckDB 2.0), the line releases ship from; **`v1.5-variegata`** (DuckDB 1.5) gets bug fixes only. On each, the
+`duckdb` pin moves tag by tag within that line. There is no `main`: DuckDB's `main` is the development branch for
+the next release (2.1), so a weekly canary build (`.github/workflows/duckdb-main-canary.yml`) compiles this branch
+against it instead, and a `v2.1-…` branch follows once that line is released.
 
 `httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**, and the ABI's
 JSON crossings need yyjson:

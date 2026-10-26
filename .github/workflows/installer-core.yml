@@ -27,7 +27,7 @@
 #   Tier 3  the single-file artifact + smoke against a stock DuckDB wheel               (dispatch/tags)
 #   manual  DAX (needs Power BI Desktop), live Fabric/OneLake, the deltars suites
 #
-# See CLAUDE.md; the branch is v1.5-variegata, mirroring DuckDB's 1.5 release line.
+# Branches mirror DuckDB's release lines: v2.0-cyanoptera (default) and v1.5-variegata (bug fixes).
 
 name: installer-core
 
