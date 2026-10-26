@@ -27,9 +27,9 @@ namespace Fabricator.Bridge;
 ///
 /// <para><b>Semantics</b>: statement-atomic — the Delta append is parked per (txn, table) inside the
 /// transient catalog and flushed as ONE Delta commit at the end of this call; a parquet PUT completes
-/// atomically. Inside an explicit DuckDB transaction a Delta append goes through an
-/// <see cref="ExternalDeltaSession"/> instead and commits with the transaction; everything else here does not
-/// join one (the caller guards).</para>
+/// atomically. Inside an explicit DuckDB transaction a Delta append, DELETE or UPDATE goes through an
+/// <see cref="ExternalDeltaSession"/> instead and commits with the transaction; a parquet append and a CREATE do
+/// not join one (the caller refuses them).</para>
 /// </summary>
 public static class ExternalTableRouting
 {
@@ -241,30 +241,62 @@ public static class ExternalTableRouting
         // outlives the C++ side's struct and segfaults; every exit below must not leak it.
         var ids = CollectInt64(keys);
         var (root, leaf) = SplitTable(tableUri);
+        return Autocommit(root, catalog => DeleteByIdentityCore(catalog, tableUri, leaf, identityColumn, ids));
+    }
+
+    /// <summary>The explicit-transaction form of <see cref="DeleteByIdentity(string, string, IArrowArrayStream, long)"/>:
+    /// the rows are buffered in <paramref name="session"/> and deleted at its COMMIT. Refused once the session
+    /// has written to the table, because the ids come from SQL Server's read of the COMMITTED table.</summary>
+    public static long DeleteByIdentity(string tableUri, string identityColumn, IArrowArrayStream keys, long txnId,
+                                        ExternalDeltaSession session)
+    {
+        var ids = CollectInt64(keys);
+        var (root, leaf) = SplitTable(tableUri);
+        RefuseAfterWrites(session, root, leaf, tableUri, "DELETE");
+        return session.Run(root, leaf, txnId,
+            catalog => DeleteByIdentityCore(catalog, tableUri, leaf, identityColumn, ids));
+    }
+
+    private static long DeleteByIdentityCore(IProviderCatalog catalog, string tableUri, string leaf,
+                                             string identityColumn, List<long> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return 0;
+        }
+        var map = ResolveRowIds(catalog, leaf, identityColumn, ids);
+        Log.LogInformation("external delta DELETE {Uri}: {Ids} id(s) -> {Rows} resolved row(s)",
+            tableUri, ids.Count, map.Count);
+        return DeleteRowIds(catalog, leaf, map.Values);
+    }
+
+    // The delta provider's own rowid DELETE: buffered inside an explicit transaction, committed directly in
+    // autocommit (where the caller's CommitTransaction is only the parked-state backstop).
+    private static long DeleteRowIds(IProviderCatalog catalog, string leaf, ICollection<long> rowIds)
+    {
+        if (rowIds.Count == 0)
+        {
+            return 0;
+        }
+        var builder = new Int64Array.Builder().Reserve(rowIds.Count);
+        foreach (var rid in rowIds)
+        {
+            builder.Append(rid);
+        }
+        var keySchema = new Schema(
+            new[] { new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: false) }, null);
+        var batch = new RecordBatch(keySchema, new IArrowArray[] { builder.Build() }, rowIds.Count);
+        return catalog.ExecuteDelete("main", leaf, new InMemoryArrayStream(keySchema, new[] { batch }));
+    }
+
+    // One statement on its own transient catalog and its own Delta commit.
+    private static long Autocommit(string root, Func<IProviderCatalog, long> write)
+    {
         var catalog = ProviderRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
         try
         {
-            if (ids.Count == 0)
-            {
-                return 0;
-            }
-            var map = ResolveRowIds(catalog, leaf, identityColumn, ids);
-            Log.LogInformation("external delta DELETE {Uri}: {Ids} id(s) -> {Rows} resolved row(s)",
-                tableUri, ids.Count, map.Count);
-            if (map.Count == 0)
-            {
-                return 0;
-            }
-            var rowIds = new Int64Array.Builder().Reserve(map.Count);
-            foreach (var rid in map.Values)
-            {
-                rowIds.Append(rid);
-            }
-            var keySchema = new Schema(
-                new[] { new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: false) }, null);
-            var batch = new RecordBatch(keySchema, new IArrowArray[] { rowIds.Build() }, map.Count);
-            long n = catalog.ExecuteDelete("main", leaf, new InMemoryArrayStream(keySchema, new[] { batch }));
-            catalog.CommitTransaction(); // autocommit DELETE commits directly; this is the parked-state backstop
+            long n = write(catalog);
+            catalog.CommitTransaction();
             return n;
         }
         catch
@@ -275,6 +307,18 @@ public static class ExternalTableRouting
         finally
         {
             catalog.Dispose();
+        }
+    }
+
+    private static void RefuseAfterWrites(ExternalDeltaSession session, string root, string leaf, string tableUri,
+                                          string verb)
+    {
+        if (session.HasWrites(root, leaf))
+        {
+            throw new NotSupportedException(
+                $"{verb} on external Delta table {tableUri} after this transaction already wrote to it: the rows "
+                + "come from SQL Server's read, which does not see this transaction's writes — COMMIT first, or "
+                + "delete by a predicate the Delta engine can evaluate.");
         }
     }
 
@@ -293,72 +337,79 @@ public static class ExternalTableRouting
     /// </remarks>
     public static long DeleteWhere(string tableUri, FilterNode? filter, IArrowArrayStream? filterValues)
     {
-        // Materialize the one-row constants batch FIRST: an imported C stream left to the GC finalizer outlives the
-        // host's struct (the rule DeleteByIdentity follows), and both branches below need the values again.
-        RecordBatch? constants = null;
+        var where = ReadWhere(filter, filterValues);
+        var (root, leaf) = SplitTable(tableUri);
+        return Autocommit(root, c =>
+        {
+            var catalog = (DeltaCatalog)c;
+            var path = catalog.TablePath("main", leaf);
+            var (supported, columns) = catalog.DescribeDeleteShortcut(path, null);
+            if (supported && columns is not null && where.Referenced.IsSubsetOf(columns))
+            {
+                Log.LogInformation("external delta DELETE {Uri}: partition predicate {Predicate}, files removed unread",
+                    tableUri, where.Predicate);
+                return catalog.DeleteWhere("main", leaf, path, filter, where.ConstantsStream());
+            }
+            return DeleteMatching(catalog, tableUri, leaf, filter, where);
+        });
+    }
+
+    /// <summary>The explicit-transaction form of <see cref="DeleteWhere(string, FilterNode?, IArrowArrayStream?)"/>.
+    /// Always the scan + row-evaluator route: it reads through <paramref name="session"/>, so it sees this
+    /// transaction's own writes, where engineered-wood's predicate delete would see only the committed table.
+    /// The rows are buffered and deleted at the session's COMMIT.</summary>
+    public static long DeleteWhere(string tableUri, FilterNode? filter, IArrowArrayStream? filterValues, long txnId,
+                                   ExternalDeltaSession session)
+    {
+        var where = ReadWhere(filter, filterValues);
+        var (root, leaf) = SplitTable(tableUri);
+        return session.Run(root, leaf, txnId,
+            c => DeleteMatching((DeltaCatalog)c, tableUri, leaf, filter, where));
+    }
+
+    private static long DeleteMatching(DeltaCatalog catalog, string tableUri, string leaf, FilterNode? filter,
+                                       ExactWhere where)
+    {
+        var rowIds = MatchingRowIds(catalog, leaf, filter, where.Constants, where.Predicate, where.Referenced);
+        Log.LogInformation("external delta DELETE {Uri}: {Predicate} matched {Rows} row(s)",
+            tableUri, where.Predicate, rowIds.Count);
+        return DeleteRowIds(catalog, leaf, rowIds);
+    }
+
+    // The predicate of a DELETE … WHERE with its one-row constants batch, read once. The batch is materialized
+    // FIRST: an imported C stream left to the GC finalizer outlives the host's struct (the rule DeleteByIdentity
+    // follows), and the scan and the predicate delete both need the values again.
+    private sealed class ExactWhere
+    {
+        public RecordBatch? Constants;
+        public EngineeredWood.Expressions.Predicate Predicate = null!;
+        public HashSet<string> Referenced = new(StringComparer.Ordinal);
+
+        public IArrowArrayStream? ConstantsStream() =>
+            Constants is null ? null : new InMemoryArrayStream(Constants.Schema, new[] { Constants });
+    }
+
+    private static ExactWhere ReadWhere(FilterNode? filter, IArrowArrayStream? filterValues)
+    {
+        var where = new ExactWhere();
         if (filterValues is not null)
         {
             using (filterValues)
             {
-                constants = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                where.Constants = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             }
         }
         var values = new List<object?>();
-        if (constants is not null)
+        if (where.Constants is not null)
         {
-            for (int i = 0; i < constants.ColumnCount; i++)
+            for (int i = 0; i < where.Constants.ColumnCount; i++)
             {
-                values.Add(ArrowValueReader.ReadScalar(constants.Column(i), 0));
+                values.Add(ArrowValueReader.ReadScalar(where.Constants.Column(i), 0));
             }
         }
-        var predicate = DeltaFilterBuilder.BuildExact(filter, values);
-        var referenced = new HashSet<string>(StringComparer.Ordinal);
-        CollectColumns(filter, referenced);
-
-        var (root, leaf) = SplitTable(tableUri);
-        var catalog = (DeltaCatalog)ProviderRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
-        try
-        {
-            var path = catalog.TablePath("main", leaf);
-            var (supported, columns) = catalog.DescribeDeleteShortcut(path, null);
-            if (supported && columns is not null && referenced.IsSubsetOf(columns))
-            {
-                Log.LogInformation("external delta DELETE {Uri}: partition predicate {Predicate}, files removed unread",
-                    tableUri, predicate);
-                long removed = catalog.DeleteWhere("main", leaf, path, filter,
-                    constants is null ? null : new InMemoryArrayStream(constants.Schema, new[] { constants }));
-                catalog.CommitTransaction();
-                return removed;
-            }
-
-            var rowIds = MatchingRowIds(catalog, leaf, filter, constants, predicate, referenced);
-            Log.LogInformation("external delta DELETE {Uri}: {Predicate} matched {Rows} row(s)",
-                tableUri, predicate, rowIds.Count);
-            if (rowIds.Count == 0)
-            {
-                return 0;
-            }
-            var builder = new Int64Array.Builder().Reserve(rowIds.Count);
-            foreach (var rid in rowIds)
-            {
-                builder.Append(rid);
-            }
-            var keySchema = new Schema(
-                new[] { new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: false) }, null);
-            var batch = new RecordBatch(keySchema, new IArrowArray[] { builder.Build() }, rowIds.Count);
-            long n = catalog.ExecuteDelete("main", leaf, new InMemoryArrayStream(keySchema, new[] { batch }));
-            catalog.CommitTransaction(); // autocommit DELETE commits directly; this is the parked-state backstop
-            return n;
-        }
-        catch
-        {
-            try { catalog.RollbackTransaction(); } catch { /* discard-only backstop */ }
-            throw;
-        }
-        finally
-        {
-            catalog.Dispose();
-        }
+        where.Predicate = DeltaFilterBuilder.BuildExact(filter, values);
+        CollectColumns(filter, where.Referenced);
+        return where;
     }
 
     private static void CollectColumns(FilterNode? node, HashSet<string> into)
@@ -433,79 +484,90 @@ public static class ExternalTableRouting
             (schema, batches, _) = DeltaWriter.Materialize(data, default);
         }
         var (root, leaf) = SplitTable(tableUri);
-        var catalog = ProviderRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
-        try
+        return Autocommit(root, catalog =>
+            UpdateByIdentityCore(catalog, tableUri, leaf, identityColumn, setColumnCount, schema, batches));
+    }
+
+    /// <summary>The explicit-transaction form of <see cref="UpdateByIdentity(string, string, int, IArrowArrayStream)"/>:
+    /// the old rows and the post-images are buffered in <paramref name="session"/> and committed at its COMMIT.
+    /// Refused once the session has written to the table: both the ids AND the SET values come from SQL Server's
+    /// read of the COMMITTED table.</summary>
+    public static long UpdateByIdentity(string tableUri, string identityColumn, int setColumnCount,
+                                        IArrowArrayStream data, long txnId, ExternalDeltaSession session)
+    {
+        Schema schema;
+        List<RecordBatch> batches;
+        using (data)
         {
-            if (batches.Count == 0)
+            (schema, batches, _) = DeltaWriter.Materialize(data, default);
+        }
+        var (root, leaf) = SplitTable(tableUri);
+        RefuseAfterWrites(session, root, leaf, tableUri, "UPDATE");
+        return session.Run(root, leaf, txnId, catalog =>
+            UpdateByIdentityCore(catalog, tableUri, leaf, identityColumn, setColumnCount, schema, batches));
+    }
+
+    private static long UpdateByIdentityCore(IProviderCatalog catalog, string tableUri, string leaf,
+                                             string identityColumn, int setColumnCount, Schema schema,
+                                             List<RecordBatch> batches)
+    {
+        if (batches.Count == 0)
+        {
+            return 0;
+        }
+        if (schema.FieldsList.Count != setColumnCount + 1)
+        {
+            throw new NotSupportedException(
+                "external-table UPDATE expects exactly one identity key column (compound keys are not "
+                + "identity-keyed).");
+        }
+        var ids = new List<long>();
+        foreach (var b in batches)
+        {
+            AppendInt64(b.Column(setColumnCount), ids);
+        }
+        var map = ResolveRowIds(catalog, leaf, identityColumn, ids);
+        Log.LogInformation("external delta UPDATE {Uri}: {Ids} id(s) -> {Rows} resolved row(s)",
+            tableUri, ids.Count, map.Count);
+        if (map.Count == 0)
+        {
+            return 0;
+        }
+        // Rebuild each batch: SET columns pass through; the key column becomes the resolved transient
+        // rowid (NULL where unresolved — the delta update's parser skips NULL rowids).
+        var fields = new List<Field>(schema.FieldsList.Count);
+        for (int j = 0; j < setColumnCount; j++)
+        {
+            fields.Add(schema.FieldsList[j]);
+        }
+        fields.Add(new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: true));
+        var outSchema = new Schema(fields, null);
+        var outBatches = new List<RecordBatch>(batches.Count);
+        foreach (var b in batches)
+        {
+            var rid = new Int64Array.Builder().Reserve(b.Length);
+            var keyVals = new List<long?>(b.Length);
+            AppendInt64Nullable(b.Column(setColumnCount), keyVals);
+            foreach (var id in keyVals)
             {
-                return 0;
+                if (id is { } v && map.TryGetValue(v, out var r))
+                {
+                    rid.Append(r);
+                }
+                else
+                {
+                    rid.AppendNull();
+                }
             }
-            if (schema.FieldsList.Count != setColumnCount + 1)
-            {
-                throw new NotSupportedException(
-                    "external-table UPDATE expects exactly one identity key column (compound keys are not "
-                    + "identity-keyed).");
-            }
-            var ids = new List<long>();
-            foreach (var b in batches)
-            {
-                AppendInt64(b.Column(setColumnCount), ids);
-            }
-            var map = ResolveRowIds(catalog, leaf, identityColumn, ids);
-            Log.LogInformation("external delta UPDATE {Uri}: {Ids} id(s) -> {Rows} resolved row(s)",
-                tableUri, ids.Count, map.Count);
-            if (map.Count == 0)
-            {
-                return 0;
-            }
-            // Rebuild each batch: SET columns pass through; the key column becomes the resolved transient
-            // rowid (NULL where unresolved — the delta update's parser skips NULL rowids).
-            var fields = new List<Field>(schema.FieldsList.Count);
+            var cols = new IArrowArray[setColumnCount + 1];
             for (int j = 0; j < setColumnCount; j++)
             {
-                fields.Add(schema.FieldsList[j]);
+                cols[j] = b.Column(j);
             }
-            fields.Add(new Field(DeltaCatalog.RowIdColumn, Int64Type.Default, nullable: true));
-            var outSchema = new Schema(fields, null);
-            var outBatches = new List<RecordBatch>(batches.Count);
-            foreach (var b in batches)
-            {
-                var rid = new Int64Array.Builder().Reserve(b.Length);
-                var keyVals = new List<long?>(b.Length);
-                AppendInt64Nullable(b.Column(setColumnCount), keyVals);
-                foreach (var id in keyVals)
-                {
-                    if (id is { } v && map.TryGetValue(v, out var r))
-                    {
-                        rid.Append(r);
-                    }
-                    else
-                    {
-                        rid.AppendNull();
-                    }
-                }
-                var cols = new IArrowArray[setColumnCount + 1];
-                for (int j = 0; j < setColumnCount; j++)
-                {
-                    cols[j] = b.Column(j);
-                }
-                cols[setColumnCount] = rid.Build();
-                outBatches.Add(new RecordBatch(outSchema, cols, b.Length));
-            }
-            long n = catalog.ExecuteUpdate("main", leaf, setColumnCount,
-                                           new InMemoryArrayStream(outSchema, outBatches));
-            catalog.CommitTransaction();
-            return n;
+            cols[setColumnCount] = rid.Build();
+            outBatches.Add(new RecordBatch(outSchema, cols, b.Length));
         }
-        catch
-        {
-            try { catalog.RollbackTransaction(); } catch { /* discard-only backstop */ }
-            throw;
-        }
-        finally
-        {
-            catalog.Dispose();
-        }
+        return catalog.ExecuteUpdate("main", leaf, setColumnCount, new InMemoryArrayStream(outSchema, outBatches));
     }
 
     // identity value -> transient (file, position) rowid, via chunked PRUNED scans: the IN predicate rides

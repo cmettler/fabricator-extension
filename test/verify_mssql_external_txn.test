@@ -1,14 +1,17 @@
 # name: test/verify_mssql_external_txn.test
-# description: INSERT into a SQL Server EXTERNAL TABLE over Delta on S3 inside an explicit DuckDB transaction.
-#              The rows are written as data files at statement time and the Delta commit waits for COMMIT; a
-#              ROLLBACK discards them and deletes the files. Before, such an INSERT was refused ("autocommit
+# description: INSERT and DELETE on a SQL Server EXTERNAL TABLE over Delta on S3 inside an explicit DuckDB
+#              transaction. An INSERT writes its data files at statement time and a DELETE buffers its rows; the
+#              Delta commit waits for COMMIT (one per table, the deletes staged copy-on-write so the table keeps
+#              no deletion vector), and a ROLLBACK discards everything. Before, both were refused ("autocommit
 #              only").
 #
-#              ⚠ What it does NOT give: SQL Server reads committed storage, so the transaction's own INSERTs are
-#              invisible through the external table until COMMIT (§1 pins that). DELETE/UPDATE stay autocommit
-#              only — buffering them needs deletion vectors, which SQL Server's Delta reader refuses (§4). A
-#              parquet external table stays autocommit only too: a file is visible the moment it exists.
-#              Needs the docker SQL Server + MinIO (service tier).
+#              ⚠ What it does NOT give: SQL Server reads committed storage, so the transaction's own writes are
+#              invisible through the external table until COMMIT (§1, §4 pin that). For the same reason a DELETE
+#              whose rows come from SQL Server's read (an identity-keyed one) is refused once the transaction has
+#              written to that table (§5). Still refused: deleting a row inserted in the same transaction (no
+#              deletion vectors), an UPDATE (every external UPDATE is identity-keyed, and the Delta layer does not
+#              buffer an UPDATE on an identity table), and an INSERT into a parquet external table (a file is
+#              visible the moment it exists). Needs the docker SQL Server + MinIO (service tier).
 # group: [fabricator]
 
 require fabricator
@@ -60,7 +63,8 @@ SELECT fabricator_exec('sqldb',
   'IF NOT EXISTS (SELECT 1 FROM sys.external_file_formats WHERE name = ''DeltaFileFormat'')
      CREATE EXTERNAL FILE FORMAT DeltaFileFormat WITH (FORMAT_TYPE = DELTA)');
 
-# ═══ §0  Two Delta tables under ONE root (one transient catalog serves both), three rows each ═════════════
+# ═══ §0  Two Delta tables under ONE root (one transient catalog serves both), three rows each, plus an identity
+#         table for the identity-keyed DELETE (§5) ════════════════════════════════════════════════════════════
 
 statement ok
 DROP TABLE IF EXISTS xt.main.e1;
@@ -75,6 +79,15 @@ statement ok
 CREATE TABLE xt.main.e2 AS SELECT i::BIGINT AS id, 'w' || i AS v FROM range(1, 4) t(i);
 
 statement ok
+DROP TABLE IF EXISTS xt.main.e3;
+
+statement ok
+CREATE TABLE xt.main.e3 (id BIGINT AS (0), v VARCHAR);
+
+statement ok
+INSERT INTO xt.main.e3 (v) VALUES ('z1'), ('z2'), ('z3'), ('z4');
+
+statement ok
 SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.s3_exttxn1'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_exttxn1');
 
 statement ok
@@ -87,6 +100,13 @@ SELECT fabricator_exec('sqldb', 'CREATE EXTERNAL TABLE dbo.s3_exttxn1 (id BIGINT
 statement ok
 SELECT fabricator_exec('sqldb', 'CREATE EXTERNAL TABLE dbo.s3_exttxn2 (id BIGINT, v VARCHAR(20))
   WITH (LOCATION = ''/fabricator/exttxn/e2'', DATA_SOURCE = s3_ds, FILE_FORMAT = DeltaFileFormat)');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.s3_exttxn3'') IS NOT NULL DROP EXTERNAL TABLE dbo.s3_exttxn3');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'CREATE EXTERNAL TABLE dbo.s3_exttxn3 (id BIGINT, v VARCHAR(20))
+  WITH (LOCATION = ''/fabricator/exttxn/e3'', DATA_SOURCE = s3_ds, FILE_FORMAT = DeltaFileFormat)');
 
 statement ok
 SELECT fabricator_exec('sqldb', 'IF OBJECT_ID(''dbo.exttxn_side'') IS NOT NULL DROP TABLE dbo.exttxn_side;
@@ -231,39 +251,209 @@ SELECT (SELECT count(*) FROM sqldb.dbo.exttxn_side), (SELECT count(*) FROM sqldb
 ----
 1	7
 
-# ═══ §4  DELETE / UPDATE stay autocommit only (a buffered delete would need a deletion vector) ═══════════
+# ═══ §4  DELETE by a predicate: buffered, deleted at COMMIT, copy-on-write ═════════════════════════════════
+# e1 holds 1,2,3,10,11,12,40. Its predicates render exactly, so the DELETE reads through the transaction's Delta
+# session: it sees the transaction's own writes, which SQL Server's read would not.
+
+statement ok
+CREATE TABLE log4 AS SELECT count(*) AS n FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
 
 statement ok
 BEGIN;
 
-statement error
+query I
 DELETE FROM sqldb.dbo.s3_exttxn1 WHERE id = 40;
 ----
-cannot roll back with an explicit transaction
+1
 
-statement ok
-ROLLBACK;
-
-# The refused statement aborted the transaction; nothing changed.
+# No read-your-writes, and no commit yet.
 query I
 SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
 ----
 7
 
-# ═══ §5  Autocommit INSERT is unchanged: one statement, one commit ════════════════════════════════════════
+query I
+SELECT count(*) - (SELECT n FROM log4) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1 WHERE id = 40;
+----
+1
+
+query I
+SELECT count(*) - (SELECT n FROM log4) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+----
+0
+
+# An INSERT and two DELETEs on one table: ONE Delta commit at COMMIT.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (41, 'x41');
+
+query I
+DELETE FROM sqldb.dbo.s3_exttxn1 WHERE id = 10;
+----
+1
+
+query I
+DELETE FROM sqldb.dbo.s3_exttxn1 WHERE id = 11;
+----
+1
+
+statement ok
+COMMIT;
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM sqldb.dbo.s3_exttxn1;
+----
+1,2,3,12,40,41
+
+query I
+SELECT count(*) - (SELECT n FROM log4) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+----
+1
+
+# Copy-on-write: not one action carries a deletion vector, so SQL Server's Delta reader still reads the table.
+query I
+SELECT count(*) FROM read_text('s3://fabricator/exttxn/e1/_delta_log/*.json') WHERE content LIKE '%deletionVector%';
+----
+0
+
+query I
+SELECT * FROM fabricator_query('sqldb',
+  'SELECT COUNT(*) FROM OPENROWSET(BULK ''/fabricator/exttxn/e1'', FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+6
+
+# A row inserted in the same transaction cannot be deleted: hiding it needs a deletion vector.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (42, 'x42');
+
+statement error
+DELETE FROM sqldb.dbo.s3_exttxn1 WHERE id = 42;
+----
+needs deletion vectors
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
+----
+6
+
+# ═══ §5  DELETE keyed by the identity column: allowed until the transaction has written to the table ════════
+# lower() does not render exactly, so these DELETEs take the rowid path: SQL Server's scan supplies the identity
+# values, and SQL Server reads the COMMITTED table.
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM sqldb.dbo.s3_exttxn3 WHERE lower(v) = 'z2';
+----
+1
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn3;
+----
+4
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_exttxn3;
+----
+4
+
+# After an INSERT, SQL Server's scan cannot offer the new row's id, so an identity-keyed DELETE would silently
+# miss it: refused.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO sqldb.dbo.s3_exttxn3 (v) VALUES ('z9');
+
+statement error
+DELETE FROM sqldb.dbo.s3_exttxn3 WHERE lower(v) LIKE 'z%';
+----
+already wrote to it
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT string_agg(v, ',' ORDER BY id) FROM sqldb.dbo.s3_exttxn3;
+----
+z1,z2,z3,z4
+
+# After an identity-keyed DELETE, a predicate DELETE is fine: it reads through the session, not SQL Server.
+statement ok
+BEGIN;
+
+query I
+DELETE FROM sqldb.dbo.s3_exttxn3 WHERE lower(v) = 'z2';
+----
+1
+
+query I
+DELETE FROM sqldb.dbo.s3_exttxn3 WHERE id = 3;
+----
+1
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, v FROM sqldb.dbo.s3_exttxn3 ORDER BY id;
+----
+1	z1
+4	z4
+
+# UPDATE stays refused inside a transaction: every external UPDATE is identity-keyed, and the Delta layer does not
+# buffer an UPDATE on an identity table.
+statement ok
+BEGIN;
+
+statement error
+UPDATE sqldb.dbo.s3_exttxn3 SET v = 'u1' WHERE id = 1;
+----
+identity/IcebergCompat
+
+statement ok
+ROLLBACK;
+
+query IT
+SELECT id, v FROM sqldb.dbo.s3_exttxn3 ORDER BY id;
+----
+1	z1
+4	z4
+
+# ═══ §6  Autocommit INSERT is unchanged: one statement, one commit ════════════════════════════════════════
 
 statement ok
 INSERT INTO sqldb.dbo.s3_exttxn1 VALUES (50, 'x50');
 
 query I
-SELECT count(*) - (SELECT n FROM log_before) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
+SELECT count(*) - (SELECT n FROM log4) FROM glob('s3://fabricator/exttxn/e1/_delta_log/*.json');
 ----
-3
+2
 
 query I
 SELECT count(*) FROM sqldb.dbo.s3_exttxn1;
 ----
-8
+7
 
 # ═══ teardown: the external tables and the side table are catalog objects on the shared TestDB ═══════════
 
@@ -272,6 +462,9 @@ SELECT fabricator_exec('sqldb', 'DROP EXTERNAL TABLE dbo.s3_exttxn1');
 
 statement ok
 SELECT fabricator_exec('sqldb', 'DROP EXTERNAL TABLE dbo.s3_exttxn2');
+
+statement ok
+SELECT fabricator_exec('sqldb', 'DROP EXTERNAL TABLE dbo.s3_exttxn3');
 
 statement ok
 SELECT fabricator_exec('sqldb', 'DROP TABLE dbo.exttxn_side');

@@ -443,8 +443,9 @@ SELECT s.name, o.name, c.name, dc.definition
         public bool SupportsUpdateWhere =>
             _catalog.SupportsUpdateWhereCore(_definition.SchemaName, _definition.TableName);
 
-        // An explicit transaction still plans the shortcut: an external table's DeleteWhere then refuses with the
-        // autocommit-only message (GuardExternalDml), which says more than the rowid path's missing-key error.
+        // An explicit transaction still plans the shortcut: an ordinary table's statement runs on the transaction's
+        // pinned connection, and an external Delta table's DeleteWhere reads through the transaction's Delta
+        // session, so both see its own writes.
         bool IDeleteWhereShape.DeleteWhereAutocommitOnly => false;
 
         IReadOnlyList<string>? IDeleteWhereShape.DeleteWhereColumns => null;

@@ -287,7 +287,9 @@ the Delta log** — so it is a cross-system key both sides can see and the Delta
 
 - No identity column on the Delta target → UPDATE/DELETE stay rejected (slice C's error, now
   pointing at "declare an IDENTITY column or use a direct Delta ATTACH").
-- Autocommit-only, statement-atomic (slice C semantics); explicit-txn rejection.
+- Statement-atomic in autocommit (slice C semantics). Inside an explicit transaction (since 2026-10-26) the
+  DELETE is buffered until COMMIT and refused once the transaction has written to the table; the UPDATE is refused
+  — see §DELETE inside an explicit transaction.
 - Trust assumption: identity uniqueness relies on all writers honoring the HWM (Spark + us do); a
   rogue writer's duplicate would make the DML affect all duplicates — documented, same trust class
   as any engine-assigned key.
@@ -449,7 +451,8 @@ DELETE on an external table cannot run at all). `UPDATE` keeps the old rule — 
 - VARCHAR is exact here (`exact_strings` for an external Delta table only): the Delta engine compares bytes, not SQL
   Server's collation. An ordinary SQL Server table keeps VARCHAR on the rowid path.
 - Autocommit only, like external DELETE/UPDATE generally (an INSERT can wait for COMMIT since 2026-10-26, a delete
-  cannot — see §INSERT inside an explicit transaction); the explicit-transaction refusal is `GuardExternalDml`.
+  cannot — see §INSERT inside an explicit transaction); inside an explicit transaction it is buffered, see
+  §DELETE inside an explicit transaction.
 - ⚠ Through the EXTERNAL TABLE, SQL Server reads a Delta partition column as NULL (Microsoft's documented
   limitation; `OPENROWSET` reads it correctly). Pinned in the gate.
 
@@ -471,11 +474,9 @@ deleted). C#-only, no ABI change.
   Several tables commit one after the other (Delta has no cross-table transaction).
 - **No read-your-writes.** SQL Server reads committed storage, so the transaction's own INSERTs are invisible through
   the external table until COMMIT. Pinned in the gate.
-- **Still autocommit only:** DELETE/UPDATE (`GuardExternalDml`) — a buffered delete needs deletion vectors
-  (`EnsureBufferedDmlEligible` refuses without them), and a materialized vector makes SQL Server's reader fail with
-  19726; an INSERT into a **parquet** external table — the file is visible the moment it exists; and the CETAS-analog
-  `CREATE TABLE … WITH (location=…)`. Lifting the DELETE/UPDATE refusal needs a copy-on-write staging verb in
-  engineered-wood (`DeltaTransaction` stages deletes only as deletion vectors today).
+- **Still autocommit only:** an INSERT into a **parquet** external table — the file is visible the moment it
+  exists; and the CETAS-analog `CREATE TABLE … WITH (location=…)`. DELETE followed on the same day, once
+  engineered-wood could stage deletes copy-on-write — see §DELETE inside an explicit transaction.
 - A catalog teardown without COMMIT/ROLLBACK rolls the session back (`SqlServerTransaction.Dispose`).
 
 Gate `verify_mssql_external_txn` (62, service): two INSERTs into one table become one Delta commit, nothing reaches
@@ -484,3 +485,32 @@ files (with a control that a file was written), SQL Server's own changes roll ba
 DELETE refusal. Two mutants: committing at the statement dies at "nothing reached the log"; a ROLLBACK that discards
 nothing dies at the file count. `verify_mssql_s3_polybase` (263 → 267) now asserts the ROLLBACK where it pinned the
 old refusal, and pins the parquet refusal.
+
+## DELETE inside an explicit transaction (2026-10-26)
+
+Since engineered-wood stages deletes copy-on-write (`StageRowDeletesAsync(selection, RowDeleteMode.CopyOnWrite)`,
+upstream #531) and our flush picks that mode on a table without deletion vectors, a DELETE on an external Delta
+table can join the transaction too. It runs through the same `ExternalDeltaSession` as the INSERTs: the session's
+catalog for the table's root buffers the rows, and COMMIT makes one Delta commit per table with the touched files
+rewritten — no deletion vector, so SQL Server keeps reading the table. C#-only, no ABI change; `GuardExternalDml`
+is gone, `SqlServerBackend.ExternalSession(txnId)` hands out the session (null in autocommit).
+
+- **Predicate DELETE (`DeleteWhere`) always takes the scan route inside a transaction** — a scan through the
+  session (which sees the transaction's own writes) plus engineered-wood's exact row evaluator — even for a
+  partition predicate, because engineered-wood's predicate delete reads only the committed table.
+- **The identity-keyed DELETE is refused once the session has changed rows of that table**
+  (`ExternalDeltaSession.HasWrites`). Its ids come from SQL Server's scan, which reads committed storage: after an
+  INSERT it would miss the new rows, after an UPDATE it would match the old values. The rule is deliberately
+  coarser than that (a DELETE after only DELETEs would be correct) so that it is easy to state.
+- **Still refused:** deleting a row inserted in the same transaction (`BufferDeleteRows`: hiding it needs a deletion
+  vector); and UPDATE — every external UPDATE is identity-keyed, and `EnsureBufferedDmlEligible` does not buffer an
+  UPDATE on an identity table (`!SupportsExternalCommit`), so it fails with the Delta layer's own message.
+- The refactor gave each storage DML path one core with two callers: `Autocommit(root, …)` (own catalog, own commit)
+  and `ExternalDeltaSession.Run(root, leaf, txnId, …)` (the transaction's catalog, no commit).
+
+Gate `verify_mssql_external_txn` (62 → 111): a predicate DELETE invisible to SQL Server before COMMIT and undone by
+ROLLBACK; an INSERT plus two DELETEs as ONE commit with no `deletionVector` in the log and OPENROWSET agreeing; the
+same-transaction delete refused; identity-keyed DELETE inside a transaction, refused after an INSERT, and the UPDATE
+refusal pinned. Two mutants: a predicate DELETE that commits at once dies at the no-read-your-writes row; dropping
+the after-write refusal dies at its row. `verify_mssql_external_delete` (43 → 45) and `verify_mssql_s3_polybase`
+(267 → 268) assert a ROLLBACK where they pinned the old refusal.

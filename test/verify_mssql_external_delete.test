@@ -200,17 +200,25 @@ SELECT count(*) FROM read_text('s3://fabricator/extdel/ex/_delta_log/*.json') WH
 
 # ═══ §4  What is still refused ════════════════════════════════════════════════════════════════════════
 
-# Storage-side DML cannot join an explicit transaction (its own Delta commit).
+# Inside an explicit transaction the DELETE is buffered until COMMIT (verify_mssql_external_txn), so a ROLLBACK
+# leaves the table unchanged. It takes the scan route there even for a partition predicate: engineered-wood's
+# predicate delete would not see the transaction's own writes.
+statement ok
+CREATE TABLE extdel_before AS SELECT count(*) AS n FROM sqldb.dbo.s3_extdel;
+
 statement ok
 BEGIN;
 
-statement error
+statement ok
 DELETE FROM sqldb.dbo.s3_extdel WHERE p = 'a';
-----
-cannot roll back with an explicit
 
 statement ok
 ROLLBACK;
+
+query I
+SELECT count(*) - (SELECT n FROM extdel_before) FROM sqldb.dbo.s3_extdel;
+----
+0
 
 # A predicate that does not render exactly needs a rowid, which this table does not have.
 statement error

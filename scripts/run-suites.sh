@@ -1469,7 +1469,11 @@ case "$TIER" in
         #   BEGIN..COMMIT — one Delta commit per table at COMMIT, ROLLBACK deletes the written files. And
         #   verify_mssql_s3_polybase 263 -> 267: its old "refused in a transaction" INSERT row now asserts the
         #   ROLLBACK, plus the parquet INSERT that stays refused.
-        : "${MIN_ASSERTIONS:=4357}"
+        # 2026-10-26: 4357 -> 4409. External-table DELETE inside BEGIN..COMMIT (buffered in the same Delta session,
+        #   copy-on-write at COMMIT): verify_mssql_external_txn 62 -> 111, and the two suites whose "refused in a
+        #   transaction" DELETE row now asserts the ROLLBACK — verify_mssql_external_delete 43 -> 45,
+        #   verify_mssql_s3_polybase 267 -> 268.
+        : "${MIN_ASSERTIONS:=4409}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

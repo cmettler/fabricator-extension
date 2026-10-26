@@ -606,17 +606,23 @@ UPDATE sqldb.dbo.s3_iddml SET id = 100 WHERE name = 'a';
 ----
 identity column
 
-# guard: storage-side DML cannot join an explicit transaction
+# storage-side DML joins an explicit transaction: buffered until COMMIT, so a ROLLBACK leaves the table unchanged
+# (verify_mssql_external_txn covers the COMMIT side)
 statement ok
 BEGIN;
 
-statement error
+query I
 DELETE FROM sqldb.dbo.s3_iddml WHERE name = 'a';
 ----
-cannot roll back with an explicit
+1
 
 statement ok
 ROLLBACK;
+
+query I
+SELECT count(*) FROM sqldb.dbo.s3_iddml WHERE name = 'a';
+----
+1
 
 # a DELETE whose ids match nothing (concurrently-deleted semantics) affects zero rows, no error
 statement ok

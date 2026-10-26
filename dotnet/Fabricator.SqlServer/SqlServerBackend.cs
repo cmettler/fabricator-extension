@@ -1083,9 +1083,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         /// <summary>
         /// Explicit user BEGIN..COMMIT (v60 is_explicit; the ambient id is set by set_active_txn right
         /// before begin_transaction). Consulted by the external-table INSERT/DML routing and the session
-        /// tag: inside an explicit transaction an INSERT into an external Delta table parks its Delta commit
-        /// until COMMIT (<see cref="External"/>), while a parquet INSERT and an external DELETE/UPDATE are
-        /// refused (autocommit only). Was a second id-keyed dictionary (`_explicitTxns`) before slice 4a put
+        /// tag: inside an explicit transaction a write to an external Delta table parks its Delta commit until
+        /// COMMIT (<see cref="External"/>), while a parquet INSERT is refused (autocommit only). Was a second id-keyed dictionary (`_explicitTxns`) before slice 4a put
         /// it ON the transaction.
         /// </summary>
         public bool IsExplicit { get; set; }
@@ -1122,8 +1121,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         public readonly object ExecGate = new();
 
         /// <summary>
-        /// INSERTs into external Delta tables inside this explicit transaction: data files written, the Delta
-        /// commits parked until COMMIT. Created on the first such INSERT; null otherwise.
+        /// Writes to external Delta tables inside this explicit transaction: data files written and deletes
+        /// buffered, the Delta commits parked until COMMIT. Created on the first such write; null otherwise.
         /// </summary>
         public ExternalDeltaSession? External;
 
@@ -2358,18 +2357,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // to storage (identity -> transient rowid resolution + the delta provider's own rowid DELETE).
         if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } delIdCol } extDel)
         {
-            // A guard throw must not leak the imported key stream (a GC-finalized imported C stream
-            // outlives the host's struct and segfaults) — dispose it deterministically.
-            try
-            {
-                GuardExternalDml(schemaName, tableName, "DELETE FROM");
-            }
-            catch
-            {
-                keys.Dispose();
-                throw;
-            }
-            return ExternalTableRouting.DeleteByIdentity(extDel.StorageUri!, delIdCol, keys, AmbientTransaction.Current);
+            // Inside an explicit transaction the rows are buffered in the transaction's Delta session and deleted
+            // at COMMIT; in autocommit the DELETE is its own Delta commit.
+            long delTxn = AmbientTransaction.Current;
+            return ExternalSession(delTxn) is { } delSession
+                ? ExternalTableRouting.DeleteByIdentity(extDel.StorageUri!, delIdCol, keys, delTxn, delSession)
+                : ExternalTableRouting.DeleteByIdentity(extDel.StorageUri!, delIdCol, keys, delTxn);
         }
         // Cancel a long rowid DELETE (many chunked batches) on query interrupt. The opener is fresh here (the
         // modify operator's Finalize calls FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
@@ -2484,23 +2477,18 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // what the rowid path needs (and what a table SQL Server reads through PolyBase usually lacks).
         if (DetectExternalTable(schemaName, tableName) is { } ext)
         {
-            try
-            {
-                if (!IsRoutableDelta(ext))
-                {
-                    throw new NotSupportedException(
-                        $"fabricator: DELETE on external table {schemaName}.{tableName} is not supported "
-                        + "(only an external DELTA table on s3:// or adls:// can be written)");
-                }
-                GuardExternalDml(schemaName, tableName, "DELETE FROM");
-            }
-            catch
+            if (!IsRoutableDelta(ext))
             {
                 filterValues?.Dispose();
-                throw;
+                throw new NotSupportedException(
+                    $"fabricator: DELETE on external table {schemaName}.{tableName} is not supported "
+                    + "(only an external DELTA table on s3:// or adls:// can be written)");
             }
             RecordTouch(schemaName, tableName, schemaChanged: false);
-            return ExternalTableRouting.DeleteWhere(ext.StorageUri!, filter, filterValues);
+            long txnId = AmbientTransaction.Current;
+            return ExternalSession(txnId) is { } session
+                ? ExternalTableRouting.DeleteWhere(ext.StorageUri!, filter, filterValues, txnId, session)
+                : ExternalTableRouting.DeleteWhere(ext.StorageUri!, filter, filterValues);
         }
         return DmlWhereCore(schemaName, tableName, null, filter, filterValues);
     }
@@ -2570,26 +2558,22 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // itself is rejected — it is engine-assigned.
         if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } updIdCol } extUpd)
         {
-            // Guard throws must not leak the imported update stream (finalizer segfault) — dispose it.
-            try
+            // A refusal must not leak the imported update stream (finalizer segfault) — dispose it.
+            for (int j = 0; j < setColumnCount; j++)
             {
-                GuardExternalDml(schemaName, tableName, "UPDATE");
-                for (int j = 0; j < setColumnCount; j++)
+                if (string.Equals(data.Schema.FieldsList[j].Name, updIdCol, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (string.Equals(data.Schema.FieldsList[j].Name, updIdCol, StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw new NotSupportedException(
-                            $"UPDATE of the identity column '{updIdCol}' on external table "
-                            + $"{schemaName}.{tableName} is not supported (engine-assigned).");
-                    }
+                    data.Dispose();
+                    throw new NotSupportedException(
+                        $"UPDATE of the identity column '{updIdCol}' on external table "
+                        + $"{schemaName}.{tableName} is not supported (engine-assigned).");
                 }
             }
-            catch
-            {
-                data.Dispose();
-                throw;
-            }
-            return ExternalTableRouting.UpdateByIdentity(extUpd.StorageUri!, updIdCol, setColumnCount, data);
+            long updTxn = AmbientTransaction.Current;
+            return ExternalSession(updTxn) is { } updSession
+                ? ExternalTableRouting.UpdateByIdentity(extUpd.StorageUri!, updIdCol, setColumnCount, data, updTxn,
+                    updSession)
+                : ExternalTableRouting.UpdateByIdentity(extUpd.StorageUri!, updIdCol, setColumnCount, data);
         }
         // Cancel a long rowid UPDATE (one statement per matched row) on query interrupt. Opener is fresh (the
         // modify Finalize's FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
@@ -3593,16 +3577,18 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         return null;
     }
 
-    // Storage-side DELETE/UPDATE is statement-atomic (its own Delta commit). Unlike an INSERT it cannot wait
-    // for COMMIT: buffering a delete needs deletion vectors, which SQL Server's Delta reader refuses (19726).
-    private void GuardExternalDml(string schemaName, string tableName, string verb)
+    // The Delta side of an explicit transaction's writes to external Delta tables, created on the first one; null
+    // in autocommit, where each statement is its own Delta commit.
+    private ExternalDeltaSession? ExternalSession(long txnId)
     {
-        if (IsExplicitTxn(AmbientTransaction.Current))
+        if (!IsExplicitTxn(txnId))
         {
-            throw new NotSupportedException(
-                $"{verb} external table {schemaName}.{tableName} writes directly to its storage (its own "
-                + "Delta commit) and cannot roll back with an explicit transaction — COMMIT first "
-                + "(autocommit only).");
+            return null;
+        }
+        var state = _txns.GetOrCreate(txnId);
+        lock (state)
+        {
+            return state.External ??= new ExternalDeltaSession(txnId);
         }
     }
 
@@ -3634,18 +3620,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         switch ((ext.FormatType ?? string.Empty).Trim().ToUpperInvariant())
         {
             case "DELTA":
-                if (isExplicit)
-                {
-                    // The Delta commit waits for the DuckDB COMMIT (EndTransaction); a ROLLBACK discards the files.
-                    var state = _txns.GetOrCreate(txnId);
-                    ExternalDeltaSession session;
-                    lock (state)
-                    {
-                        session = state.External ??= new ExternalDeltaSession(txnId);
-                    }
-                    return ExternalTableRouting.AppendDelta(uri, data, checkConstraints, txnId, session);
-                }
-                return ExternalTableRouting.AppendDelta(uri, data, checkConstraints, txnId);
+                // Inside an explicit transaction the Delta commit waits for the DuckDB COMMIT (EndTransaction); a
+                // ROLLBACK discards the files.
+                return ExternalSession(txnId) is { } session
+                    ? ExternalTableRouting.AppendDelta(uri, data, checkConstraints, txnId, session)
+                    : ExternalTableRouting.AppendDelta(uri, data, checkConstraints, txnId);
             case "PARQUET":
                 return ExternalTableRouting.AppendParquet(uri, data);
             default:
