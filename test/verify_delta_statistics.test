@@ -211,3 +211,48 @@ SELECT
   (SELECT count(*) FROM (SELECT unnest(json_keys(json_extract(stats, '$.maxValues'))) FROM src));
 ----
 2	2
+
+# ============================================================================
+# 9. A BOOLEAN'S BOUNDS ARE WRITTEN AS BOOLEANS, OR NOT AT ALL.
+#    DuckDB reports a boolean's min/max as `0` / `1`. The native writer compared that text with "true" only,
+#    so EVERY native-written file with a boolean column recorded maxValues = false — and the scan, pruning on
+#    the log, skipped the file for `h = true`: the count below was 0, with no error. Any other reader that
+#    prunes on Delta statistics (Spark, PolyBase) was misled the same way.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/boolst' AS s4 (TYPE fabricator, PROVIDER 'delta');
+
+# column_mapping 'none' so the stats keys are the column names (with mapping they are random `col-…` keys in no
+# fixed order).
+statement ok
+CREATE TABLE s4.main.mixed (id INTEGER, h BOOLEAN) WITH (column_mapping='none');
+
+statement ok
+INSERT INTO s4.main.mixed SELECT i, i % 2 = 0 FROM range(30) t(i);
+
+query II
+SELECT (SELECT count(*) FROM s4.main.mixed WHERE h = true), (SELECT count(*) FROM s4.main.mixed WHERE h = false);
+----
+15	15
+
+# The bound itself, as the log records it: min false, max true.
+query II
+SELECT DISTINCT json_extract(add->>'stats', '$.minValues.h')::VARCHAR AS mn,
+                json_extract(add->>'stats', '$.maxValues.h')::VARCHAR AS mx
+FROM read_json('${FABRICATOR_DELTA_WRITE_DIR}/boolst/mixed/_delta_log/*.json')
+WHERE add IS NOT NULL;
+----
+false	true
+
+# The control for pruning still WORKING: a file holding only `true` is rightly skipped for `h = false`.
+statement ok
+CREATE TABLE s4.main.alltrue (id INTEGER, h BOOLEAN);
+
+statement ok
+INSERT INTO s4.main.alltrue SELECT i, true FROM range(10) t(i);
+
+query II
+SELECT (SELECT count(*) FROM s4.main.alltrue WHERE h = true), (SELECT count(*) FROM s4.main.alltrue WHERE h = false);
+----
+10	0

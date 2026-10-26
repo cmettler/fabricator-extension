@@ -483,6 +483,17 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
                 // that is the follow-up.
                 if (!maxExact) max = null;
 
+                // ⚠⚠ DuckDB reports a BOOLEAN's min/max as `0` / `1`, not `false` / `true` (MEASURED, RETURN_STATS on
+                // 2.0). This used to compare the text with "true" only, so every native-written file with a boolean
+                // column recorded maxValues = FALSE — and a reader pruning on the log (ours, Spark, PolyBase)
+                // skipped the file for `col = true`: `SELECT count(*) … WHERE flag = true` answered 0, no error.
+                // Both spellings are read now; anything else is left out rather than guessed.
+                if (kind == StatKind.Bool)
+                {
+                    min = BoolStatText(min);
+                    max = BoolStatText(max);
+                }
+
                 cols.Add((col, kind, min, max, nulls));
             }
 
@@ -520,6 +531,15 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             return NumRecordsOnly(numRecords);
         }
     }
+
+    // "1"/"true" and "0"/"false" (any case) normalised to the JSON spelling; null for anything else, so the
+    // stat is omitted (no bound is a correct bound) rather than written as a guess.
+    private static string? BoolStatText(string? text) => text?.Trim().ToLowerInvariant() switch
+    {
+        "1" or "true" => "true",
+        "0" or "false" => "false",
+        _ => null,
+    };
 
     private static void WriteStat(Utf8JsonWriter w, string name, StatKind kind, string text)
     {

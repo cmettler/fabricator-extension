@@ -951,7 +951,10 @@ case "$TIER" in
         # 2026-10-25: 10634 -> 10740. verify_delta_delete_where (106, new): the Delta predicate DELETE through
         #   engineered-wood (#506) — routing, two differentials against the rowid path, and the files-are-never-
         #   opened proofs (a partition and a statistics-proven file overwritten with garbage, deleted anyway).
-        : "${MIN_ASSERTIONS:=10740}"
+        # 2026-10-26: 10740 -> 10751. verify_delta_statistics 34 -> 45 (§9): a BOOLEAN's bounds. DuckDB reports them
+        #   as 0/1 and the native writer recorded maxValues = false for every boolean column, so `WHERE h = true`
+        #   pruned the file away — 0 rows, no error.
+        : "${MIN_ASSERTIONS:=10751}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
