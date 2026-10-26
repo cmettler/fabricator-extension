@@ -12,6 +12,7 @@
 #include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 
 // yyjson (vcpkg) — OUR OWN copy, deliberately not DuckDB's vendored `duckdb_yyjson` (namespaced,
 // not DUCKDB_API-exported, so a loadable extension could not resolve it). See CMakeLists.txt.
@@ -275,9 +276,8 @@ vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {
 
 	vector<FabricatorTableInfo> tables;
 	for (idx_t i = 0; i < table.paths.size(); i++) {
-		// BOTH shapes are carried: the whole path (which the catalog walks to find/create the schema entry)
-		// and its LEAF, which is what the twenty existing schema_name consumers read. See the field's own
-		// warning in fabricator_metadata.hpp for why the leaf stays.
+		// The whole path (which the catalog walks to find/create the schema entry) and its LEAF, kept for
+		// messages.
 		auto &path = table.paths[i];
 		FabricatorTableInfo info;
 		info.schema_path = path;
@@ -293,12 +293,12 @@ vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
 	fabricator::CatalogFunctions(handle, stream);
-	// Columns: schema_name, name, kind, [param_count (int), return_type]. We read only
-	// the first three string columns here; the trailing columns are ignored.
-	auto rows = ReadStringTable(stream, 3);
+	// Columns: schema_path (LIST<VARCHAR>), name, kind, then param_count (int), return_type, varargs — the
+	// trailing columns are diagnostic (fabricator_functions()) and not read here.
+	auto table = ReadPathTable(stream, 3);
 	vector<FabricatorFunctionInfo> funcs;
-	for (idx_t i = 0; i < rows[0].size(); i++) {
-		funcs.push_back({rows[0][i], rows[1][i], rows[2][i]});
+	for (idx_t i = 0; i < table.paths.size(); i++) {
+		funcs.push_back({table.paths[i], table.columns[0][i], table.columns[1][i]});
 	}
 	return funcs;
 }
@@ -314,13 +314,13 @@ vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle) {
 		ArrowArrayStream stream;
 		std::memset(&stream, 0, sizeof(stream));
 		fabricator::CatalogMacros(handle, stream);
-		// Columns: schema, name, create_sql.
-		auto rows = ReadStringTable(stream, 3);
-		for (idx_t i = 0; i < rows[0].size(); i++) {
-			if (rows[1][i].empty() || rows[2][i].empty()) {
+		// Columns: schema_path (LIST<VARCHAR>), name, create_sql.
+		auto table = ReadPathTable(stream, 3);
+		for (idx_t i = 0; i < table.paths.size(); i++) {
+			if (table.columns[0][i].empty() || table.columns[1][i].empty()) {
 				continue; // a nameless or bodiless declaration cannot be bound to anything
 			}
-			macros.push_back({rows[0][i], rows[1][i], rows[2][i]});
+			macros.push_back({table.paths[i], table.columns[0][i], table.columns[1][i]});
 		}
 	} catch (std::exception &) {
 		macros.clear(); // partial reads are discarded — an all-or-nothing declaration set is easier to reason about
@@ -338,13 +338,13 @@ vector<FabricatorViewInfo> DiscoverCatalogViews(FabricatorHandle handle) {
 		ArrowArrayStream stream;
 		std::memset(&stream, 0, sizeof(stream));
 		fabricator::CatalogViews(handle, stream);
-		// Columns: schema, name, create_sql.
-		auto rows = ReadStringTable(stream, 3);
-		for (idx_t i = 0; i < rows[0].size(); i++) {
-			if (rows[1][i].empty() || rows[2][i].empty()) {
+		// Columns: schema_path (LIST<VARCHAR>), name, create_sql.
+		auto table = ReadPathTable(stream, 3);
+		for (idx_t i = 0; i < table.paths.size(); i++) {
+			if (table.columns[0][i].empty() || table.columns[1][i].empty()) {
 				continue; // a nameless or bodiless declaration cannot be bound to anything
 			}
-			views.push_back({rows[0][i], rows[1][i], rows[2][i]});
+			views.push_back({table.paths[i], table.columns[0][i], table.columns[1][i]});
 		}
 	} catch (std::exception &) {
 		views.clear(); // partial reads discarded — all-or-nothing, like the macro set
@@ -352,11 +352,11 @@ vector<FabricatorViewInfo> DiscoverCatalogViews(FabricatorHandle handle) {
 	return views;
 }
 
-void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const vector<string> &schema_path,
                               const string &func_name, vector<string> &names, vector<LogicalType> &types,
                               vector<FabricatorParamStyle> *out_styles) {
 	ArrowSchema schema {};
-	fabricator::GetFunctionParamSchema(handle, schema_name, func_name, schema);
+	fabricator::GetFunctionParamSchema(handle, schema_path, func_name, schema);
 	if (out_styles) {
 		// A parameter's STYLE rides its FIELD metadata (the same C-ABI channel as the volatility signal
 		// above): fabricator.param_style = "named" | "table" | "constant" | "varargs". Absent => positional. ONE schema
@@ -384,10 +384,10 @@ void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, c
 	fabricator::ReadArrowSchema(context, schema, types, names);
 }
 
-LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle handle, const vector<string> &schema_path,
                                     const string &func_name, bool *out_volatile) {
 	ArrowSchema schema {};
-	fabricator::GetFunctionReturnSchema(handle, schema_name, func_name, schema);
+	fabricator::GetFunctionReturnSchema(handle, schema_path, func_name, schema);
 	if (out_volatile) {
 		// The volatility signal rides the result FIELD's metadata (the same C-ABI channel as extension-type
 		// markers): fabricator.volatile = "0" => CONSISTENT (pure, constant-foldable). ABSENT => VOLATILE —
@@ -405,15 +405,16 @@ LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle han
 	vector<LogicalType> types;
 	fabricator::ReadArrowSchema(context, schema, types, names);
 	if (types.empty()) {
-		throw InvalidInputException("fabricator: function '%s.%s' has no scalar return type", schema_name, func_name);
+		throw InvalidInputException("fabricator: function '%s.%s' has no scalar return type",
+		                            StringUtil::Join(schema_path, "."), func_name);
 	}
 	return types[0];
 }
 
-void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle, const vector<string> &schema_path,
                                const string &func_name, vector<string> &names, vector<LogicalType> &types) {
 	ArrowSchema schema {};
-	fabricator::GetFunctionOutputSchema(handle, schema_name, func_name, nullptr, schema);
+	fabricator::GetFunctionOutputSchema(handle, schema_path, func_name, nullptr, schema);
 	fabricator::ReadArrowSchema(context, schema, types, names);
 }
 

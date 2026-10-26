@@ -31,8 +31,9 @@ namespace Fabricator.Bridge;
 ///
 /// <para>See docs/macros-and-sqlgen-functions.md §5.</para>
 /// </summary>
-/// <param name="SchemaName">
-/// The schema within the attached catalog to bind into (e.g. <c>"dbo"</c>, <c>"main"</c>). A view whose schema
+/// <param name="SchemaPath">
+/// The schema within the attached catalog to bind into, as a path: <c>"dbo"</c>, <c>"main"</c>, or
+/// <c>new SchemaPath("ws", "doc")</c> for a nested schema. A view whose schema
 /// is not among those the catalog discovered is skipped — the same rule macros and discovered functions
 /// follow, so an ATTACH <c>schema_filter</c> gates views too.
 /// </param>
@@ -47,8 +48,8 @@ namespace Fabricator.Bridge;
 /// </param>
 /// <param name="CreateSql">
 /// The complete statement, written UNQUALIFIED — the host overwrites the catalog/schema with this catalog's
-/// ATTACH alias and <see cref="SchemaName"/>, which is what anchors the body's search path here. A statement
+/// ATTACH alias and <see cref="SchemaPath"/>, which is what anchors the body's search path here. A statement
 /// that does not parse as a single <c>CREATE VIEW</c> is skipped with a warning (a broken declaration never
 /// blocks an ATTACH).
 /// </param>
-public sealed record ViewDefinition(string SchemaName, string Name, string CreateSql);
+public sealed record ViewDefinition(SchemaPath SchemaPath, string Name, string CreateSql);

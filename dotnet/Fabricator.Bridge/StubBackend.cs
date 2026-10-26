@@ -49,11 +49,10 @@ public sealed class StubBackend : IProvider
 
         public IArrowArrayStream GetTables() => EmptyStringTable("schema_name", "table_name", "table_type");
 
-        public IArrowArrayStream GetFunctions() =>
-            EmptyStringTable("schema_name", "name", "kind", "param_count", "return_type");
+        public IEnumerable<FunctionDeclaration> GetFunctions() => System.Array.Empty<FunctionDeclaration>();
 
-        public IArrowArrayStream GetMacros() => EmptyStringTable("schema", "name", "create_sql");
-        public IArrowArrayStream GetViews() => EmptyStringTable("schema", "name", "create_sql");
+        public IEnumerable<CatalogMacroDefinition> GetMacros() => System.Array.Empty<CatalogMacroDefinition>();
+        public IEnumerable<ViewDefinition> GetViews() => System.Array.Empty<ViewDefinition>();
 
         public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
 
@@ -110,13 +109,13 @@ public sealed class StubBackend : IProvider
                                            IArrowArrayStream? filterValues) =>
             ExecuteQuery($"SELECT * FROM {schemaName}.{tableName}");
 
-        public Schema GetFunctionParamSchema(string schemaName, string functionName) =>
+        public Schema GetFunctionParamSchema(SchemaPath schemaName, string functionName) =>
             new Schema(System.Array.Empty<Field>(), null);
 
-        public Schema GetFunctionReturnSchema(string schemaName, string functionName) =>
+        public Schema GetFunctionReturnSchema(SchemaPath schemaName, string functionName) =>
             new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
-        public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
+        public Schema GetFunctionOutputSchema(SchemaPath schemaName, string functionName, RecordBatch? args = null) =>
             new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
         // GetScalarFunction / TableFnBind / InOutBind / AggOpen: the interface's uniform throwing defaults

@@ -141,7 +141,7 @@ void OneLakeMove(const std::string &src, const std::string &dest, const std::str
 // registry, with `catalog_name` = the DuckDB ATTACH alias. `args` (nullable — no arguments) is the 1-row
 // constant-argument batch and is CONSUMED by the callee. Called at BIND time only. Throws
 // duckdb::IOException carrying the managed message on failure.
-std::string GenerateTableSql(FabricatorHandle handle, const std::string &schema, const std::string &func,
+std::string GenerateTableSql(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              const std::string &catalog_name, ArrowArrayStream *args);
 
 // -----------------------------------------------------------------------------
@@ -185,11 +185,6 @@ void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStr
 // `params` (nullable, ABI v88): as ExecuteQuery's.
 int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema_may_change = nullptr,
                    ArrowArrayStream *params = nullptr);
-
-// Bulk-load an Arrow stream into a table; the managed side consumes/releases
-// `in`. Returns rows written. (Generic: provider does type mapping + DDL + copy.)
-int64_t BulkInsert(FabricatorHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                   bool replace, ArrowArrayStream &in);
 
 // rowid-based DELETE: `keys` carries the key column values (Arrow). The managed
 // side generates + runs the provider DELETE. Consumes/releases `keys`.
@@ -332,7 +327,7 @@ void InsertReturning(FabricatorHandle handle, const std::vector<std::string> &sc
                      const std::string &table, ArrowArrayStream &in, ArrowArrayStream &out);
 
 // -----------------------------------------------------------------------------
-// Streaming bulk-load (begin/push/complete). Unlike BulkInsert (which hands over a
+// Streaming bulk-load (begin/push/complete). Unlike the removed bulk_insert (which handed over a
 // whole stream), this streams batches so the host never buffers the full dataset;
 // the managed side drains them on a background task with bounded-channel
 // backpressure. See abi.h.
@@ -373,12 +368,12 @@ int64_t CompleteBulk(FabricatorHandle session, bool abort);
 // Fills `out` with the Arrow schema of the function's input parameters (one field per param, in order),
 // used to register the DuckDB function's argument types. A bare ArrowSchema (the caller reads it then
 // releases it via ArrowSchemaWrapper).
-void GetFunctionParamSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
+void GetFunctionParamSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                             ArrowSchema &out);
 
 // Fills `out` with the Arrow schema whose single field = the scalar function's DECLARED return type. A field
 // of Arrow `null` type is the UNRESOLVED sentinel — scalarfn_bind supplies the type per call site.
-void GetFunctionReturnSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
+void GetFunctionReturnSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              ArrowSchema &out);
 
 // ---------------------------------------------------------------------------
@@ -402,7 +397,7 @@ struct CallContext {
 	int64_t txn_id = 0;
 };
 
-FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                               ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
                               ArrowSchema &out_schema);
 
@@ -418,7 +413,7 @@ void ScalarFnClose(FabricatorHandle binding);
 // Fills `out` with the Arrow schema of a table-returning function's output columns. `args` (nullable) is a
 // 1-row Arrow stream of the constant call arguments; a custom table function's output schema may depend on it
 // (consumed by the managed side when non-null). Pass nullptr when there are no constant args (in-out base).
-void GetFunctionOutputSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
+void GetFunctionOutputSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              ArrowArrayStream *args, ArrowSchema &out);
 
 // (ExecuteTable / ExecuteProc were removed at ABI v30 — superseded by the table-function session
@@ -437,7 +432,7 @@ void GetFunctionOutputSchema(FabricatorHandle handle, const std::string &schema,
 //! Opens an aggregate session AND binds the call site (ABI v89): `args` (nullable) is a 1-row stream of the
 //! call's arguments, `arg_constant` the folded-constant mask, and `out_result` receives the RESOLVED result
 //! field — an Arrow NULL type there means "the declared type stands".
-FabricatorHandle AggOpen(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle AggOpen(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                          ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
                          ArrowSchema &out_result);
 
@@ -485,7 +480,7 @@ void AggFinalizeSpill(FabricatorHandle session, ArrowArray &states, ArrowArraySt
 // the managed side when present); `input_schema` = the input table's Arrow schema (consumed). Fills
 // `out_schema` with a zero-row stream whose schema = the binding's full output columns. Returns an
 // opaque binding handle (reused by InOutExchangeOpen; freed via InOutBindClose).
-FabricatorHandle InOutBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle InOutBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                          ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema);
 
 // Open one execution exchange on a bound binding. `input` = a host-populated stream the managed side
@@ -508,7 +503,7 @@ void InOutBindClose(FabricatorHandle binding);
 // Bind one lateral call. `args` (nullable) = a 1-row stream of the constant NAMED cost args; `input_schema`
 // = the per-row input columns (consumed). Fills `out_schema` with a zero-row stream whose schema = the
 // function's OWN output columns. Returns an opaque binding handle (freed via LateralBindClose).
-FabricatorHandle LateralBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle LateralBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema);
 
 // Open one per-thread session on a bound binding (several may be open at once). `projected` = the indices,
@@ -536,7 +531,7 @@ void LateralBindClose(FabricatorHandle binding);
 // by the managed side). Fills `out_schema` with a zero-row stream = the function's output columns; sets
 // `supports_pushdown` (true = the binding accepts projection/filter pushdown — a discovered TVF).
 // Returns an opaque binding handle (reused by TableFnExecute across executions; freed via TableFnClose).
-FabricatorHandle TableFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle TableFnBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                          ArrowArrayStream *args, ArrowArrayStream &out_schema, bool &supports_pushdown);
 
 // Execute a bound table function. `spec_json` (empty => SELECT *) + `filter_values` (nullable) carry

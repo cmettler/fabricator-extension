@@ -16,7 +16,7 @@ namespace Fabricator.Bridge;
 /// </summary>
 public abstract class StaticTableFunction : ICatalogTableFunction
 {
-    public abstract string SchemaName { get; }
+    public abstract SchemaPath SchemaPath { get; }
     public abstract string Name { get; }
     public abstract Schema Parameters { get; }
 

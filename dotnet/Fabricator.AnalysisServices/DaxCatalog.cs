@@ -135,11 +135,11 @@ internal sealed class DaxCatalog : IProviderCatalog
     // CatalogFunctionSet holds (the XMLA/TMSL refresh functions). The bespoke three keep their hand-written
     // declarations because their kinds — 'proc', 'collector', 'inout' — are dispatched by name below rather
     // than through the set; everything registered in the set declares itself.
-    public IArrowArrayStream GetFunctions() => FunctionsMetadata.Stream(BespokeDeclarations());
+    public IEnumerable<FunctionDeclaration> GetFunctions() => BespokeDeclarations();
 
-    // No catalog-bound macros and no capability profile on this provider — empty streams, declared shapes.
-    public IArrowArrayStream GetMacros() => EmptyStringTable("schema", "name", "create_sql");
-    public IArrowArrayStream GetViews() => EmptyStringTable("schema", "name", "create_sql");
+    // No catalog-bound macros or views on this provider.
+    public IEnumerable<CatalogMacroDefinition> GetMacros() => System.Array.Empty<CatalogMacroDefinition>();
+    public IEnumerable<ViewDefinition> GetViews() => System.Array.Empty<ViewDefinition>();
 
     public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
 
@@ -202,14 +202,14 @@ internal sealed class DaxCatalog : IProviderCatalog
     // so its args register as NAMED parameters — it takes an optional `params` arg alongside `expression`, which
     // a positional table fn cannot express; daxevaltable is a 'collector' (whole-table); daxeach is a streaming
     // 'inout' (per-row).
-    private IEnumerable<FunctionsMetadata.Declaration> BespokeDeclarations()
+    private IEnumerable<FunctionDeclaration> BespokeDeclarations()
     {
-        yield return new FunctionsMetadata.Declaration(_modelName, DaxEvalName, "proc", 2);
-        yield return new FunctionsMetadata.Declaration(_modelName, DaxEvalTableName, "collector", 1);
-        yield return new FunctionsMetadata.Declaration(_modelName, DaxEachName, "inout", 1);
+        yield return new FunctionDeclaration(_modelName, DaxEvalName, "proc", 2);
+        yield return new FunctionDeclaration(_modelName, DaxEvalTableName, "collector", 1);
+        yield return new FunctionDeclaration(_modelName, DaxEachName, "inout", 1);
         // The model schema is already known here, so nothing needs the __all__ sentinel — these declare
         // themselves into the model's own schema, not into `system` (a DMV namespace).
-        foreach (var d in Functions.Declarations(() => new[] { _modelName }))
+        foreach (var d in Functions.Declarations(() => new SchemaPath[] { _modelName }))
         {
             yield return d;
         }
@@ -722,7 +722,7 @@ internal sealed class DaxCatalog : IProviderCatalog
         return tables;
     }
 
-    public Schema GetFunctionParamSchema(string schemaName, string functionName)
+    public Schema GetFunctionParamSchema(SchemaPath schemaName, string functionName)
     {
         // daxeval takes `expression` (required) + an optional `params` JSON arg — both NAMED parameters
         // (daxeval registers as a 'proc'). daxevaltable / daxeach take only `expression` (a named param
@@ -762,7 +762,7 @@ internal sealed class DaxCatalog : IProviderCatalog
                ?? throw NoFunction(schemaName, functionName);
     }
 
-    public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
+    public Schema GetFunctionOutputSchema(SchemaPath schemaName, string functionName, RecordBatch? args = null)
     {
         if (IsDaxEval(functionName))
         {
@@ -773,7 +773,7 @@ internal sealed class DaxCatalog : IProviderCatalog
                ?? throw NoFunction(schemaName, functionName);
     }
 
-    public ITableFunctionSession TableFnBind(string schemaName, string functionName, RecordBatch? args)
+    public ITableFunctionSession TableFnBind(SchemaPath schemaName, string functionName, RecordBatch? args)
     {
         if (IsDaxEval(functionName))
         {
@@ -783,10 +783,10 @@ internal sealed class DaxCatalog : IProviderCatalog
                ?? throw NoFunction(schemaName, functionName);
     }
 
-    public Schema GetFunctionReturnSchema(string schemaName, string functionName)
+    public Schema GetFunctionReturnSchema(SchemaPath schemaName, string functionName)
         => Functions.ReturnSchema(schemaName, functionName) ?? throw NoScalar();
 
-    public IScalarFunction? GetScalarFunction(string schemaName, string functionName)
+    public IScalarFunction? GetScalarFunction(SchemaPath schemaName, string functionName)
         => Functions.Scalar(schemaName, functionName) ?? throw NoScalar();
 
     private static NotSupportedException NoScalar() =>
@@ -794,10 +794,10 @@ internal sealed class DaxCatalog : IProviderCatalog
 
     // Names the function, because a miss here means the host registered a declaration this catalog cannot
     // serve — the declaration list and the registry disagree, which is a bug in OUR wiring, not user error.
-    private static NotSupportedException NoFunction(string schema, string func) =>
+    private static NotSupportedException NoFunction(SchemaPath schema, string func) =>
         new($"dax provider: no catalog function '{schema}.{func}'.");
 
-    public IInOutFunctionBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    public IInOutFunctionBinding InOutBind(SchemaPath schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         // args carries the named "expression" param (1-row, column 0); inputSchema = the input table.
         if (IsDaxEvalTable(functionName))
@@ -849,7 +849,7 @@ internal sealed class DaxCatalog : IProviderCatalog
         public void Dispose() { }
     }
 
-    public IAggregateSession AggOpen(string schemaName, string functionName)
+    public IAggregateSession AggOpen(SchemaPath schemaName, string functionName)
         => Functions.AggOpen(schemaName, functionName)
            ?? throw new NotSupportedException("dax provider: no aggregate functions.");
 

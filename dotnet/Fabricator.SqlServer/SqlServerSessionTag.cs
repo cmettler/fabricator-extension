@@ -57,7 +57,7 @@ internal sealed class SqlServerSessionTagFunction : ICatalogTableFunction
 
     internal SqlServerSessionTagFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
 
     public string Name => FunctionName;
 

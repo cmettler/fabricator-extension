@@ -1036,6 +1036,9 @@ Three things about the automatic mode that are easy to trip over:
   so leave the setting off there and invalidate explicitly.
 - **Prefer the scoped form when you know what changed** — `fabricator_invalidate_cache('mssql', 'dbo', 't')`
   (or a name regex) keeps the rest of the cache warm, where the automatic path re-discovers everything.
+  The regex is tried against the bare name AND the schema-qualified one, so under nested schemas
+  `fabricator_invalidate_cache('cat', 'sales\.eu\.orders')` touches that one table while `'orders'` still
+  reaches every table of that name.
 
 Without the setting, one asymmetry is worth knowing: a table **created** out-of-band is invisible until you
 refresh, while a table **dropped** out-of-band is handled gracefully *only if you had not already read it in
@@ -3713,7 +3716,8 @@ Signatures and result schemas are resolved lazily on first use (so attach stays 
 SQL lives in C#). `fabricator_functions('db')` lists what was discovered.
 
 ```sql
-SELECT schema_name, name, kind FROM fabricator_functions('mssql');   -- kind: scalar | table | proc | inout
+SELECT schema_path, name, kind FROM fabricator_functions('mssql');   -- kind: scalar | table | proc | inout
+-- schema_path is a LIST, outermost first: [dbo] here, [sales, eu] under a nested Delta catalog
 ```
 
 ### Scalar UDFs
@@ -4880,6 +4884,14 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
 - **Reads and writes.** `INSERT`, `UPDATE`, `DELETE`, `CREATE`/`DROP TABLE`, `ALTER` and
   `CREATE`/`DROP SCHEMA` all work at any depth. The one exception is `COMMENT ON`, which DuckDB's parser
   caps at three qualifications, so a nested table cannot be named in it at all.
+- **Functions, macros and views nest too.** Whatever the provider declares for a schema is registered at its
+  full path, so `cat.sales.eu.fab_pct(1, 4)`, `FROM cat.sales.eu.fab_numbers(5)` and
+  `FROM cat.sales.eu.fab_view_info` resolve like a table does. A declared view's body binds against the
+  view's own schema path — DuckDB 2.0 itself would anchor it on the last segment only and silently read a
+  same-named top-level schema, so the extension qualifies the body when it materializes the view.
+- ⚠ A `CREATE TABLE … AS` into a nested schema is planned by the extension, because DuckDB 2.0 checks the
+  table's existence by the last schema segment and, if `cat.eu.t` exists, creates `cat.sales.eu.t` EMPTY. That
+  correction rides the optimizer: under `PRAGMA disable_optimizer` the DuckDB behaviour comes back.
 - A Delta table sitting **directly under the root** is not discovered (every level is a real directory, so
   a table needs at least one); it is skipped with a warning. `'onelevel'` does not discover one either.
 - Not available on a **OneLake** root: Fabric's `Tables/` area is defined as exactly two levels, and the

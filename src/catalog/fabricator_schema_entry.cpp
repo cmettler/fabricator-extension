@@ -16,6 +16,11 @@
 #include "catalog/fabricator_lateral.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_txn_util.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/execution/operator/schema/physical_create_table.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
@@ -330,19 +335,24 @@ void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const st
 	// Like InvalidateEntryCache but scoped: drop only the materialized entries whose NAME matches. The name
 	// lists are kept, so an ALTER'd object re-fetches its fresh schema on next access and a DROPped one
 	// self-heals (its column re-fetch fails -> GetOrCreateEntry evicts it). Everything else stays warm.
+	// The pattern is tried against the bare name AND the schema-qualified one (`a.b.t`), so it can be scoped to
+	// one branch of a nested schema tree, where the bare name matches every same-named object in every branch. A
+	// pattern that only names objects behaves exactly as before.
+	const string prefix = StringUtil::Join(SchemaPathStrings(), ".") + ".";
+	auto hit = [&](const string &name) { return matches(name) || matches(prefix + name); };
 	lock_guard<mutex> lock(entry_lock_);
-	RetireMatching(entries_, matches, retired_entries_);
+	RetireMatching(entries_, hit, retired_entries_);
 	// ⚠ at_entries_ is keyed name+US+unit+US+value, so the caller's NAME predicate must be applied to the
 	// name PART. Passing the composite key straight to `matches` would silently match nothing and leave a
 	// time-travel entry describing a table that has since been ALTERed.
 	RetireMatching(at_entries_,
-	               [&](const string &key) { return matches(key.substr(0, key.find('\x1f'))); },
+	               [&](const string &key) { return hit(key.substr(0, key.find('\x1f'))); },
 	               retired_entries_);
-	RetireMatching(function_entries_, matches, retired_entries_);
-	RetireMatching(table_function_entries_, matches, retired_entries_);
-	RetireMatching(aggregate_function_entries_, matches, retired_entries_);
-	RetireMatching(macro_entries_, matches, retired_entries_);
-	RetireMatching(view_entries_, matches, retired_entries_);
+	RetireMatching(function_entries_, hit, retired_entries_);
+	RetireMatching(table_function_entries_, hit, retired_entries_);
+	RetireMatching(aggregate_function_entries_, hit, retired_entries_);
+	RetireMatching(macro_entries_, hit, retired_entries_);
+	RetireMatching(view_entries_, hit, retired_entries_);
 	for (auto &child : child_schemas_) {
 		child.second->InvalidateMatching(matches);
 	}
@@ -463,7 +473,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		return nullptr;
 	}
 
-	CreateTableInfo info(QualifiedName(catalog.GetName(), name, Identifier(table_name)));
+	CreateTableInfo info(GetQualifiedName(Identifier(table_name)));
 	for (idx_t i = 0; i < names.size(); i++) {
 		info.columns.AddColumn(ColumnDefinition(Identifier(names[i]), types[i]));
 	}
@@ -586,7 +596,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 // cannot capture (the same reason FabricatorAggregateFunctionInfo exists).
 struct FabricatorScalarFunctionInfo : public ScalarFunctionInfo {
 	FabricatorHandle handle = nullptr;
-	string schema;
+	//! The function's schema, outermost first (ABI v97); EMPTY for a global (connection-free) function.
+	vector<string> schema_path;
 	string func;
 	vector<string> arg_names;
 	//! Position of the declared VARARGS tail, or INVALID_INDEX. Needed at BIND because a variadic call is
@@ -895,7 +906,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(BindScalarFunctionInput &in
 		// Zero-argument scalar: pass NO stream rather than an empty one. A zero-FIELD Arrow schema cannot
 		// cross the C interface in EITHER direction (Apache.Arrow throws on 'fields'), which is the same
 		// reason the exec callback sends a throwaway column and tablefn_bind passes nullptr here.
-		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema, info.func, nullptr,
+		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema_path, info.func, nullptr,
 		                                           arg_constant, MakeCallContext(context), result_schema);
 	} else {
 		DataChunk chunk;
@@ -915,7 +926,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(BindScalarFunctionInput &in
 		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
-		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema, info.func, producer.Stream(),
+		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema_path, info.func, producer.Stream(),
 		                                           arg_constant, MakeCallContext(context), result_schema);
 	}
 
@@ -960,7 +971,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(BindScalarFunctionInput &in
 // `return_type` is the function's DECLARED type, used only to register the entry (so catalog listings and
 // overload displays are accurate). SQLNULL there is the UNRESOLVED sentinel => registered as ANY and the
 // bind MUST supply a type. Either way the bind's answer is what the call site uses.
-static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, const string &schema_name,
+static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, const vector<string> &schema_path,
                                                   const string &fn_name, vector<LogicalType> arg_types,
                                                   vector<string> arg_names, LogicalType return_type,
                                                   bool is_volatile,
@@ -1127,7 +1138,7 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	// Identity for the bind callback, which is a raw function pointer and cannot capture.
 	auto fn_info = make_shared_ptr<FabricatorScalarFunctionInfo>();
 	fn_info->handle = handle;
-	fn_info->schema = schema_name;
+	fn_info->schema_path = schema_path;
 	fn_info->func = fn_name;
 	fn_info->arg_names = arg_names;
 	fn_info->varargs_index = varargs_index;
@@ -1159,9 +1170,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	LogicalType return_type;
 	bool is_volatile = true;
 	try {
-		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		FetchFunctionParamSchema(context, handle_, SchemaPathStrings(), func_name, arg_names, arg_types,
 		                         &arg_styles);
-		return_type = FetchFunctionReturnType(context, handle_, name.GetIdentifierName(), func_name, &is_volatile);
+		return_type = FetchFunctionReturnType(context, handle_, SchemaPathStrings(), func_name, &is_volatile);
 	} catch (std::exception &) {
 		// The discovered name is stale — the function no longer exists on the server
 		// (e.g. dropped out-of-band). Treat it as not-found rather than erroring.
@@ -1174,11 +1185,11 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	// declaration throws HERE rather than in the fetch above — it is a declaration bug, not a stale name, and
 	// the catch above would turn it into a silent "function does not exist".
 	ScalarFunction fn = BuildFabricatorScalarFunction(
-	    handle_, name.GetIdentifierName(), func_name, arg_types, arg_names, return_type, is_volatile,
+	    handle_, SchemaPathStrings(), func_name, arg_types, arg_names, return_type, is_volatile,
 	    FabricatorVarArgsIndex(func_name, arg_names, arg_styles));
 
 	CreateScalarFunctionInfo info(std::move(fn));
-	info.SetQualification(catalog.GetName(), Identifier(name));
+	info.SetQualifiedName(GetQualifiedName(info.GetQualifiedName().Name()));
 	auto entry = make_uniq<ScalarFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	function_entries_[func_name] = std::move(entry);
@@ -1201,7 +1212,8 @@ namespace {
 // Monotonic ids are never reused, so they never collide across threads or prepared-statement re-executions.
 struct FabricatorAggregateFunctionInfo : public AggregateFunctionInfo {
 	FabricatorHandle handle = nullptr;
-	string schema;
+	//! The function's schema, outermost first (ABI v97); EMPTY for a global (connection-free) function.
+	vector<string> schema_path;
 	string func;
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
@@ -1578,7 +1590,7 @@ unique_ptr<FunctionData> FabricatorAggregateBind(BindAggregateFunctionInput &inp
 		// A zero-argument aggregate: pass NO stream. A zero-FIELD Arrow schema cannot cross in either
 		// direction (Apache.Arrow throws on 'fields') — the same rule every other args marshal follows.
 		bind_data->holder->session =
-		    fabricator::AggOpen(info.handle, info.schema, info.func, nullptr, arg_constant,
+		    fabricator::AggOpen(info.handle, info.schema_path, info.func, nullptr, arg_constant,
 		                        MakeCallContext(context), result_schema);
 	} else {
 		DataChunk chunk;
@@ -1595,7 +1607,7 @@ unique_ptr<FunctionData> FabricatorAggregateBind(BindAggregateFunctionInput &inp
 		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
-		bind_data->holder->session = fabricator::AggOpen(info.handle, info.schema, info.func, producer.Stream(),
+		bind_data->holder->session = fabricator::AggOpen(info.handle, info.schema_path, info.func, producer.Stream(),
 		                                                arg_constant, MakeCallContext(context), result_schema);
 	}
 
@@ -1780,7 +1792,7 @@ void FabricatorAggregateFinalize(Vector &state, AggregateFinalizeInputData &aggr
 // the C# session over the agg_* ABI (the scalar session's aggregate analog). `handle` = 0 for a connection-free
 // GLOBAL aggregate (C# resolves by name); `spillable` selects the bytes-in-blob mode (the callbacks branch on
 // the flag). Shared by catalog-bound aggregates (GetOrCreateAggregateFunction) + load-time global aggregates.
-static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handle, const string &schema_name,
+static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handle, const vector<string> &schema_path,
                                                         const string &func_name, vector<LogicalType> arg_types,
                                                         vector<string> arg_names, LogicalType return_type,
                                                         bool spillable) {
@@ -1818,7 +1830,7 @@ static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handl
 	                     nullptr, FabricatorAggregateBind, nullptr);
 	auto fn_info = make_shared_ptr<FabricatorAggregateFunctionInfo>();
 	fn_info->handle = handle;
-	fn_info->schema = schema_name;
+	fn_info->schema_path = schema_path;
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
@@ -1845,9 +1857,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	vector<FabricatorParamStyle> arg_styles;
 	LogicalType return_type;
 	try {
-		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		FetchFunctionParamSchema(context, handle_, SchemaPathStrings(), func_name, arg_names, arg_types,
 		                         &arg_styles);
-		return_type = FetchFunctionReturnType(context, handle_, name.GetIdentifierName(), func_name);
+		return_type = FetchFunctionReturnType(context, handle_, SchemaPathStrings(), func_name);
 	} catch (std::exception &) {
 		// Stale discovery (the function no longer exists) — treat as not-found, like the scalar path.
 		aggregate_functions_.erase(func_name);
@@ -1858,12 +1870,12 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	// Outside the catch above: a malformed declaration is a bug to report, not a stale name to drop.
 	FabricatorRefuseVarArgs(func_name, "aggregate", arg_names, arg_styles);
 	AggregateFunction fn =
-	    BuildFabricatorAggregateFunction(handle_, name.GetIdentifierName(), func_name, arg_types, arg_names, return_type, spillable);
+	    BuildFabricatorAggregateFunction(handle_, SchemaPathStrings(), func_name, arg_types, arg_names, return_type, spillable);
 
 	AggregateFunctionSet set{Identifier(func_name)}; // braces: parens here are a most-vexing parse
 	set.AddFunction(fn);
 	CreateAggregateFunctionInfo info(std::move(set));
-	info.SetQualification(catalog.GetName(), Identifier(name));
+	info.SetQualifiedName(GetQualifiedName(info.GetQualifiedName().Name()));
 	auto entry = make_uniq<AggregateFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	aggregate_function_entries_[func_name] = std::move(entry);
@@ -1913,7 +1925,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext
 		// body because those land in the system catalog's main schema. A catalog-bound macro must carry THIS
 		// catalog's ATTACH alias (chosen by the user at ATTACH time, so a static declaration cannot state it) and
 		// this schema. Do not copy the global branch's validation into this path: it asserts the inverse.
-		info->SetQualification(catalog.GetName(), Identifier(name));
+		info->SetQualifiedName(GetQualifiedName(info->GetQualifiedName().Name()));
 		// NOT `internal`: that marks a system/built-in entry, which is right for the load-time global macros and
 		// wrong for a catalog entry (none of our other catalog entries set it either).
 		if (info->type == CatalogType::TABLE_MACRO_ENTRY) {
@@ -1938,6 +1950,107 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext
 	// entry is cached either way, so the matching lookup finds it without re-parsing, but THIS lookup reports
 	// not-found.
 	return ref.type == want_type ? optional_ptr<CatalogEntry>(&ref) : nullptr;
+}
+
+namespace {
+
+void CollectCteNames(QueryNode &node, case_insensitive_set_t &names) {
+	for (auto &kv : node.cte_map.map) {
+		names.insert(kv.first.GetIdentifierName());
+		if (kv.second->query_node) {
+			CollectCteNames(*kv.second->query_node, names);
+		}
+	}
+}
+
+//! Visits every QUERY NODE of a statement once — the root, CTE bodies, FROM subqueries and subqueries nested
+//! inside expressions. ParsedExpressionIterator walks the first three itself but treats an expression
+//! subquery as a leaf, so that recursion is ours.
+void VisitQueryNodes(QueryNode &node, const std::function<void(QueryNode &)> &on_node,
+                     const std::function<void(TableRef &)> &on_ref,
+                     const std::function<void(FunctionExpression &)> &on_function) {
+	on_node(node);
+	std::function<void(unique_ptr<ParsedExpression> &)> on_expr;
+	on_expr = [&](unique_ptr<ParsedExpression> &expr) {
+		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			auto &sub = expr->Cast<SubqueryExpression>();
+			if (sub.SubqueryMutable() && sub.SubqueryMutable()->node) {
+				VisitQueryNodes(*sub.SubqueryMutable()->node, on_node, on_ref, on_function);
+			}
+		} else if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
+			on_function(expr->Cast<FunctionExpression>());
+		}
+		ParsedExpressionIterator::EnumerateChildren(*expr, on_expr);
+	};
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(node, on_expr, [&](TableRef &ref) {
+		if (ref.type == TableReferenceType::SUBQUERY) {
+			auto &sub = ref.Cast<SubqueryRef>();
+			if (sub.subquery && sub.subquery->node) {
+				on_node(*sub.subquery->node); // its children were walked by the iterator already
+			}
+		}
+		on_ref(ref);
+	});
+	for (auto &kv : node.cte_map.map) {
+		if (kv.second->query_node) {
+			on_node(*kv.second->query_node);
+		}
+	}
+}
+
+} // namespace
+
+// ⚠⚠ UPSTREAM BUG, and it is a WRONG ANSWER: DuckDB 2.0 builds a view's search path from
+// `ParentSchema().name` (bind_basetableref.cpp) — the LEAF of the schema path. So an unqualified name in the
+// body of `cat.sales.eu.v` resolves in `cat.eu`, a DIFFERENT schema when one exists, and reads its rows without
+// an error. Measured on native DuckDB too, so it is not ours; see docs/duckdb-upstream-issues.md.
+//
+// A foreign catalog gets no hook into that search path, so the BODY is qualified instead, at materialization,
+// for a nested schema only (at depth 1 the leaf IS the path and nothing changes):
+//  * a TABLE name with no qualification becomes catalog.path.name — unless it names a CTE, which a
+//    qualification would turn into a missing table;
+//  * a FUNCTION or macro name with no qualification is qualified only when THIS schema declares it, so a
+//    built-in (`range`, `upper`, …) is left alone and still resolves through the system catalog.
+// ⚠ Consequence worth knowing: in a nested view an unqualified table name now ALWAYS means this schema's
+// table; it no longer falls through to another catalog the way an unanchored name could.
+void FabricatorSchemaEntry::QualifyNestedViewBody(SelectStatement &query) {
+	auto path = GetSchemaPath();
+	if (path.size() < 2 || !query.node) {
+		return;
+	}
+	case_insensitive_set_t ctes;
+	VisitQueryNodes(*query.node, [&](QueryNode &node) { CollectCteNames(node, ctes); }, [](TableRef &) {},
+	                [](FunctionExpression &) {});
+	const auto declares_function = [&](const string &fn) {
+		return scalar_functions_.count(fn) || table_functions_.count(fn) || sql_table_functions_.count(fn) ||
+		       custom_inout_functions_.count(fn) || custom_lateral_functions_.count(fn) ||
+		       custom_collector_functions_.count(fn) || aggregate_functions_.count(fn) || macros_.count(fn) ||
+		       (fn.size() > 5 && StringUtil::EndsWith(fn, "_each") &&
+		        table_functions_.count(fn.substr(0, fn.size() - 5)));
+	};
+	const auto qualify = [&](const Identifier &leaf) {
+		return QualifiedName::FromCatalogSchema(catalog.GetName(), path, leaf);
+	};
+	VisitQueryNodes(
+	    *query.node, [](QueryNode &) {},
+	    [&](TableRef &ref) {
+		    if (ref.type == TableReferenceType::BASE_TABLE) {
+			    auto &table = ref.Cast<BaseTableRef>();
+			    auto &qn = table.GetQualifiedName();
+			    if (qn.Path().size() == 1 && !ctes.count(qn.Name().GetIdentifierName())) {
+				    table.SetQualifiedName(qualify(qn.Name()));
+			    }
+		    }
+	    },
+	    [&](FunctionExpression &fn) {
+		    auto &qn = fn.GetQualifiedName();
+		    if (qn.Path().size() == 1 && declares_function(qn.Name().GetIdentifierName())) {
+			    fn.SetQualifiedName(qualify(qn.Name()));
+		    }
+	    });
 }
 
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateView(ClientContext &context, const string &view_name) {
@@ -1994,7 +2107,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateView(ClientContext 
 		// What these two lines DO buy is that the entry describes itself consistently: CreateInfo's
 		// catalog/schema feed GetInfo() / ToSQL() / duckdb_views().sql, so a provider that shipped a
 		// QUALIFIED body would otherwise leave an entry living here while claiming to live somewhere else.
-		info->SetQualification(catalog.GetName(), Identifier(name));
+		info->SetQualifiedName(GetQualifiedName(info->GetQualifiedName().Name()));
+		if (info->query) {
+			QualifyNestedViewBody(*info->query);
+		}
 		// Belt and braces: a parsed CREATE VIEW carries no bound types, and empty types is what selects the
 		// UNBOUND construction path. Stating it means a future parser change cannot quietly bind us.
 		info->types.clear();
@@ -2023,7 +2139,8 @@ namespace {
 // so it can't capture — unlike the scalar callback's std::function).
 struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	FabricatorHandle handle = nullptr;
-	string schema;
+	//! The function's schema, outermost first (ABI v97); EMPTY for a global (connection-free) function.
+	vector<string> schema_path;
 	string func;
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
@@ -2075,7 +2192,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
 	FabricatorHandle handle = info.handle;
-	string schema_name = info.schema;
+	vector<string> schema_path = info.schema_path;
 	string func_name = info.func;
 	bool is_proc = info.is_proc;
 
@@ -2225,7 +2342,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 	//    is_proc here (is_proc above is only the named-vs-positional arg marshaling). The binding is freed at
 	//    plan teardown via the refcounted TableFnBindState captured on the scan factory.
 	auto bind_state = make_shared_ptr<TableFnBindState>();
-	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args,
+	bind_data->factory = [handle, schema_path, func_name, arg_types, arg_names, properties, marshal_args,
 	                      bind_state](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
 		if (arg_types.empty()) {
 			// A function taking NO arguments: pass no stream at all rather than an empty one. `args` is
@@ -2234,7 +2351,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 			// ArgumentNullException on 'fields'), so marshaling one fails the bind with an error that names
 			// nothing recognizable. Keeping this branch is what makes zero-argument table functions work,
 			// which is the shape a catalog-bound function that infers everything from its ATTACH wants.
-			bind_state->binding = fabricator::TableFnBind(handle, schema_name, func_name, nullptr, out,
+			bind_state->binding = fabricator::TableFnBind(handle, schema_path, func_name, nullptr, out,
 			                                          bind_state->supports_pushdown);
 			return;
 		}
@@ -2242,7 +2359,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
-		bind_state->binding = fabricator::TableFnBind(handle, schema_name, func_name, producer.Stream(), out,
+		bind_state->binding = fabricator::TableFnBind(handle, schema_path, func_name, producer.Stream(), out,
 		                                          bind_state->supports_pushdown);
 	};
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
@@ -2566,7 +2683,7 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 		// empty batch (SqlGen.Generate), so the generator's own arity rule is what refuses the call.
 		// ⚠ Same rule and same reason as the zero-argument branch in FabricatorTableFunctionBind — it was
 		// simply unreachable here until a generator could have minimum arity 0.
-		sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name, nullptr);
+		sql = fabricator::GenerateTableSql(info.handle, info.schema_path, info.func, info.catalog_name, nullptr);
 	} else {
 		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		DataChunk chunk;
@@ -2581,7 +2698,7 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 		fabricator::FixNullTypedChildren(array, arg_types); // an ANY parameter given a bare NULL
 		producer.AddBatch(array);
 		producer.Finish();
-		sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name,
+		sql = fabricator::GenerateTableSql(info.handle, info.schema_path, info.func, info.catalog_name,
 		                                   producer.Stream());
 	}
 	return FabricatorParseGeneratedSelect(sql, context, info.func);
@@ -2713,7 +2830,8 @@ void ExchangeHolder::Finish(ClientContext &context) {
 // Bind data (reused across prepared re-executions; the holder is shared, the binding bound once).
 struct FabricatorExchangeBindData : public TableFunctionData {
 	FabricatorHandle handle = nullptr;
-	string schema;
+	//! The function's schema, outermost first (ABI v97); EMPTY for a global (connection-free) function.
+	vector<string> schema_path;
 	string func;
 	vector<LogicalType> input_types;
 	vector<string> input_names;
@@ -2797,7 +2915,7 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 	FabricatorSetActiveTxn(info.handle, context);
 	auto bind_data = make_uniq<FabricatorExchangeBindData>();
 	bind_data->handle = info.handle;
-	bind_data->schema = info.schema;
+	bind_data->schema_path = info.schema_path;
 	bind_data->func = info.func;
 	bind_data->holder = make_shared_ptr<ExchangeHolder>();
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
@@ -2839,7 +2957,7 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 	ArrowArrayStream out_schema;
 	std::memset(&out_schema, 0, sizeof(out_schema));
 	bind_data->holder->binding =
-	    fabricator::InOutBind(info.handle, info.schema, info.func, args_ptr, input_schema, out_schema);
+	    fabricator::InOutBind(info.handle, info.schema_path, info.func, args_ptr, input_schema, out_schema);
 
 	ArrowSchemaWrapper schema_root;
 	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
@@ -3123,7 +3241,8 @@ struct FabricatorCollectorGlobalState : public GlobalTableFunctionState {
 // Bind data (reused across prepared re-executions; the holder is shared, the binding bound once).
 struct FabricatorCollectorBindData : public TableFunctionData {
 	FabricatorHandle handle = nullptr;
-	string schema;
+	//! The function's schema, outermost first (ABI v97); EMPTY for a global (connection-free) function.
+	vector<string> schema_path;
 	string func;
 	shared_ptr<CollectorHolder> holder;
 	//! The binding's FULL declared output width — what a narrowed column list indexes INTO. Kept because
@@ -3196,7 +3315,7 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 	FabricatorSetActiveTxn(info.handle, context);
 	auto bind_data = make_uniq<FabricatorCollectorBindData>();
 	bind_data->handle = info.handle;
-	bind_data->schema = info.schema;
+	bind_data->schema_path = info.schema_path;
 	bind_data->func = info.func;
 	bind_data->holder = make_shared_ptr<CollectorHolder>();
 	auto &holder = *bind_data->holder;
@@ -3238,7 +3357,7 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 	ArrowArrayStream out_schema;
 	std::memset(&out_schema, 0, sizeof(out_schema));
 	bind_data->holder->binding =
-	    fabricator::InOutBind(info.handle, info.schema, info.func, args_ptr, input_schema, out_schema);
+	    fabricator::InOutBind(info.handle, info.schema_path, info.func, args_ptr, input_schema, out_schema);
 
 	ArrowSchemaWrapper schema_root;
 	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
@@ -3470,8 +3589,74 @@ void WrapFabricatorInOutNodes(unique_ptr<LogicalOperator> &op) {
 	}
 }
 
+// A CREATE TABLE … AS into a NESTED fabricator schema, planned with an existence check BY PATH.
+//
+// ⚠⚠ UPSTREAM BUG, and it LOSES THE ROWS SILENTLY. DuckDB 2.0's PhysicalPlanGenerator::CreatePlan(
+// LogicalCreateTable) asks `catalog.GetEntry(…, create_info.GetQualifiedName().Schema(), name)` whether the
+// table already exists — the LEAF schema only. Under nested schemas that resolves `cat.sales.eu.t` as `cat.eu.t`,
+// so when a top-level `eu.t` exists the planner takes the "already exists" branch, plans a bare
+// PhysicalCreateTable and DROPS the query: the nested table is created EMPTY and the statement succeeds.
+// Measured on native DuckDB too (an in-memory database, no extension), so it is not ours; see
+// docs/duckdb-upstream-issues.md.
+//
+// The planner gives a foreign catalog no hook before that check (PlanCreateTableAs is reached only AFTER it),
+// so a nested CTAS is replaced by this operator, whose CreatePlan repeats the planner's decision with the
+// existence check asked of the SCHEMA ENTRY — which is the right branch by construction. Depth 1 is left alone:
+// there the leaf is the path, and the planner's own check is correct.
+// ⚠ It rides the optimizer, so PRAGMA disable_optimizer brings the upstream behaviour back.
+struct FabricatorNestedCtasOperator : public LogicalExtensionOperator {
+	explicit FabricatorNestedCtasOperator(unique_ptr<LogicalOperator> create_p)
+	    : create(unique_ptr_cast<LogicalOperator, LogicalCreateTable>(std::move(create_p))) {
+		children = std::move(create->children);
+		types = create->types;
+	}
+
+	unique_ptr<LogicalCreateTable> create;
+
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		auto &create_info = create->info->base->Cast<CreateTableInfo>();
+		auto &schema = create->info->schema.Cast<FabricatorSchemaEntry>();
+		auto existing = schema.LookupEntry(CatalogTransaction(schema.catalog, context),
+		                                    EntryLookupInfo(CatalogType::TABLE_ENTRY, create_info.GetQualifiedName().Name()));
+		bool replace = create->info->Base().on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
+		if ((!existing || replace) && !children.empty()) {
+			auto &plan = planner.CreatePlan(*children[0]);
+			return schema.catalog.PlanCreateTableAs(context, planner, *create, plan);
+		}
+		return planner.Make<PhysicalCreateTable>(*create, create->schema, std::move(create->info),
+		                                         create->estimated_cardinality);
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return GenerateColumnBindings(TableIndex(0), types.size());
+	}
+
+	void ResolveTypes() override {
+		types = {LogicalType::BIGINT};
+	}
+
+	string GetExtensionName() const override {
+		return "fabricator_nested_ctas";
+	}
+};
+
+void WrapNestedCtas(unique_ptr<LogicalOperator> &plan) {
+	if (!plan || plan->type != LogicalOperatorType::LOGICAL_CREATE_TABLE) {
+		return;
+	}
+	auto &create = plan->Cast<LogicalCreateTable>();
+	if (create.children.empty() || create.info->schema.catalog.GetCatalogType() != "fabricator") {
+		return;
+	}
+	if (create.info->schema.Cast<FabricatorSchemaEntry>().SchemaPathStrings().size() < 2) {
+		return;
+	}
+	plan = make_uniq<FabricatorNestedCtasOperator>(std::move(plan));
+}
+
 void FabricatorInOutOptimize(OptimizerExtensionInput &, unique_ptr<LogicalOperator> &plan) {
 	WrapFabricatorInOutNodes(plan);
+	WrapNestedCtas(plan);
 }
 
 } // namespace
@@ -3517,13 +3702,13 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				bool is_volatile = true;
 				try {
 					// handle = 0 + empty schema = the global marker; C# resolves the function by name.
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
-					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name, &is_volatile);
+					FetchFunctionParamSchema(context, nullptr, vector<string>(), fn_name, arg_names, arg_types, &arg_styles);
+					return_type = FetchFunctionReturnType(context, nullptr, vector<string>(), fn_name, &is_volatile);
 				} catch (std::exception &) {
 					continue; // skip a global whose schema can't be resolved
 				}
 				ScalarFunction fn = BuildFabricatorScalarFunction(
-				    nullptr, "", fn_name, arg_types, arg_names, return_type, is_volatile,
+				    nullptr, vector<string>(), fn_name, arg_types, arg_names, return_type, is_volatile,
 				    FabricatorVarArgsIndex(fn_name, arg_names, arg_styles));
 				loader.RegisterFunction(fn);
 			} else if (kind == "inout" || kind == "collector") {
@@ -3542,7 +3727,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				tf.projection_pushdown = true;
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 				fn_info->handle = nullptr; // global marker
-				fn_info->schema = "";
+				fn_info->schema_path.clear();
 				fn_info->func = fn_name;
 				fn_info->is_proc = false;
 				try {
@@ -3551,7 +3736,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 					vector<string> arg_names;
 					vector<LogicalType> arg_types;
 					vector<FabricatorParamStyle> arg_styles;
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
+					FetchFunctionParamSchema(context, nullptr, vector<string>(), fn_name, arg_names, arg_types, &arg_styles);
 					FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, tf,
 					                              /*named_any_for_null=*/true);
 					fn_info->arg_names = std::move(arg_names);
@@ -3574,7 +3759,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				vector<LogicalType> arg_types;
 				vector<FabricatorParamStyle> arg_styles;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
+					FetchFunctionParamSchema(context, nullptr, vector<string>(), fn_name, arg_names, arg_types, &arg_styles);
 				} catch (std::exception &) {
 					continue; // skip a global whose signature can't be resolved
 				}
@@ -3582,7 +3767,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 					continue; // a lateral function's arguments ARE its input; a zero-arg one is uncallable
 				}
 				try {
-					loader.RegisterFunction(FabricatorMakeLateralFunction(nullptr, "", fn_name, std::move(arg_names),
+					loader.RegisterFunction(FabricatorMakeLateralFunction(nullptr, vector<string>(), fn_name, std::move(arg_names),
 					                                                     std::move(arg_types),
 					                                                     std::move(arg_styles)));
 				} catch (std::exception &) {
@@ -3597,13 +3782,13 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				vector<FabricatorParamStyle> arg_styles;
 				LogicalType return_type;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
-					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name);
+					FetchFunctionParamSchema(context, nullptr, vector<string>(), fn_name, arg_names, arg_types, &arg_styles);
+					return_type = FetchFunctionReturnType(context, nullptr, vector<string>(), fn_name);
 				} catch (std::exception &) {
 					continue;
 				}
 				FabricatorRefuseVarArgs(fn_name, "aggregate", arg_names, arg_styles);
-				AggregateFunction fn = BuildFabricatorAggregateFunction(nullptr, "", fn_name, arg_types, arg_names,
+				AggregateFunction fn = BuildFabricatorAggregateFunction(nullptr, vector<string>(), fn_name, arg_types, arg_names,
 				                                                      return_type, kind == "aggregate_spill");
 				loader.RegisterFunction(fn);
 			} else if (kind == "table") {
@@ -3615,7 +3800,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				vector<LogicalType> arg_types;
 				vector<FabricatorParamStyle> arg_styles;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
+					FetchFunctionParamSchema(context, nullptr, vector<string>(), fn_name, arg_names, arg_types, &arg_styles);
 				} catch (std::exception &) {
 					continue;
 				}
@@ -3657,7 +3842,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				}
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 				fn_info->handle = nullptr; // global marker
-				fn_info->schema = "";
+				fn_info->schema_path.clear();
 				fn_info->func = fn_name;
 				fn_info->arg_types = arg_types;
 				fn_info->arg_names = arg_names;
@@ -3676,7 +3861,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				vector<LogicalType> all_types;
 				vector<FabricatorParamStyle> styles;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, all_names, all_types, &styles);
+					FetchFunctionParamSchema(context, nullptr, vector<string>(), fn_name, all_names, all_types, &styles);
 				} catch (std::exception &) {
 					continue;
 				}
@@ -3692,7 +3877,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 				fn_info->varargs_index = sqlgen_varargs_index;
 				fn_info->handle = nullptr; // global marker
-				fn_info->schema = "";
+				fn_info->schema_path.clear();
 				fn_info->func = fn_name;
 				fn_info->arg_types = arg_types;
 				fn_info->arg_names = arg_names;
@@ -3781,7 +3966,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	vector<LogicalType> arg_types;
 	vector<FabricatorParamStyle> arg_styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		FetchFunctionParamSchema(context, handle_, SchemaPathStrings(), func_name, arg_names, arg_types,
 		                         &arg_styles);
 	} catch (std::exception &) {
 		// Stale discovery (dropped out-of-band) — treat as not-found.
@@ -3846,7 +4031,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	}
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
-	fn_info->schema = name.GetIdentifierName();
+	fn_info->schema_path = SchemaPathStrings();
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
@@ -3860,7 +4045,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));
-	info.SetQualification(catalog.GetName(), Identifier(name));
+	info.SetQualifiedName(GetQualifiedName(info.GetQualifiedName().Name()));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -3878,7 +4063,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	vector<LogicalType> all_types;
 	vector<FabricatorParamStyle> styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, all_names, all_types, &styles);
+		FetchFunctionParamSchema(context, handle_, SchemaPathStrings(), func_name, all_names, all_types, &styles);
 	} catch (std::exception &) {
 		// Stale discovery (the provider no longer declares it) — treat as not-found, like the other paths.
 		sql_table_functions_.erase(func_name);
@@ -3896,7 +4081,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->varargs_index = sqlgen_varargs_index;
 	fn_info->handle = handle_;
-	fn_info->schema = name.GetIdentifierName();
+	fn_info->schema_path = SchemaPathStrings();
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
@@ -3905,7 +4090,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));
-	info.SetQualification(catalog.GetName(), Identifier(name));
+	info.SetQualifiedName(GetQualifiedName(info.GetQualifiedName().Name()));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -3925,7 +4110,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	inout.projection_pushdown = true;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
-	fn_info->schema = name.GetIdentifierName();
+	fn_info->schema_path = SchemaPathStrings();
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
 	// The signature comes from the DECLARED parameter styles: the table input is one of them now, so it is no
@@ -3936,7 +4121,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 		vector<string> arg_names;
 		vector<LogicalType> arg_types;
 		vector<FabricatorParamStyle> arg_styles;
-		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		FetchFunctionParamSchema(context, handle_, SchemaPathStrings(), func_name, arg_names, arg_types,
 		                         &arg_styles);
 		FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, inout);
 		fn_info->arg_names = std::move(arg_names);
@@ -3951,7 +4136,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));
-	info.SetQualification(catalog.GetName(), Identifier(name));
+	info.SetQualifiedName(GetQualifiedName(info.GetQualifiedName().Name()));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -3968,7 +4153,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateLateralFunction(Cli
 	vector<LogicalType> arg_types;
 	vector<FabricatorParamStyle> arg_styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		FetchFunctionParamSchema(context, handle_, SchemaPathStrings(), func_name, arg_names, arg_types,
 		                         &arg_styles);
 	} catch (std::exception &) {
 		// Stale declaration (a cache refresh dropped it) — treat as not-found rather than registering a
@@ -3981,10 +4166,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateLateralFunction(Cli
 		custom_lateral_functions_.erase(func_name);
 		return nullptr;
 	}
-	auto fn = FabricatorMakeLateralFunction(handle_, name.GetIdentifierName(), func_name, std::move(arg_names), std::move(arg_types),
+	auto fn = FabricatorMakeLateralFunction(handle_, SchemaPathStrings(), func_name, std::move(arg_names), std::move(arg_types),
 	                                        std::move(arg_styles));
 	CreateTableFunctionInfo info(std::move(fn));
-	info.SetQualification(catalog.GetName(), Identifier(name));
+	info.SetQualifiedName(GetQualifiedName(info.GetQualifiedName().Name()));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -4007,7 +4192,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 	collector.projection_pushdown = true;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
-	fn_info->schema = name.GetIdentifierName();
+	fn_info->schema_path = SchemaPathStrings();
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
 	// Signature from the declared styles (see FabricatorBuildInOutSignature): the table input is a declared
@@ -4016,7 +4201,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 		vector<string> arg_names;
 		vector<LogicalType> arg_types;
 		vector<FabricatorParamStyle> arg_styles;
-		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		FetchFunctionParamSchema(context, handle_, SchemaPathStrings(), func_name, arg_names, arg_types,
 		                         &arg_styles);
 		FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, collector, /*named_any_for_null=*/true);
 		fn_info->arg_names = std::move(arg_names);
@@ -4031,7 +4216,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 	collector.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(collector));
-	info.SetQualification(catalog.GetName(), Identifier(name));
+	info.SetQualifiedName(GetQualifiedName(info.GetQualifiedName().Name()));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);

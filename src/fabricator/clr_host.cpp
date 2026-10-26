@@ -661,22 +661,6 @@ int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema
 	return affected;
 }
 
-int64_t BulkInsert(FabricatorHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                   bool replace, ArrowArrayStream &in) {
-	const FabricatorVTable &vt = GetBridge();
-	if (!vt.bulk_insert) {
-		throw duckdb::IOException("Fabricator: bridge does not provide bulk_insert");
-	}
-	int64_t affected = 0;
-	char *err = nullptr;
-	int32_t rc = vt.bulk_insert(handle, schema.c_str(), table.c_str(), create_table ? 1 : 0, replace ? 1 : 0, &in,
-	                            &affected, &err);
-	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: bulk_insert failed");
-	}
-	return affected;
-}
-
 namespace {
 // Borrowed UTF-8 pointers for a schema PATH argument (ABI v91/v92). The caller's vector outlives the
 // crossing, so nothing is copied; an EMPTY path passes a null pointer with length 0 rather than a
@@ -1143,7 +1127,7 @@ void OneLakeCloseWrite(FabricatorHandle file) {
 	}
 }
 
-std::string GenerateTableSql(FabricatorHandle handle, const std::string &schema, const std::string &func,
+std::string GenerateTableSql(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              const std::string &catalog_name, ArrowArrayStream *args) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.generate_table_sql) {
@@ -1151,7 +1135,8 @@ std::string GenerateTableSql(FabricatorHandle handle, const std::string &schema,
 	}
 	char *err = nullptr;
 	char *out_sql = nullptr;
-	int32_t rc = vt.generate_table_sql(handle, schema.c_str(), func.c_str(), catalog_name.c_str(), args,
+	PathArgs path(schema_path);
+	int32_t rc = vt.generate_table_sql(handle, path.Data(), path.Len(), func.c_str(), catalog_name.c_str(), args,
 	                                   &out_sql, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: generate_table_sql failed");
@@ -1209,33 +1194,35 @@ void ClearSessionSettings(int64_t session) noexcept {
 	}
 }
 
-void GetFunctionParamSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
+void GetFunctionParamSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                             ArrowSchema &out) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.get_function_param_schema) {
 		throw duckdb::IOException("Fabricator: bridge does not provide get_function_param_schema");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.get_function_param_schema(handle, schema.c_str(), func.c_str(), &out, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.get_function_param_schema(handle, path.Data(), path.Len(), func.c_str(), &out, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: get_function_param_schema failed");
 	}
 }
 
-void GetFunctionReturnSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
+void GetFunctionReturnSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              ArrowSchema &out) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.get_function_return_schema) {
 		throw duckdb::IOException("Fabricator: bridge does not provide get_function_return_schema");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.get_function_return_schema(handle, schema.c_str(), func.c_str(), &out, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.get_function_return_schema(handle, path.Data(), path.Len(), func.c_str(), &out, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: get_function_return_schema failed");
 	}
 }
 
-FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                               ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
                               ArrowSchema &out_schema) {
 	const FabricatorVTable &vt = GetBridge();
@@ -1244,7 +1231,8 @@ FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema
 	}
 	FabricatorHandle binding = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.scalarfn_bind(handle, schema.c_str(), func.c_str(), args, arg_constant.c_str(), call.opener,
+	PathArgs path(schema_path);
+	int32_t rc = vt.scalarfn_bind(handle, path.Data(), path.Len(), func.c_str(), args, arg_constant.c_str(), call.opener,
 	                              call.session, call.txn_id, &out_schema, &binding, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: scalarfn_bind failed");
@@ -1283,14 +1271,15 @@ void ScalarFnClose(FabricatorHandle binding) {
 	}
 }
 
-void GetFunctionOutputSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
+void GetFunctionOutputSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              ArrowArrayStream *args, ArrowSchema &out) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.get_function_output_schema) {
 		throw duckdb::IOException("Fabricator: bridge does not provide get_function_output_schema");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.get_function_output_schema(handle, schema.c_str(), func.c_str(), args, &out, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.get_function_output_schema(handle, path.Data(), path.Len(), func.c_str(), args, &out, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: get_function_output_schema failed");
 	}
@@ -1302,7 +1291,7 @@ void GetFunctionOutputSchema(FabricatorHandle handle, const std::string &schema,
 // (The 4g table-in-out push wrappers InOutOpen/InOutPush/InOutFinish/InOutAbort were removed at ABI v31 —
 //  every `_each` form now runs on the streaming exchange: InOutBind/InOutExchangeOpen/InOutBindClose below.)
 
-FabricatorHandle InOutBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle InOutBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                          ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.inout_bind) {
@@ -1310,8 +1299,9 @@ FabricatorHandle InOutBind(FabricatorHandle handle, const std::string &schema, c
 	}
 	FabricatorHandle binding = nullptr;
 	char *err = nullptr;
+	PathArgs path(schema_path);
 	int32_t rc =
-	    vt.inout_bind(handle, schema.c_str(), func.c_str(), args, &input_schema, &out_schema, &binding, &err);
+	    vt.inout_bind(handle, path.Data(), path.Len(), func.c_str(), args, &input_schema, &out_schema, &binding, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: inout_bind failed");
 	}
@@ -1354,7 +1344,7 @@ void InOutBindClose(FabricatorHandle binding) {
 // Row-mapped (correlated LATERAL) table functions (ABI v79).
 // -----------------------------------------------------------------------------
 
-FabricatorHandle LateralBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle LateralBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                              ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.lateral_bind) {
@@ -1362,8 +1352,9 @@ FabricatorHandle LateralBind(FabricatorHandle handle, const std::string &schema,
 	}
 	FabricatorHandle binding = nullptr;
 	char *err = nullptr;
+	PathArgs path(schema_path);
 	int32_t rc =
-	    vt.lateral_bind(handle, schema.c_str(), func.c_str(), args, &input_schema, &out_schema, &binding, &err);
+	    vt.lateral_bind(handle, path.Data(), path.Len(), func.c_str(), args, &input_schema, &out_schema, &binding, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: lateral_bind failed");
 	}
@@ -1425,7 +1416,7 @@ void LateralBindClose(FabricatorHandle binding) {
 	}
 }
 
-FabricatorHandle TableFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle TableFnBind(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                          ArrowArrayStream *args, ArrowArrayStream &out_schema, bool &supports_pushdown) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.tablefn_bind) {
@@ -1434,7 +1425,8 @@ FabricatorHandle TableFnBind(FabricatorHandle handle, const std::string &schema,
 	FabricatorHandle binding = nullptr;
 	int32_t pushdown = 0;
 	char *err = nullptr;
-	int32_t rc = vt.tablefn_bind(handle, schema.c_str(), func.c_str(), args, &out_schema, &pushdown, &binding, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.tablefn_bind(handle, path.Data(), path.Len(), func.c_str(), args, &out_schema, &pushdown, &binding, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: tablefn_bind failed");
 	}
@@ -1480,7 +1472,7 @@ void TableFnClose(FabricatorHandle binding) {
 	}
 }
 
-FabricatorHandle AggOpen(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle AggOpen(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &func,
                          ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
                          ArrowSchema &out_result) {
 	const FabricatorVTable &vt = GetBridge();
@@ -1489,7 +1481,8 @@ FabricatorHandle AggOpen(FabricatorHandle handle, const std::string &schema, con
 	}
 	FabricatorHandle session = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.agg_open(handle, schema.c_str(), func.c_str(), args, arg_constant.c_str(), call.opener,
+	PathArgs path(schema_path);
+	int32_t rc = vt.agg_open(handle, path.Data(), path.Len(), func.c_str(), args, arg_constant.c_str(), call.opener,
 	                         call.session, call.txn_id, &out_result, &session, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: agg_open failed");

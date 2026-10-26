@@ -290,7 +290,7 @@ internal sealed class FabricVariableFunction : ICatalogScalarFunction
 
     internal FabricVariableFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "variable";
 
     public Schema Parameters { get; } = new Schema(new[]

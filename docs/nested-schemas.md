@@ -327,6 +327,29 @@ interface's leaf-taking default is exactly the wrong way round.
 qualifications, so it never reaches us. The gate pins the PARSER's error rather than ours, and fails the
 day upstream lifts the cap.
 
+### ✅ Slice 2d — everything else nests: functions, macros, views (BUILT 2026-10-26, ABI v92 -> v97)
+
+User-raised: *"ich hatte angenommen wir hätten multi schema überall supported nicht nur für tabellen"*. Slices
+2b/2c nested TABLES; every other declaration still crossed as one schema NAME and registered into the
+catalog's TOP-LEVEL `schemas_` map — correct only because nothing nested yet, and exactly wrong once it does,
+since under nesting the leaf is what is NOT unique. Full ABI record: [abi-history.md](abi-history.md) §v97.
+
+- `catalog_functions` / `catalog_macros` / `catalog_views` carry a `schema_path` list; the nine per-function
+  entries take a path; providers return typed `FunctionDeclaration` / `CatalogMacroDefinition` /
+  `ViewDefinition` lists and the Bridge builds the Arrow. `__all__` expands over every nested level.
+- The host registers each declaration at its PATH and qualifies every entry with the full path.
+- `fabricator_invalidate_cache(cat, regex)` matches the bare name or `a.b.name`.
+- **⚠⚠ Two DuckDB 2.0 defects, both silent, both measured on native DuckDB** — the reason this slice needed
+  more than plumbing ([duckdb-upstream-issues.md](duckdb-upstream-issues.md) §12, §13):
+  - a view body binds against the LEAF schema ⇒ the host qualifies a nested view's body at materialization;
+  - a nested CTAS checks existence by the LEAF and drops the query when the leaf names an existing table ⇒ an
+    optimizer extension plans a nested CTAS with the existence check asked of the schema entry.
+  - ⚠ The second one was found only because the probe for the first put a top-level `eu` beside `sales.eu`.
+    A fixture without a leaf collision passes both bugs.
+- Gate `verify_delta_nested_schemas` §12 (94 -> **143**), three mutants killed at their own rows.
+- ⚠ Still flat by nature: SQL Server and DAX declarations (depth 1, a deeper path is refused by name), and the
+  load-time GLOBAL functions (handle 0, empty path).
+
 ### Slice 2 — as originally planned
 
 - host: schema TREE + parent links; `FabricatorSchemaEntry::LookupEntry` answers `SCHEMA_ENTRY`; the

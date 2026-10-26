@@ -217,7 +217,7 @@ internal sealed class CdcEnableDatabaseFunction : ICatalogTableFunction
 
     internal CdcEnableDatabaseFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "enable_database";
 
@@ -249,7 +249,7 @@ internal sealed class CdcEnableFunction : ICatalogTableFunction
 
     internal CdcEnableFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "enable";
 
@@ -324,7 +324,7 @@ internal sealed class CdcDisableFunction : ICatalogTableFunction
 
     internal CdcDisableFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "disable";
 
@@ -372,7 +372,7 @@ internal sealed class CdcRetirePreviousInstanceFunction : ICatalogTableFunction
 
     internal CdcRetirePreviousInstanceFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "retire_previous_instance";
 
@@ -426,7 +426,7 @@ internal sealed class CdcCaptureNowFunction : ICatalogTableFunction
 
     internal CdcCaptureNowFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "capture_now";
 

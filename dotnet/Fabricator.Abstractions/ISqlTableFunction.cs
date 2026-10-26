@@ -69,17 +69,18 @@ public sealed record SqlGenContext(string CatalogName, IProviderCatalog Catalog)
 
 /// <summary>
 /// A catalog-bound SQL-generating table function (attach-time scope) — resolved as
-/// <c>SELECT * FROM db.SchemaName.Name(args)</c>. Unlike the global form, the generator gets a
+/// <c>SELECT * FROM db.schema.Name(args)</c>. Unlike the global form, the generator gets a
 /// <see cref="SqlGenContext"/>: the catalog's ATTACH ALIAS (so it can emit fully-qualified references back into
 /// its own catalog — e.g. <c>FROM "db"."dbo"."sales_2024"</c> — and let those scans keep their pushdown) plus
 /// the provider catalog for bind-time lookups. See docs/macros-and-sqlgen-functions.md §2.
 /// </summary>
 public interface ICatalogSqlTableFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo"); created on attach if it isn't already present.</summary>
-    string SchemaName { get; }
+    /// <summary>Target catalog schema as a path (e.g. <c>"dbo"</c>, or <c>new SchemaPath("ws", "doc")</c> for a
+    /// nested one). A schema the catalog does not have is not created: the function is skipped.</summary>
+    SchemaPath SchemaPath { get; }
 
-    /// <summary>Function name, resolved as <c>db.SchemaName.Name(args)</c>.</summary>
+    /// <summary>Function name, resolved as <c>db.schema.Name(args)</c>.</summary>
     string Name { get; }
 
     /// <summary>The call signature — see <see cref="ISqlTableFunction.Parameters"/>.</summary>

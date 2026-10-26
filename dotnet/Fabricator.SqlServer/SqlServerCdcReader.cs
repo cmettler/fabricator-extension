@@ -51,7 +51,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
 
     internal CdcChangesFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "changes";
 

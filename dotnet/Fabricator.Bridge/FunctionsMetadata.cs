@@ -10,66 +10,17 @@ using Apache.Arrow.Types;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// Builds the <c>catalog_functions</c> discovery stream (was metadata kind 6 before ABI v72) IN MEMORY, for a provider that has no SQL
-/// engine to assemble it with.
-///
-/// <para>The SQL-Server catalog produces this same stream as T-SQL executed on the server (its discovered
-/// routines <c>UNION ALL</c> literal rows for the custom registries). A Delta/DAX-style catalog has no server to
-/// run that on, so it needs this: the identical column contract, built locally. Column ORDER is the contract —
-/// the host reads the first three string columns (<c>schema_name</c>, <c>name</c>, <c>kind</c>) and ignores any
-/// trailing ones (see <c>DiscoverFunctions</c> in <c>src/catalog/fabricator_metadata.cpp</c>).</para>
-///
-/// <para><c>kind</c> must be one of the strings the host's registration switch knows —
-/// <c>scalar</c> / <c>table</c> / <c>proc</c> / <c>table_sql</c> / <c>inout</c> / <c>collector</c> /
-/// <c>aggregate</c> / <c>aggregate_spill</c> — anything else is silently ignored there, which is a very quiet
-/// way to lose a function.</para>
+/// Builds the <c>catalog_functions</c> discovery stream from a provider's <see cref="FunctionDeclaration"/>s. Every
+/// provider's declarations cross through here since ABI v97, so the wire shape lives in ONE place: a
+/// <c>LIST&lt;VARCHAR&gt;</c> schema path, then name, kind, param_count, return_type and varargs. The host reads the
+/// path, the name and the kind (see <c>DiscoverFunctions</c> in <c>src/catalog/fabricator_metadata.cpp</c>);
+/// <c>fabricator_functions()</c> shows all six.
 /// </summary>
 public static class FunctionsMetadata
 {
-    /// <summary>One declaration row: which schema it binds into, its name, and its host registration kind.</summary>
-    /// <remarks>
-    /// <para>⚠ This stream used to carry only the first THREE columns while the SQL-Server catalog assembled
-    /// the same declarations as a five-column T-SQL <c>UNION ALL</c> — so <c>fabricator_functions()</c>
-    /// reported <c>param_count</c> and <c>return_type</c> on a SQL Server catalog and NOT on a Delta / DAX /
-    /// delta-rs one, for the same declarations. The host reads only the first three either way
-    /// (<c>DiscoverFunctions</c>), and the user-facing view takes its schema FROM the stream
-    /// (<c>PopulateReturnSchema</c>), which is what made the divergence invisible from the C++ side.
-    /// Widened to the full shape 2026-08-31 while adding <see cref="VarArgs"/>.</para>
-    /// </remarks>
-    public readonly struct Declaration
-    {
-        public Declaration(string schemaName, string name, string kind, int paramCount = 0,
-                           string returnType = "", string varArgs = "")
-        {
-            SchemaName = schemaName;
-            Name = name;
-            Kind = kind;
-            ParamCount = paramCount;
-            ReturnType = returnType;
-            VarArgs = varArgs;
-        }
-
-        public string SchemaName { get; }
-        public string Name { get; }
-        public string Kind { get; }
-
-        /// <summary>Declared argument count (positional ++ named), or the input-table width for in-out kinds.</summary>
-        public int ParamCount { get; }
-
-        /// <summary>Arrow type name of a scalar/aggregate result; empty for every other kind.</summary>
-        public string ReturnType { get; }
-
-        /// <summary>
-        /// The VARIADIC TAIL's type, or empty when the function is not variadic — which is what makes
-        /// <see cref="ParamCount"/> readable: beside a non-empty value here it is a MINIMUM, not an exact
-        /// arity. Mirrors <c>duckdb_functions().varargs</c>.
-        /// </summary>
-        public string VarArgs { get; }
-    }
-
     /// <summary>The Arrow schema of the kind-6 stream, in the host's column order.</summary>
     public static Schema StreamSchema { get; } = new Schema.Builder()
-        .Field(new Field("schema_name", StringType.Default, nullable: true))
+        .Field(SchemaPathColumn.Field("schema_path"))
         .Field(new Field("name", StringType.Default, nullable: true))
         .Field(new Field("kind", StringType.Default, nullable: true))
         .Field(new Field("param_count", Int32Type.Default, nullable: true))
@@ -83,18 +34,18 @@ public static class FunctionsMetadata
     /// when <c>length &gt; 0</c>, so a 1-column empty fallback also passes today, but emitting the real schema is
     /// what makes the stream self-describing if that leniency is ever tightened.
     /// </summary>
-    public static IArrowArrayStream Stream(IEnumerable<Declaration>? declarations)
+    public static IArrowArrayStream Stream(IEnumerable<FunctionDeclaration>? declarations)
     {
-        var schemas = new StringArray.Builder();
+        var schemas = new SchemaPathColumn();
         var names = new StringArray.Builder();
         var kinds = new StringArray.Builder();
         var counts = new Int32Array.Builder();
         var returns = new StringArray.Builder();
         var varargs = new StringArray.Builder();
         int n = 0;
-        foreach (var d in declarations ?? System.Array.Empty<Declaration>())
+        foreach (var d in declarations ?? System.Array.Empty<FunctionDeclaration>())
         {
-            schemas.Append(d.SchemaName);
+            schemas.Append(d.SchemaPath);
             names.Append(d.Name);
             kinds.Append(d.Kind);
             counts.Append(d.ParamCount);

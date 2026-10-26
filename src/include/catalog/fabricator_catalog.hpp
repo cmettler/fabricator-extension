@@ -241,6 +241,11 @@ private:
 	//! identical and had to stay so: LoadCatalog and RefreshCache must register the same tree or a refresh
 	//! silently reshapes the catalog.
 	FabricatorSchemaEntry &EnsureSchemaPathLocked(const vector<string> &path);
+	//! The schema entry at `path`, or null — creates NOTHING (a declaration must not resurrect a schema the
+	//! ATTACH schema_filter kept out). Requires schema_lock_.
+	FabricatorSchemaEntry *FindSchemaPathLocked(const vector<string> &path);
+	//! Registers the discovered functions, macros and views onto their schema paths. Requires schema_lock_.
+	void RegisterDeclarationsLocked();
 
 	//! Removes the schema entry at `path` — a top-level one from `schemas_`, a nested one from its parent —
 	//! into the retire-don't-destroy graveyard. Creates NOTHING on the way: a drop of an absent schema is a

@@ -160,10 +160,11 @@ public sealed class DeltaRsCatalog : IProviderCatalog
 
     // The delta.* function declarations (cat.delta.snapshots / cat.delta.changes). Built in memory —
     // nothing is discovered; the set is what this provider declares.
-    public IArrowArrayStream GetFunctions() => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames));
+    public IEnumerable<FunctionDeclaration> GetFunctions() =>
+        Functions.Declarations(() => SchemaNames().Select(s => (SchemaPath)s).ToList());
 
-    public IArrowArrayStream GetMacros() => EmptyTable("schema", "name", "create_sql");
-    public IArrowArrayStream GetViews() => EmptyTable("schema", "name", "create_sql");
+    public IEnumerable<CatalogMacroDefinition> GetMacros() => System.Array.Empty<CatalogMacroDefinition>();
+    public IEnumerable<ViewDefinition> GetViews() => System.Array.Empty<ViewDefinition>();
 
     public IArrowArrayStream GetServerInfo() => EmptyTable("property", "value");
 
@@ -1087,13 +1088,13 @@ public sealed class DeltaRsCatalog : IProviderCatalog
     });
     private CatalogFunctionSet? _functions;
 
-    public Schema GetFunctionParamSchema(string s, string f) =>
+    public Schema GetFunctionParamSchema(SchemaPath s, string f) =>
         Functions.ParamSchema(s, f) ?? throw NoFunctions();
     // GetFunctionReturnSchema / GetScalarFunction / InOutBind / AggOpen: the interface's uniform throwing
     // defaults answer — this catalog declares no function of those kinds, so it is never asked.
-    public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
+    public Schema GetFunctionOutputSchema(SchemaPath s, string f, RecordBatch? a = null) =>
         Functions.OutputSchema(s, f, a) ?? throw NoFunctions();
-    public ITableFunctionSession TableFnBind(string s, string f, RecordBatch? a) =>
+    public ITableFunctionSession TableFnBind(SchemaPath s, string f, RecordBatch? a) =>
         Functions.TableFnBind(s, f, a) ?? throw NoFunctions();
 
     public void Dispose() => _engine.Dispose();

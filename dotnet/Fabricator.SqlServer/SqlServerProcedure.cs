@@ -36,7 +36,7 @@ internal sealed class SqlServerProcedure : ICatalogTableFunction
         _func = functionName;
     }
 
-    public string SchemaName => _schema;
+    public SchemaPath SchemaPath => _schema;
     public string Name => _func;
 
     // The proc's input parameters (shared param-schema query; field names are the de-@'d parameter names).

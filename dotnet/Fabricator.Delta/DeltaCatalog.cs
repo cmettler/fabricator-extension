@@ -1355,13 +1355,13 @@ public sealed class DeltaCatalog : IProviderCatalog
     // unlike SqlServerCatalog, this provider has no SQL engine to assemble a discovery query with, and
     // nothing here is discovered anyway: the set is what the provider declares. `__all__` expands across
     // discovered schemas (lazily — an empty set costs no schema enumeration, which on OneLake is I/O).
-    public IArrowArrayStream GetFunctions() => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames));
+    public IEnumerable<FunctionDeclaration> GetFunctions() => Functions.Declarations(DataSchemaPaths);
 
     // Provider-declared CATALOG-BOUND macros (schema, name, create_sql), bound by the host into this
     // catalog's schemas as db.schema.m(...). Local declarations — nothing here touches storage, which is
     // exactly why they ride their own discovery entry instead of a SQL discovery stream.
-    public IArrowArrayStream GetMacros() => CatalogMacroMetadata.Stream(ExpandCatalogMacroSchemas());
-    public IArrowArrayStream GetViews() => CatalogViewMetadata.Stream(ExpandCatalogViewSchemas());
+    public IEnumerable<CatalogMacroDefinition> GetMacros() => ExpandCatalogMacroSchemas();
+    public IEnumerable<ViewDefinition> GetViews() => ExpandCatalogViewSchemas();
 
     // DIAGNOSTIC capability rows (property, value) for fabricator_server_info() — since ABI v71 the HOST
     // reads CapabilitiesJson instead (same _pushdownMode source, so the two cannot drift).
@@ -1680,11 +1680,8 @@ public sealed class DeltaCatalog : IProviderCatalog
         }
         if (NestedLayout)
         {
-            // ⚠ TOP-LEVEL names only, and that is the right answer here rather than a shortcut. This list
-            // drives the `__all__` expansion of catalog MACROS and VIEWS, which the host resolves against
-            // its TOP-LEVEL schema map (they do not nest — see FabricatorTableInfo.schema_name). Returning
-            // a deeper level would declare a macro into a schema the host would then fail to find, and
-            // dropping it silently is exactly how a declaration goes missing with no message.
+            // TOP-LEVEL names only: this flat list feeds GetSchemas, which a nested root does not answer
+            // (GetSchemaPaths does). The `__all__` expansion reads DataSchemaPaths, which covers every level.
             var top = new SortedSet<string>(System.StringComparer.Ordinal) { MainSchema };
             foreach (var (path, _) in DiscoverNestedTables())
             {
@@ -1766,6 +1763,22 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// registering no Fabric functions must advertise no <c>fabric</c> schema, or it would gain a permanently
     /// empty one).</para>
     /// </remarks>
+    /// <summary>The DATA schemas as paths — what the <c>__all__</c> sentinel expands over. Under
+    /// <c>schemas 'nested'</c> that is every level, prefixes included, so a function, macro or view declared
+    /// everywhere also lands in a nested schema. Never the function namespaces (see
+    /// <see cref="CatalogSchemaNames"/>).</summary>
+    private IReadOnlyList<SchemaPath> DataSchemaPaths()
+    {
+        if (!NestedLayout)
+        {
+            return SchemaNames().Select(s => (SchemaPath)s).ToList();
+        }
+        return NestedSchemaPaths()
+            .Where(p => !(p.Count == 1 && p[0] == DeltaFunctions.SchemaName))
+            .Select(p => new SchemaPath(p))
+            .ToList();
+    }
+
     private IReadOnlyList<string> CatalogSchemaNames()
     {
         var data = SchemaNames();
@@ -1802,18 +1815,18 @@ public sealed class DeltaCatalog : IProviderCatalog
     private IReadOnlyList<ViewDefinition> ExpandCatalogViewSchemas()
     {
         var outList = new List<ViewDefinition>();
-        IReadOnlyList<string>? schemas = null;
+        IReadOnlyList<SchemaPath>? schemas = null;
         foreach (var v in DeltaBackend.DeclaredCatalogViews)
         {
-            if (!string.Equals(v.SchemaName, "__all__", System.StringComparison.Ordinal))
+            if (v.SchemaPath != CatalogFunctionSet.AllSchemas)
             {
                 outList.Add(v);
                 continue;
             }
-            schemas ??= SchemaNames();
+            schemas ??= DataSchemaPaths();
             foreach (var s in schemas)
             {
-                outList.Add(v with { SchemaName = s });
+                outList.Add(v with { SchemaPath = s });
             }
         }
         return outList;
@@ -1823,18 +1836,18 @@ public sealed class DeltaCatalog : IProviderCatalog
     {
         var declared = DeltaBackend.DeclaredCatalogMacros;
         var outList = new List<CatalogMacroDefinition>();
-        IReadOnlyList<string>? schemas = null;
+        IReadOnlyList<SchemaPath>? schemas = null;
         foreach (var m in declared)
         {
-            if (!string.Equals(m.SchemaName, "__all__", System.StringComparison.Ordinal))
+            if (m.SchemaPath != CatalogFunctionSet.AllSchemas)
             {
                 outList.Add(m);
                 continue;
             }
-            schemas ??= SchemaNames();
+            schemas ??= DataSchemaPaths();
             foreach (var s in schemas)
             {
-                outList.Add(m with { SchemaName = s });
+                outList.Add(m with { SchemaPath = s });
             }
         }
         return outList;
@@ -6235,31 +6248,31 @@ public sealed class DeltaCatalog : IProviderCatalog
         return new CatalogFunctionSet(scalars, tables);
     }
 
-    public Schema GetFunctionParamSchema(string s, string f) =>
+    public Schema GetFunctionParamSchema(SchemaPath s, string f) =>
         Functions.ParamSchema(s, f) ?? throw NoFunction(s, f);
 
-    public Schema GetFunctionReturnSchema(string s, string f) =>
+    public Schema GetFunctionReturnSchema(SchemaPath s, string f) =>
         Functions.ReturnSchema(s, f) ?? throw NoFunction(s, f);
 
-    public IScalarFunction? GetScalarFunction(string s, string f) =>
+    public IScalarFunction? GetScalarFunction(SchemaPath s, string f) =>
         Functions.Scalar(s, f) ?? throw NoFunction(s, f);
 
-    public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
+    public Schema GetFunctionOutputSchema(SchemaPath s, string f, RecordBatch? a = null) =>
         Functions.OutputSchema(s, f, a) ?? throw NoFunction(s, f);
 
-    public ITableFunctionSession TableFnBind(string s, string f, RecordBatch? a) =>
+    public ITableFunctionSession TableFnBind(SchemaPath s, string f, RecordBatch? a) =>
         Functions.TableFnBind(s, f, a) ?? throw NoFunction(s, f);
 
-    public IInOutFunctionBinding InOutBind(string s, string f, RecordBatch? a, Schema input) => throw NoFunctions();
-    public IAggregateSession AggOpen(string s, string f) => throw NoFunctions();
+    public IInOutFunctionBinding InOutBind(SchemaPath s, string f, RecordBatch? a, Schema input) => throw NoFunctions();
+    public IAggregateSession AggOpen(SchemaPath s, string f) => throw NoFunctions();
 
     private static NotSupportedException NoFunctions() => new("delta provider: no catalog functions.");
 
     // Names the function, because a lookup miss here means the host registered a declaration this catalog
     // cannot serve — i.e. the declaration list and the registry disagree, which is a bug in OUR wiring, not
     // user error. A bare "no catalog functions" would send the reader looking in the wrong place.
-    private static NotSupportedException NoFunction(string schema, string func) =>
-        new($"delta provider: no catalog function '{schema}.{func}'.");
+    private static NotSupportedException NoFunction(SchemaPath schema, string func) =>
+        new($"delta provider: no catalog function {schema}.\"{func}\".");
 
     // Catalog teardown (DETACH, or a transient ExternalTableRouting/COPY catalog's finally): sweep any
     // transactions still in the manager — their held EW transactions abort and their buffered batches

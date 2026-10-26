@@ -61,7 +61,7 @@ internal sealed class CdcDecPositionFunction : CdcPositionMathFunction
 /// <summary>Shared body of <c>inc_position</c> / <c>dec_position</c>.</summary>
 internal abstract class CdcPositionMathFunction : ICatalogScalarFunction
 {
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public abstract string Name { get; }
 

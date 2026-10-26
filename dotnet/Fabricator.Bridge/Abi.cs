@@ -34,9 +34,6 @@ public unsafe struct FabricatorVTable
     //                   int64* affected, int32* schema_may_change, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, long*, int*, byte**, int> ExecuteDml;
 
-    // int32 bulk_insert(void* handle, const char* schema, const char* table,
-    //                   int32 create_table, int32 replace, ArrowArrayStream* in, int64* affected, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, CArrowArrayStream*, long*, byte**, int> BulkInsert;
 
     // int32 execute_delete(void* handle, const char* schema, const char* table, ArrowArrayStream* keys, int64* affected, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, long*, byte**, int> ExecuteDelete;
@@ -92,17 +89,17 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<byte*, byte*, byte*, byte*, byte**, byte**, int> BuildConnectionString;
 
     // int32 get_function_param_schema(void* handle, const char* schema, const char* func, ArrowSchema* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte**, int> GetFunctionParamSchema;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowSchema*, byte**, int> GetFunctionParamSchema;
 
     // int32 get_function_return_schema(void* handle, const char* schema, const char* func, ArrowSchema* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte**, int> GetFunctionReturnSchema;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowSchema*, byte**, int> GetFunctionReturnSchema;
 
     // Scalar-function session (ABI v80) — the successor to the removed stateless execute_scalar.
     // int32 scalarfn_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args,
     //                     const char* arg_constant, ArrowSchema* out_schema, void** out_binding, char** err)
     // `arg_constant` is a mask, one char per argument: '1' = a folded constant, '0' = a runtime expression
     // whose slot holds a NULL PLACEHOLDER. A provider MUST consult it before reading a value.
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, nint, long, long, CArrowSchema*, nint*, byte**, int> ScalarFnBind;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, byte*, nint, long, long, CArrowSchema*, nint*, byte**, int> ScalarFnBind;
 
     // int32 scalarfn_execute(void* binding, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, nint, long, long, CArrowArrayStream*, byte**, int> ScalarFnExecute;
@@ -111,7 +108,7 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte**, int> ScalarFnClose;
 
     // int32 get_function_output_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowSchema* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, byte**, int> GetFunctionOutputSchema;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, CArrowSchema*, byte**, int> GetFunctionOutputSchema;
 
     // (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
     //  tablefn_bind / tablefn_execute / tablefn_close below.)
@@ -123,7 +120,7 @@ public unsafe struct FabricatorVTable
     //                      const char* arg_constant, ArrowSchema* out_result, void** out_session, char** err)
     // It is the aggregate's BIND as well as its session open — one session per CALL SITE, which is what lets
     // the result type be resolved from the call's constant arguments.
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, nint, long, long, CArrowSchema*, nint*, byte**, int> AggOpen;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, byte*, nint, long, long, CArrowSchema*, nint*, byte**, int> AggOpen;
 
     // int32 agg_update(void* session, ArrowArray* batch, char** err)  -- batch = [int64 id ++ params]
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> AggUpdate;
@@ -151,7 +148,7 @@ public unsafe struct FabricatorVTable
 
     // int32 inout_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args /*nullable*/,
     //                  ArrowSchema* input_schema, ArrowArrayStream* out_schema, void** out_binding, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> InOutBind;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> InOutBind;
 
     // int32 inout_exchange_open(void* binding, ArrowArrayStream* input, ArrowArrayStream* output, char** err)
     // The two int params are the PROJECTION HINT: the output-column indices the caller reads (null/0 = all).
@@ -163,7 +160,7 @@ public unsafe struct FabricatorVTable
 
     // int32 tablefn_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args /*nullable*/,
     //                  ArrowArrayStream* out_schema, int* supports_pushdown, void** out_binding, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, int*, nint*, byte**, int> TableFnBind;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, CArrowArrayStream*, int*, nint*, byte**, int> TableFnBind;
 
     // int32 tablefn_execute(void* binding, const char* spec_json, ArrowArrayStream* filter_values,
     //                       ArrowArrayStream* out, int32* schema_may_change, char** err)   [v81]
@@ -242,9 +239,9 @@ public unsafe struct FabricatorVTable
     // SQL-GENERATING table function (v68): generate the replacement SQL for one call — the managed side of
     // DuckDB's bind_replace. handle == 0 => the global registry (schema/catalog_name empty); non-zero => the
     // catalog's, with catalog_name = the ATTACH alias. `args` (nullable) = the 1-row constant-arg batch.
-    // int32 generate_table_sql(void* handle, char* schema, char* func, char* catalog_name,
+    // int32 generate_table_sql(void* handle, char** schema_path, int32 schema_path_len, char* func, char* catalog_name,
     //                          ArrowArrayStream* args, char** out_sql, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, CArrowArrayStream*, byte**, byte**, int>
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, byte*, CArrowArrayStream*, byte**, byte**, int>
         GenerateTableSql;
 
     // int32 clear_session_settings(int64 session, char** err) (v69) — drop a closed DuckDB connection's
@@ -309,7 +306,7 @@ public unsafe struct FabricatorVTable
 
     // int32 lateral_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args /*nullable*/,
     //                    ArrowSchema* input_schema, ArrowArrayStream* out_schema, void** out_binding, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> LateralBind;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> LateralBind;
 
     // int32 lateral_open(void* binding, const int32_t* projected, int32_t projected_count,
     //                    void** out_session, char** err)

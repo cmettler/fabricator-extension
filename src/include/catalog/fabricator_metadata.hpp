@@ -23,11 +23,8 @@ struct FabricatorTableInfo {
 	//! The FULL schema path, outermost first — `["a","b"]` is schema `b` nested inside `a`. Depth 1 for
 	//! every provider that does not declare `supports_nested_schemas`.
 	vector<string> schema_path;
-	//! The LEAF schema name, i.e. `schema_path.back()` (empty for an empty path).
-	//! \warning KEPT BESIDE the path rather than replaced by it, deliberately: twenty consumers read this
-	//! field, and the ones that matter — functions, macros, views — resolve against the catalog's TOP-LEVEL
-	//! `schemas_` map and are correct exactly because they do not nest. Only table registration walks the
-	//! path. Replacing the field would have touched all twenty for no gain.
+	//! The LEAF schema name, i.e. `schema_path.back()` (empty for an empty path) — for messages only. Table
+	//! registration walks the path.
 	string schema_name;
 	string table_name;
 	string table_type; // "BASE TABLE" | "VIEW"
@@ -118,7 +115,8 @@ vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle);
 
 //! A discovered routine (function or procedure) — any provider, via catalog_functions.
 struct FabricatorFunctionInfo {
-	string schema_name;
+	//! The schema to register into, outermost first (v97). Resolved with FindSchemaPathLocked, never by leaf.
+	vector<string> schema_path;
 	string name;
 	string kind; // "scalar" | "table" | "proc" | "other"
 };
@@ -126,12 +124,12 @@ struct FabricatorFunctionInfo {
 //! Discovers user functions/procedures across all schemas (kind per FabricatorFunctionInfo).
 vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle);
 
-//! A provider-declared CATALOG-BOUND DuckDB macro: one complete CREATE MACRO statement to bind into
-//! `schema_name` of the attached catalog. The host parses `create_sql` with DuckDB's OWN parser (so the full
-//! macro grammar works) and OVERWRITES the parsed catalog/schema with this catalog's alias + schema_name — the
-//! opposite of the global registration, which rejects a qualified body outright.
+//! A provider-declared CATALOG-BOUND DuckDB macro: one complete CREATE MACRO statement to bind into the
+//! schema at `schema_path` of the attached catalog. The host parses `create_sql` with DuckDB's OWN parser (so
+//! the full macro grammar works) and OVERWRITES the parsed catalog/schema with this catalog's alias + that
+//! schema — the opposite of the global registration, which rejects a qualified body outright.
 struct FabricatorMacroInfo {
-	string schema_name;
+	vector<string> schema_path;
 	string name;
 	string create_sql;
 };
@@ -140,14 +138,14 @@ struct FabricatorMacroInfo {
 //! that does not serve the kind simply declares none, so the caller does not need its own guard.
 vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle);
 
-//! A provider-declared CATALOG-BOUND DuckDB view: one complete CREATE VIEW statement to bind into
-//! `schema_name` of the attached catalog. Parsed with DuckDB's OWN parser and re-qualified onto this
-//! catalog's alias + schema_name, exactly like a macro — the DIFFERENCE is what happens at BIND time:
+//! A provider-declared CATALOG-BOUND DuckDB view: one complete CREATE VIEW statement to bind into the
+//! schema at `schema_path` of the attached catalog. Parsed with DuckDB's OWN parser and re-qualified onto this
+//! catalog's alias + that schema, exactly like a macro — the DIFFERENCE is what happens at BIND time:
 //! DuckDB anchors a view body's search path to the VIEW's own catalog and schema, so an unqualified table
 //! reference inside `create_sql` resolves against THIS catalog. A macro body does not (it binds in the
 //! CALLER's context), which is why a view is the declaration form for a body that names provider tables.
 struct FabricatorViewInfo {
-	string schema_name;
+	vector<string> schema_path;
 	string name;
 	string create_sql;
 };
@@ -189,19 +187,22 @@ enum class FabricatorParamStyle : uint8_t {
 //! Resolves a scalar function's parameter names + DuckDB types from the Arrow schema of
 //! its (zero-row) param-schema stream — reuses the C# type mapping, no duplicate logic.
 //! When out_styles is given, it also reports each parameter's style (see FabricatorParamStyle).
-void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle,
+                              const vector<string> &schema_path,
                               const string &func_name, vector<string> &names, vector<LogicalType> &types,
                               vector<FabricatorParamStyle> *out_styles = nullptr);
 
 //! Resolves a scalar function's return type from its (single-field) return-schema stream. When
 //! out_volatile is given it also reads the volatility signal riding the result FIELD's metadata
 //! (fabricator.volatile = "0" => CONSISTENT/pure, constant-foldable; absent => VOLATILE, the default).
-LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle handle,
+                                    const vector<string> &schema_path,
                                     const string &func_name, bool *out_volatile = nullptr);
 
 //! Resolves a table-valued function's output column names + DuckDB types from the Arrow
 //! schema of its (zero-row) output-schema stream — reuses the C# type mapping.
-void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle,
+                               const vector<string> &schema_path,
                                const string &func_name, vector<string> &names, vector<LogicalType> &types);
 
 //! Resolves a table's column names + DuckDB types from the table session's `table_schema` stream (a

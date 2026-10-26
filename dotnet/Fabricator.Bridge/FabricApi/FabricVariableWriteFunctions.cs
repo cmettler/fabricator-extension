@@ -171,7 +171,7 @@ internal sealed class FabricCreateVariableLibraryFunction : ICatalogScalarFuncti
 
     internal FabricCreateVariableLibraryFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "create_variable_library";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -226,7 +226,7 @@ internal sealed class FabricSetVariableFunction : ICatalogScalarFunction
 
     internal FabricSetVariableFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "set_variable";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -287,7 +287,7 @@ internal sealed class FabricSetVariablesJsonFunction : ICatalogScalarFunction
 
     internal FabricSetVariablesJsonFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "set_variables_json";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -382,7 +382,7 @@ internal sealed class FabricSetVariableOverrideFunction : ICatalogScalarFunction
 
     internal FabricSetVariableOverrideFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "set_variable_override";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -447,7 +447,7 @@ internal sealed class FabricSetActiveValueSetFunction : ICatalogScalarFunction
 
     internal FabricSetActiveValueSetFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "set_active_value_set";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -488,7 +488,7 @@ internal sealed class FabricDropVariableLibraryFunction : ICatalogScalarFunction
 
     internal FabricDropVariableLibraryFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "drop_variable_library";
 
     public Schema Parameters { get; } = new Schema(new[]

@@ -263,7 +263,7 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
 
     internal FabricRefreshSqlEndpointFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "refresh_sql_endpoint";
 
     /// <summary>No positional arguments — everything comes from the ATTACH.</summary>
@@ -407,7 +407,7 @@ internal sealed class FabricCreateShortcutFunction : ICatalogScalarFunction
         Parameters = new Schema(fields, null);
     }
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name { get; }
 
     public Schema Parameters { get; }
@@ -483,7 +483,7 @@ internal sealed class FabricCreateShortcutJsonFunction : ICatalogScalarFunction
 
     internal FabricCreateShortcutJsonFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "create_shortcut_json";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -524,7 +524,7 @@ internal sealed class FabricDropShortcutFunction : ICatalogScalarFunction
 
     internal FabricDropShortcutFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "drop_shortcut";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -581,7 +581,7 @@ internal sealed class FabricListShortcutsFunction : ICatalogTableFunction
 
     internal FabricListShortcutsFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "list_shortcuts";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);

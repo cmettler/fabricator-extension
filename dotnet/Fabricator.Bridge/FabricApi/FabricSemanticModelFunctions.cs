@@ -61,7 +61,7 @@ internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
 
     internal FabricSemanticModelsFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "semantic_models";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
@@ -149,7 +149,7 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
 
     internal FabricRefreshSemanticModelFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "refresh_semantic_model";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("model") }, null);
@@ -289,7 +289,7 @@ internal sealed class FabricSemanticModelRefreshesFunction : ICatalogTableFuncti
 
     internal FabricSemanticModelRefreshesFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "semantic_model_refreshes";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("model") }, null);

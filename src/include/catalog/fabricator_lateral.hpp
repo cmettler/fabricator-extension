@@ -45,7 +45,7 @@ extern const char *const FabricatorBatchedLateralSetting;
 
 //! Build the registered TableFunction for one row-mapped provider function. Used by BOTH the load-time global
 //! registrar and the attach-time catalog path — they differ only in `handle`/`schema_name`.
-TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const string &schema_name,
+TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const vector<string> &schema_path,
                                            const string &func_name, vector<string> arg_names,
                                            vector<LogicalType> arg_types, vector<FabricatorParamStyle> arg_styles);
 

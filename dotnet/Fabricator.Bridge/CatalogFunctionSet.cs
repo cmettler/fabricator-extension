@@ -33,8 +33,8 @@ namespace Fabricator.Bridge;
 /// </summary>
 public sealed class CatalogFunctionSet
 {
-    /// <summary>Declare a function in every discovered schema of the catalog.</summary>
-    public const string AllSchemas = "__all__";
+    /// <summary>Declare a function in every discovered schema of the catalog, nested ones included.</summary>
+    public static readonly SchemaPath AllSchemas = new("__all__");
 
     private readonly Dictionary<string, ICatalogScalarFunction> _scalars;
     private readonly Dictionary<string, ICatalogTableFunction> _tables;
@@ -62,7 +62,7 @@ public sealed class CatalogFunctionSet
         _aggregates = Index(aggregates);
     }
 
-    // One indexer for all six: every catalog-bound interface carries SchemaName + Name, but they share no
+    // One indexer for all six: every catalog-bound interface carries SchemaPath + Name, but they share no
     // common base that declares both, so the key selectors are passed per kind by the callers below.
     private static Dictionary<string, T> Index<T>(IEnumerable<T>? items) where T : class
     {
@@ -74,15 +74,15 @@ public sealed class CatalogFunctionSet
         return map;
     }
 
-    private static string SchemaOf(object fn) => fn switch
+    private static SchemaPath SchemaOf(object fn) => fn switch
     {
-        ICatalogScalarFunction f => f.SchemaName,
-        ICatalogTableFunction f => f.SchemaName,
-        ICatalogSqlTableFunction f => f.SchemaName,
-        ICatalogInOutFunction f => f.SchemaName,
-        ICatalogLateralFunction f => f.SchemaName,
-        ICatalogCollectorFunction f => f.SchemaName,
-        ICatalogAggregateFunction f => f.SchemaName,
+        ICatalogScalarFunction f => f.SchemaPath,
+        ICatalogTableFunction f => f.SchemaPath,
+        ICatalogSqlTableFunction f => f.SchemaPath,
+        ICatalogInOutFunction f => f.SchemaPath,
+        ICatalogLateralFunction f => f.SchemaPath,
+        ICatalogCollectorFunction f => f.SchemaPath,
+        ICatalogAggregateFunction f => f.SchemaPath,
         _ => throw new ArgumentException($"not a catalog-bound function: {fn.GetType().Name}"),
     };
 
@@ -103,34 +103,34 @@ public sealed class CatalogFunctionSet
         _scalars.Count == 0 && _tables.Count == 0 && _sqlTables.Count == 0 && _inOut.Count == 0
         && _laterals.Count == 0 && _collectors.Count == 0 && _aggregates.Count == 0;
 
-    private static string Key(string schema, string name) => $"{schema}.{name}";
+    // Segments joined by a character no identifier contains, so ["a.b"] and ["a","b"] cannot share a key.
+    private static string Key(SchemaPath schema, string name) => string.Join("", schema) + "" + name;
 
     /// <summary>
-    /// The kind-6 declaration rows for this set, with <see cref="AllSchemas"/> expanded across
-    /// <paramref name="schemaNames"/> (evaluated lazily — a catalog that declares nothing must not pay for a
-    /// schema enumeration, which on OneLake is a storage round-trip).
+    /// The declarations of this set, with <see cref="AllSchemas"/> expanded across <paramref name="schemaPaths"/>
+    /// (evaluated lazily — a catalog that declares nothing must not pay for a schema enumeration, which on
+    /// OneLake is a storage round-trip).
     /// </summary>
-    public IEnumerable<FunctionsMetadata.Declaration> Declarations(Func<IReadOnlyList<string>> schemaNames)
+    public IEnumerable<FunctionDeclaration> Declarations(Func<IReadOnlyList<SchemaPath>> schemaPaths)
     {
         if (IsEmpty)
         {
-            return System.Array.Empty<FunctionsMetadata.Declaration>();
+            return System.Array.Empty<FunctionDeclaration>();
         }
-        var rows = new List<FunctionsMetadata.Declaration>();
-        IReadOnlyList<string>? schemas = null;
-        void Emit(string declaredSchema, string name, string kind, int paramCount, string returnType,
+        var rows = new List<FunctionDeclaration>();
+        IReadOnlyList<SchemaPath>? schemas = null;
+        void Emit(SchemaPath declaredSchema, string name, string kind, int paramCount, string returnType,
                   string varArgs = "")
         {
-            if (!string.Equals(declaredSchema, AllSchemas, StringComparison.Ordinal))
+            if (declaredSchema != AllSchemas)
             {
-                rows.Add(new FunctionsMetadata.Declaration(declaredSchema, name, kind, paramCount, returnType,
-                                                           varArgs));
+                rows.Add(new FunctionDeclaration(declaredSchema, name, kind, paramCount, returnType, varArgs));
                 return;
             }
-            schemas ??= schemaNames();
+            schemas ??= schemaPaths();
             foreach (var s in schemas)
             {
-                rows.Add(new FunctionsMetadata.Declaration(s, name, kind, paramCount, returnType, varArgs));
+                rows.Add(new FunctionDeclaration(s, name, kind, paramCount, returnType, varArgs));
             }
         }
         foreach (var f in _scalars.Values)
@@ -138,34 +138,34 @@ public sealed class CatalogFunctionSet
             // "ANY" when the function declares no fixed return type (resolved per call site at scalarfn_bind).
             // ⚠ DeclaredCount, not FieldsList.Count: a variadic scalar must report its MINIMUM arity, and
             // the two differ by exactly the tail field.
-            Emit(f.SchemaName, f.Name, "scalar", Params.DeclaredCount(f.Parameters),
+            Emit(f.SchemaPath, f.Name, "scalar", Params.DeclaredCount(f.Parameters),
                  f.Result?.DataType.Name ?? "ANY", Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _tables.Values)
         {
-            Emit(f.SchemaName, f.Name, "table", Params.DeclaredCount(f.Parameters), "",
+            Emit(f.SchemaPath, f.Name, "table", Params.DeclaredCount(f.Parameters), "",
                  Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _sqlTables.Values)
         {
-            Emit(f.SchemaName, f.Name, "table_sql", Params.DeclaredCount(f.Parameters), "",
+            Emit(f.SchemaPath, f.Name, "table_sql", Params.DeclaredCount(f.Parameters), "",
                  Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _inOut.Values)
         {
-            Emit(f.SchemaName, f.Name, "inout", Params.DeclaredCount(f.Parameters), "",
+            Emit(f.SchemaPath, f.Name, "inout", Params.DeclaredCount(f.Parameters), "",
                  Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _laterals.Values)
         {
             // DeclaredCount counts positional + named, which for a lateral function is exactly its argument
             // count: its positional parameters ARE the per-row input columns and each occupies an arg slot.
-            Emit(f.SchemaName, f.Name, "lateral", Params.DeclaredCount(f.Parameters), "",
+            Emit(f.SchemaPath, f.Name, "lateral", Params.DeclaredCount(f.Parameters), "",
                  Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _collectors.Values)
         {
-            Emit(f.SchemaName, f.Name, "collector", Params.DeclaredCount(f.Parameters), "",
+            Emit(f.SchemaPath, f.Name, "collector", Params.DeclaredCount(f.Parameters), "",
                  Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _aggregates.Values)
@@ -174,7 +174,7 @@ public sealed class CatalogFunctionSet
             // so external GROUP BY can spill it) — the host picks the callback set from this kind.
             // An aggregate cannot declare a tail (refused at registration), so VarArgsTypeName is always
             // empty here — passed anyway so the row is built the same way as every other kind's.
-            Emit(f.SchemaName, f.Name, f.SupportsSpill ? "aggregate_spill" : "aggregate",
+            Emit(f.SchemaPath, f.Name, f.SupportsSpill ? "aggregate_spill" : "aggregate",
                  // ⚠ NULL Result = "resolved per call site" (ABI v89); this column is diagnostic, so report
                  // nothing rather than dereferencing — a throw here fails the whole functions listing.
                  Params.DeclaredCount(f.Parameters), f.Result?.DataType.Name ?? string.Empty,
@@ -183,28 +183,28 @@ public sealed class CatalogFunctionSet
         return rows;
     }
 
-    private bool TryGet<T>(Dictionary<string, T> map, string schema, string func, out T fn) =>
+    private bool TryGet<T>(Dictionary<string, T> map, SchemaPath schema, string func, out T fn) =>
         map.TryGetValue(Key(schema, func), out fn!) || map.TryGetValue(Key(AllSchemas, func), out fn!);
 
-    public bool TryScalar(string schema, string func, out ICatalogScalarFunction fn) =>
+    public bool TryScalar(SchemaPath schema, string func, out ICatalogScalarFunction fn) =>
         TryGet(_scalars, schema, func, out fn);
 
-    public bool TryTable(string schema, string func, out ICatalogTableFunction fn) =>
+    public bool TryTable(SchemaPath schema, string func, out ICatalogTableFunction fn) =>
         TryGet(_tables, schema, func, out fn);
 
-    public bool TrySqlTable(string schema, string func, out ICatalogSqlTableFunction fn) =>
+    public bool TrySqlTable(SchemaPath schema, string func, out ICatalogSqlTableFunction fn) =>
         TryGet(_sqlTables, schema, func, out fn);
 
-    public bool TryInOut(string schema, string func, out ICatalogInOutFunction fn) =>
+    public bool TryInOut(SchemaPath schema, string func, out ICatalogInOutFunction fn) =>
         TryGet(_inOut, schema, func, out fn);
 
-    public bool TryLateral(string schema, string func, out ICatalogLateralFunction fn) =>
+    public bool TryLateral(SchemaPath schema, string func, out ICatalogLateralFunction fn) =>
         TryGet(_laterals, schema, func, out fn);
 
-    public bool TryCollector(string schema, string func, out ICatalogCollectorFunction fn) =>
+    public bool TryCollector(SchemaPath schema, string func, out ICatalogCollectorFunction fn) =>
         TryGet(_collectors, schema, func, out fn);
 
-    public bool TryAggregate(string schema, string func, out ICatalogAggregateFunction fn) =>
+    public bool TryAggregate(SchemaPath schema, string func, out ICatalogAggregateFunction fn) =>
         TryGet(_aggregates, schema, func, out fn);
 
     // ---- the ABI members, as one-liners a hosting catalog can forward to ------------------------------
@@ -213,7 +213,7 @@ public sealed class CatalogFunctionSet
     // did inline, which only matters if one name were registered under two kinds — itself a bug.
 
     /// <summary>Argument schema for any kind that has one. Returns null when the name is not ours.</summary>
-    public Schema? ParamSchema(string schema, string func)
+    public Schema? ParamSchema(SchemaPath schema, string func)
     {
         if (TryScalar(schema, func, out var s)) { return s.Parameters; }
         // ONE schema per function, each field already carrying its style — nothing to combine here any more.
@@ -247,7 +247,7 @@ public sealed class CatalogFunctionSet
     /// result is returned UNTAGGED — volatility is a scalar-only notion (a folded aggregate makes no sense), and
     /// tagging it would advertise a property the host would then act on.
     /// </summary>
-    public Schema? ReturnSchema(string schema, string func)
+    public Schema? ReturnSchema(SchemaPath schema, string func)
     {
         if (TryScalar(schema, func, out var fn))
         {
@@ -262,14 +262,14 @@ public sealed class CatalogFunctionSet
 
     /// <summary>The scalar DEFINITION, or null when this set declares no such function — the host binds it
     /// per call site (<see cref="IProviderCatalog.GetScalarFunction"/>).</summary>
-    public ICatalogScalarFunction? Scalar(string schema, string func) =>
+    public ICatalogScalarFunction? Scalar(SchemaPath schema, string func) =>
         TryScalar(schema, func, out var fn) ? fn : null;
 
     /// <summary>
     /// Output schema of a table function, resolved from its constant args — this is the whole reason the
     /// Bind→Binding model exists, so the binding is built and immediately disposed rather than cached.
     /// </summary>
-    public Schema? OutputSchema(string schema, string func, RecordBatch? args)
+    public Schema? OutputSchema(SchemaPath schema, string func, RecordBatch? args)
     {
         if (!TryTable(schema, func, out var fn))
         {
@@ -284,7 +284,7 @@ public sealed class CatalogFunctionSet
     /// result BY NAME (the flag is projection mapping, NOT SQL pushdown — see
     /// <see cref="TableFunctionBindingAdapter"/>).
     /// </summary>
-    public ITableFunctionSession? TableFnBind(string schema, string func, RecordBatch? args) =>
+    public ITableFunctionSession? TableFnBind(SchemaPath schema, string func, RecordBatch? args) =>
         TryTable(schema, func, out var fn)
             ? new TableFunctionBindingAdapter(fn.Bind(args!), supportsPushdown: true)
             : null;
@@ -294,7 +294,7 @@ public sealed class CatalogFunctionSet
     /// call (bind_replace). BIND-time only and possibly repeated, so a generator must be deterministic and
     /// side-effect-free. Null when the name is not ours.
     /// </summary>
-    public string? GenerateTableSql(string schema, string func, SqlGenContext ctx, RecordBatch? args) =>
+    public string? GenerateTableSql(SchemaPath schema, string func, SqlGenContext ctx, RecordBatch? args) =>
         TrySqlTable(schema, func, out var fn) ? SqlGen.Generate(fn, ctx, args) : null;
 
     /// <summary>
@@ -303,7 +303,7 @@ public sealed class CatalogFunctionSet
     /// name is not ours. A caller that honours isolation applies it to the returned binding itself — the level
     /// is provider state, not something this set knows.
     /// </summary>
-    public IInOutFunctionBinding? InOutBind(string schema, string func, RecordBatch? args, Schema inputSchema)
+    public IInOutFunctionBinding? InOutBind(SchemaPath schema, string func, RecordBatch? args, Schema inputSchema)
     {
         if (TryCollector(schema, func, out var collector))
         {
@@ -317,7 +317,7 @@ public sealed class CatalogFunctionSet
     /// <see cref="InOutBind"/> on purpose: the two answer different ABI entries and their bindings have
     /// different contracts (an in-out echoes its input, a lateral function does not).
     /// </summary>
-    public ILateralFunctionBinding? LateralBind(string schema, string func, RecordBatch? args, Schema inputSchema)
+    public ILateralFunctionBinding? LateralBind(SchemaPath schema, string func, RecordBatch? args, Schema inputSchema)
     {
         if (!TryLateral(schema, func, out var fn))
         {
@@ -333,6 +333,6 @@ public sealed class CatalogFunctionSet
     /// Opens an aggregate session mapping DuckDB's per-group int64 state ids to live C# accumulators. Null when
     /// the name is not ours.
     /// </summary>
-    public IAggregateSession? AggOpen(string schema, string func) =>
+    public IAggregateSession? AggOpen(SchemaPath schema, string func) =>
         TryAggregate(schema, func, out var fn) ? new AggregateSession(fn) : null;
 }

@@ -91,13 +91,12 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 96;
+        vtable->AbiVersion = 97;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
         vtable->FreeError = &FreeError;
         vtable->ExecuteDml = &ExecuteDml;
-        vtable->BulkInsert = &BulkInsert;
         vtable->ExecuteDelete = &ExecuteDelete;
         vtable->ExecuteUpdate = &ExecuteUpdate;
         vtable->CreateTable = &CreateTable;
@@ -366,44 +365,15 @@ public static unsafe class Bootstrap
         }
     }
 
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int BulkInsert(nint handle, byte* schema, byte* table, int createTable, int replace,
-                                  CArrowArrayStream* input, long* affected, byte** err)
-    {
-        try
-        {
-            if (input is null)
-            {
-                return FabricatorStatus.InvalidArgument;
-            }
-            var catalog = Handles.Resolve<IProviderCatalog>(handle)
-                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
-
-            // We take ownership of the C stream (consume + release on dispose).
-            var stream = CArrowArrayStreamImporter.ImportArrayStream(input);
-            long rows = catalog.BulkInsert(schemaName, tableName, stream, createTable != 0, replace != 0,
-                                           checkConstraints: false, txnId: AmbientTransaction.Current,
-                                           partitionColumns: null, sortColumns: null, schemaMode: null,
-                                           partitionOverwrite: false, optionsJson: null);
-            if (affected is not null)
-            {
-                *affected = rows;
-            }
-            return FabricatorStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return FabricatorStatus.Error;
-        }
-    }
-
     /// <summary>Copies a schema PATH argument (ABI v91/v92) out of the host's borrowed UTF-8 pointers.</summary>
     /// <remarks>⚠ COPIED, not aliased: the pointers belong to the host and are valid for the call only,
     /// while every provider holds the names it is given (on an ITable, in a log line, in a path it
     /// caches). Depth 1 for every provider that does not declare <c>supports_nested_schemas</c>.</remarks>
+    /// <summary>The schema path of a CATALOG function (ABI v97). Never empty: a global function crosses with
+    /// handle 0 and is resolved before its path is read.</summary>
+    private static SchemaPath FunctionSchemaPath(byte** schemaPath, int schemaPathLen) =>
+        new(ReadSchemaPath(schemaPath, schemaPathLen));
+
     private static string[] ReadSchemaPath(byte** schemaPath, int schemaPathLen)
     {
         var path = new string[schemaPathLen < 0 ? 0 : schemaPathLen];
@@ -508,11 +478,11 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogFunctions(nint handle, CArrowArrayStream* outStream, byte** err) =>
-        CatalogList(handle, outStream, err, "catalog_functions", c => c.GetFunctions());
+        CatalogList(handle, outStream, err, "catalog_functions", c => FunctionsMetadata.Stream(c.GetFunctions()));
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogMacros(nint handle, CArrowArrayStream* outStream, byte** err) =>
-        CatalogList(handle, outStream, err, "catalog_macros", c => c.GetMacros());
+        CatalogList(handle, outStream, err, "catalog_macros", c => CatalogMacroMetadata.Stream(c.GetMacros()));
 
     // The provider init hook (v78). Unlike the CatalogList entries this returns no stream — it exists purely
     // so a provider can do context-requiring setup at a DEFINED point, and its failure is reported so the
@@ -546,7 +516,7 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogViews(nint handle, CArrowArrayStream* outStream, byte** err) =>
-        CatalogList(handle, outStream, err, "catalog_views", c => c.GetViews());
+        CatalogList(handle, outStream, err, "catalog_views", c => CatalogViewMetadata.Stream(c.GetViews()));
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogServerInfo(nint handle, CArrowArrayStream* outStream, byte** err) =>
@@ -1188,7 +1158,7 @@ public static unsafe class Bootstrap
     // BIND-time only; no data path. handle == 0 => the global registry; non-zero => the catalog's, with
     // catalogName = the DuckDB ATTACH alias so a catalog-bound generator can qualify references back into it.
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GenerateTableSql(nint handle, byte* schema, byte* func, byte* catalogName,
+    private static int GenerateTableSql(nint handle, byte** schemaPath, int schemaPathLen, byte* func, byte* catalogName,
                                        CArrowArrayStream* args, byte** outSql, byte** err)
     {
         try
@@ -1209,7 +1179,7 @@ public static unsafe class Bootstrap
                 : (Handles.Resolve<IProviderCatalog>(handle)
                    ?? throw new InvalidOperationException(
                        $"fabricator: generate_table_sql got a stale catalog handle for '{f}'"))
-                    .GenerateTableSql(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f,
+                    .GenerateTableSql(FunctionSchemaPath(schemaPath, schemaPathLen), f,
                                       Marshal.PtrToStringUTF8((nint)catalogName) ?? string.Empty, argsBatch);
             *outSql = (byte*)Marshal.StringToCoTaskMemUTF8(sql); // host frees via free_error
             return FabricatorStatus.Ok;
@@ -1433,7 +1403,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GetFunctionParamSchema(nint handle, byte* schema, byte* func, CArrowSchema* outSchema,
+    private static int GetFunctionParamSchema(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowSchema* outSchema,
                                               byte** err)
     {
         try
@@ -1453,7 +1423,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.Ok;
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var s = FunctionSchemaPath(schemaPath, schemaPathLen);
             ArrowSchemaExport.Export(catalog.GetFunctionParamSchema(s, f), outSchema);
             return FabricatorStatus.Ok;
         }
@@ -1465,7 +1435,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GetFunctionReturnSchema(nint handle, byte* schema, byte* func, CArrowSchema* outSchema,
+    private static int GetFunctionReturnSchema(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowSchema* outSchema,
                                                byte** err)
     {
         try
@@ -1481,7 +1451,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.Ok;
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var s = FunctionSchemaPath(schemaPath, schemaPathLen);
             CArrowSchemaExporter.ExportSchema(catalog.GetFunctionReturnSchema(s, f), outSchema);
             return FabricatorStatus.Ok;
         }
@@ -1498,7 +1468,7 @@ public static unsafe class Bootstrap
     // Mirrors TableFnBind / TableFnExecute / TableFnClose.
     // -------------------------------------------------------------------------
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ScalarFnBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+    private static int ScalarFnBind(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowArrayStream* args,
                                     byte* argConstant, nint opener, long session, long txn,
                                     CArrowSchema* outSchema, nint* outBinding, byte** err)
     {
@@ -1529,16 +1499,23 @@ public static unsafe class Bootstrap
             }
             var bindArgs = new ScalarBindArgs(argsBatch, constant);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             // The catalog RESOLVES the definition; the HOST binds it — the GetTable split. handle == 0 => a
             // connection-free GLOBAL scalar, resolved from the global registry by name (which throws by name
-            // when unregistered, so only the catalog branch can answer null).
-            var fn = handle == 0
-                ? GlobalFunctions.ResolveScalar(f)
-                : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                      .GetScalarFunction(schemaName, f)
-                  ?? throw new NotSupportedException(
-                      $"fabricator: no scalar function '{schemaName}.{f}' in this catalog");
+            // when unregistered, so only the catalog branch can answer null). It crosses with an EMPTY path, so the
+            // path is read on the catalog branch only.
+            IScalarFunction fn;
+            if (handle == 0)
+            {
+                fn = GlobalFunctions.ResolveScalar(f);
+            }
+            else
+            {
+                var path = FunctionSchemaPath(schemaPath, schemaPathLen);
+                fn = (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                         .GetScalarFunction(path, f)
+                     ?? throw new NotSupportedException(
+                         $"fabricator: no scalar function {path}.\"{f}\" in this catalog");
+            }
             var bound = new ScalarBindingHandle(fn, fn.Bind(bindArgs));
             // Export the resolved result as a BARE ArrowSchema — the carrier get_function_return_schema uses.
             // ⚠ NOT tablefn_bind's zero-row stream: reading a stream's schema host-side goes through
@@ -1601,7 +1578,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GetFunctionOutputSchema(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+    private static int GetFunctionOutputSchema(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowArrayStream* args,
                                                CArrowSchema* outSchema, byte** err)
     {
         try
@@ -1611,7 +1588,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.InvalidArgument;
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var s = FunctionSchemaPath(schemaPath, schemaPathLen);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // `args` (nullable) is a 1-row stream of the constant call args — a custom table function's output
             // schema may depend on them. Discovered SQL functions ignore it.
@@ -1638,7 +1615,7 @@ public static unsafe class Bootstrap
     //  every `_each` form now runs on the streaming exchange: InOutBind / InOutExchangeOpen / InOutBindClose.)
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args, CArrowSchema* inputSchema,
+    private static int InOutBind(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowArrayStream* args, CArrowSchema* inputSchema,
                                  CArrowArrayStream* outSchema, nint* outBinding, byte** err)
     {
         try
@@ -1661,7 +1638,7 @@ public static unsafe class Bootstrap
             var binding = handle == 0
                 ? GlobalFunctions.ResolveInOut(f, argsBatch, inSchema)
                 : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                    .InOutBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch, inSchema);
+                    .InOutBind(FunctionSchemaPath(schemaPath, schemaPathLen), f, argsBatch, inSchema);
             // Export the binding's full output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
                 new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
@@ -1732,7 +1709,7 @@ public static unsafe class Bootstrap
     // --- row-mapped (correlated LATERAL) functions, ABI v79. See ILateralFunction + LateralExchange. ---
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int LateralBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+    private static int LateralBind(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowArrayStream* args,
                                    CArrowSchema* inputSchema, CArrowArrayStream* outSchema, nint* outBinding,
                                    byte** err)
     {
@@ -1755,7 +1732,7 @@ public static unsafe class Bootstrap
             var binding = handle == 0
                 ? GlobalFunctions.ResolveLateral(f, argsBatch, inSchema)
                 : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                    .LateralBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch, inSchema);
+                    .LateralBind(FunctionSchemaPath(schemaPath, schemaPathLen), f, argsBatch, inSchema);
             var bound = new LateralBindingHandle(binding, f, inSchema);
             // The host binds its RETURN TYPES from this: the function's own columns, WITHOUT the provenance
             // column (which is transport, not a result column).
@@ -1866,7 +1843,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableFnBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+    private static int TableFnBind(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowArrayStream* args,
                                  CArrowArrayStream* outSchema, int* supportsPushdown, nint* outBinding, byte** err)
     {
         try
@@ -1887,7 +1864,7 @@ public static unsafe class Bootstrap
             var bound = handle == 0
                 ? GlobalFunctions.ResolveTable(f, argsBatch)
                 : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                    .TableFnBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch);
+                    .TableFnBind(FunctionSchemaPath(schemaPath, schemaPathLen), f, argsBatch);
             // Export the binding's output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
                 new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
@@ -2314,7 +2291,7 @@ public static unsafe class Bootstrap
         new(new[] { new Field("slot", Int64Type.Default, false), new Field("source", BinaryType.Default, true) }, null);
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int AggOpen(nint handle, byte* schema, byte* func, CArrowArrayStream* args, byte* argConstant,
+    private static int AggOpen(nint handle, byte** schemaPath, int schemaPathLen, byte* func, CArrowArrayStream* args, byte* argConstant,
                                nint opener, long session, long txn, CArrowSchema* outResult, nint* outSession,
                                byte** err)
     {
@@ -2352,7 +2329,7 @@ public static unsafe class Bootstrap
             var aggSession = handle == 0
                 ? GlobalFunctions.ResolveAggregate(f, bindArgs)
                 : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                    .AggOpen(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, bindArgs);
+                    .AggOpen(FunctionSchemaPath(schemaPath, schemaPathLen), f, bindArgs);
             // ⚠ A session that resolved nothing reports the Arrow NULL sentinel, which the host reads as
             // "the declared type stands" — so the default path costs one exported schema and no decision.
             var resultField = aggSession.ResolvedResult ?? new Field("result", NullType.Default, nullable: true);

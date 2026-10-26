@@ -12,6 +12,49 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v97 (2026-10-26) — every catalog object takes a SCHEMA PATH: functions, macros, views (nested schemas, slice 2d)
+
+v90–v92 nested TABLES; this version nests everything else a provider declares. BREAKING for providers and
+plugins, no aliases (user decision: "wir brauchen auf rückwärtskompatibilität nicht zu achten").
+
+- **Wire.** `catalog_functions`, `catalog_macros` and `catalog_views` lead with a `LIST<VARCHAR>` `schema_path`
+  (outermost first) instead of one schema name. The nine per-function entries — `get_function_param_schema`,
+  `get_function_return_schema`, `get_function_output_schema`, `scalarfn_bind`, `agg_open`, `inout_bind`,
+  `tablefn_bind`, `generate_table_sql`, `lateral_bind` — swap `const char *schema` for
+  `const char *const *schema_path, int32_t schema_path_len`. A GLOBAL function crosses with handle 0 and an
+  EMPTY path. The dead `bulk_insert` entry (no C++ caller since the streaming bulk path, v16) is removed —
+  `IProviderCatalog.BulkInsert` stays and is reached through `begin_bulk`, which carries a path since v92.
+- **Managed contract.** A new `SchemaPath` type (Abstractions): implicit from `string`, ordinal structural
+  equality, `Leaf`/`Depth`/`Child`. `IProviderCatalog` returns TYPED declarations — `GetFunctions()`
+  (`FunctionDeclaration`), `GetMacros()` (`CatalogMacroDefinition`), `GetViews()` (`ViewDefinition`) — and the
+  Bridge builds the Arrow streams, so no provider writes discovery Arrow any more. Every catalog function
+  interface declares `SchemaPath SchemaPath` (was `string SchemaName`), and the nine function members take a
+  `SchemaPath`. `CatalogFunctionSet.AllSchemas` (`__all__`) expands over every NESTED level on Delta
+  (`DataSchemaPaths`).
+  - ⚠⚠ **THE IMPLICIT CONVERSION IS A TRAP FOR PLUGINS:** a member still declared with a `string` schema
+    COMPILES — it simply no longer implements the interface, and the DIM default (which throws "not hosted")
+    answers instead. Retype by script, then let the compiler report the conversions; do not trust a green build.
+  - SQL Server and DAX do not nest; their members take the path and refuse a depth ≠ 1 by name.
+- **Host.** Declarations register at their PATH (`FindSchemaPathLocked`, creates nothing — a filtered-out
+  schema stays out), never by leaf; every catalog entry is qualified with the full path
+  (`SchemaCatalogEntry::GetQualifiedName`), which at depth 1 is byte-identical to before.
+  `fabricator_invalidate_cache(cat, regex)` tries the pattern against the bare name AND `a.b.name`, so a
+  pattern can name one branch of the tree; a bare pattern means what it always meant.
+- **⚠⚠ TWO DuckDB 2.0 BUGS SURFACED, both SILENT, both measured on native DuckDB with no extension**
+  (docs/duckdb-upstream-issues.md §12, §13), and the host works around both because the catalog cannot be
+  given the information any other way:
+  - a VIEW body binds against `ParentSchema().name` — the LEAF — so an unqualified name in `cat.sales.eu.v`
+    read `cat.eu`'s table. ⇒ `QualifyNestedViewBody` qualifies the body at materialization (tables unless a
+    CTE; functions/macros only when this schema declares them, so built-ins are untouched), depth ≥ 2 only.
+  - `PhysicalPlanGenerator::CreatePlan(LogicalCreateTable)` checks for an existing table by the LEAF schema,
+    so a CTAS into `cat.sales.eu.t` while `cat.eu.t` exists planned a bare CREATE and DROPPED THE QUERY — an
+    empty table and a successful statement. ⇒ an optimizer extension replaces a nested CTAS with
+    `FabricatorNestedCtasOperator`, which repeats the planner's decision with the existence check asked of the
+    schema entry. ⚠ It rides the optimizer: `PRAGMA disable_optimizer` brings the upstream behaviour back.
+- Gate: `verify_delta_nested_schemas` §12 (94 → 143), three mutants each killed at its own row (the view
+  rewrite :446, the CTAS operator :465, the qualified invalidation :522). `fabricator_functions()` reports
+  `schema_path` instead of `schema_name`; three suites follow.
+
 ## v96 (2026-10-25) — `remote_translate`: a pushed query as a Substrait plan
 
 Appended to the vtable: `remote_translate(catalog, plan, plan_len, out_json, err)`. DuckDB 2.0's remote optimizer

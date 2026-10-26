@@ -66,7 +66,8 @@ namespace {
 //! Static info attached to the registered TableFunction (the provider identity + the declared signature).
 struct LateralFunctionInfo : public TableFunctionInfo {
 	FabricatorHandle handle = nullptr;
-	string schema;
+	//! The function's schema, outermost first (ABI v97); EMPTY for a global (connection-free) function.
+	vector<string> schema_path;
 	string func;
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
@@ -85,7 +86,8 @@ struct LateralBindingHolder {
 
 struct LateralBindData : public TableFunctionData {
 	FabricatorHandle handle = nullptr;
-	string schema;
+	//! The function's schema, outermost first (ABI v97); EMPTY for a global (connection-free) function.
+	vector<string> schema_path;
 	string func;
 	//! The per-row INPUT columns — the function's positional parameters as DuckDB resolved them from the
 	//! argument expressions (input_table_types), MINUS any bind-time CONSTANT slots (those never reach the
@@ -364,7 +366,7 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	auto &info = input.info->Cast<LateralFunctionInfo>();
 	auto bind_data = make_uniq<LateralBindData>();
 	bind_data->handle = info.handle;
-	bind_data->schema = info.schema;
+	bind_data->schema_path = info.schema_path;
 	bind_data->func = info.func;
 	bind_data->holder = make_shared_ptr<LateralBindingHolder>();
 
@@ -520,7 +522,7 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	ArrowArrayStream out_schema;
 	std::memset(&out_schema, 0, sizeof(out_schema));
 	bind_data->holder->binding =
-	    fabricator::LateralBind(info.handle, info.schema, info.func, args_ptr, input_schema, out_schema);
+	    fabricator::LateralBind(info.handle, info.schema_path, info.func, args_ptr, input_schema, out_schema);
 
 	ArrowSchemaWrapper schema_root;
 	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
@@ -949,7 +951,7 @@ void LateralOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 
 } // namespace
 
-TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const string &schema_name,
+TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const vector<string> &schema_path,
                                            const string &func_name, vector<string> arg_names,
                                            vector<LogicalType> arg_types, vector<FabricatorParamStyle> arg_styles) {
 	TableFunction tf(Identifier(func_name), {}, nullptr, LateralBind, nullptr, LateralInitLocal);
@@ -1025,7 +1027,7 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 		sig.AddKeywordOnly(Identifier(n.first), n.second, Value());
 	}
 	info->handle = handle;
-	info->schema = schema_name;
+	info->schema_path = schema_path;
 	info->func = func_name;
 	info->arg_names = std::move(arg_names);
 	info->arg_types = std::move(arg_types);

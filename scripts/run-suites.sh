@@ -960,7 +960,10 @@ case "$TIER" in
         # 2026-10-26: 10765 -> 10785. verify_merge_into 235 -> 245 per engine leg: a MERGE whose NOT MATCHED INSERT
         #   targets a non-default schema (the insert leg once sent an EMPTY schema path, and Delta then wrote the
         #   row into a new table under main).
-        : "${MIN_ASSERTIONS:=10785}"
+        # 2026-10-26: 10785 -> 10834. verify_delta_nested_schemas 94 -> 143 (ABI v97): functions, macros and views
+        #   resolve at depth 2, a nested view body binds against its own path, a nested CTAS keeps its rows when the
+        #   leaf names an existing table, and scoped invalidation matches the qualified name.
+        : "${MIN_ASSERTIONS:=10834}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

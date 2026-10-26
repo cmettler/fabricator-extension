@@ -88,7 +88,7 @@ public sealed class DeltaSnapshotsFunction : ICatalogTableFunction
 
     public DeltaSnapshotsFunction(Func<string, IArrowArrayStream> open) => _open = open;
 
-    public string SchemaName => DeltaFunctions.SchemaName;
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
     public string Name => "snapshots";
 
     public Schema Parameters { get; } = new(new[]
@@ -127,7 +127,7 @@ public sealed class DeltaChangesFunction : ICatalogTableFunction
     public DeltaChangesFunction(Func<string, long?, long?, DateTime?, DateTime?, IArrowArrayStream> open)
         => _open = open;
 
-    public string SchemaName => DeltaFunctions.SchemaName;
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
     public string Name => "changes";
 
     private static readonly TimestampType TsType = new(TimeUnit.Microsecond, (string?)null);
@@ -175,7 +175,7 @@ public sealed class DeltaTblPropertiesFunction : ICatalogTableFunction
 
     public DeltaTblPropertiesFunction(Func<string, IArrowArrayStream> read) => _read = read;
 
-    public string SchemaName => DeltaFunctions.SchemaName;
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
     public string Name => "tblproperties";
 
     public Schema Parameters { get; } = new(new[]
@@ -200,7 +200,7 @@ public sealed class DeltaSetTblPropertiesFunction : ICatalogTableFunction
 
     public DeltaSetTblPropertiesFunction(Func<string, string, IArrowArrayStream> set) => _set = set;
 
-    public string SchemaName => DeltaFunctions.SchemaName;
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
     public string Name => "set_tblproperties";
 
     public Schema Parameters { get; } = new(new[]
@@ -239,7 +239,7 @@ public sealed class DeltaCheckpointFunction : ICatalogTableFunction
 
     public DeltaCheckpointFunction(Func<string, IArrowArrayStream> checkpoint) => _checkpoint = checkpoint;
 
-    public string SchemaName => DeltaFunctions.SchemaName;
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
     public string Name => "checkpoint";
 
     public Schema Parameters { get; } = new(new[]
@@ -263,7 +263,7 @@ public sealed class DeltaGetTxnVersionFunction : ICatalogTableFunction
 
     public DeltaGetTxnVersionFunction(Func<string, string, IArrowArrayStream> get) => _get = get;
 
-    public string SchemaName => DeltaFunctions.SchemaName;
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
     public string Name => "get_transaction_version";
 
     public Schema Parameters { get; } = new(new[]
@@ -299,7 +299,7 @@ public sealed class DeltaSetTxnVersionFunction : ICatalogTableFunction
 
     public DeltaSetTxnVersionFunction(Func<string, string, long, long?, IArrowArrayStream> set) => _set = set;
 
-    public string SchemaName => DeltaFunctions.SchemaName;
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
     public string Name => "set_transaction_version";
 
     public Schema Parameters { get; } = new(new[]

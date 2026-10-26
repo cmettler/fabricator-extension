@@ -1,7 +1,8 @@
 # name: test/verify_delta_nested_schemas.test
 # description: Delta folder-as-catalog with the `schemas 'nested'` ATTACH option — the directory tree UNDER the
 #              root IS the schema tree, to any depth (DuckDB 2.0 nested schemas), so <root>/sales/eu/deep resolves
-#              as cat.sales.eu.deep. READS and WRITES both nest since ABI v92; §7 re-reads the deep table through a
+#              as cat.sales.eu.deep. READS and WRITES both nest since ABI v92, and since v97 so do the declared
+#              functions, macros and views (§12); §7 re-reads the deep table through a
 #              sub-root attached FLAT, which is what proves a nested write landed in the right directory rather than
 #              one level too shallow. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base. Local FS.
 # group: [fabricator]
@@ -368,3 +369,182 @@ statement error
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS bad2 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
 ----
 use schemas 'nested'
+
+# ── §12 EVERY CATALOG OBJECT NESTS, not only tables (ABI v97). The functions, macros and views a provider
+#    declares are registered at their schema PATH, so `cat.sales.eu.fab_pct()` resolves. The fixture puts a
+#    top-level `eu` BESIDE `sales.eu` on purpose: under nesting the leaf is exactly what is NOT unique, and two
+#    of the assertions below are only discriminating because the leaf names a different schema.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/fx' AS fx1 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+statement ok
+CREATE SCHEMA fx1.sales;
+
+statement ok
+CREATE SCHEMA fx1.eu;
+
+statement ok
+CREATE TABLE fx1.eu.fab_view_source AS SELECT 'top eu' AS who;
+
+statement ok
+DETACH fx1;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/fx/sales' AS fx2 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+statement ok
+CREATE SCHEMA fx2.eu;
+
+statement ok
+CREATE TABLE fx2.eu.fab_view_source AS SELECT 'nested sales.eu' AS who;
+
+statement ok
+DETACH fx2;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/fx' AS fx (TYPE fabricator, PROVIDER 'delta', schemas 'nested');
+
+# The discovery wire carries the PATH: one declaration per level, the depth-2 one included.
+query II
+SELECT schema_path, kind FROM fabricator_functions('fx') WHERE name = 'fab_delta_info' ORDER BY ALL;
+----
+[eu]	table
+[main]	table
+[sales]	table
+[sales, eu]	table
+
+# A catalog function, a scalar macro, a defaulted-parameter macro and a table macro, all at depth 2.
+query I
+SELECT count(*) FROM fx.sales.eu.fab_delta_info();
+----
+5
+
+query RI
+SELECT fx.sales.eu.fab_pct(1, 4), fx.sales.eu.fab_clamp(500);
+----
+25.0	100
+
+query I
+SELECT count(*) FROM fx.sales.eu.fab_numbers(5);
+----
+5
+
+query II
+SELECT * FROM fx.sales.eu.fab_view_info;
+----
+fabricator	delta
+
+query I
+SELECT count(*) FROM fx.sales.eu.fab_view_numbers;
+----
+10
+
+# ⚠⚠ THE VIEW BODY BINDS AGAINST THE VIEW'S OWN PATH. fab_view_probe reads an UNQUALIFIED fab_view_source.
+#    DuckDB 2.0 anchors a view body on ParentSchema().name — the LEAF — so without the host's rewrite this read
+#    `top eu`: a different schema's rows, with no error (measured on native DuckDB too;
+#    docs/duckdb-upstream-issues.md). The top-level read is the control that the fixture can tell them apart.
+query I
+SELECT who FROM fx.sales.eu.fab_view_probe;
+----
+nested sales.eu
+
+query I
+SELECT who FROM fx.eu.fab_view_probe;
+----
+top eu
+
+# ⚠⚠ A CTAS INTO A NESTED SCHEMA KEEPS ITS ROWS when the leaf names an existing table elsewhere. DuckDB 2.0's
+#    planner asks whether `<leaf>.<name>` exists, finds `eu.fab_view_source` at the top level, and plans a bare
+#    CREATE with the query DROPPED — the nested table came out EMPTY and the statement succeeded.
+statement ok
+CREATE TABLE fx.eu.collide AS SELECT 'top' AS w;
+
+statement ok
+CREATE TABLE fx.sales.eu.collide AS SELECT 'nested' AS w;
+
+query T
+SELECT w FROM fx.sales.eu.collide;
+----
+nested
+
+query T
+SELECT w FROM fx.eu.collide;
+----
+top
+
+# The planner's other two branches survive the path-checked replacement: REPLACE rewrites, IF NOT EXISTS keeps.
+statement ok
+CREATE OR REPLACE TABLE fx.sales.eu.collide AS SELECT 'replaced' AS w;
+
+statement ok
+CREATE TABLE IF NOT EXISTS fx.sales.eu.collide AS SELECT 'ignored' AS w;
+
+query T
+SELECT w FROM fx.sales.eu.collide;
+----
+replaced
+
+statement error
+CREATE TABLE fx.sales.eu.collide AS SELECT 'dup' AS w;
+----
+already exists
+
+# ── scoped invalidation. A pattern is tried against the bare name AND the qualified `a.b.name`, so it can
+#    name one branch of the tree. Both `collide` tables are materialized, then widened behind the catalog's
+#    back through flat attaches; only what the pattern names may pick the new column up.
+query I
+SELECT count(*) FROM (DESCRIBE fx.sales.eu.collide);
+----
+1
+
+query I
+SELECT count(*) FROM (DESCRIBE fx.eu.collide);
+----
+1
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/fx' AS fxa (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/fx/sales' AS fxb (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+statement ok
+ALTER TABLE fxa.eu.collide ADD COLUMN extra INTEGER;
+
+statement ok
+ALTER TABLE fxb.eu.collide ADD COLUMN extra INTEGER;
+
+query I
+SELECT fabricator_invalidate_cache('fx', 'sales\.eu\.collide');
+----
+true
+
+query I
+SELECT count(*) FROM (DESCRIBE fx.sales.eu.collide);
+----
+2
+
+query I
+SELECT count(*) FROM (DESCRIBE fx.eu.collide);
+----
+1
+
+# The bare name still reaches every branch, which is the pre-v97 meaning unchanged.
+query I
+SELECT fabricator_invalidate_cache('fx', 'collide');
+----
+true
+
+query I
+SELECT count(*) FROM (DESCRIBE fx.eu.collide);
+----
+2
+
+statement ok
+DETACH fxa;
+
+statement ok
+DETACH fxb;
+
+statement ok
+DETACH fx;

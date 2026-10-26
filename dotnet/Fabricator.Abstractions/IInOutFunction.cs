@@ -84,10 +84,11 @@ public interface IInOutFunction
 }
 
 /// <summary>A catalog-bound table-in-out function (attach-time scope) — <see cref="IInOutFunction"/> plus the
-/// <see cref="SchemaName"/>. For a connection-free, ATTACH-free in-out, implement the base
+/// <see cref="SchemaPath"/>. For a connection-free, ATTACH-free in-out, implement the base
 /// <see cref="IInOutFunction"/> and declare it as a global instead.</summary>
 public interface ICatalogInOutFunction : IInOutFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo").</summary>
-    string SchemaName { get; }
+    /// <summary>Target catalog schema as a path (e.g. <c>"dbo"</c>, or <c>new SchemaPath("ws", "doc")</c> for a
+    /// nested one). A schema the catalog does not have is not created: the function is skipped.</summary>
+    SchemaPath SchemaPath { get; }
 }

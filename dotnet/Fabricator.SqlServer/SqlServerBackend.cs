@@ -581,9 +581,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// declarations all name a schema) never runs it. <c>schema_filter</c> is applied, so a function is not
     /// declared in a schema the catalog does not surface.</para>
     /// </remarks>
-    private IReadOnlyList<string> ExpandAllSchemas()
+    private IReadOnlyList<SchemaPath> ExpandAllSchemas()
     {
-        var names = new List<string>();
+        var names = new List<SchemaPath>();
         foreach (var row in ReadMetadataRows(SchemasSql, 1))
         {
             if (row[0] is { } name && (_schemaFilter is null || _schemaFilter.IsMatch(name)))
@@ -2777,18 +2777,35 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             : FilteredTables();
     }
 
-    public IArrowArrayStream GetFunctions() => _functionFilter is null
-        ? ExecuteMetadataQuery(FunctionsMetadataSql())
-        : FilteredFunctions();
+    /// <summary>Discovered routines (user functions and procedures, plus each one's <c>_each</c> form), the bespoke
+    /// session-tag function and the provider's declared catalog functions. <c>function_filter</c> applies to all of
+    /// them by NAME; <c>schema_filter</c> is applied by the host, which registers only functions whose schema it
+    /// registered.</summary>
+    public IEnumerable<FunctionDeclaration> GetFunctions()
+    {
+        var all = new List<FunctionDeclaration>();
+        foreach (var r in ReadMetadataRows(FunctionsSql, 6))
+        {
+            all.Add(new FunctionDeclaration(r[0]!, r[1]!, r[2]!,
+                int.Parse(r[3] ?? "0", System.Globalization.CultureInfo.InvariantCulture), r[4] ?? "", r[5] ?? ""));
+        }
+        // The bespoke session-tag function: always present on a SQL Server catalog, and NOT in the function set
+        // because it must capture the live catalog (it pins that catalog's CONNECTION), which the per-catalog
+        // Functions set does not carry — it captures ATTACH context (Fabric workspace/item/credential), not a
+        // connection. Same "match the name first" pattern the DAX provider uses for daxeval.
+        all.Add(new FunctionDeclaration("dbo", SqlServerSessionTagFunction.FunctionName, "table", 2));
+        all.AddRange(Functions.Declarations(ExpandAllSchemas));
+        return _functionFilter is null ? all : all.FindAll(d => _functionFilter.IsMatch(d.Name));
+    }
 
     // Provider-declared CATALOG-BOUND macros (schema, name, create_sql) — bound by the host into this
     // catalog's schemas as db.schema.m(...). Note this deliberately does NOT go through
     // FunctionsMetadataSql: a macro body is a local declaration, so embedding it in a T-SQL literal to send
     // to the server and read back would be pure waste, and would make the declaration depend on server
     // reachability. Gated by schema_filter host-side (a macro whose schema was not registered is dropped).
-    public IArrowArrayStream GetMacros() => CatalogMacroMetadata.Stream(CustomFunctions.CatalogMacros);
+    public IEnumerable<CatalogMacroDefinition> GetMacros() => CustomFunctions.CatalogMacros;
 
-    public IArrowArrayStream GetViews() => CatalogViewMetadata.Stream(CustomFunctions.CatalogViews);
+    public IEnumerable<ViewDefinition> GetViews() => CustomFunctions.CatalogViews;
 
     // The detected capability profile as (property, value) rows — the fabricator_server_info() diagnostic.
     // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
@@ -3024,102 +3041,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         return new InMemoryArrayStream(schema, new[] { batch });
     }
 
-    // function_filter applied: only routines whose NAME matches the icase regex are surfaced (so the C++
-    // catalog registers only those). Type-preserving (the diagnostic fabricator_functions keeps param_count
-    // as INT) — filters the rows of the discovery stream, which schema/name/kind (string) + param_count (int)
-    // + return_type (string). schema_filter is applied C++-side (register only functions in registered schemas).
-    private IArrowArrayStream FilteredFunctions()
-    {
-        using var src = ExecuteMetadataQuery(FunctionsMetadataSql());
-        var schema = src.Schema;
-        int nameIdx = 1; // schema_name(0), name(1), kind(2), param_count(3), return_type(4)
-        var outBatches = new List<RecordBatch>();
-        while (true)
-        {
-            var batch = src.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            if (batch is null)
-            {
-                break;
-            }
-            using (batch)
-            {
-                var names = (StringArray)batch.Column(nameIdx);
-                var keep = new List<int>();
-                for (int i = 0; i < batch.Length; i++)
-                {
-                    var nm = names.GetString(i);
-                    if (nm is not null && _functionFilter!.IsMatch(nm))
-                    {
-                        keep.Add(i);
-                    }
-                }
-                if (keep.Count == 0)
-                {
-                    continue;
-                }
-                var cols = new IArrowArray[batch.ColumnCount];
-                for (int c = 0; c < batch.ColumnCount; c++)
-                {
-                    cols[c] = TakeRows(batch.Column(c), keep);
-                }
-                outBatches.Add(new RecordBatch(schema, cols, keep.Count));
-            }
-        }
-        return new InMemoryArrayStream(schema, outBatches);
-    }
-
-    // Selects rows by index from a discovery column, preserving its Arrow type (Utf8 or Int32 — the only
-    // types the Functions metadata produces). Apache.Arrow C# has no built-in take, so rebuild via a builder.
-    private static IArrowArray TakeRows(IArrowArray col, List<int> idx)
-    {
-        switch (col)
-        {
-            case StringArray s:
-            {
-                var b = new StringArray.Builder();
-                foreach (var i in idx) { if (s.IsNull(i)) b.AppendNull(); else b.Append(s.GetString(i)); }
-                return b.Build();
-            }
-            case Int32Array a:
-            {
-                var b = new Int32Array.Builder();
-                foreach (var i in idx) { if (a.IsNull(i)) b.AppendNull(); else b.Append(a.GetValue(i)!.Value); }
-                return b.Build();
-            }
-            default:
-                throw new NotSupportedException($"function_filter: unexpected discovery column type {col.GetType().Name}");
-        }
-    }
-
-    // Discovered SQL Server routines + the provider's custom scalar/table functions, appended via
-    // UNION ALL so the C++ catalog discovers + registers them uniformly (then dispatches custom ones to C#).
-    private string FunctionsMetadataSql()
-    {
-        // NOTE: no IsEmpty early-return — the bespoke session-tag row below is always appended, so the
-        // UNION ALL is always needed even when no custom functions are registered.
-        static string Esc(string s) => s.Replace("'", "''");
-        // FunctionsSql ends with ORDER BY; strip it so the UNION ALL is valid (the diagnostic /
-        // discovery callers sort themselves, so dropping the ordering here is harmless).
-        int orderIdx = FunctionsSql.LastIndexOf(" ORDER BY ", StringComparison.Ordinal);
-        var sb = new StringBuilder(orderIdx >= 0 ? FunctionsSql[..orderIdx] : FunctionsSql);
-        // One literal row per declaration, in the discovered stream's five-column shape
-        // (schema_name, name, kind, param_count, return_type). The host reads the first three; the last two
-        // exist because every UNION ALL branch must match the discovery query's arity.
-        // The bespoke session-tag function: always present on a SQL Server catalog, and NOT in the function set
-        // because it must capture the live catalog (it pins that catalog's CONNECTION), which the per-catalog
-        // Functions set still does not carry — it captures ATTACH context (Fabric workspace/item/credential),
-        // not a connection. Same "match the name first" pattern the DAX provider uses for daxeval.
-        sb.Append(" UNION ALL SELECT 'dbo', '").Append(Esc(SqlServerSessionTagFunction.FunctionName))
-          .Append("', 'table', 2, '', ''");
-        foreach (var d in Functions.Declarations(ExpandAllSchemas))
-        {
-            sb.Append(" UNION ALL SELECT '").Append(Esc(d.SchemaName)).Append("', '").Append(Esc(d.Name))
-              .Append("', '").Append(Esc(d.Kind)).Append("', ").Append(d.ParamCount).Append(", '")
-              .Append(Esc(d.ReturnType)).Append("', '").Append(Esc(d.VarArgs)).Append('\'');
-        }
-        return sb.ToString();
-    }
-
     // Discovered routines (user scalar/table functions + procedures), uniform shape
     // (schema_name, name, kind, param_count, return_type, varargs). For scalar functions the
     // return value is sys.parameters.parameter_id = 0; input params are parameter_id > 0.
@@ -3128,12 +3049,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         "CASE o.type WHEN 'FN' THEN 'scalar' WHEN 'FS' THEN 'scalar' " +
         "WHEN 'IF' THEN 'table' WHEN 'TF' THEN 'table' WHEN 'FT' THEN 'table' " +
         "WHEN 'P' THEN 'proc' WHEN 'PC' THEN 'proc' ELSE 'other' END AS kind, " +
-        "(SELECT COUNT(*) FROM sys.parameters p WHERE p.object_id = o.object_id AND p.parameter_id > 0) AS param_count, " +
+        "CAST((SELECT COUNT(*) FROM sys.parameters p WHERE p.object_id = o.object_id AND p.parameter_id > 0) " +
+        "AS VARCHAR(10)) AS param_count, " +
         "ISNULL((SELECT t.name FROM sys.parameters p JOIN sys.types t ON p.user_type_id = t.user_type_id " +
         "WHERE p.object_id = o.object_id AND p.parameter_id = 0), '') AS return_type, " +
         // A discovered SQL routine is never variadic -- T-SQL has no varargs -- so this is a literal ''.
-        // It exists so every branch of this UNION ALL (and the C#-appended declaration rows) share one
-        // six-column shape, which is also the schema fabricator_functions() reports.
         "'' AS varargs " +
         "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
         "WHERE o.type IN ('FN','FS','IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
@@ -3144,7 +3064,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // on providers with nothing to apply per row (30 dead siblings on a Fabric attach alone).
         // Only routines that TAKE parameters get one — there is nothing to apply per input row otherwise.
         "UNION ALL " +
-        "SELECT s.name AS schema_name, o.name + '_each' AS name, 'inout' AS kind, 0 AS param_count, " +
+        "SELECT s.name AS schema_name, o.name + '_each' AS name, 'inout' AS kind, '0' AS param_count, " +
         "'' AS return_type, '' AS varargs " +
         "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
         "WHERE o.type IN ('IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
@@ -4292,7 +4212,14 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             ? functionName.Substring(0, functionName.Length - EachSuffix.Length)
             : functionName;
 
-    public Schema GetFunctionParamSchema(string schemaName, string functionName)
+    // SQL Server schemas do not nest and this catalog never declares supports_nested_schemas, so the host only
+    // ever sends one-segment paths. A deeper one is refused rather than resolved by its leaf, which would
+    // address a different, same-named schema.
+    private static string Flat(SchemaPath path) => path.Depth == 1
+        ? path.Leaf
+        : throw new NotSupportedException($"fabricator: SQL Server schemas do not nest (asked for {path})");
+
+    public Schema GetFunctionParamSchema(SchemaPath schemaName, string functionName)
     {
         // A custom function of any kind answers from the set (which tags a table/sqlgen function's NAMED
         // parameters, so an optional argument can be written `fn(x, flag := true)`); otherwise it is a
@@ -4314,7 +4241,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             return custom;
         }
-        using var s = RoutineParamSchemaQuery(schemaName, functionName);
+        using var s = RoutineParamSchemaQuery(Flat(schemaName), functionName);
         return s.Schema;
     }
 
@@ -4324,7 +4251,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// ATTACH alias, so a generator can emit references back into it; BIND-time only and possibly repeated, so
     /// the generator must be deterministic and side-effect-free. See docs/macros-and-sqlgen-functions.md §2.
     /// </summary>
-    public string GenerateTableSql(string schemaName, string functionName, string catalogName, RecordBatch? args)
+    public string GenerateTableSql(SchemaPath schemaName, string functionName, string catalogName, RecordBatch? args)
     {
         return Functions.GenerateTableSql(schemaName, functionName,
                                                   new SqlGenContext(catalogName, this), args)
@@ -4356,7 +4283,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         return ExecuteQuery(sb.ToString());
     }
 
-    public Schema GetFunctionReturnSchema(string schemaName, string functionName)
+    public Schema GetFunctionReturnSchema(SchemaPath schemaName, string functionName)
     {
         // A pure custom scalar's field carries the CONSISTENT tag (constant folding) — see
         // ScalarFunctionMetadata; discovered SQL UDFs below never tag (remote bodies stay VOLATILE).
@@ -4365,7 +4292,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             return custom;
         }
-        using var s = RoutineReturnSchemaQuery(schemaName, functionName);
+        using var s = RoutineReturnSchemaQuery(Flat(schemaName), functionName);
         return s.Schema;
     }
 
@@ -4394,8 +4321,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // from the call's constants via its own Bind, and a discovered SQL UDF takes the default binding, which
     // defers to the DECLARED type — deliberately, since reading SqlServerScalarFunction.Result is a round
     // trip to INFORMATION_SCHEMA and the host already holds that type from registration.
-    public IScalarFunction GetScalarFunction(string schemaName, string functionName) =>
-        ResolveScalar(schemaName, functionName);
+    public IScalarFunction GetScalarFunction(SchemaPath schemaName, string functionName) =>
+        ResolveScalar(Flat(schemaName), functionName);
 
     // A table-valued function's output columns from INFORMATION_SCHEMA.ROUTINE_COLUMNS
     // (the result-set columns of inline + multi-statement TVFs), each with a
@@ -4500,7 +4427,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         return result;
     }
 
-    public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null)
+    public Schema GetFunctionOutputSchema(SchemaPath schemaName, string functionName, RecordBatch? args = null)
     {
         // A custom table function's output schema may depend on the constant args (bound per call, then the
         // binding is discarded). `args` is null only for the in-out `_each` base-schema probe, which does not
@@ -4518,11 +4445,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // A discovered TVF (its result columns are in ROUTINE_COLUMNS) resolves its full output schema via
         // SqlServerTableValuedFunction; else a stored proc (OUTPUT params + return_value, else
         // sp_describe_first_result_set) via the SqlServerProcedure wrapper.
-        if (FunctionOutputColumns(schemaName, functionName).Count > 0)
+        if (FunctionOutputColumns(Flat(schemaName), functionName).Count > 0)
         {
-            return new SqlServerTableValuedFunction(this, schemaName, functionName).OutputSchema;
+            return new SqlServerTableValuedFunction(this, Flat(schemaName), functionName).OutputSchema;
         }
-        using var procBinding = new SqlServerProcedure(this, schemaName, functionName).Bind(args!);
+        using var procBinding = new SqlServerProcedure(this, Flat(schemaName), functionName).Bind(args!);
         return procBinding.OutputSchema;
     }
 
@@ -4531,7 +4458,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // GetFunctionOutputSchema does — a custom (pure-C#) table function, else a discovered TVF (its result
     // columns are in ROUTINE_COLUMNS; pushdown), else a stored proc (no pushdown). The binding resolves the
     // output schema once and is reused across (prepared) re-executions.
-    public ITableFunctionSession TableFnBind(string schemaName, string functionName, RecordBatch? args)
+    public ITableFunctionSession TableFnBind(SchemaPath schemaName, string functionName, RecordBatch? args)
     {
         // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
         // result by NAME (true); a discovered TVF pushes the projection into SQL (true); a stored proc is
@@ -4545,11 +4472,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             return custom;
         }
-        if (FunctionOutputColumns(schemaName, functionName).Count > 0)
+        if (FunctionOutputColumns(Flat(schemaName), functionName).Count > 0)
         {
-            return new TvfTableFunctionSession(new SqlServerTableValuedFunction(this, schemaName, functionName), args!);
+            return new TvfTableFunctionSession(new SqlServerTableValuedFunction(this, Flat(schemaName), functionName), args!);
         }
-        return new TableFunctionBindingAdapter(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
+        return new TableFunctionBindingAdapter(new SqlServerProcedure(this, Flat(schemaName), functionName).Bind(args!), supportsPushdown: false);
     }
 
     // Phase 6 streaming-exchange bind for every `_each` form. A custom C# in-out (ICatalogInOutFunction —
@@ -4557,7 +4484,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // read-only connection (SqlServerTvfEach); a stored-proc `_each` EXECs once per input row on DuckDB's
     // pinned write transaction (SqlServerProcEach). Proc vs TVF is classified the same way as elsewhere — a
     // TVF has result columns in ROUTINE_COLUMNS, a proc doesn't.
-    public IInOutFunctionBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    public IInOutFunctionBinding InOutBind(SchemaPath schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         // A custom COLLECTOR (pipeline breaker) is tried before a streaming in-out inside the set: the host
         // registered it on the Sink+Source collector operator (kind='collector'), which feeds a NON-gated
@@ -4568,9 +4495,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // which is exactly the coupling that made a SQL-Server semantic the host's business.
         var routine = StripEach(functionName);
         var binding = Functions.InOutBind(schemaName, functionName, args, inputSchema)
-                      ?? (FunctionOutputColumns(schemaName, routine).Count > 0
-                          ? new SqlServerTvfEach(this, schemaName, routine, inputSchema)
-                          : (IInOutFunctionBinding)new SqlServerProcEach(this, schemaName, routine, inputSchema));
+                      ?? (FunctionOutputColumns(Flat(schemaName), routine).Count > 0
+                          ? new SqlServerTvfEach(this, Flat(schemaName), routine, inputSchema)
+                          : (IInOutFunctionBinding)new SqlServerProcEach(this, Flat(schemaName), routine, inputSchema));
         // Resolve the SQL isolation for this in-out call and set it on the binding (if it honors isolation):
         // a SET mssql_isolation_level (pushed to the provider settings store) overrides this catalog's ATTACH
         // isolation_level default; pure-C# / proc bindings ignore it. Replaces the former C++
@@ -4586,7 +4513,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // Row-mapped (correlated LATERAL) bind. Only provider-AUTHORED lateral functions exist: a discovered SQL
     // routine has no row-mapped form to fall back to — its per-row shape is the `_each` in-out above, which
     // takes a table argument — so an unknown name is an error rather than a fallback.
-    public ILateralFunctionBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+    public ILateralFunctionBinding LateralBind(SchemaPath schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
         Functions.LateralBind(schemaName, functionName, args, inputSchema)
         ?? throw new ArgumentException(
             $"fabricator: '{schemaName}.{functionName}' is not a lateral function");
@@ -4594,7 +4521,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
     // accumulators (IAggregateFunction). Only provider-authored aggregates exist (SQL Server has no
     // DuckDB-aggregate to discover), so this requires a registered aggregate in the custom function set.
-    public IAggregateSession AggOpen(string schemaName, string functionName) =>
+    public IAggregateSession AggOpen(SchemaPath schemaName, string functionName) =>
         // The session impl lives in Fabricator.Bridge (shared with connection-free global aggregates).
         Functions.AggOpen(schemaName, functionName)
         ?? throw new ArgumentException(

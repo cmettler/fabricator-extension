@@ -19,14 +19,14 @@ SELECT fabricator_exec('fdb', 'CREATE OR ALTER FUNCTION dbo.tvf_one(@n INT) RETU
 # Discovery: kind + param_count for both (ordered by name).
 query TTI
 SELECT name, kind, param_count FROM fabricator_functions('fdb')
-WHERE schema_name = 'dbo' AND name IN ('vf_add', 'tvf_one') ORDER BY name;
+WHERE schema_path = ['dbo'] AND name IN ('vf_add', 'tvf_one') ORDER BY name;
 ----
 tvf_one	table	1
 vf_add	scalar	2
 
 # Scalar return type is surfaced.
 query T
-SELECT return_type FROM fabricator_functions('fdb') WHERE schema_name = 'dbo' AND name = 'vf_add';
+SELECT return_type FROM fabricator_functions('fdb') WHERE schema_path = ['dbo'] AND name = 'vf_add';
 ----
 int
 

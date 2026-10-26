@@ -1005,6 +1005,54 @@ OPTIMIZE the same, all via `withColumn`), in engineered-wood (`RowTrackingWriter
 Columns` appends both) and in our native writer (keeps the batch's order). A writer that puts one first would
 make an id-keyed read return NULLs with no message.
 
+## 12. A VIEW in a nested schema binds its body against the LEAF schema — a wrong answer, 2.0
+
+Found 2026-10-26 while nesting our declared views (ABI v97). Ready to file; native control below.
+
+```sql
+CREATE SCHEMA eu; CREATE SCHEMA sales; CREATE SCHEMA sales.eu;
+CREATE TABLE eu.src(w VARCHAR);       INSERT INTO eu.src VALUES ('TOP');
+CREATE TABLE sales.eu.src(w VARCHAR); INSERT INTO sales.eu.src VALUES ('NESTED');
+CREATE VIEW sales.eu.v  AS SELECT * FROM src;            -- unqualified
+CREATE VIEW sales.eu.v2 AS SELECT * FROM sales.eu.src;   -- qualified (control)
+SELECT * FROM sales.eu.v;    -- TOP     ← another schema's rows, no error
+SELECT * FROM sales.eu.v2;   -- NESTED
+```
+
+- **Cause:** `bind_basetableref.cpp`, the `VIEW_ENTRY` case, builds the view binder's search path with
+  `GetSearchPath(view.ParentCatalog(), view.ParentSchema().name, true)` — the parent schema's NAME, i.e. the
+  leaf of `GetSchemaPath()`. `CatalogSearchEntry` holds one schema identifier, so a path cannot be expressed
+  there at all; the fix needs the search entry to carry a path (or the view binder to resolve against the
+  parent entry directly).
+- ⚠ Silent whenever a top-level schema shares the leaf name; when none does, an unqualified reference merely
+  fails to resolve, which hides the cause.
+- **Our workaround:** `FabricatorSchemaEntry::QualifyNestedViewBody` qualifies a declared view's body at
+  materialization (depth ≥ 2 only). Gate `verify_delta_nested_schemas` §12, mutant killed at :446.
+
+## 13. A CTAS into a nested schema creates an EMPTY table when the leaf names an existing one — silent data loss, 2.0
+
+Found the same day, by the probe for §12. Ready to file; native control below.
+
+```sql
+CREATE SCHEMA eu; CREATE SCHEMA a; CREATE SCHEMA a.eu;
+CREATE TABLE eu.src AS SELECT 'TOP' AS w;
+CREATE TABLE a.eu.src AS SELECT 'A' AS w;    -- succeeds
+SELECT count(*) FROM a.eu.src;                -- 0   ← the query's row is gone
+CREATE TABLE a.eu.other AS SELECT 'X' AS w;   -- control: no leaf collision
+SELECT count(*) FROM a.eu.other;              -- 1
+```
+
+- **Cause:** `PhysicalPlanGenerator::CreatePlan(LogicalCreateTable)` (`plan_create_table.cpp`) decides between a
+  CTAS and a bare CREATE with `catalog.GetEntry(TABLE_ENTRY, create_info.GetQualifiedName().Schema(), name)` —
+  `Schema()` is the element before the name, i.e. the LEAF. It finds `eu.src`, takes the "already exists"
+  branch, plans `PhysicalCreateTable` without the query, and the create itself then succeeds in `a.eu`
+  because nothing is there. The bound schema (`op.schema`) is the right one; the check should ask it.
+- ⚠ The top-level table is untouched, so nothing anywhere looks wrong except the missing rows.
+- **Our workaround:** an optimizer extension replaces a CTAS into a nested fabricator schema with
+  `FabricatorNestedCtasOperator`, whose `CreatePlan` repeats the planner's decision with the existence check
+  asked of the schema entry. ⚠ `PRAGMA disable_optimizer` disables it. Gate `verify_delta_nested_schemas` §12,
+  mutant killed at :465.
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the

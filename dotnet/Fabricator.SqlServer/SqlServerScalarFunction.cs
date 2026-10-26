@@ -32,6 +32,9 @@ internal sealed class SqlServerScalarFunction : ICatalogScalarFunction
     }
 
     public string SchemaName { get; }
+
+    // SQL Server schemas do not nest: a discovered UDF always lives at depth 1.
+    public SchemaPath SchemaPath => SchemaName;
     public string Name { get; }
 
     public Schema Parameters

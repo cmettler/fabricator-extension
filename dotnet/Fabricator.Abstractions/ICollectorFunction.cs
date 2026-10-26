@@ -90,10 +90,11 @@ public interface ICollectorFunction
 }
 
 /// <summary>A catalog-bound collector table-in-out function (attach-time scope) —
-/// <see cref="ICollectorFunction"/> plus the <see cref="SchemaName"/>. For a connection-free collector,
+/// <see cref="ICollectorFunction"/> plus the <see cref="SchemaPath"/>. For a connection-free collector,
 /// implement the base <see cref="ICollectorFunction"/> and declare it as a global instead.</summary>
 public interface ICatalogCollectorFunction : ICollectorFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo").</summary>
-    string SchemaName { get; }
+    /// <summary>Target catalog schema as a path (e.g. <c>"dbo"</c>, or <c>new SchemaPath("ws", "doc")</c> for a
+    /// nested one). A schema the catalog does not have is not created: the function is skipped.</summary>
+    SchemaPath SchemaPath { get; }
 }

@@ -31,8 +31,9 @@ namespace Fabricator.Bridge;
 /// </list>
 /// <para>See docs/macros-and-sqlgen-functions.md §1.4.</para>
 /// </summary>
-/// <param name="SchemaName">
-/// The schema within the attached catalog to bind into (e.g. <c>"dbo"</c>, <c>"main"</c>). A macro whose
+/// <param name="SchemaPath">
+/// The schema within the attached catalog to bind into, as a path: <c>"dbo"</c>, <c>"main"</c>, or
+/// <c>new SchemaPath("ws", "doc")</c> for a nested schema. A macro whose
 /// schema is not among those the catalog discovered is skipped — the same rule discovered functions follow, so
 /// an ATTACH <c>schema_filter</c> gates macros too.
 /// </param>
@@ -42,8 +43,8 @@ namespace Fabricator.Bridge;
 /// </param>
 /// <param name="CreateSql">
 /// The complete statement, written UNQUALIFIED — the host overwrites the catalog/schema with this catalog's
-/// ATTACH alias and <see cref="SchemaName"/>. Note this is the OPPOSITE of the global form, which rejects a
+/// ATTACH alias and <see cref="SchemaPath"/>. Note this is the OPPOSITE of the global form, which rejects a
 /// qualified body outright. A statement that does not parse as a single <c>CREATE MACRO</c> is skipped with a
 /// warning (a broken provider macro never blocks an ATTACH).
 /// </param>
-public sealed record CatalogMacroDefinition(string SchemaName, string Name, string CreateSql);
+public sealed record CatalogMacroDefinition(SchemaPath SchemaPath, string Name, string CreateSql);

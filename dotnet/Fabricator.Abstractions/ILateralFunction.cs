@@ -178,10 +178,11 @@ public interface ILateralFunction
 }
 
 /// <summary>A catalog-bound lateral function (attach-time scope) — <see cref="ILateralFunction"/> plus the
-/// <see cref="SchemaName"/>. For a connection-free, ATTACH-free one, implement the base interface and declare
+/// <see cref="SchemaPath"/>. For a connection-free, ATTACH-free one, implement the base interface and declare
 /// it as a global instead.</summary>
 public interface ICatalogLateralFunction : ILateralFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo").</summary>
-    string SchemaName { get; }
+    /// <summary>Target catalog schema as a path (e.g. <c>"dbo"</c>, or <c>new SchemaPath("ws", "doc")</c> for a
+    /// nested one). A schema the catalog does not have is not created: the function is skipped.</summary>
+    SchemaPath SchemaPath { get; }
 }

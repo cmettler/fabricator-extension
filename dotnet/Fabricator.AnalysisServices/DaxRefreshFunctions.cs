@@ -186,12 +186,12 @@ internal abstract class DaxRefreshBase : ICatalogTableFunction
     protected DaxRefreshBase(DaxCatalog catalog, string schemaName)
     {
         Catalog = catalog;
-        SchemaName = schemaName;
+        SchemaPath = schemaName;
     }
 
     protected DaxCatalog Catalog { get; }
 
-    public string SchemaName { get; }
+    public SchemaPath SchemaPath { get; }
 
     public abstract string Name { get; }
 

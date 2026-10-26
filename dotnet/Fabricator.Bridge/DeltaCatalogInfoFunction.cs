@@ -35,7 +35,7 @@ internal sealed class DeltaCatalogInfoFunction : ICatalogTableFunction
 
     internal DeltaCatalogInfoFunction(IReadOnlyList<KeyValuePair<string, string>> facts) => _facts = facts;
 
-    public string SchemaName => CatalogFunctionSet.AllSchemas;
+    public SchemaPath SchemaPath => CatalogFunctionSet.AllSchemas;
     public string Name => "fab_delta_info";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);

@@ -130,7 +130,7 @@ internal static class FabricSessionFunctions
 
         internal FabricSessionsFunction(FabricApiClient api) => _api = api;
 
-        public string SchemaName => FabricApiFunctions.SchemaName;
+        public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
         public string Name => "sessions";
 
         /// <summary>No positional parameters: the zero-argument call is the useful one.</summary>

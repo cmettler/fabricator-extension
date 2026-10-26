@@ -163,13 +163,6 @@ typedef struct FabricatorVTable {
 	int32_t (*execute_dml)(FabricatorHandle handle, const char *sql, struct ArrowArrayStream *params,
 	                       int64_t *affected, int32_t *schema_may_change, char **err);
 
-	// Bulk-load an Arrow stream (produced by the host) into a table. Generic: the
-	// managed side maps the Arrow schema to provider types, optionally creates the
-	// table (create_table / replace), and bulk-copies. *affected = rows written.
-	// The managed side takes ownership of `in` (consumes + releases it).
-	int32_t (*bulk_insert)(FabricatorHandle handle, const char *schema, const char *table, int32_t create_table,
-	                       int32_t replace, struct ArrowArrayStream *in, int64_t *affected, char **err);
-
 	// rowid-based DELETE. `keys` is an Arrow stream whose columns (named by their
 	// Arrow field names) are the key column values to delete. The managed side
 	// generates the provider DELETE (parameterized). Takes ownership of `keys`.
@@ -344,10 +337,14 @@ typedef struct FabricatorVTable {
 	// + return types and execute them, all over Arrow.
 	// -------------------------------------------------------------------------
 
+	// ⚠ Every CATALOG function entry below takes `schema_path` / `schema_path_len` (v97, was a single
+	// `const char *schema`): the function's schema as an array of UTF-8 names, OUTERMOST FIRST — the same
+	// shape the v92 write entries take. A global (connection-free) function crosses with handle 0 and an
+	// EMPTY path. A leaf name cannot address a function once schemas nest: the same name may sit in two branches.
 	// *out receives the Arrow schema of the function's input parameters (one field per param, in order),
 	// used to register the DuckDB function's arg types. A bare ArrowSchema (the managed side exports it; the
 	// caller reads it then calls its release callback).
-	int32_t (*get_function_param_schema)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*get_function_param_schema)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                                     struct ArrowSchema *out, char **err);
 
 	// *out receives the Arrow schema whose single field = the scalar function's DECLARED return type (a bare
@@ -355,7 +352,7 @@ typedef struct FabricatorVTable {
 	// type is the UNRESOLVED sentinel: the function declares no fixed return type and scalarfn_bind must
 	// supply one per call site. (Same sentinel/meaning as a SQLNULL *parameter*, which registers as ANY.)
 	// The volatility signal rides this field's metadata (fabricator.volatile = "0" => CONSISTENT).
-	int32_t (*get_function_return_schema)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*get_function_return_schema)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                                      struct ArrowSchema *out, char **err);
 
 	// -------------------------------------------------------------------------
@@ -402,7 +399,7 @@ typedef struct FabricatorVTable {
 	// ClientContext that is gone (measured as a SIGSEGV at OPTIMIZE, docs/abi-history.md §v80). The ambients
 	// are AsyncLocals the host can only overwrite, so only the managed handler can put back what it found;
 	// see CallScope. `opener` may be 0 where the host has no context to give.
-	int32_t (*scalarfn_bind)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*scalarfn_bind)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                         struct ArrowArrayStream *args, const char *arg_constant,
 	                         FabricatorHandle opener, int64_t session, int64_t txn_id,
 	                         struct ArrowSchema *out_schema, FabricatorHandle *out_binding, char **err);
@@ -434,7 +431,7 @@ typedef struct FabricatorVTable {
 	// the managed side when present) — a custom table function's output schema MAY depend on them (the managed
 	// side binds the call and returns the bound output schema); discovered SQL TVFs/procs read it from metadata
 	// and ignore `args`. Pass NULL for `args` when there are none (e.g. the in-out `_each` base-schema lookup).
-	int32_t (*get_function_output_schema)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*get_function_output_schema)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                                      struct ArrowArrayStream *args, struct ArrowSchema *out, char **err);
 
 	// (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
@@ -473,7 +470,7 @@ typedef struct FabricatorVTable {
 	// it, exactly as scalarfn_bind does — an aggregate binds wherever it is CALLED, so the host must not
 	// assign the ambients around it. Without this a bind that touches the host (to resolve a type, say)
 	// dereferences whatever context the last crossing left.
-	int32_t (*agg_open)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*agg_open)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                    struct ArrowArrayStream *args, const char *arg_constant, FabricatorHandle opener,
 	                    int64_t session, int64_t txn, struct ArrowSchema *out_result,
 	                    FabricatorHandle *out_session, char **err);
@@ -554,7 +551,7 @@ typedef struct FabricatorVTable {
 	// ++ the function's own output columns, computed in C# from the args + input schema — read it
 	// for the DuckDB return types, then release it. *out_binding receives an opaque binding handle
 	// (reused by inout_exchange_open across prepared re-executions; freed via inout_bind_close).
-	int32_t (*inout_bind)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*inout_bind)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                      struct ArrowArrayStream *args, struct ArrowSchema *input_schema,
 	                      struct ArrowArrayStream *out_schema, FabricatorHandle *out_binding, char **err);
 
@@ -605,7 +602,7 @@ typedef struct FabricatorVTable {
 	// (full result, projected positionally + filtered above the scan). *out_binding
 	// receives an opaque binding handle, reused by tablefn_execute across (prepared)
 	// re-executions and freed via tablefn_close.
-	int32_t (*tablefn_bind)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*tablefn_bind)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                      struct ArrowArrayStream *args, struct ArrowArrayStream *out_schema,
 	                      int32_t *supports_pushdown, FabricatorHandle *out_binding, char **err);
 
@@ -825,7 +822,7 @@ typedef struct FabricatorVTable {
 	// SUPPLIED named parameters identified by field name; nullable when the function takes none (consumed
 	// either way). *out_sql = an owned UTF-8 statement, freed by the host via free_error. Called at BIND
 	// time only, possibly repeatedly (EXPLAIN / DESCRIBE / a view re-bind), never during execution.
-	int32_t (*generate_table_sql)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*generate_table_sql)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                              const char *catalog_name, struct ArrowArrayStream *args, char **out_sql,
 	                              char **err);
 
@@ -906,14 +903,17 @@ typedef struct FabricatorVTable {
 	// ("BASE TABLE"|"VIEW"). schema_filter/table_filter applied
 	// provider-side (they bound ENUMERATION only, never targeted access).
 	int32_t (*catalog_tables)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
-	// Five columns: schema, name, kind, param_count, return_type (the host reads the first three).
+	// Six columns: schema path (LIST<VARCHAR> since v97, as catalog_schemas), name, kind, param_count, return_type,
+	// varargs (the host reads the first three; fabricator_functions() shows all six).
 	int32_t (*catalog_functions)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
-	// Three columns: schema, name, create_sql — provider-declared CATALOG-BOUND DuckDB macros, each
+	// Three columns: schema path (LIST<VARCHAR> since v97), name, create_sql — provider-declared CATALOG-BOUND
+	// DuckDB macros, each
 	// create_sql one complete CREATE MACRO statement parsed by DuckDB's OWN parser host-side and bound into
 	// the ATTACHed catalog's schema (db.schema.m(...)). A purely LOCAL declaration — never embedded in
 	// provider SQL, never dependent on server reachability. Fetch is best-effort host-side.
 	int32_t (*catalog_macros)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
-	// Three columns: schema, name, create_sql — provider-declared CATALOG-BOUND DuckDB VIEWS, each
+	// Three columns: schema path (LIST<VARCHAR> since v97), name, create_sql — provider-declared CATALOG-BOUND
+	// DuckDB VIEWS, each
 	// create_sql one complete CREATE VIEW statement parsed by DuckDB's OWN parser host-side and bound into
 	// the ATTACHed catalog's schema, resolving as an ordinary relation `db.schema.v`.
 	//
@@ -1104,7 +1104,7 @@ typedef struct FabricatorVTable {
 	// correlated passthrough columns are the HOST's business (DuckDB's projected_input on the row-by-row
 	// path, our own stamping on the batched one). *out_binding receives an opaque binding handle, reused
 	// across executions and per-thread sessions; freed via lateral_bind_close.
-	int32_t (*lateral_bind)(FabricatorHandle handle, const char *schema, const char *func,
+	int32_t (*lateral_bind)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len, const char *func,
 	                        struct ArrowArrayStream *args, struct ArrowSchema *input_schema,
 	                        struct ArrowArrayStream *out_schema, FabricatorHandle *out_binding, char **err);
 
@@ -1448,7 +1448,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 96
+#define FABRICATOR_ABI_VERSION 97
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

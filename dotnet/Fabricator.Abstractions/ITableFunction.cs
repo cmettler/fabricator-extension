@@ -12,7 +12,7 @@ namespace Fabricator.Bridge;
 /// <see cref="Bind"/> receives the constant call arguments and returns a per-call
 /// <see cref="ITableFunctionBinding"/> whose output schema MAY depend on those arguments (e.g. a
 /// generic <c>query(sql)</c> or a function whose column set follows a parameter). Surfaced into every
-/// attached catalog and resolved as <c>SELECT * FROM db.SchemaName.Name(args)</c> through the same
+/// attached catalog and resolved as <c>SELECT * FROM db.schema.Name(args)</c> through the same
 /// table-function path as a discovered TVF — the catalog dispatches to the binding instead of generating SQL.
 ///
 /// The definition object is shared (registered once); the per-call state lives on the binding it produces.
@@ -58,12 +58,13 @@ public interface ITableFunction
 }
 
 /// <summary>A catalog-bound custom table function (attach-time scope) — <see cref="ITableFunction"/> plus the
-/// <see cref="SchemaName"/>. For a connection-free, ATTACH-free table function, implement the base
+/// <see cref="SchemaPath"/>. For a connection-free, ATTACH-free table function, implement the base
 /// <see cref="ITableFunction"/> and declare it as a global instead.</summary>
 public interface ICatalogTableFunction : ITableFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo"); created on attach if it isn't already present.</summary>
-    string SchemaName { get; }
+    /// <summary>Target catalog schema as a path (e.g. <c>"dbo"</c>, or <c>new SchemaPath("ws", "doc")</c> for a
+    /// nested one). A schema the catalog does not have is not created: the function is skipped.</summary>
+    SchemaPath SchemaPath { get; }
 }
 
 /// <summary>

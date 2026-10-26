@@ -107,7 +107,7 @@ internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
 
     internal FabricTableMaintenanceFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "table_maintenance";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("table") }, null);
@@ -230,7 +230,7 @@ internal sealed class FabricRunJobFunction : ICatalogTableFunction
 
     internal FabricRunJobFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "run_job";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -309,7 +309,7 @@ internal sealed class FabricJobStatusFunction : ICatalogTableFunction
 
     internal FabricJobStatusFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "job_status";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -391,7 +391,7 @@ internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
 
     internal FabricJobInstancesFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "job_instances";
 
     /// <summary>No positionals: <c>item</c> must be omittable for the fan-out, and only a NAMED parameter can be.</summary>
@@ -529,7 +529,7 @@ internal sealed class FabricCancelJobFunction : ICatalogScalarFunction
 
     internal FabricCancelJobFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "cancel_job";
 
     public Schema Parameters { get; } = new Schema(new[]
@@ -590,7 +590,7 @@ internal sealed class FabricResetShortcutCacheFunction : ICatalogTableFunction
 
     internal FabricResetShortcutCacheFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "reset_shortcut_cache";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);
@@ -643,7 +643,7 @@ internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
 
     internal FabricOperationStatusFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "operation_status";
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("operation_id") }, null);
@@ -727,7 +727,7 @@ internal sealed class FabricLakehouseTablesFunction : ICatalogTableFunction
 
     internal FabricLakehouseTablesFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "lakehouse_tables";
 
     public Schema Parameters { get; } = new Schema(System.Array.Empty<Field>(), null);

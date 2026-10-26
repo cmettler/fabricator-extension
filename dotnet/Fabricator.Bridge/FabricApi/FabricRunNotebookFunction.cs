@@ -41,7 +41,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
 
     internal FabricRunNotebookFunction(FabricApiClient api) => _api = api;
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
     public string Name => "run_notebook";
 
     /// <summary>The notebook is the only required argument.</summary>

@@ -23,7 +23,7 @@ public static class CatalogViewMetadata
 {
     /// <summary>The Arrow schema of the stream. Column ORDER is the contract with the host.</summary>
     public static Schema StreamSchema { get; } = new Schema.Builder()
-        .Field(new Field("schema", StringType.Default, nullable: true))
+        .Field(SchemaPathColumn.Field("schema_path"))
         .Field(new Field("name", StringType.Default, nullable: true))
         .Field(new Field("create_sql", StringType.Default, nullable: true))
         .Build();
@@ -34,13 +34,13 @@ public static class CatalogViewMetadata
     /// </summary>
     public static IArrowArrayStream Stream(IEnumerable<ViewDefinition>? views)
     {
-        var schemas = new StringArray.Builder();
+        var schemas = new SchemaPathColumn();
         var names = new StringArray.Builder();
         var bodies = new StringArray.Builder();
         int n = 0;
         foreach (var v in views ?? System.Array.Empty<ViewDefinition>())
         {
-            schemas.Append(v.SchemaName);
+            schemas.Append(v.SchemaPath);
             names.Append(v.Name);
             bodies.Append(v.CreateSql);
             n++;

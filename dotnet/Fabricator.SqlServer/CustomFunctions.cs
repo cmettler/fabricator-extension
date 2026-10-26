@@ -272,7 +272,7 @@ internal static class CustomFunctions
 // FIXED output schema → derives from StaticCollectorFunction (just OutputSchema + Collect). Pure C#, no SQL.
 internal sealed class CfCollectFunction : StaticCollectorFunction
 {
-    public override string SchemaName => "dbo";
+    public override SchemaPath SchemaPath => "dbo";
     public override string Name => "cf_collect";
 
     public override Schema InputSchema =>
@@ -342,7 +342,7 @@ internal sealed class CfCollectFunction : StaticCollectorFunction
 // aggregates run in the fast in-memory mode (bounded by the group's cardinality), like DuckDB's own median.
 internal sealed class CfMedianFunction : ICatalogAggregateFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_median";
     public Schema Parameters => new(new[] { new Field("x", DoubleType.Default, nullable: true) }, metadata: null);
     public Field Result => new("median", DoubleType.Default, nullable: true);
@@ -400,7 +400,7 @@ internal sealed class CfMedianFunction : ICatalogAggregateFunction
 // commutative, and that is the point rather than a defect.
 internal sealed class CfConcatFunction : ICatalogAggregateFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_concat";
     public Schema Parameters => new(new[] { new Field("x", StringType.Default, nullable: true) }, metadata: null);
     public Field Result => new("concat", StringType.Default, nullable: true);
@@ -433,7 +433,7 @@ internal sealed class CfConcatFunction : ICatalogAggregateFunction
 // combine and windowing.
 internal sealed class CfProductFunction : ICatalogAggregateFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_product";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("product", Int64Type.Default, nullable: true);
@@ -476,7 +476,7 @@ internal sealed class CfProductFunction : ICatalogAggregateFunction
 // commutative => a clean parallel/combine test. Empty group / all-NULL => NULL.
 internal sealed class CfBitOrFunction : ICatalogAggregateFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_bit_or";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("bit_or", Int64Type.Default, nullable: true);
@@ -521,7 +521,7 @@ internal sealed class CfBitOrFunction : ICatalogAggregateFunction
 // => 9 bytes, well under the 1 KB cap. Empty group / all-NULL => NULL.
 internal sealed class CfSumSpillFunction : ICatalogAggregateFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_sum_spill";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("sum", Int64Type.Default, nullable: true);
@@ -581,7 +581,7 @@ internal sealed class CfSumSpillFunction : ICatalogAggregateFunction
 // input chunk + a sentinel. Pure C#, no SQL object.
 internal sealed class CfTagFunction : StaticInOutFunction
 {
-    public override string SchemaName => "dbo";
+    public override SchemaPath SchemaPath => "dbo";
     public override string Name => "cf_tag";
 
     public override Schema InputSchema =>
@@ -630,7 +630,7 @@ internal sealed class CfTagFunction : StaticInOutFunction
 // the full sum), which is what the test asserts. Pure C#, no SQL object.
 internal sealed class CfRunningSumFunction : StaticInOutFunction
 {
-    public override string SchemaName => "dbo";
+    public override SchemaPath SchemaPath => "dbo";
     public override string Name => "cf_running_sum";
 
     public override Schema InputSchema =>
@@ -679,7 +679,7 @@ internal sealed class CfRunningSumFunction : StaticInOutFunction
 // cf_tag/cf_running_sum (the author owns the streaming loop + sentinel). Pure C#, no SQL object.
 internal sealed class CfExchangeFunction : StaticInOutFunction
 {
-    public override string SchemaName => "dbo";
+    public override SchemaPath SchemaPath => "dbo";
     public override string Name => "cf_exchange";
 
     public override Schema InputSchema =>
@@ -727,7 +727,7 @@ internal sealed class CfExchangeFunction : StaticInOutFunction
 // SQL Server). FIXED output schema → derives from StaticTableFunction (just OutputSchema + Invoke).
 internal sealed class CfRangeFunction : StaticTableFunction
 {
-    public override string SchemaName => "dbo";
+    public override SchemaPath SchemaPath => "dbo";
     public override string Name => "cf_range";
 
     public override Schema Parameters => new(new[]
@@ -763,7 +763,7 @@ internal sealed class CfRangeFunction : StaticTableFunction
 // binding resolves the schema once at bind and reuses it for the row.
 internal sealed class CfColumnsFunction : ICatalogTableFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_columns";
     public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
@@ -822,7 +822,7 @@ internal sealed class CfColumnsFunction : ICatalogTableFunction
 // FRESH connection, so the outer query's context is untouched (reentrancy-safe). See docs/host-query.md.
 internal sealed class CfHostAnswerFunction : ICatalogScalarFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_host_answer";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("answer", Int64Type.Default, nullable: false);
@@ -853,7 +853,7 @@ internal sealed class CfHostAnswerFunction : ICatalogScalarFunction
 // pointing at a released stream, and scanning it SEGFAULTED. verify_custom_functions asserts both halves.
 internal sealed class CfHostSumFunction : ICatalogScalarFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_host_sum";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("host_sum", Int64Type.Default, nullable: false);
@@ -887,7 +887,7 @@ internal sealed class CfHostSumFunction : ICatalogScalarFunction
 // host_query parameter binding. host-query.md.
 internal sealed class CfHostParamFunction : ICatalogScalarFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_host_param";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("host_param", Int64Type.Default, nullable: false);
@@ -1124,7 +1124,7 @@ internal sealed class CfUnionByPatternFunction : ICatalogSqlTableFunction
     Apache.Arrow.Schema Fabricator.Bridge.ICatalogSqlTableFunction.Parameters =>
         Fabricator.Bridge.Params.Combine(Parameters, NamedParameters);
 
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_union_by_pattern";
 
     public Schema Parameters => new(new[]
@@ -1467,7 +1467,7 @@ internal sealed class GfProductFunction : IAggregateFunction
 // Demo: dbo.cf_add(a, b) -> a + b, computed in C# (no such object exists in SQL Server).
 internal sealed class CfAddFunction : ICatalogScalarFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_add";
 
     public Schema Parameters => new(new[]
@@ -1844,7 +1844,7 @@ internal sealed class GfLatBadOriginFunction : ILateralFunction
 // it can only be called on a relation the caller can name).
 internal sealed class CfLatSplitFunction : ICatalogLateralFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
 
     public string Name => "cf_lat_split";
 
@@ -2229,7 +2229,7 @@ internal sealed class GfVaArgsFunction : ITableFunction
 /// </remarks>
 internal sealed class CfVaSumFunction : ICatalogScalarFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_va_sum";
 
     public Schema Parameters => new(new[] { Params.VarArgs("n", Int64Type.Default) }, metadata: null);
@@ -2616,7 +2616,7 @@ internal sealed class GfInOutVaFunction : IInOutFunction
 /// <summary><c>db.dbo.cf_va_rows(label, …)</c> — the catalog TABLE path: one row per tail argument.</summary>
 internal sealed class CfVaRowsFunction : ICatalogTableFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_va_rows";
 
     public Schema Parameters => new(new[]
@@ -2692,7 +2692,7 @@ internal sealed class CfVaRowsFunction : ICatalogTableFunction
 /// need it, which keeps the demo about the tail.</summary>
 internal sealed class CfVaSelectFunction : ICatalogSqlTableFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_va_select";
 
     public Schema Parameters => new(new[] { Params.VarArgs("v", Int64Type.Default) }, metadata: null);
@@ -2720,7 +2720,7 @@ internal sealed class CfVaSelectFunction : ICatalogSqlTableFunction
 /// here, not bind-time arguments. 1:1 with the input rows.</summary>
 internal sealed class CfVaSpanFunction : ICatalogLateralFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_va_span";
 
     public Schema Parameters => new(new[]
@@ -2779,7 +2779,7 @@ internal sealed class CfVaSpanFunction : ICatalogLateralFunction
 /// base composes <c>Parameters</c> itself (table input ++ named) and so cannot carry a tail.</summary>
 internal sealed class CfVaTagFunction : ICatalogInOutFunction
 {
-    public string SchemaName => "dbo";
+    public SchemaPath SchemaPath => "dbo";
     public string Name => "cf_va_tag";
 
     public Schema Parameters => new(new[]

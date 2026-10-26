@@ -280,6 +280,8 @@ private:
 	//! DuckDB keeps tables and views in ONE catalog set and its consumers filter by the entry's actual type
 	//! (duckdb_columns() scans TABLE_ENTRY alone and handles both).
 	void ScanDeclaredViews(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
+	//! Qualifies a nested view body against this schema path (the upstream leaf search path). Requires entry_lock_.
+	void QualifyNestedViewBody(SelectStatement &query);
 
 	FabricatorHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"

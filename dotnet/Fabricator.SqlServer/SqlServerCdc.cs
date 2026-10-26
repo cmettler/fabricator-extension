@@ -214,7 +214,7 @@ internal sealed class CdcPositionFunction : ICatalogScalarFunction
 
     internal CdcPositionFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     /// <remarks>
     /// ⚠⚠ NOT named <c>position</c>, which is what the design note proposed and which MEASURED WRONG:
@@ -285,7 +285,7 @@ internal sealed class CdcMinPositionFunction : ICatalogScalarFunction
 
     internal CdcMinPositionFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "min_position";
 
@@ -353,7 +353,7 @@ internal sealed class CdcTablesFunction : ICatalogTableFunction
 
     internal CdcTablesFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "tables";
 
@@ -413,7 +413,7 @@ internal sealed class CdcHealthFunction : ICatalogTableFunction
 
     internal CdcHealthFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "health";
 

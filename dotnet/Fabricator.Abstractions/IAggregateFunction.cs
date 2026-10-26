@@ -10,7 +10,7 @@ namespace Fabricator.Bridge;
 /// A provider-authored custom aggregate function (UDAF), implemented in C# over Arrow — the aggregate
 /// analog of <see cref="ICatalogScalarFunction"/> (4e) / <see cref="ICatalogTableFunction"/> (4f) /
 /// <see cref="ICatalogInOutFunction"/> (4g). Surfaced into every attached catalog and usable wherever
-/// DuckDB allows an aggregate: <c>SELECT db.SchemaName.Name(args) FROM t</c>, with <c>GROUP BY</c>,
+/// DuckDB allows an aggregate: <c>SELECT db.schema.Name(args) FROM t</c>, with <c>GROUP BY</c>,
 /// parallel aggregation, and window (<c>OVER(...)</c>) contexts.
 ///
 /// DuckDB's aggregate model is state-vectorized: DuckDB owns a contiguous array of fixed-size state
@@ -135,12 +135,13 @@ public sealed class StaticAggregateBinding : IAggregateBinding
 }
 
 /// <summary>A catalog-bound custom aggregate (attach-time scope) — <see cref="IAggregateFunction"/> plus the
-/// <see cref="SchemaName"/>. For a connection-free, ATTACH-free aggregate, implement the base
+/// <see cref="SchemaPath"/>. For a connection-free, ATTACH-free aggregate, implement the base
 /// <see cref="IAggregateFunction"/> and declare it as a global instead.</summary>
 public interface ICatalogAggregateFunction : IAggregateFunction
 {
-    /// <summary>Target catalog schema (e.g. "dbo"); created on attach if it isn't already present.</summary>
-    string SchemaName { get; }
+    /// <summary>Target catalog schema as a path (e.g. <c>"dbo"</c>, or <c>new SchemaPath("ws", "doc")</c> for a
+    /// nested one). A schema the catalog does not have is not created: the function is skipped.</summary>
+    SchemaPath SchemaPath { get; }
 }
 
 /// <summary>

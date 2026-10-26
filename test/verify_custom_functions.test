@@ -82,9 +82,9 @@ SELECT cdb.dbo.cf_host_param(0);
 
 # It is discovered like any catalog function...
 query TTT
-SELECT schema_name, name, kind FROM fabricator_functions('cdb') WHERE name = 'cf_add';
+SELECT schema_path, name, kind FROM fabricator_functions('cdb') WHERE name = 'cf_add';
 ----
-dbo	cf_add	scalar
+[dbo]	cf_add	scalar
 
 # ...yet there is NO such object in SQL Server — proving it is the C#-authored custom function.
 query I

@@ -21,7 +21,7 @@ namespace Fabricator.Bridge;
 public abstract class StaticInOutFunction : ICatalogInOutFunction
 {
     /// <summary>Target catalog schema (e.g. "dbo").</summary>
-    public abstract string SchemaName { get; }
+    public abstract SchemaPath SchemaPath { get; }
 
     /// <summary>Function name.</summary>
     public abstract string Name { get; }

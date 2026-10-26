@@ -85,6 +85,87 @@ FabricatorSchemaEntry &FabricatorCatalog::EnsureSchemaPathLocked(const vector<st
 	return *current;
 }
 
+FabricatorSchemaEntry *FabricatorCatalog::FindSchemaPathLocked(const vector<string> &path) {
+	if (path.empty()) {
+		return nullptr;
+	}
+	auto it = schemas_.find(path.front());
+	if (it == schemas_.end()) {
+		return nullptr;
+	}
+	FabricatorSchemaEntry *current = it->second.get();
+	for (idx_t i = 1; i < path.size() && current; i++) {
+		current = current->FindChildSchema(path[i]);
+	}
+	return current;
+}
+
+void FabricatorCatalog::RegisterDeclarationsLocked() {
+	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates), macros and views register
+	// onto the schema at their PATH (ABI v97) — but ONLY a schema already registered by discovery. The managed
+	// schema_filter keeps non-matching schemas out of DiscoverSchemas, so skipping a declaration whose schema is
+	// absent applies the filter to all three (the core never re-creates a filtered-out schema). See
+	// docs/provider-extensibility.md §3.
+	//
+	// ⚠ FOUND BY PATH, NEVER BY LEAF. Until v97 these looked up `schemas_` by a single name, so a declaration
+	// could only ever land at the top level, and under nested schemas the leaf is exactly what is NOT unique.
+	for (auto &func : DiscoverFunctions(handle_)) {
+		auto schema_ptr = FindSchemaPathLocked(func.schema_path);
+		if (!schema_ptr) {
+			continue;
+		}
+		auto &schema = *schema_ptr;
+		if (func.kind == "scalar") {
+			schema.AddScalarFunction(func.name);
+		} else if (func.kind == "table") {
+			schema.AddTableFunction(func.name, /*is_proc=*/false);
+		} else if (func.kind == "proc") {
+			schema.AddTableFunction(func.name, /*is_proc=*/true);
+		} else if (func.kind == "table_sql") {
+			// Provider-authored SQL-GENERATING table function (v68): registered with bind_replace only — the
+			// call `db.schema.fn(args)` is rewritten into the provider's generated SQL at bind time, so the
+			// referenced scans keep their own pushdown and no data crosses the bridge at execution.
+			schema.AddSqlTableFunction(func.name);
+		} else if (func.kind == "inout") {
+			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
+			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
+			schema.AddInOutFunction(func.name);
+		} else if (func.kind == "lateral") {
+			// Provider-authored ROW-MAPPED (correlated LATERAL) function: its POSITIONAL parameters are real
+			// value types and no {TABLE} marker, so `db.schema.fn(t.a, t.b)` binds against an outer relation.
+			// See catalog/fabricator_lateral.hpp.
+			schema.AddLateralFunction(func.name);
+		} else if (func.kind == "collector") {
+			// Provider-authored custom collector (pipeline breaker, pure C#): a {TABLE}-param table function
+			// routed to the Sink+Source operator — buffers all input, then emits. See docs/inout-collector-mode.md.
+			schema.AddCollectorFunction(func.name);
+		} else if (func.kind == "aggregate") {
+			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
+			schema.AddAggregateFunction(func.name, /*spillable=*/false);
+		} else if (func.kind == "aggregate_spill") {
+			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
+			schema.AddAggregateFunction(func.name, /*spillable=*/true);
+		}
+	}
+	// Provider-declared CATALOG-BOUND macros. Their own dedicated entry (catalog_macros), NOT a column on the
+	// functions stream: that stream may be provider SQL run on the server, and a macro body is a purely local
+	// declaration. DiscoverCatalogMacros never throws — declaring macros is optional.
+	for (auto &macro : DiscoverCatalogMacros(handle_)) {
+		if (auto schema = FindSchemaPathLocked(macro.schema_path)) {
+			schema->AddMacro(macro.name, macro.create_sql);
+		}
+	}
+	// Provider-declared CATALOG-BOUND views (catalog_views). Same local-declaration contract and the same
+	// schema rule as macros. ⚠ Registered AFTER the tables so AddView can see the discovered names and
+	// report a collision — see FabricatorSchemaEntry::AddView for why a collision is refused at LOOKUP
+	// rather than here.
+	for (auto &view : DiscoverCatalogViews(handle_)) {
+		if (auto schema = FindSchemaPathLocked(view.schema_path)) {
+			schema->AddView(view.name, view.create_sql);
+		}
+	}
+}
+
 void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 
@@ -147,71 +228,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	for (auto &table : DiscoverTables(handle_)) {
 		EnsureSchemaPathLocked(table.schema_path).AddTable(table.table_name, table.table_type);
 	}
-	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates) register onto their
-	// schema — but ONLY a schema already registered above. The managed schema_filter keeps non-matching
-	// schemas out of DiscoverSchemas, so skipping a function whose schema is absent applies the filter to
-	// functions too (the core never re-creates a filtered-out schema). See docs/provider-extensibility.md §3.
-	for (auto &func : DiscoverFunctions(handle_)) {
-		auto sit = schemas_.find(func.schema_name);
-		if (sit == schemas_.end()) {
-			continue;
-		}
-		auto &schema = *sit->second;
-		if (func.kind == "scalar") {
-			schema.AddScalarFunction(func.name);
-		} else if (func.kind == "table") {
-			schema.AddTableFunction(func.name, /*is_proc=*/false);
-		} else if (func.kind == "proc") {
-			schema.AddTableFunction(func.name, /*is_proc=*/true);
-		} else if (func.kind == "table_sql") {
-			// Provider-authored SQL-GENERATING table function (v68): registered with bind_replace only — the
-			// call `db.schema.fn(args)` is rewritten into the provider's generated SQL at bind time, so the
-			// referenced scans keep their own pushdown and no data crosses the bridge at execution.
-			schema.AddSqlTableFunction(func.name);
-		} else if (func.kind == "inout") {
-			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
-			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
-			schema.AddInOutFunction(func.name);
-		} else if (func.kind == "lateral") {
-			// Provider-authored ROW-MAPPED (correlated LATERAL) function: its POSITIONAL parameters are real
-			// value types and no {TABLE} marker, so `db.schema.fn(t.a, t.b)` binds against an outer relation.
-			// See catalog/fabricator_lateral.hpp.
-			schema.AddLateralFunction(func.name);
-		} else if (func.kind == "collector") {
-			// Provider-authored custom collector (pipeline breaker, pure C#): a {TABLE}-param table function
-			// routed to the Sink+Source operator — buffers all input, then emits. See docs/inout-collector-mode.md.
-			schema.AddCollectorFunction(func.name);
-		} else if (func.kind == "aggregate") {
-			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
-			schema.AddAggregateFunction(func.name, /*spillable=*/false);
-		} else if (func.kind == "aggregate_spill") {
-			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
-			schema.AddAggregateFunction(func.name, /*spillable=*/true);
-		}
-	}
-	// Provider-declared CATALOG-BOUND macros. Their own dedicated entry (catalog_macros), NOT a column on the
-	// functions stream: that stream is provider SQL run on the server, and a macro body is a purely local
-	// declaration. Same schema rule as functions (only a schema registered above), so an ATTACH
-	// schema_filter gates macros too.
-	// DiscoverCatalogMacros never throws — declaring macros is optional.
-	for (auto &macro : DiscoverCatalogMacros(handle_)) {
-		auto sit = schemas_.find(macro.schema_name);
-		if (sit == schemas_.end()) {
-			continue;
-		}
-		sit->second->AddMacro(macro.name, macro.create_sql);
-	}
-	// Provider-declared CATALOG-BOUND views (catalog_views). Same local-declaration contract and the same
-	// schema rule as macros. ⚠ Registered AFTER the tables so AddView can see the discovered names and
-	// report a collision — see FabricatorSchemaEntry::AddView for why a collision is refused at LOOKUP
-	// rather than here.
-	for (auto &view : DiscoverCatalogViews(handle_)) {
-		auto sit = schemas_.find(view.schema_name);
-		if (sit == schemas_.end()) {
-			continue;
-		}
-		sit->second->AddView(view.name, view.create_sql);
-	}
+	RegisterDeclarationsLocked();
 }
 
 void FabricatorCatalog::InvalidateAllEntries() {
@@ -253,71 +270,7 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 	for (auto &table : DiscoverTables(handle_)) {
 		EnsureSchemaPathLocked(table.schema_path).AddTable(table.table_name, table.table_type);
 	}
-	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates) register onto their
-	// schema — but ONLY a schema already registered above. The managed schema_filter keeps non-matching
-	// schemas out of DiscoverSchemas, so skipping a function whose schema is absent applies the filter to
-	// functions too (the core never re-creates a filtered-out schema). See docs/provider-extensibility.md §3.
-	for (auto &func : DiscoverFunctions(handle_)) {
-		auto sit = schemas_.find(func.schema_name);
-		if (sit == schemas_.end()) {
-			continue;
-		}
-		auto &schema = *sit->second;
-		if (func.kind == "scalar") {
-			schema.AddScalarFunction(func.name);
-		} else if (func.kind == "table") {
-			schema.AddTableFunction(func.name, /*is_proc=*/false);
-		} else if (func.kind == "proc") {
-			schema.AddTableFunction(func.name, /*is_proc=*/true);
-		} else if (func.kind == "table_sql") {
-			// Provider-authored SQL-GENERATING table function (v68): registered with bind_replace only — the
-			// call `db.schema.fn(args)` is rewritten into the provider's generated SQL at bind time, so the
-			// referenced scans keep their own pushdown and no data crosses the bridge at execution.
-			schema.AddSqlTableFunction(func.name);
-		} else if (func.kind == "inout") {
-			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
-			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
-			schema.AddInOutFunction(func.name);
-		} else if (func.kind == "lateral") {
-			// Provider-authored ROW-MAPPED (correlated LATERAL) function: its POSITIONAL parameters are real
-			// value types and no {TABLE} marker, so `db.schema.fn(t.a, t.b)` binds against an outer relation.
-			// See catalog/fabricator_lateral.hpp.
-			schema.AddLateralFunction(func.name);
-		} else if (func.kind == "collector") {
-			// Provider-authored custom collector (pipeline breaker, pure C#): a {TABLE}-param table function
-			// routed to the Sink+Source operator — buffers all input, then emits. See docs/inout-collector-mode.md.
-			schema.AddCollectorFunction(func.name);
-		} else if (func.kind == "aggregate") {
-			// Provider-authored custom aggregate (4h, UDAF, pure C#): an AggregateFunctionCatalogEntry.
-			schema.AddAggregateFunction(func.name, /*spillable=*/false);
-		} else if (func.kind == "aggregate_spill") {
-			// Spillable variant: state serialized into DuckDB's blob so external GROUP BY can spill to disk.
-			schema.AddAggregateFunction(func.name, /*spillable=*/true);
-		}
-	}
-	// Provider-declared CATALOG-BOUND macros. Their own dedicated entry (catalog_macros), NOT a column on the
-	// functions stream: that stream is provider SQL run on the server, and a macro body is a purely local
-	// declaration. Same schema rule as functions (only a schema registered above), so an ATTACH
-	// schema_filter gates macros too.
-	// DiscoverCatalogMacros never throws — declaring macros is optional.
-	for (auto &macro : DiscoverCatalogMacros(handle_)) {
-		auto sit = schemas_.find(macro.schema_name);
-		if (sit == schemas_.end()) {
-			continue;
-		}
-		sit->second->AddMacro(macro.name, macro.create_sql);
-	}
-	// Provider-declared CATALOG-BOUND views (catalog_views). Same local-declaration contract and the same
-	// schema rule as macros. ⚠ Registered AFTER the tables so AddView can see the discovered names and
-	// report a collision — see FabricatorSchemaEntry::AddView for why a collision is refused at LOOKUP
-	// rather than here.
-	for (auto &view : DiscoverCatalogViews(handle_)) {
-		auto sit = schemas_.find(view.schema_name);
-		if (sit == schemas_.end()) {
-			continue;
-		}
-		sit->second->AddView(view.name, view.create_sql);
-	}
+	RegisterDeclarationsLocked();
 }
 
 void FabricatorCatalog::Initialize(bool load_builtin) {

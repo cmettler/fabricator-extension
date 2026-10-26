@@ -23,7 +23,7 @@ public static class CatalogMacroMetadata
 {
     /// <summary>The Arrow schema of the kind-15 stream. Column ORDER is the contract with the host.</summary>
     public static Schema StreamSchema { get; } = new Schema.Builder()
-        .Field(new Field("schema", StringType.Default, nullable: true))
+        .Field(SchemaPathColumn.Field("schema_path"))
         .Field(new Field("name", StringType.Default, nullable: true))
         .Field(new Field("create_sql", StringType.Default, nullable: true))
         .Build();
@@ -35,13 +35,13 @@ public static class CatalogMacroMetadata
     /// </summary>
     public static IArrowArrayStream Stream(IEnumerable<CatalogMacroDefinition>? macros)
     {
-        var schemas = new StringArray.Builder();
+        var schemas = new SchemaPathColumn();
         var names = new StringArray.Builder();
         var bodies = new StringArray.Builder();
         int n = 0;
         foreach (var m in macros ?? System.Array.Empty<CatalogMacroDefinition>())
         {
-            schemas.Append(m.SchemaName);
+            schemas.Append(m.SchemaPath);
             names.Append(m.Name);
             bodies.Append(m.CreateSql);
             n++;

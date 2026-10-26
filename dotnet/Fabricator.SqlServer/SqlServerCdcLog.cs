@@ -46,7 +46,7 @@ internal sealed class CdcDdlHistoryFunction : ICatalogTableFunction
 
     internal CdcDdlHistoryFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "ddl_history";
 
@@ -105,7 +105,7 @@ internal sealed class CdcLsnTimeMappingFunction : ICatalogTableFunction
 
     internal CdcLsnTimeMappingFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
-    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+    public SchemaPath SchemaPath => SqlServerCdcFunctions.SchemaName;
 
     public string Name => "lsn_time_mapping";
 

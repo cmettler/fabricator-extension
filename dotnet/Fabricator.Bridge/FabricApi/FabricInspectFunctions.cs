@@ -46,7 +46,7 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
 
     protected FabricApiClient Api { get; }
 
-    public string SchemaName => FabricApiFunctions.SchemaName;
+    public SchemaPath SchemaPath => FabricApiFunctions.SchemaName;
 
     public abstract string Name { get; }
 

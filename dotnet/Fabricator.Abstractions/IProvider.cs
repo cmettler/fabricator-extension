@@ -413,21 +413,21 @@ public interface IProviderCatalog : IDisposable
     /// flat schema column as a single-element path, so an un-migrated provider is unaffected.</remarks>
     IArrowArrayStream GetTablePaths() => SchemaPathAdapter.WidenFirstColumn(GetTables(), "schema_path");
 
-    /// <summary>Discovered/declared routines: schema, name, kind, param_count, return_type (the host reads
-    /// the first three).</summary>
-    IArrowArrayStream GetFunctions();
+    /// <summary>Discovered/declared routines, each bound into its schema path. The bridge builds the
+    /// <c>catalog_functions</c> stream from these.</summary>
+    IEnumerable<FunctionDeclaration> GetFunctions();
 
-    /// <summary>Provider-declared CATALOG-BOUND DuckDB macros: schema, name, create_sql — each
-    /// create_sql one complete CREATE MACRO statement the HOST parses with DuckDB's own parser and binds
-    /// into the ATTACHed catalog's schema. A purely LOCAL declaration (never round-tripped through
-    /// provider SQL — see docs/macros-and-sqlgen-functions.md §1.4). Empty = no macros.</summary>
-    IArrowArrayStream GetMacros();
+    /// <summary>Provider-declared CATALOG-BOUND DuckDB macros — each create_sql one complete CREATE MACRO
+    /// statement the HOST parses with DuckDB's own parser and binds into the ATTACHed catalog's schema. A purely
+    /// LOCAL declaration (never round-tripped through provider SQL — see docs/macros-and-sqlgen-functions.md
+    /// §1.4). Empty = no macros.</summary>
+    IEnumerable<CatalogMacroDefinition> GetMacros();
 
-    /// <summary>Provider-declared CATALOG-BOUND DuckDB views: schema, name, create_sql — each create_sql one
-    /// complete CREATE VIEW statement the HOST parses with DuckDB's own parser and binds into the ATTACHed
-    /// catalog's schema, where it resolves as an ordinary relation. A purely LOCAL declaration, never
-    /// round-tripped through provider SQL. Empty = no views. See docs/macros-and-sqlgen-functions.md §5.</summary>
-    IArrowArrayStream GetViews();
+    /// <summary>Provider-declared CATALOG-BOUND DuckDB views — each create_sql one complete CREATE VIEW statement
+    /// the HOST parses with DuckDB's own parser and binds into the ATTACHed catalog's schema, where it resolves as
+    /// an ordinary relation. A purely LOCAL declaration, never round-tripped through provider SQL. Empty = no
+    /// views. See docs/macros-and-sqlgen-functions.md §5.</summary>
+    IEnumerable<ViewDefinition> GetViews();
 
     /// <summary>The detected capability profile as DIAGNOSTIC (property, value) rows — the
     /// <c>fabricator_server_info()</c> table function's source. The HOST consumes
@@ -605,19 +605,19 @@ public interface IProviderCatalog : IDisposable
     /// that declares no functions of a kind is never asked — and one that declares some and omits the member
     /// gets this refusal naming the exact call instead of a NullReference three layers away.
     /// </summary>
-    static NotSupportedException NotHosted(string kind, string schemaName, string functionName) =>
-        new($"fabricator: catalog does not host {kind} functions (asked for '{schemaName}.{functionName}')");
+    static NotSupportedException NotHosted(string kind, SchemaPath schemaPath, string functionName) =>
+        new($"fabricator: catalog does not host {kind} functions (asked for {schemaPath}.\"{functionName}\")");
 
     /// <summary>
     /// The Arrow schema describing a function's input parameters (one field per parameter, in order). Used
     /// to register the DuckDB function's argument types. Exported to the host as a bare <c>ArrowSchema</c>.
     /// </summary>
-    Schema GetFunctionParamSchema(string schemaName, string functionName) =>
-        throw NotHosted("catalog", schemaName, functionName);
+    Schema GetFunctionParamSchema(SchemaPath schemaPath, string functionName) =>
+        throw NotHosted("catalog", schemaPath, functionName);
 
     /// <summary>The Arrow schema whose single field is the scalar function's return type.</summary>
-    Schema GetFunctionReturnSchema(string schemaName, string functionName) =>
-        throw NotHosted("scalar", schemaName, functionName);
+    Schema GetFunctionReturnSchema(SchemaPath schemaPath, string functionName) =>
+        throw NotHosted("scalar", schemaPath, functionName);
 
     /// <summary>
     /// Resolves a scalar function to its <see cref="IScalarFunction"/> DEFINITION — resolution only, the
@@ -628,7 +628,7 @@ public interface IProviderCatalog : IDisposable
     /// such scalar, which the host refuses BY NAME — and null is the default, so a catalog that declares no
     /// scalar functions (and is therefore never asked) implements nothing.
     /// </summary>
-    IScalarFunction? GetScalarFunction(string schemaName, string functionName) => null;
+    IScalarFunction? GetScalarFunction(SchemaPath schemaPath, string functionName) => null;
 
     /// <summary>
     /// The Arrow schema describing a table-returning function's output columns.
@@ -636,8 +636,8 @@ public interface IProviderCatalog : IDisposable
     /// table function's output schema may depend on them (bound via <see cref="ICatalogTableFunction.Bind"/>);
     /// discovered SQL TVFs/procs read their schema from metadata and ignore it.
     /// </summary>
-    Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
-        throw NotHosted("table", schemaName, functionName);
+    Schema GetFunctionOutputSchema(SchemaPath schemaPath, string functionName, RecordBatch? args = null) =>
+        throw NotHosted("table", schemaPath, functionName);
 
     /// <summary>
     /// Binds one table-function call (Phase 5 session model — the successor to the removed
@@ -648,8 +648,8 @@ public interface IProviderCatalog : IDisposable
     /// scan (possibly many times); the managed side classifies the function (discovered TVF / stored proc /
     /// custom). The binding is reused across (prepared) re-executions and disposed via the host's tablefn_close.
     /// </summary>
-    ITableFunctionSession TableFnBind(string schemaName, string functionName, RecordBatch? args) =>
-        throw NotHosted("table", schemaName, functionName);
+    ITableFunctionSession TableFnBind(SchemaPath schemaPath, string functionName, RecordBatch? args) =>
+        throw NotHosted("table", schemaPath, functionName);
 
     /// <summary>
     /// Binds one streaming table-in-out call (Phase 6 exchange path) for every <c>_each</c> form.
@@ -660,8 +660,8 @@ public interface IProviderCatalog : IDisposable
     /// read-only connection), a stored proc (per-row EXEC on DuckDB's pinned write transaction), or a custom
     /// C# in-out. The gate-based exchange operator drives it.
     /// </summary>
-    IInOutFunctionBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
-        throw NotHosted("table-in-out", schemaName, functionName);
+    IInOutFunctionBinding InOutBind(SchemaPath schemaPath, string functionName, RecordBatch? args, Schema inputSchema) =>
+        throw NotHosted("table-in-out", schemaPath, functionName);
 
     /// <summary>
     /// Binds one ROW-MAPPED (correlated LATERAL) call. <paramref name="args"/> (nullable) is a 1-row batch of
@@ -673,8 +673,8 @@ public interface IProviderCatalog : IDisposable
     /// catalog that declares no <c>lateral</c> function can never be asked. Returning null instead would let a
     /// declaration typo surface as a null-reference deep in the host.
     /// </remarks>
-    ILateralFunctionBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
-        throw NotHosted("lateral", schemaName, functionName);
+    ILateralFunctionBinding LateralBind(SchemaPath schemaPath, string functionName, RecordBatch? args, Schema inputSchema) =>
+        throw NotHosted("lateral", schemaPath, functionName);
 
     /// <summary>
     /// Generates the replacement SQL for one call of a catalog-bound SQL-generating table function
@@ -686,8 +686,8 @@ public interface IProviderCatalog : IDisposable
     /// the supplied named ones by field name. BIND-time only, and possibly repeated (EXPLAIN / a view re-bind),
     /// so it must be deterministic and side-effect-free. Providers without any such function throw.
     /// </summary>
-    string GenerateTableSql(string schemaName, string functionName, string catalogName, RecordBatch? args) =>
-        throw NotHosted("SQL-generating table", schemaName, functionName);
+    string GenerateTableSql(SchemaPath schemaPath, string functionName, string catalogName, RecordBatch? args) =>
+        throw NotHosted("SQL-generating table", schemaPath, functionName);
 
     /// <summary>
     /// Opens a custom-aggregate session for <c>schema.func</c> (a provider-authored
@@ -695,11 +695,11 @@ public interface IProviderCatalog : IDisposable
     /// to live C# accumulators; the C++ aggregate callbacks marshal ids + argument columns through it. See
     /// <see cref="IAggregateSession"/>.
     /// </summary>
-    IAggregateSession AggOpen(string schemaName, string functionName) =>
-        throw NotHosted("aggregate", schemaName, functionName);
+    IAggregateSession AggOpen(SchemaPath schemaPath, string functionName) =>
+        throw NotHosted("aggregate", schemaPath, functionName);
 
     /// <summary>
-    /// As <see cref="AggOpen(string,string)"/>, plus THIS CALL SITE's constant arguments — which is what lets
+    /// As <see cref="AggOpen(SchemaPath,string)"/>, plus THIS CALL SITE's constant arguments — which is what lets
     /// a catalog aggregate resolve its result type per call (<see cref="IAggregateFunction.Bind"/>).
     /// </summary>
     /// <remarks>
@@ -709,8 +709,8 @@ public interface IProviderCatalog : IDisposable
     /// <see cref="IAggregateFunction.Result"/> has nothing to resolve, and one that does not gets a binding
     /// that THROWS by name (<see cref="StaticAggregateBinding"/>) rather than a wrong type.
     /// </remarks>
-    IAggregateSession AggOpen(string schemaName, string functionName, ScalarBindArgs args) =>
-        AggOpen(schemaName, functionName);
+    IAggregateSession AggOpen(SchemaPath schemaPath, string functionName, ScalarBindArgs args) =>
+        AggOpen(schemaPath, functionName);
 
     /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>
