@@ -367,48 +367,61 @@ There are no UNIQUE/PRIMARY KEY constraints that refer to this table
 #     separately, and the copy-on-write delete of id1 renumbered every row after it, so the second
 #     delete's captured position named id4. SINGLE-FILE is what makes it bite — with one row per file
 #     the rewrite renumbers nothing, which is why every earlier test of this passed.
-#     Now the merge is forced to buffer, and buffering requires deletion vectors, so this table
-#     REFUSES the statement. Asserted as: a clean error, then the table intact.
+#     Now the merge is forced to buffer. Buffering used to require deletion vectors, so this table
+#     REFUSED the statement; since 2026-10-26 the buffered deletes are staged copy-on-write at COMMIT
+#     (engineered-wood stages a rewrite of the touched files), so it RUNS — fused into one commit, with
+#     the right survivors and no deletion vector in the log.
 # ==============================================================================================
 
 statement ok
 CREATE TABLE lake.main.nodv WITH (deletion_vectors=false) AS SELECT i AS id, i * 10 AS v FROM range(1, 5) AS r(i);
 
-statement error
+statement ok
+CREATE TABLE nodv_log AS SELECT count(*) AS n FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/nodv/_delta_log/*.json');
+
+statement ok
 MERGE INTO lake.main.nodv USING (VALUES (1, 0), (3, 0)) s(id, v) ON nodv.id = s.id
   WHEN MATCHED AND s.id = 1 THEN DELETE
   WHEN MATCHED AND s.id = 3 THEN DELETE;
-----
-requires deletion vectors on the table
 
-# NOTHING was destroyed — all four rows, original values. Before the fix this read `2, 3`.
+# id4 survives. Before the forcing this read `2, 3` (id3 kept, id4 destroyed).
 query II
 SELECT id, v FROM lake.main.nodv ORDER BY id;
 ----
-1	10
 2	20
-3	30
 4	40
 
+# Fused: ONE commit for both actions.
+query I
+SELECT count(*) - (SELECT n FROM nodv_log) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/nodv/_delta_log/*.json');
+----
+1
+
+# Copy-on-write, not a vector the table never declared.
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/mergeinto/nodv/_delta_log/*.json')
+WHERE content LIKE '%deletionVector":{%';
+----
+0
+
 # The update variant of the same hazard (a delete positioned BEFORE an updated row silently lost the
-# update) is refused by the same mechanism.
-statement error
+# update): the update lands on id3 and nothing else moves.
+statement ok
+CREATE OR REPLACE TABLE lake.main.nodv WITH (deletion_vectors=false) AS SELECT i AS id, i * 10 AS v FROM range(1, 5) AS r(i);
+
+statement ok
 MERGE INTO lake.main.nodv USING (VALUES (1, 0), (3, 333)) s(id, v) ON nodv.id = s.id
   WHEN MATCHED AND s.id = 1 THEN DELETE
   WHEN MATCHED THEN UPDATE SET v = s.v;
-----
-requires deletion vectors on the table
 
 query II
 SELECT id, v FROM lake.main.nodv ORDER BY id;
 ----
-1	10
 2	20
-3	30
+3	333
 4	40
 
-# POSITIVE CONTROL — the refusal must be about BUFFERING, not about non-DV tables being unwritable.
-# A SINGLE-action merge on the very same table still works: one action cannot invalidate another.
+# A SINGLE-action merge on the same table, unbuffered (the direct copy-on-write path), still works.
 statement ok
 MERGE INTO lake.main.nodv USING (VALUES (2, 0)) s(id, v) ON nodv.id = s.id
   WHEN MATCHED THEN DELETE;
@@ -416,8 +429,7 @@ MERGE INTO lake.main.nodv USING (VALUES (2, 0)) s(id, v) ON nodv.id = s.id
 query II
 SELECT id, v FROM lake.main.nodv ORDER BY id;
 ----
-1	10
-3	30
+3	333
 4	40
 
 # ==============================================================================================

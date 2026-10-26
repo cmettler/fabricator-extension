@@ -954,7 +954,10 @@ case "$TIER" in
         # 2026-10-26: 10740 -> 10751. verify_delta_statistics 34 -> 45 (§9): a BOOLEAN's bounds. DuckDB reports them
         #   as 0/1 and the native writer recorded maxValues = false for every boolean column, so `WHERE h = true`
         #   pruned the file away — 0 rows, no error.
-        : "${MIN_ASSERTIONS:=10751}"
+        # 2026-10-26: 10751 -> 10765. Buffered DML on a table without deletion vectors is staged copy-on-write
+        #   (engineered-wood #525): verify_merge_into §11 and verify_delta_catalog_transactions §7 assert the results
+        #   where they asserted the old refusal.
+        : "${MIN_ASSERTIONS:=10765}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

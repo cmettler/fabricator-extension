@@ -4090,20 +4090,8 @@ public sealed class DeltaCatalog : IProviderCatalog
     // ERRORS with the autocommit escape hatch instead of falling back to an immediate commit.
     private void EnsureBufferedDmlEligible(in DeltaReader.TxnDmlProfile p, string op, bool forUpdate)
     {
-        if (!p.DvEnabled)
-        {
-            // ⚠ Do NOT say "run it in autocommit" here. Since MERGE landed, buffering is ALSO forced for a
-            // merge carrying two or more UPDATE/DELETE actions EVEN IN AUTOCOMMIT — because those actions share
-            // one scan's row addresses and a copy-on-write delete would renumber the rows the other action
-            // already addressed. So this message is reachable on a statement that IS in autocommit, where
-            // advising autocommit is both wrong and baffling. State the requirement; name both ways out.
-            throw new System.NotSupportedException(
-                $"delta: {op} requires deletion vectors on the table when it is buffered (this table has them "
-                + "disabled). It is buffered inside an explicit transaction, and for a MERGE carrying more than "
-                + "one UPDATE/DELETE action — two such actions cannot be applied one at a time without risking "
-                + "the wrong row. Enable deletion vectors on the table, or use at most one UPDATE/DELETE action "
-                + "per merge outside a transaction.");
-        }
+        // A table without deletion vectors buffers too: the flush stages its deletes copy-on-write (the touched
+        // files rewritten at COMMIT) instead of as vectors.
         if (p.CdfEnabled && !p.SupportsExternalCommit)
         {
             throw new System.NotSupportedException(
@@ -4182,6 +4170,13 @@ public sealed class DeltaCatalog : IProviderCatalog
                         "delta: DELETE of rows inserted in the same transaction is not supported on a "
                         + "Change-Data-Feed table (their insert was already captured in the feed) — "
                         + "COMMIT the inserts first.");
+                }
+                if (!profile.DvEnabled)
+                {
+                    // The flush hides such rows with a deletion vector born on the new file's add.
+                    throw new System.NotSupportedException(
+                        "delta: DELETE of rows inserted in the same transaction needs deletion vectors on the "
+                        + "table (this one has them disabled) — COMMIT the inserts first.");
                 }
             }
             if (!pending.DeletedByOrdinal.TryGetValue((int)ordinal, out var set))
@@ -4781,7 +4776,14 @@ public sealed class DeltaCatalog : IProviderCatalog
             long rowsDeleted = pendingRowsDeleted;
             if (deletes.Count > 0)
             {
-                rowsDeleted += await txn.StageRowDeletesAsync(RowSelection.ByPath(deletes), token)
+                // Without deletion vectors the touched files are rewritten instead (copy-on-write): plain
+                // remove + add, so a reader without vector support — SQL Server's Delta reader among them —
+                // still reads the table.
+                var deleteMode = EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.IsEnabled(
+                        pinnedSnap.Metadata.Configuration)
+                    ? RowDeleteMode.DeletionVector
+                    : RowDeleteMode.CopyOnWrite;
+                rowsDeleted += await txn.StageRowDeletesAsync(RowSelection.ByPath(deletes), deleteMode, token)
                     .ConfigureAwait(false);
             }
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.

@@ -61,7 +61,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Statistics → optimizer: cardinality + per-column NDV | ✅ (NDV only; min/max intentionally not reported) |
 | **Write** | INSERT, INSERT…SELECT, INSERT…RETURNING (`OUTPUT INSERTED.*`) | ✅ |
 | | UPDATE / DELETE (rowid-based, parameterized) | ✅ |
-| | `MERGE INTO` — all actions incl. `NOT MATCHED BY SOURCE`, `DO NOTHING`, `ERROR` | ✅ (needs a rowid; 2+ `UPDATE`/`DELETE` actions are fused and need deletion vectors on Delta; no `RETURNING`) |
+| | `MERGE INTO` — all actions incl. `NOT MATCHED BY SOURCE`, `DO NOTHING`, `ERROR` | ✅ (needs a rowid; 2+ `UPDATE`/`DELETE` actions are fused into one commit on Delta; no `RETURNING`) |
 | | `UPDATE … SET col = DEFAULT` | ❌ (write the value explicitly) |
 | | `INSERT … ON CONFLICT` | ❌ (no unique constraint is advertised — use `MERGE INTO`) |
 | | CREATE TABLE AS / COPY TO (streaming bulk via `SqlBulkCopy`) | ✅ |
@@ -711,17 +711,14 @@ The rule counts `UPDATE`/`DELETE` actions only, because an `INSERT` addresses no
 | merge shape | fused? | on a `deletion_vectors=false` target |
 |---|---|---|
 | one `UPDATE`/`DELETE` (± an `INSERT`) | no — one commit per action | works (copy-on-write) |
-| two or more `UPDATE`/`DELETE` actions | **yes, one commit** | **refused** |
+| two or more `UPDATE`/`DELETE` actions | **yes, one commit** | works (copy-on-write, in the same commit) |
 
-The refusal is the price of the guarantee: fusing requires deletion vectors, so on a table created with
-`deletion_vectors=false` a merge with two such actions reports *"requires deletion vectors on the table when
-it is buffered … Enable deletion vectors on the table, or use at most one UPDATE/DELETE action per merge
-outside a transaction."* Deletion vectors are on by default, so this only affects tables that switched them
-off — typically for readers that cannot consume them, such as SQL Server's external-table Delta reader.
+On a table without deletion vectors the fused commit rewrites the touched files instead (copy-on-write), so the
+result stays readable by engines that cannot consume vectors, such as SQL Server's Delta reader. The same holds
+for `UPDATE`/`DELETE` inside `BEGIN … COMMIT` on such a table. Until 2026-10-26 both were refused there.
 
 *(DuckLake draws the same line and stops there — it [refuses two such actions
-outright](https://ducklake.select/docs/stable/duckdb/usage/upserting). We serve them by fusing, and refuse
-only when the table cannot be buffered at all.)*
+outright](https://ducklake.select/docs/stable/duckdb/usage/upserting). We serve them by fusing.)*
 
 ⚠ **A fused merge reports `operation = 'TRANSACTION'`, never `'MERGE'`.** Another engine's
 `DESCRIBE HISTORY` will not match on `MERGE`. Wrap any merge in `BEGIN … COMMIT` if you want it atomic
@@ -4587,6 +4584,8 @@ COMMIT;
   transaction's data statements (*"ALTER TABLE after buffered data changes"* — so it cannot follow a CTAS,
   which is itself a data statement), and **`UPDATE` on such a table still fails**, because every one of its
   rows was inserted in the same transaction and updating not-yet-committed rows is a separate limitation.
+  `DELETE` of rows inserted in the same transaction needs deletion vectors on the table (the default): the
+  commit hides them with a vector on the new file.
 - ⚠ **Another session can see the table, empty, until you commit** — and a `ROLLBACK` drops it on a
   best-effort basis. If that drop fails (a permission or network error) an **empty table is left behind**;
   the reason is logged with the path. Set `FABRICATOR_LOG_LEVEL=Information` to see it.
