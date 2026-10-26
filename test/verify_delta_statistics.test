@@ -14,6 +14,8 @@ require fabricator
 
 require parquet
 
+require json
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ============================================================================
@@ -142,3 +144,78 @@ query II
 EXPLAIN (FORMAT json) SELECT * FROM s2.main.big WHERE k = 7;
 ----
 physical_plan	<REGEX>:.*"Estimated Cardinality": "4000".*
+
+# ============================================================================
+# 3. A TRUNCATED STRING MAX IS STILL AN UPPER BOUND ON THIS LINE.
+#    DuckDB 1.5.6 truncates string statistics at 256 bytes and ROUNDS the truncated max UP (the last kept byte is
+#    incremented), so the value written into maxValues stays a valid upper bound. DuckDB 2.0 stopped rounding up
+#    and reports `max_is_exact` instead, which is why the 2.0 line drops such a max. Pinned here so a DuckDB bump
+#    on this line that changes the truncation cannot turn the bound into a prefix unnoticed.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/trunc' AS s3 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE TABLE s3.main.longstr (s VARCHAR) WITH (column_mapping='none');
+
+statement ok
+INSERT INTO s3.main.longstr SELECT repeat('a', 2000) || 'ZZZ';
+
+query II
+SELECT length(m) <= 256, m > repeat('a', 2000) || 'ZZZ'
+FROM (SELECT json_extract_string(add->>'stats', '$.maxValues.s') AS m
+      FROM read_json('${FABRICATOR_DELTA_WRITE_DIR}/trunc/longstr/_delta_log/*.json')
+      WHERE add IS NOT NULL);
+----
+true	true
+
+query I
+SELECT count(*) FROM s3.main.longstr WHERE s > repeat('a', 300);
+----
+1
+
+# ============================================================================
+# 9. A BOOLEAN'S BOUNDS ARE WRITTEN AS BOOLEANS, OR NOT AT ALL.
+#    DuckDB reports a boolean's min/max as `0` / `1`. The native writer compared that text with "true" only,
+#    so EVERY native-written file with a boolean column recorded maxValues = false — and the scan, pruning on
+#    the log, skipped the file for `h = true`: the count below was 0, with no error. Any other reader that
+#    prunes on Delta statistics (Spark, PolyBase) was misled the same way.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/boolst' AS s4 (TYPE fabricator, PROVIDER 'delta');
+
+# column_mapping 'none' so the stats keys are the column names (with mapping they are random `col-…` keys in no
+# fixed order).
+statement ok
+CREATE TABLE s4.main.mixed (id INTEGER, h BOOLEAN) WITH (column_mapping='none');
+
+statement ok
+INSERT INTO s4.main.mixed SELECT i, i % 2 = 0 FROM range(30) t(i);
+
+query II
+SELECT (SELECT count(*) FROM s4.main.mixed WHERE h = true), (SELECT count(*) FROM s4.main.mixed WHERE h = false);
+----
+15	15
+
+# The bound itself, as the log records it: min false, max true.
+query II
+SELECT DISTINCT json_extract(add->>'stats', '$.minValues.h')::VARCHAR AS mn,
+                json_extract(add->>'stats', '$.maxValues.h')::VARCHAR AS mx
+FROM read_json('${FABRICATOR_DELTA_WRITE_DIR}/boolst/mixed/_delta_log/*.json')
+WHERE add IS NOT NULL;
+----
+false	true
+
+# The control for pruning still WORKING: a file holding only `true` is rightly skipped for `h = false`.
+statement ok
+CREATE TABLE s4.main.alltrue (id INTEGER, h BOOLEAN);
+
+statement ok
+INSERT INTO s4.main.alltrue SELECT i, true FROM range(10) t(i);
+
+query II
+SELECT (SELECT count(*) FROM s4.main.alltrue WHERE h = true), (SELECT count(*) FROM s4.main.alltrue WHERE h = false);
+----
+10	0

@@ -4395,6 +4395,13 @@ principal wins even if `PROVIDER` says something else:
 | Concurrent writers: OCC retry (a blind append / CTAS — an append that READ the table surfaces the conflict instead, see below) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
 | Concurrent writers on **OneLake**, many processes appending to ONE table — no lost writes (measured: 96 concurrent commits, all landed), but a losing writer can occasionally surface an error rather than retrying transparently, so retry the statement | ⚠ |
 
+> ⚠ **Tables with a BOOLEAN column written before 2026-10-26 by `PROVIDER 'delta'`** recorded the column's maximum
+> as `false` in the Delta log, so `WHERE flag = true` (here, and in any reader that prunes on Delta statistics) can
+> skip files that do match — a bare `WHERE flag` is unaffected. Rewrite such a table's rows once, e.g.
+> `UPDATE t SET flag = flag` (⚠ `OPTIMIZE` alone is not enough: it leaves a file it does not compact untouched);
+> new writes record the right bounds. Partition columns were never affected. Details:
+> [docs/known-limitations.md](docs/known-limitations.md).
+
 > **Partition values are escaped the way Spark escapes them**, so a value containing `/ : = % ? * " ' #` or a
 > backslash or a control character becomes `%XX` in the directory name (`region=a/b` → `region=a%2Fb`). The
 > value you read back is always the original — Delta records it in the log, not in the path.

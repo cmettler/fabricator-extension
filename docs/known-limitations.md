@@ -286,6 +286,32 @@ dies at the mixed-type row, removing the `fabricator_scan` flag dies at the `pub
 projection differs and a mutant removing it survives. It is set for the contract, not for a test.
 
 ---
+### ~~1.29~~ FIXED 2026-10-26 — a native-written Delta file recorded every BOOLEAN's maximum as `false`
+
+**What went wrong.** The native write path (`PROVIDER 'delta'`'s default, DuckDB's own parquet writer) builds the
+Delta `add.stats` from DuckDB's `RETURN_STATS`, which reports a boolean's bounds as `0` / `1`. The conversion
+compared the text with `"true"` only, so EVERY file with a boolean column recorded `maxValues: false` (and
+`minValues: false`). Any reader that prunes on the log then skipped the file for `col = true`:
+`SELECT count(*) FROM t WHERE flag = true` answered **0** where 15 rows matched, with no error. Measured on our own
+scan (both engines — the codec reader prunes on the same log); Spark and SQL Server's PolyBase prune on the same
+statistics and are presumably misled the same way (not measured). `WHERE flag` (bare) and `flag = false` were
+unaffected, and a PARTITION column was never affected (its value lives in `partitionValues`, not in the stats).
+
+**How old.** At least as old as the previous engineered-wood pin — measured there with the same result, so the
+shipped builds carry it. The engineered-wood codec WRITER was never affected.
+
+**⚠ EXISTING TABLES DO NOT HEAL.** The wrong bound is in each file's `add` action. A table written before the fix
+keeps it until its rows are rewritten. ⚠ `OPTIMIZE` is NOT enough on its own — MEASURED, it leaves a file it does not
+compact (a single small file) untouched. `UPDATE t SET flag = flag` is (measured): every row moves to a new file
+with the right bounds, and the old file stays in the log only fully masked by a deletion vector (or removed), so
+skipping it on its wrong bound loses nothing.
+Until then, `WHERE flag` (bare) is answered correctly on such a table while `WHERE flag = true` is not.
+
+**Fix.** `0`/`1` and `false`/`true` are both read; anything else is OMITTED rather than guessed (no bound is a
+correct bound). Gate `verify_delta_statistics` §9: the counts, the bound as the log records it, and a control
+that pruning still WORKS (an all-`true` file is rightly skipped for `= false`). The reverted fix dies at the first
+row with `0 15`, the original symptom.
+
 ## 2. Claimed but NOT measured — treat as unproven
 
 | # | claim | why it is unproven, and what would settle it |
