@@ -1,0 +1,291 @@
+# name: test/verify_sql_variant_mssql.test
+# description: A sql_variant column reads as DuckDB VARIANT (Arrow arrow.parquet.variant), each value as the
+#              variant primitive of its own base type. It used to read as VARCHAR through .NET ToString(),
+#              which turned varbinary into the text "System.Byte[]" and dropped datetime2's fractional seconds
+#              (known-limitations 1.30). The mapping follows mssql-adbc's VariantDecoders.cs. Writing goes
+#              the other way: a VARIANT column becomes sql_variant, each value stored exactly or refused.
+# group: [fabricator]
+
+require fabricator
+
+require icu
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('db', 'IF OBJECT_ID(''dbo.sv_t'') IS NOT NULL DROP TABLE dbo.sv_t;
+  IF OBJECT_ID(''dbo.sv_copy'') IS NOT NULL DROP TABLE dbo.sv_copy;
+  IF OBJECT_ID(''dbo.sv_copy2'') IS NOT NULL DROP TABLE dbo.sv_copy2;
+  CREATE TABLE dbo.sv_t (id int, v sql_variant)');
+
+statement ok
+SELECT fabricator_exec('db', 'INSERT dbo.sv_t (id, v) VALUES
+  (1, CAST(CAST(42 AS int) AS sql_variant)), (2, CAST(CAST(1.5 AS decimal(10,3)) AS sql_variant)), (3, CAST(CAST(2.25 AS float) AS sql_variant)),
+  (4, CAST(CAST(''2026-10-27T13:14:15.1234567'' AS datetime2) AS sql_variant)), (5, CAST(CAST(''2026-10-27'' AS date) AS sql_variant)),
+  (6, CAST(CAST(''2026-10-27T13:14:15.123'' AS datetime) AS sql_variant)), (7, CAST(CAST(''13:14:15.5'' AS time) AS sql_variant)),
+  (8, CAST(CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS sql_variant)), (9, CAST(CAST(0xCAFE AS varbinary(10)) AS sql_variant)),
+  (10, CAST(CAST(N''äbc'' AS nvarchar(10)) AS sql_variant)), (11, CAST(CAST(1 AS bit) AS sql_variant)), (12, CAST(CAST(12.3456 AS money) AS sql_variant)),
+  (13, CAST(CAST(''2026-10-27T13:14:15+02:00'' AS datetimeoffset) AS sql_variant)), (14, NULL), (15, CAST(CAST(255 AS tinyint) AS sql_variant)),
+  (16, CAST(CAST(-1.25e-10 AS real) AS sql_variant)), (17, CAST(CAST(9000000000 AS bigint) AS sql_variant)), (18, CAST(CAST(1.5 AS smallmoney) AS sql_variant)),
+  (19, CAST(CAST(REPLICATE(''x'', 70) AS varchar(100)) AS sql_variant)), (20, CAST(CAST(''2026-10-27T13:14:15.123456'' AS datetime2) AS sql_variant))');
+
+# the table was created out of band, after the ATTACH listed this catalog
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+SET TimeZone = 'UTC';
+
+# --- 1. the column is VARIANT, and each value keeps its base type ---
+query T
+SELECT typeof(v) FROM db.dbo.sv_t LIMIT 1;
+----
+VARIANT
+
+query ITT
+SELECT id, v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_t ORDER BY id;
+----
+1	42	INT32
+2	1.500	DECIMAL(4, 3)
+3	2.25	DOUBLE
+4	2026-10-27 13:14:15.1234567	TIMESTAMP_NANOS
+5	2026-10-27 00:00:00	TIMESTAMP_MICROS
+6	2026-10-27 13:14:15.123	TIMESTAMP_MICROS
+7	13:14:15.5	TIME_MICROS
+8	6f9619ff-8b86-d011-b42d-00c04fc964ff	UUID
+9	\xCA\xFE	BLOB
+10	äbc	VARCHAR
+11	true	BOOL_TRUE
+12	12.3456	DECIMAL(6, 4)
+13	2026-10-27 11:14:15+00	TIMESTAMP_MICROS_TZ
+14	NULL	VARIANT_NULL
+15	255	INT16
+16	-1.25e-10	FLOAT
+17	9000000000	INT64
+18	1.5000	DECIMAL(5, 4)
+19	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx	VARCHAR
+20	2026-10-27 13:14:15.123456	TIMESTAMP_MICROS
+
+# a SQL NULL stays a SQL NULL
+query I
+SELECT count(*) FROM db.dbo.sv_t WHERE v IS NULL;
+----
+1
+
+# the values are usable as their types
+query IR
+SELECT v::BIGINT, (SELECT v::DECIMAL(10,3) FROM db.dbo.sv_t WHERE id = 2) FROM db.dbo.sv_t WHERE id = 17;
+----
+9000000000	1.500
+
+query T
+SELECT v::BLOB FROM db.dbo.sv_t WHERE id = 9;
+----
+\xCA\xFE
+
+# --- 2. fabricator_query with free SQL takes the same mapping ---
+query TT
+SELECT typeof(v), variant_typeof(v) FROM fabricator_query('db', 'SELECT v FROM dbo.sv_t WHERE id = 4');
+----
+VARIANT	TIMESTAMP_NANOS
+
+# --- 3. a filter on the VARIANT column is evaluated by DuckDB, never sent to SQL Server ---
+query I
+SELECT id FROM db.dbo.sv_t WHERE v = 42::VARIANT;
+----
+1
+
+query I
+SELECT id FROM db.dbo.sv_t WHERE v > 1::VARIANT AND id < 5 ORDER BY id;
+----
+1
+2
+3
+4
+
+statement ok
+SELECT fabricator_exec('db', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');
+
+statement ok
+SELECT id FROM db.dbo.sv_t WHERE v = 42::VARIANT AND id < 5;
+
+query I
+SELECT pushed FROM fabricator_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[sv_t]'', st.text) > 0
+       AND CHARINDEX(''[v]'', st.text) > 0
+       AND CHARINDEX(''WHERE'', st.text) > 0
+       AND CHARINDEX(''[v] '', SUBSTRING(st.text, CHARINDEX(''WHERE'', st.text), 4000)) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS pushed');
+----
+0
+
+# control: the id half of the same filter did reach the server
+query I
+SELECT pushed FROM fabricator_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[sv_t]'', st.text) > 0
+       AND CHARINDEX(''[id] <'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS pushed');
+----
+1
+
+# --- 4. writing: a VARIANT column becomes sql_variant, each value stored as the base type that holds it
+# EXACTLY, or refused. SqlBulkCopy picks the base type from the CLR value, and two of its choices are lossy
+# (MEASURED): a DateTime becomes the legacy datetime (rounds to 1/300 s, nothing before 1753), and a string over
+# 4000 characters becomes varchar (a code page). Both are refused rather than written. ---
+
+# a CTAS of every value datetime holds exactly is a lossless round trip — values AND base types
+statement ok
+CREATE TABLE db.dbo.sv_copy AS SELECT * FROM db.dbo.sv_t WHERE id NOT IN (4, 20);
+
+query T
+SELECT data_type FROM fabricator_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)) AS data_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ''sv_copy'' AND COLUMN_NAME = ''v''');
+----
+sql_variant
+
+query I
+SELECT count(*) FROM (
+  ((SELECT id, v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_copy) EXCEPT ALL (SELECT id, v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_t WHERE id NOT IN (4, 20)))
+  UNION ALL ((SELECT id, v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_t WHERE id NOT IN (4, 20)) EXCEPT ALL (SELECT id, v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_copy)));
+----
+0
+
+# a datetime2 value datetime would round is refused, naming the cast that stores it exactly — and the refused
+# CTAS leaves no table behind
+statement error
+CREATE TABLE db.dbo.sv_copy2 AS SELECT * FROM db.dbo.sv_t;
+----
+cast it to TIMESTAMPTZ
+
+query I
+SELECT n FROM fabricator_query('db', 'SELECT CAST(COUNT(*) AS INT) AS n FROM sys.tables WHERE name = ''sv_copy2''');
+----
+0
+
+# ... and the cast it names does store it exactly, as datetimeoffset(7)
+statement ok
+INSERT INTO db.dbo.sv_copy SELECT 104, v::TIMESTAMP::TIMESTAMPTZ::VARIANT FROM db.dbo.sv_t WHERE id = 20;
+
+query TT
+SELECT v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_copy WHERE id = 104;
+----
+2026-10-27 13:14:15.123456+00	TIMESTAMP_MICROS_TZ
+
+query T
+SELECT base FROM fabricator_query('db',
+  'SELECT CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS VARCHAR(30)) AS base FROM dbo.sv_copy WHERE id = 104');
+----
+datetimeoffset
+
+# primitives of every kind insert
+statement ok
+INSERT INTO db.dbo.sv_copy VALUES (100, 5::VARIANT), (101, 'x'::VARIANT), (102, 1.25::DECIMAL(10,2)::VARIANT), (103, NULL);
+
+query ITT
+SELECT id, v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_copy WHERE id BETWEEN 100 AND 103 ORDER BY id;
+----
+100	5	INT32
+101	x	VARCHAR
+102	1.25	DECIMAL(3, 2)
+103	NULL	VARIANT_NULL
+
+query TT
+SELECT base, txt FROM fabricator_query('db',
+  'SELECT CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS VARCHAR(30)) AS base, CAST(v AS NVARCHAR(30)) AS txt
+   FROM dbo.sv_copy WHERE id IN (100, 101, 102) ORDER BY id');
+----
+int	5
+nvarchar	x
+numeric	1.25
+
+# an object, an array, an over-long string and a value datetime cannot hold exactly are refused, and none of
+# the refused rows lands
+statement error
+INSERT INTO db.dbo.sv_copy VALUES (110, {'a': 1}::VARIANT);
+----
+v::JSON
+
+statement error
+INSERT INTO db.dbo.sv_copy VALUES (111, [1, 2]::VARIANT);
+----
+v::JSON
+
+statement error
+INSERT INTO db.dbo.sv_copy VALUES (112, repeat('ä', 4001)::VARIANT);
+----
+at most 4000
+
+statement error
+INSERT INTO db.dbo.sv_copy VALUES (113, TIMESTAMP '1500-01-01 00:00:00'::VARIANT);
+----
+cast it to TIMESTAMPTZ
+
+query I
+SELECT count(*) FROM db.dbo.sv_copy WHERE id >= 110;
+----
+0
+
+# a 4000-character non-ASCII string is the limit, and keeps its characters (nvarchar, not a code page)
+statement ok
+INSERT INTO db.dbo.sv_copy VALUES (120, repeat('ä', 4000)::VARIANT);
+
+query II
+SELECT length(v::VARCHAR), v::VARCHAR = repeat('ä', 4000) FROM db.dbo.sv_copy WHERE id = 120;
+----
+4000	true
+
+# UPDATE takes the same rule (its SET values are read the same way)
+statement ok
+SELECT fabricator_exec('db', 'ALTER TABLE dbo.sv_copy ALTER COLUMN id int NOT NULL');
+
+statement ok
+SELECT fabricator_exec('db', 'ALTER TABLE dbo.sv_copy ADD CONSTRAINT pk_sv_copy PRIMARY KEY (id)');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+UPDATE db.dbo.sv_copy SET v = 'updated'::VARIANT WHERE id = 1;
+
+query TT
+SELECT v::VARCHAR, variant_typeof(v) FROM db.dbo.sv_copy WHERE id = 1;
+----
+updated	VARCHAR
+
+statement error
+UPDATE db.dbo.sv_copy SET v = {'a': 1}::VARIANT WHERE id = 2;
+----
+v::JSON
+
+query T
+SELECT v::VARCHAR FROM db.dbo.sv_copy WHERE id = 2;
+----
+1.500
+
+# ALTER TABLE ADD COLUMN with a VARIANT type creates a sql_variant column
+statement ok
+ALTER TABLE db.dbo.sv_copy ADD COLUMN w VARIANT;
+
+query T
+SELECT data_type FROM fabricator_query('db',
+  'SELECT CAST(DATA_TYPE AS VARCHAR(32)) AS data_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ''sv_copy'' AND COLUMN_NAME = ''w''');
+----
+sql_variant
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.sv_copy');
+
+# --- cleanup ---
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.sv_t');

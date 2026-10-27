@@ -324,7 +324,7 @@ correct bound). Gate `verify_delta_statistics` §9: the counts, the bound as the
 that pruning still WORKS (an all-`true` file is rightly skipped for `= false`). The reverted fix dies at the first
 row with `0 15`, the original symptom.
 
-### 1.30 A SQL Server `sql_variant` column reads as VARCHAR, through .NET `ToString()` — lossy (measured 2026-10-27, NOT fixed)
+### ~~1.30~~ FIXED 2026-10-27 — a SQL Server `sql_variant` column read as VARCHAR, through .NET `ToString()` — lossy
 
 `sql_variant` has no case in `SqlArrowMapping.MapType`, so it falls through to the CLR type (`object`) and lands
 as `StringType`; the appender then writes `o.ToString()` with the process culture. Measured on SQL Server 2025,
@@ -343,6 +343,14 @@ one value per base type:
 ⚠ The date and number formats follow the CULTURE of the process (`o.ToString()` takes no format provider), so the
 same row can read differently on another machine. The remote pushdown declines a query that uses such a column
 (it runs locally), so both paths agree on this — on the wrong answer.
+
+**FIXED the same day:** `sql_variant` now reads as DuckDB `VARIANT` and writes back exactly or refuses
+(`SqlVariantAppender`, `VariantClrValue`; README §Type mapping). Gate `verify_sql_variant_mssql`. Two things
+building it found, both SILENT: (1) with the column typed VARIANT, an `INSERT` into it stored the TEXT
+`StructArray` — `ArrowDataReader`'s last-resort branch returned the array's type NAME as the value for any type
+it did not know; it throws now. (2) SqlBulkCopy writes a `DateTime` into `sql_variant` as legacy `datetime`
+(rounding `.1234567` to `.123`, rejecting < 1753) and a string over 4000 characters as `varchar` (a code page) —
+both measured, both refused rather than written. The record of the plan, as it was:
 
 **Planned (2026-10-27, user-agreed): map `sql_variant` ⇄ DuckDB `VARIANT`** (Arrow `arrow.parquet.variant`,
 which DuckDB 2.0 imports natively; the Delta path already crosses it), after the mapping in mssql-adbc

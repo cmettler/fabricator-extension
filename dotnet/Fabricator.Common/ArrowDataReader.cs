@@ -37,7 +37,10 @@ public sealed class ArrowDataReader : DbDataReader
     public override int RecordsAffected => -1;
 
     public override string GetName(int ordinal) => _schema.FieldsList[ordinal].Name;
-    public override Type GetFieldType(int ordinal) => ClrType(_schema.FieldsList[ordinal].DataType);
+    public override Type GetFieldType(int ordinal) =>
+        VariantClrValue.IsVariantField(_schema.FieldsList[ordinal])
+            ? typeof(object)
+            : ClrType(_schema.FieldsList[ordinal].DataType);
     public override string GetDataTypeName(int ordinal) => _schema.FieldsList[ordinal].DataType.Name;
 
     public override int GetOrdinal(string name)
@@ -84,6 +87,16 @@ public sealed class ArrowDataReader : DbDataReader
     public override object GetValue(int ordinal)
     {
         var array = _batch!.Column(ordinal);
+        var field = _schema.FieldsList[ordinal];
+        if (VariantClrValue.IsVariantField(field))
+        {
+            // A DuckDB VARIANT into a sql_variant column: each value as the CLR type whose sql_variant base
+            // type holds it exactly, or refused (VariantClrValue). Its struct storage would otherwise fall to
+            // the last-resort branch below.
+            return array.IsNull(_rowInBatch)
+                ? DBNull.Value
+                : VariantClrValue.ToSqlVariant(VariantClrValue.ValueBytes(array, _rowInBatch), field.Name);
+        }
         return ValueAt(array, _rowInBatch) ?? DBNull.Value;
     }
 
@@ -126,7 +139,11 @@ public sealed class ArrowDataReader : DbDataReader
             case TimestampArray a: return a.GetTimestamp(index)?.UtcDateTime;
             case StringArray a: return a.GetString(index);
             case BinaryArray a: return a.GetBytes(index).ToArray();
-            default: return array.GetType().Name; // last-resort: should not happen for our producers
+            // ⚠ This used to RETURN the array's type name as the value, so an unmapped type was written as the
+            // text "StructArray" without an error (found when a VARIANT reached a sql_variant column).
+            default:
+                throw new NotSupportedException(
+                    $"Fabricator: a value of Arrow type {array.Data.DataType.Name} cannot be written by this provider");
         }
     }
 

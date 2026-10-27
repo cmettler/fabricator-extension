@@ -4019,7 +4019,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             {
                 var field = RequireField(column, "added column");
                 string name = spec.RequireColumn();
-                string sqlType = MapArrowToSqlType(field.DataType, Profile);
+                string sqlType = MapArrowFieldToSqlType(field, Profile);
                 string colDef = Quote(name) + " " + sqlType +
                                 (field.IsNullable ? " NULL" : " NOT NULL");
                 // ⚠⚠ THE DEFAULT AND `WITH VALUES`, and BOTH halves are measured (2026-09-08).
@@ -4061,7 +4061,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 string col = spec.RequireColumn();
                 bool nullable = ColumnIsNullable(schemaName, tableName, col);
                 ExecuteNonQuery($"ALTER TABLE {qualified} ALTER COLUMN {Quote(col)} " +
-                                MapArrowToSqlType(RequireField(column, "column type").DataType, Profile) +
+                                MapArrowFieldToSqlType(RequireField(column, "column type"), Profile) +
                                 (nullable ? " NULL" : " NOT NULL"));
                 break;
             }
@@ -4888,17 +4888,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 sb.Append(Quote(field.Name)).Append(IdentityClause(profile));
                 continue;
             }
-            if (VariantMarker.IsVariantArrowField(field))
-            {
-                // A DuckDB VARIANT crosses the boundary as an ew.variant_transport-tagged blob (the Delta
-                // provider's transport). Mapping it to VARBINARY would silently store opaque variant bytes —
-                // reject instead (before the arrow extension existed this failed at export with a clean error).
-                throw new NotSupportedException(
-                    $"Column '{field.Name}' is a DuckDB VARIANT — not supported by the SQL Server provider "
-                    + "(cast it to JSON/VARCHAR first, e.g. v::JSON).");
-            }
             sb.Append(Quote(field.Name)).Append(' ')
-              .Append(MapArrowToSqlType(field.DataType, profile, with?.TextType, with?.VarcharLength))
+              .Append(MapArrowFieldToSqlType(field, profile, with?.TextType, with?.VarcharLength))
               .Append(field.IsNullable ? " NULL" : " NOT NULL");
             if (defaultMap.TryGetValue(i, out var defaultValue))
             {
@@ -5098,6 +5089,29 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// reading <c>mssql_default_varchar_length</c>.</param>
     /// <remarks>⚠ Both are OPTIONAL and default to the session settings ON PURPOSE: this mapper serves the
     /// ALTER paths too, and an ALTER carries no <c>WITH</c>. Only the CREATE path passes them.</remarks>
+    /// <summary>
+    /// <see cref="MapArrowToSqlType"/> for a whole field, so an extension type carried in the field metadata
+    /// is seen: a DuckDB VARIANT becomes <c>sql_variant</c>, whose values are written exactly or refused one by
+    /// one (VariantClrValue — an object or array, an over-long string, a timestamp datetime would round).
+    /// Fabric Warehouse and Synapse have no sql_variant.
+    /// </summary>
+    private static string MapArrowFieldToSqlType(Field field, ServerProfile profile,
+                                                 string? textTypeOverride = null,
+                                                 long? varcharLengthOverride = null)
+    {
+        if (VariantMarker.IsVariantArrowField(field))
+        {
+            if (profile.IsWarehouse)
+            {
+                throw new NotSupportedException(
+                    $"Column '{field.Name}' is a DuckDB VARIANT, and this engine has no sql_variant "
+                    + "(cast it to JSON first, e.g. v::JSON).");
+            }
+            return "SQL_VARIANT";
+        }
+        return MapArrowToSqlType(field.DataType, profile, textTypeOverride, varcharLengthOverride);
+    }
+
     private static string MapArrowToSqlType(IArrowType type, ServerProfile profile,
                                             string? textTypeOverride = null,
                                             long? varcharLengthOverride = null)

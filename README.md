@@ -830,6 +830,7 @@ The write mapping is **profile-adaptive** — it follows the connected engine's 
 | `TIME` / `TIMESTAMP` | `TIME(7)` / `DATETIME2(7)` | `TIME(6)` / `DATETIME2(6)` |
 | `TIMESTAMP WITH TIME ZONE` | `DATETIMEOFFSET(7)` | UTC `DATETIME2(6)` (no `datetimeoffset`) |
 | `UUID` | `UNIQUEIDENTIFIER` | `UNIQUEIDENTIFIER` |
+| `VARIANT` | `SQL_VARIANT` (see below) | refused (no `sql_variant`) — cast to `JSON` |
 
 - **Text type** is driven by the **collation** (a `_UTF8` collation → `VARCHAR`, else `NVARCHAR`), not the
   edition. Length `n` comes from `mssql_default_varchar_length` (unset ⇒ `MAX`); `mssql_ctas_text_type` is a
@@ -841,7 +842,21 @@ On **reads**, SQL Server types map to DuckDB via SqlClient + Arrow:
 `int`/`tinyint`→`UINTEGER`/`UTINYINT`, `decimal(p,s)`/`money`→`DECIMAL`, `bit`→`BOOLEAN`,
 `date`→`DATE`, `time(≤6)`/`datetime2(≤6)`→`TIME`/`TIMESTAMP` (µs), **`time(7)`/`datetime2(7)`→`TIME_NS`/`TIMESTAMP_NS`**
 (the 100 ns digit is preserved), `datetimeoffset`→`TIMESTAMPTZ`, **`uniqueidentifier`→`UUID`**,
-**`json`→`JSON`** (SQL Server 2025; via the `arrow.uuid`/`arrow.json` Arrow extensions), `varbinary`→`BLOB`.
+**`json`→`JSON`** (SQL Server 2025; via the `arrow.uuid`/`arrow.json` Arrow extensions), `varbinary`→`BLOB`,
+**`sql_variant`→`VARIANT`** (DuckDB 2.0).
+
+**`sql_variant` ⇄ `VARIANT`.** Each value keeps its own base type: `int`→INT32, `decimal`/`money`→DECIMAL with its
+scale, `datetimeoffset`→TIMESTAMP WITH TIME ZONE (UTC), `uniqueidentifier`→UUID, `varbinary`→BLOB, and so on;
+`datetime2(7)` keeps its seventh digit. ⚠ `date` reads as a timestamp at midnight — SqlClient returns `date` and
+`datetime2` alike, so the two cannot be told apart. Writing stores each value as the base type that holds it
+**exactly**, or refuses the statement, naming the column:
+- an object or array (no `sql_variant` form) — cast it with `v::JSON` instead;
+- a string over 4000 characters or binary over 8000 bytes (the `sql_variant` limits);
+- a `TIMESTAMP` (or `DATE`) the legacy `datetime` cannot hold exactly — SqlClient stores a timestamp in
+  `sql_variant` as `datetime` (1/300 s, from 1753), so `.123456` would round. Cast it to `TIMESTAMPTZ` to store it
+  exactly as `datetimeoffset(7)`.
+
+A refused `CREATE TABLE … AS` leaves no table behind.
 
 ## DDL
 

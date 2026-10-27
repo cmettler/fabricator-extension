@@ -94,6 +94,11 @@ public static class SqlArrowMapping
             case "sysname":
             case "json": // SQL Server 2025 native json; ToArrowField tags it arrow.json (Utf8 storage)
                 return StringType.Default;
+            case "sql_variant":
+                // arrow.parquet.variant, which DuckDB 2.0 imports as VARIANT; each value keeps its base type
+                // (SqlVariantAppender). It used to fall through to VARCHAR via ToString(), which lost
+                // varbinary bytes and datetime2 fractions (known-limitations 1.30).
+                return VariantType.Default;
             default:
                 // Fall back on the CLR type for anything unmapped.
                 return MapClrType(col.DataType) ?? StringType.Default;

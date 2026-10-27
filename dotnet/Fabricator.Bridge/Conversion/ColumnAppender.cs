@@ -34,6 +34,11 @@ public sealed class ColumnAppender
 
     public static ColumnAppender Create(IArrowType type)
     {
+        if (type is VariantType)
+        {
+            var v = new SqlVariantAppender();
+            return new ColumnAppender(v.Append, v.AppendNull, v.Build);
+        }
         switch (type.TypeId)
         {
             case ArrowTypeId.Boolean:
