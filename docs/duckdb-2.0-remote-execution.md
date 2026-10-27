@@ -935,3 +935,23 @@ removed.
 
 **Not done:** string ORDER BY / min / max (would need the `_UTF8` collations of SQL Server 2019+ and a
 varbinary key), booleans, division, decimal arithmetic, expressions in GROUP BY, and a warehouse profile.
+
+## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
+
+DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets
+`filter_pushdown = true` (`join_filter_pushdown_optimizer.cpp`: `if (!get.function.filter_pushdown) return;`).
+Only the Delta `native_read` catalog sets it (`verify_delta_catalog_dynamic_filter`). SQL Server scans do not,
+deliberately: with the flag DuckDB also ERASES the static filters it hands the scan and trusts the scan to apply
+them exactly, while our T-SQL rendering is a superset (a case-insensitive collation makes `name = 'X'` match
+`'x'`).
+
+- ⚠ `supports_pushdown_type` is NOT a "dynamic filters only" switch: a column it refuses has ALL of its table
+  filters moved into a filter above the scan, the dynamic ones included (`plan_get.cpp`).
+- **The shape that would work:** `filter_pushdown = true` plus `supports_pushdown_type` accepting only columns
+  whose type renders EXACTLY in T-SQL — the strict rule of the DELETE shortcut (§2.4: integers, DECIMAL, DATE,
+  BOOLEAN). Every filter kind DuckDB may place on such a column must then render exactly or the scan must refuse:
+  comparisons, IN lists, IS [NOT] NULL, conjunctions, and the dynamic min/max / IN filters themselves. A filter
+  that renders weaker on an accepted column is a WRONG RESULT, since nothing re-applies it.
+- **Worth it for:** ordinary joins of a SQL Server table against a small local or remote table without remote
+  pushdown. **Not** a fix for DuckLake's `WHERE snapshot_id = (SELECT MAX(snapshot_id) …)`: the outer scan would get
+  the filter, but the MAX side is still a full read — remote pushdown is what removes both (ducklake-catalog.md §9).

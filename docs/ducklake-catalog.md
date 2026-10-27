@@ -159,7 +159,7 @@ these are LOWER bounds for a remote server):
 - `read_isolation` is SLOWER: by default reads already run on POOLED connections in parallel, without MARS; the
   opt-in moves every read of the transaction onto ONE pinned connection.
 - Remote pushdown is off unless asked for (`META_REMOTE_PUSHDOWN 'true'`); with these tiny tables it saves
-  statements but no time. Expected to matter once the metadata tables are large — not measured.
+  statements but no time — but see §9: it is what keeps a commit's cost flat as the snapshot history grows.
 - **The describe cache.** Every table reference in every statement asked SQL Server for the table's Arrow schema
   (`SELECT * FROM t WHERE 1 = 0`) — 40% of all statements. A table entry now reuses its FIRST describe for later
   binds, on a provider declaring the describe side-effect-free (capability `bind_schema_cacheable`, SQL Server
@@ -173,3 +173,31 @@ these are LOWER bounds for a remote server):
   rollback drops the entries, so the next statement sees the new schema. Gate `verify_bind_schema_cache` (85,
   service tier; three mutants: a cache outliving the entry dies at the first ALTER, an ignored kill switch at
   its positive control, the missing type guard at the out-of-band type change).
+
+## 9. Full reads, and why `META_REMOTE_PUSHDOWN 'true'` is the recommendation (2026-10-27)
+
+Which metadata scans carry a WHERE, from the trace of the §8 run (100 commits + 20 reads, no pushdown):
+
+- **Filtered:** `ducklake_data_file`, `ducklake_delete_file`, the inlined-data tables, `ducklake_metadata`,
+  `ducklake_file_column_stats`, `ducklake_inlined_data_tables` — DuckLake's simple comparisons are pushed by the
+  ordinary scan pushdown.
+- **Read in FULL on every commit:** **`ducklake_snapshot`, twice** (240 full scans for 120 operations), plus
+  `ducklake_table_stats` and `ducklake_table_column_stats` once each. The snapshot read is DuckLake's
+  `… WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)`: a comparison against a SUBQUERY is not
+  a scan filter, so both the outer scan and the MAX are full reads. The two stats tables grow with tables and
+  columns; `ducklake_snapshot` grows by ONE ROW PER COMMIT, so without pushdown every commit is linearly dearer.
+- **With `META_REMOTE_PUSHDOWN 'true'`** the whole query runs as one T-SQL statement (`… INNER JOIN (SELECT
+  MAX([snapshot_id]) …)`), which SQL Server answers from the primary key.
+
+Measured with synthetic history rows (negative ids, so MAX and the live chain are untouched), 50 commits each:
+
+| rows in `ducklake_snapshot` | no pushdown | `META_REMOTE_PUSHDOWN 'true'` |
+|---|---|---|
+| ~50 | 78 ms/commit | 79 ms/commit |
+| 50,000 | 165 ms/commit | 81 ms/commit |
+| 200,000 | **335 ms/commit** | **81 ms/commit** |
+
+Pushdown also holds under concurrency: the 8 × 25 append race lands 200/200 (21 s, against 37–40 s without it),
+and the inlined DELETE/UPDATE race balances exactly (failed + applied = issued, same DuckLake conflicts as §7).
+⇒ **Attach DuckLake with `META_REMOTE_PUSHDOWN 'true'`.** Local docker, so remote latency comes on top of both
+columns; the slope is the point.

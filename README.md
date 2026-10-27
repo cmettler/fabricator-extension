@@ -456,7 +456,11 @@ What the profile drives automatically:
   a join or a subquery. It is hidden rather than visible because a positional `INSERT INTO t VALUES (…)` would
   otherwise fail with *"table has N columns but M values were supplied"*. A column with that name is hidden on
   every catalog, with or without the option, so a catalog attached without it still sees the same table. This
-  is what makes SQL Server usable as a [DuckLake](docs/ducklake-catalog.md) metadata catalog:
+  is what makes SQL Server usable as a [DuckLake](docs/ducklake-catalog.md) metadata catalog — attach it as
+  `ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true,
+  META_REMOTE_PUSHDOWN 'true')`. The pushdown matters there: DuckLake reads the latest snapshot with a subquery
+  that only remote pushdown keeps off a full scan, so without it every commit grows dearer with the snapshot
+  history (measured 78 → 335 ms per commit at 200,000 snapshots; flat with it).
   ```sql
   ATTACH '...' AS db (TYPE fabricator, hidden_rowid true);
   CREATE TABLE db.dbo.events (id INTEGER, note VARCHAR);   -- no key: gets the hidden row id
