@@ -1496,7 +1496,9 @@ case "$TIER" in
         # and writes as VARIANT, each value exact or refused by name. Five mutants killed. Nothing else moved.
         # 2026-10-27: 5147 -> 5164, from a green 73-run tier: verify_hidden_rowid 87 -> 104 — the hidden row id gets a
         # unique index (clustered; nonclustered beside a columnstore). One mutant killed. Nothing else moved.
-        : "${MIN_ASSERTIONS:=5164}"
+        # 2026-10-27: 5164 -> 5171, from a green 73-run tier: verify_hidden_rowid 104 -> 111 — the rowid UPDATE goes 500
+        # statements to a SqlBatch round trip; 1201 rows span two full batches and a partial one. Two mutants killed.
+        : "${MIN_ASSERTIONS:=5171}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

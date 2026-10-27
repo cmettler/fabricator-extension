@@ -36,6 +36,9 @@ DROP TABLE IF EXISTS db.dbo.fabricator_hr_plain;
 statement ok
 DROP TABLE IF EXISTS db.dbo.fabricator_hr_cci;
 
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_hr_many;
+
 # --- 1. a keyless table: DuckDB sees only its own columns, the server has the identity column ---
 statement ok
 CREATE TABLE db.dbo.fabricator_hr_t (a INTEGER, b VARCHAR);
@@ -215,6 +218,22 @@ SELECT string_agg(b, ',' ORDER BY a) FROM db.dbo.fabricator_hr_cci;
 ----
 x,Y
 
+# --- 7c. a rowid UPDATE larger than one batch: the statements go 500 to a round trip, so 1201 rows take two full
+# batches and a partial one — every row must land, and the reported count must cover all three ---
+statement ok
+CREATE TABLE db.dbo.fabricator_hr_many AS SELECT i AS a, 'v' AS b FROM range(1, 1501) r(i);
+
+query I
+UPDATE db.dbo.fabricator_hr_many SET b = 'u' || r.i FROM range(1, 1202) r(i) WHERE fabricator_hr_many.a = r.i;
+----
+1201
+
+query III
+SELECT count(*) FILTER (WHERE b = 'u' || a), count(*) FILTER (WHERE b = 'v'), max(a) FILTER (WHERE b <> 'v')
+FROM db.dbo.fabricator_hr_many;
+----
+1201	299	1201
+
 # --- 8. a catalog attached WITHOUT the option: hides it all the same, and uses it as the rowid ---
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS plain (TYPE fabricator);
@@ -266,6 +285,9 @@ DROP TABLE db.dbo.fabricator_hr_ctas;
 
 statement ok
 DROP TABLE db.dbo.fabricator_hr_cci;
+
+statement ok
+DROP TABLE db.dbo.fabricator_hr_many;
 
 statement ok
 DROP TABLE plain.dbo.fabricator_hr_plain;

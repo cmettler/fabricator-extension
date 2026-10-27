@@ -2579,6 +2579,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         }
     }
 
+    /// <summary>Rows per SqlBatch in the rowid UPDATE (one statement each, one round trip per batch). Measured on
+    /// 20,000 rows: 500, 2048 and 10000 are within noise of each other, box and Fabric SQL database alike — from
+    /// 500 on the round trips no longer count and the per-statement execution on the server does.</summary>
+    private const int UpdateBatchRows = 500;
+
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
     {
         RecordTouch(schemaName, tableName, schemaChanged: false);
@@ -2603,7 +2608,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                     updSession)
                 : ExternalTableRouting.UpdateByIdentity(extUpd.StorageUri!, updIdCol, setColumnCount, data);
         }
-        // Cancel a long rowid UPDATE (one statement per matched row) on query interrupt. Opener is fresh (the
+        // Cancel a long rowid UPDATE (one statement per matched row, batched) on query interrupt. Opener is fresh (the
         // modify Finalize's FabricatorSetActiveTxn -> SetActiveOpener). See docs/cancellation.md.
         using var interrupt = new InterruptScope(AmbientOpener.Current);
         var token = interrupt.Token;
@@ -2615,39 +2620,65 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         int keyStart = setColumnCount;
         var bindings = DateTimeBindings(connection, transaction, schemaName, tableName, data.Schema.FieldsList);
 
+        // One statement per row, the same text for every row, sent UpdateBatchRows at a time as one SqlBatch: one
+        // round trip per block instead of per row, while each row keeps its own statement — so a row id that
+        // appears twice still means "the last one wins", exactly as row by row.
+        var sb = new StringBuilder("UPDATE ").Append(qualified).Append(" SET ");
+        for (int c = 0; c < setColumnCount; c++)
+        {
+            if (c > 0)
+            {
+                sb.Append(", ");
+            }
+            sb.Append(Quote(columns[c])).Append(" = @s").Append(c);
+        }
+        sb.Append(" WHERE ");
+        for (int c = keyStart; c < columns.Count; c++)
+        {
+            if (c > keyStart)
+            {
+                sb.Append(" AND ");
+            }
+            sb.Append(Quote(columns[c])).Append(" = @k").Append(c);
+        }
+        string sql = sb.ToString();
+        if (Log.IsEnabled(LogLevel.Debug))
+            Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(sql));
+
         using var reader = new ArrowDataReader(data);
         long total = 0;
-        while (reader.Read())
+        var batch = new SqlBatch(connection, transaction) { Timeout = ResolveCommandTimeout() };
+        try
         {
-            using var cmd = connection.CreateCommand();
-            cmd.Transaction = transaction;
-            cmd.CommandTimeout = ResolveCommandTimeout();
-            var sb = new StringBuilder("UPDATE ").Append(qualified).Append(" SET ");
-            for (int c = 0; c < setColumnCount; c++)
+            void Flush()
             {
-                if (c > 0)
+                if (batch.BatchCommands.Count == 0)
                 {
-                    sb.Append(", ");
+                    return;
                 }
-                string pn = "@s" + c;
-                sb.Append(Quote(columns[c])).Append(" = ").Append(pn);
-                cmd.Parameters.Add(BindColumnValue(pn, reader.IsDBNull(c) ? null : reader.GetValue(c), bindings[c]));
+                total += batch.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+                batch.BatchCommands.Clear();
             }
-            sb.Append(" WHERE ");
-            for (int c = keyStart; c < columns.Count; c++)
+
+            while (reader.Read())
             {
-                if (c > keyStart)
+                var cmd = new SqlBatchCommand(sql);
+                for (int c = 0; c < columns.Count; c++)
                 {
-                    sb.Append(" AND ");
+                    string pn = (c < keyStart ? "@s" : "@k") + c;
+                    cmd.Parameters.Add(BindColumnValue(pn, reader.IsDBNull(c) ? null : reader.GetValue(c), bindings[c]));
                 }
-                string pn = "@k" + c;
-                sb.Append(Quote(columns[c])).Append(" = ").Append(pn);
-                cmd.Parameters.Add(BindColumnValue(pn, reader.IsDBNull(c) ? null : reader.GetValue(c), bindings[c]));
+                batch.BatchCommands.Add(cmd);
+                if (batch.BatchCommands.Count >= UpdateBatchRows)
+                {
+                    Flush();
+                }
             }
-            cmd.CommandText = sb.ToString();
-            if (Log.IsEnabled(LogLevel.Debug))
-                Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
-            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            Flush();
+        }
+        finally
+        {
+            batch.Dispose();
         }
         Fabricator.Bridge.MemoryProbe.Mark("mssql update: rowid DML complete", total);
         return total;

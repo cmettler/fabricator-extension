@@ -95,6 +95,11 @@ without a key gets a `BIGINT IDENTITY` column `[__fabricator_rowid]`. C#-only, n
   columnstore, and absent on a warehouse, which has no indexes. `RowIdSql` finds it as the smallest unique index,
   i.e. the same column as before. It speeds up our row-id DML only — DuckLake's own filters and joins run on its
   own columns (`table_id`, snapshot ranges) and are not affected.
+- **The row-id UPDATE goes 500 rows to a round trip (2026-10-27).** It sent one statement per row, which on a
+  Fabric SQL database costs ~14 ms each. Now each row keeps its own parameterized statement (same text for
+  every row, so one cached plan, and a row id named twice still means "the last one wins"), and a `SqlBatch`
+  sends 500 of them at once. Measured: Fabric SQL database, 500 rows **6.9 s → 0.35 s**; box, 2,000 rows of
+  200,000 **1.9 s → 0.66 s**. The DELETE already went 500 keys to a statement.
 
 **Measured with DuckLake `417a9117f5`, default data inlining, fresh metadata database:**
 
