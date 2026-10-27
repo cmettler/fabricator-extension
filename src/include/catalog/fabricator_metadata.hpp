@@ -68,6 +68,10 @@ struct FabricatorCapabilities {
 	//! session and gets its path on the MANAGED side, through `ITable.SchemaPath`. See
 	//! docs/nested-schemas.md.
 	bool supports_nested_schemas = false;
+	//! The scan's schema-only describe has no side effect, so a table entry may reuse its FIRST describe for
+	//! later binds (FabricatorTableEntry). \warning Must stay FALSE for a provider whose describe does work
+	//! that a real scan depends on — the Delta catalog's seeds the statement's snapshot pin.
+	bool bind_schema_cacheable = false;
 
 	//! The provider runs a whole SELECT pushed by DuckDB's remote optimizer (src/catalog/fabricator_remote_select.cpp).
 	//! Opt-in: SQL Server reports it only with the `remote_pushdown` ATTACH option.

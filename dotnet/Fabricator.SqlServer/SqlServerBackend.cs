@@ -2850,8 +2850,14 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // (src/catalog/fabricator_remote_select.cpp, ABI v96). Opt-in through the `remote_pushdown` ATTACH option,
     // not on a warehouse engine (measured against box SQL Server only), and only where UTF-8 collations exist
     // (SQL Server 2019+, Azure SQL): exact string semantics rest on them (docs/duckdb-2.0-remote-execution.md §3.6).
+    // bind_schema_cacheable: the scan's schema-only describe (`SELECT * … WHERE 1 = 0`) has no side effect here —
+    // it pins nothing and reads nothing — so the host may reuse a table entry's first describe for later binds
+    // of that entry. Every DDL through this catalog already REPLACES the entry, so the reuse lives exactly as
+    // long as the entry's own column list. (Delta does not declare it: its describe seeds the statement's
+    // snapshot pin, see verify_delta_autocommit_pin.)
     public string CapabilitiesJson
-        => $"{{\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
+        => "{\"bind_schema_cacheable\":true," +
+           $"\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
            $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";
 
     private bool HasUtf8Collations

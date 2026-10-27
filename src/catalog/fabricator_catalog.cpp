@@ -200,12 +200,14 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		null_order_expressible_ = caps.null_order_expressible;
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
+		bind_schema_cacheable_ = caps.bind_schema_cacheable;
 	} catch (std::exception &ex) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;
 		null_order_expressible_ = false;
 		supports_nested_schemas_ = false;
 		remote_select_ = false;
+		bind_schema_cacheable_ = false;
 		// ⚠ IT WARNS NOW, and the silence was the defect. This catch guards TWO unrelated things: a provider
 		// that cannot answer (fine — defaults are the safe direction, superset-and-re-apply) and a TRANSIENT
 		// failure of whatever the provider needs to answer. The second one used to disable string ORDER BY

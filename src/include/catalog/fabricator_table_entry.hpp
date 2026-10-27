@@ -163,6 +163,17 @@ private:
 	std::mutex dml_info_lock_;
 	bool dml_caps_fetched_ = false;
 	FabricatorDmlCapabilities dml_caps_;
+	//! The FIRST bind-time describe's result, reused by later binds of this entry when the provider declares
+	//! the describe side-effect-free (`bind_schema_cacheable`) and `fabricator_bind_schema_cache` is on. It
+	//! lives exactly as long as the entry: every DDL through the catalog, a ROLLBACK and the cache refresh
+	//! functions REPLACE the entry, so the reuse can be no staler than the column list beside it. Only these
+	//! three are kept because they are all a scan needs after bind — the Arrow converters are rebuilt from the
+	//! real stream at InitGlobal (ArrowStreamBindData::Copy relies on the same fact).
+	std::mutex bind_schema_lock_;
+	bool bind_schema_cached_ = false;
+	vector<LogicalType> bind_schema_types_;
+	vector<string> bind_schema_names_;
+	vector<bool> bind_schema_nullable_;
 };
 
 } // namespace duckdb

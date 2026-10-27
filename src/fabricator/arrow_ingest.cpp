@@ -19,6 +19,8 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp" // DatabaseInstance::NumberOfThreads — the scan's MaxThreads
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp" // the schema-change error names the table
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/vector/struct_vector.hpp" // 2.0 split vector.hpp
 #include "duckdb/planner/table_filter.hpp"
@@ -1555,6 +1557,22 @@ static void BuildRowId(const vector<idx_t> &sources, DataChunk &all_columns, Vec
 	}
 }
 
+// The provider's stream carries a different type than the plan was bound with. It happens when the table was
+// changed OUTSIDE this catalog after its entry was built (another process altered a column's type): the entry,
+// and the plan built from it, still hold the old type. Vector::Reference would refuse the pair with an
+// INTERNAL error, which invalidates the whole database; a clean error does not, and the failed statement's
+// rollback drops every catalog entry, so the next statement binds against the new schema.
+[[noreturn]] static void ThrowSchemaChanged(const ArrowStreamBindData &bind_data, column_t col_id,
+                                            const LogicalType &actual, const LogicalType &expected) {
+	string column = col_id < bind_data.names.size() ? bind_data.names[(idx_t)col_id] : "column " + to_string(col_id);
+	string table = bind_data.table ? bind_data.table->name.GetIdentifierName() : string("the table");
+	string catalog = bind_data.table ? bind_data.table->ParentCatalog().GetName().GetIdentifierName() : string();
+	throw IOException("Fabricator: column '%s' of '%s' is %s on the provider but %s in the catalog — the table was "
+	                  "changed outside this session. The next statement sees the new schema; to refresh explicitly, "
+	                  "run SELECT fabricator_refresh_cache('%s').",
+	                  column, table, actual.ToString(), expected.ToString(), catalog);
+}
+
 void ArrowStreamScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &gstate = data.global_state->Cast<ArrowStreamGlobalState>();
 	auto &lstate = data.local_state->Cast<ArrowStreamLocalState>();
@@ -1599,7 +1617,12 @@ void ArrowStreamScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		if (gstate.output_source_pos[k] < 0) {
 			BuildRowId(gstate.rowid_source_pos, lstate.all_columns, output.data[k], output_size);
 		} else {
-			output.data[k].Reference(lstate.all_columns.data[(idx_t)gstate.output_source_pos[k]]);
+			auto &source = lstate.all_columns.data[(idx_t)gstate.output_source_pos[k]];
+			if (source.GetType() != output.data[k].GetType()) {
+				ThrowSchemaChanged(data.bind_data->Cast<ArrowStreamBindData>(), gstate.output_column_ids[k],
+				                   source.GetType(), output.data[k].GetType());
+			}
+			output.data[k].Reference(source);
 		}
 	}
 

@@ -1,0 +1,246 @@
+# name: test/verify_bind_schema_cache.test
+# description: The bind-time describe cache. Every reference to a catalog table in every statement used to ask
+#              the provider for the table's Arrow schema (`SELECT * FROM t WHERE 1 = 0`) — one round trip per
+#              reference, about 40% of all statements DuckLake issues against a SQL Server metadata catalog. A
+#              provider that declares the describe side-effect-free (`bind_schema_cacheable`: SQL Server) now
+#              has a table entry's FIRST describe serve every later bind of that entry. The reuse lives exactly
+#              as long as the entry, and the entry is REPLACED by every DDL through the catalog, by ROLLBACK and
+#              by the cache functions — so this suite asserts each of those still shows the new schema.
+#              `SET fabricator_bind_schema_cache = false` is the kill switch and the reference oracle.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_bsc_t;
+
+statement ok
+CREATE TABLE db.dbo.fabricator_bsc_t (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO db.dbo.fabricator_bsc_t VALUES (1, 'x'), (2, 'y');
+
+# How often SQL Server executed the describe of this table. The text is the provider's exact describe.
+statement ok
+CREATE MACRO bsc_describes() AS (
+  SELECT coalesce(sum(n), 0) FROM fabricator_query('db',
+    'SELECT CAST(qs.execution_count AS BIGINT) AS n FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE st.text = N''SELECT * FROM [dbo].[fabricator_bsc_t] WHERE 1 = 0'''));
+
+# --- 1. the cache: five more binds of the same entry describe it NO further time ---
+query I
+SELECT count(*) FROM db.dbo.fabricator_bsc_t;
+----
+2
+
+statement ok
+SET VARIABLE bsc_before = bsc_describes();
+
+statement ok
+SELECT * FROM db.dbo.fabricator_bsc_t;
+
+statement ok
+SELECT a FROM db.dbo.fabricator_bsc_t WHERE a > 1;
+
+statement ok
+SELECT b FROM db.dbo.fabricator_bsc_t;
+
+statement ok
+SELECT count(*) FROM db.dbo.fabricator_bsc_t;
+
+statement ok
+SELECT * FROM db.dbo.fabricator_bsc_t t1 JOIN db.dbo.fabricator_bsc_t t2 USING (a);
+
+query I
+SELECT bsc_describes() - getvariable('bsc_before');
+----
+0
+
+# The positive control: with the kill switch every bind describes again (six references above, here five).
+statement ok
+SET fabricator_bind_schema_cache = false;
+
+statement ok
+SET VARIABLE bsc_before = bsc_describes();
+
+statement ok
+SELECT * FROM db.dbo.fabricator_bsc_t;
+
+statement ok
+SELECT a FROM db.dbo.fabricator_bsc_t WHERE a > 1;
+
+statement ok
+SELECT * FROM db.dbo.fabricator_bsc_t t1 JOIN db.dbo.fabricator_bsc_t t2 USING (a);
+
+query I
+SELECT bsc_describes() - getvariable('bsc_before') >= 4;
+----
+true
+
+statement ok
+RESET fabricator_bind_schema_cache;
+
+# --- 2. ALTER through the catalog: every kind replaces the entry, and the next bind sees the new schema ---
+statement ok
+ALTER TABLE db.dbo.fabricator_bsc_t ADD COLUMN c INTEGER;
+
+query IIT
+SELECT a, c, b FROM db.dbo.fabricator_bsc_t ORDER BY a;
+----
+1	NULL	x
+2	NULL	y
+
+statement ok
+UPDATE db.dbo.fabricator_bsc_t SET c = a * 10;
+
+statement ok
+ALTER TABLE db.dbo.fabricator_bsc_t RENAME COLUMN c TO cc;
+
+query II
+SELECT a, cc FROM db.dbo.fabricator_bsc_t ORDER BY a;
+----
+1	10
+2	20
+
+statement ok
+ALTER TABLE db.dbo.fabricator_bsc_t ALTER COLUMN cc TYPE BIGINT;
+
+query T
+SELECT typeof(cc) FROM db.dbo.fabricator_bsc_t LIMIT 1;
+----
+BIGINT
+
+statement ok
+ALTER TABLE db.dbo.fabricator_bsc_t DROP COLUMN b;
+
+query II
+SELECT * FROM db.dbo.fabricator_bsc_t ORDER BY a;
+----
+1	10
+2	20
+
+# --- 3. a ROLLED BACK ALTER: the uncommitted schema must not survive in a cached describe ---
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE db.dbo.fabricator_bsc_t ADD COLUMN tmp INTEGER;
+
+query III
+SELECT * FROM db.dbo.fabricator_bsc_t ORDER BY a;
+----
+1	10	NULL
+2	20	NULL
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT * FROM db.dbo.fabricator_bsc_t ORDER BY a;
+----
+1	10
+2	20
+
+# --- 4. CREATE OR REPLACE with a different shape ---
+statement ok
+CREATE OR REPLACE TABLE db.dbo.fabricator_bsc_t (p VARCHAR, q DOUBLE);
+
+statement ok
+INSERT INTO db.dbo.fabricator_bsc_t VALUES ('k', 1.5);
+
+query TR
+SELECT * FROM db.dbo.fabricator_bsc_t;
+----
+k	1.5
+
+# --- 5. out-of-band DDL: the auto-invalidate and the explicit refresh both reach the cached describe ---
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT fabricator_exec('db', 'ALTER TABLE dbo.fabricator_bsc_t ADD r INT NULL');
+
+query TRI
+SELECT * FROM db.dbo.fabricator_bsc_t;
+----
+k	1.5	NULL
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+SELECT fabricator_exec('db', 'ALTER TABLE dbo.fabricator_bsc_t ADD s INT NULL');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+query TRII
+SELECT * FROM db.dbo.fabricator_bsc_t;
+----
+k	1.5	NULL	NULL
+
+# --- 6. a change made by ANOTHER process (here a second catalog on the same database): this catalog's entry,
+# and so its cached describe, still holds the old schema. That was true before the cache too — the per-bind
+# describe never refreshed the entry, it only produced a SECOND, disagreeing schema, and a changed column TYPE
+# then failed inside Vector::Reference with an INTERNAL error that invalidated the whole database. Now the scan
+# refuses the mismatch cleanly, and the failed statement's rollback drops the entries, so the next statement
+# binds against the new schema.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS other (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('other', 'DROP TABLE IF EXISTS dbo.fabricator_bsc_o; CREATE TABLE dbo.fabricator_bsc_o (a INT, b VARCHAR(10)); INSERT dbo.fabricator_bsc_o VALUES (1, ''x'')');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+query IT
+SELECT * FROM db.dbo.fabricator_bsc_o;
+----
+1	x
+
+statement ok
+SELECT fabricator_exec('other', 'ALTER TABLE dbo.fabricator_bsc_o ALTER COLUMN a BIGINT');
+
+statement error
+SELECT * FROM db.dbo.fabricator_bsc_o;
+----
+changed outside this session
+
+query ITT
+SELECT a, b, typeof(a) FROM db.dbo.fabricator_bsc_o;
+----
+1	x	BIGINT
+
+# a dropped column fails at the provider (207), and heals the same way
+statement ok
+SELECT fabricator_exec('other', 'ALTER TABLE dbo.fabricator_bsc_o DROP COLUMN b');
+
+statement error
+SELECT * FROM db.dbo.fabricator_bsc_o;
+----
+Invalid column name
+
+query I
+SELECT * FROM db.dbo.fabricator_bsc_o;
+----
+1
+
+# the database is still usable — nothing above invalidated it
+query I
+SELECT count(*) FROM db.dbo.fabricator_bsc_o;
+----
+1
+
+statement ok
+SELECT fabricator_exec('other', 'DROP TABLE dbo.fabricator_bsc_o');
+
+# --- cleanup ---
+statement ok
+DROP TABLE db.dbo.fabricator_bsc_t;

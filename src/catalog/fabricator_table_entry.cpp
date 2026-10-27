@@ -1050,6 +1050,14 @@ static unique_ptr<BaseStatistics> BuildPartitionColumnStats(const LogicalType &t
 	return make_uniq<BaseStatistics>(std::move(stats));
 }
 
+// The kill switch for reusing a table entry's bind-time describe, and the reference oracle (off = describe on
+// every bind, the behaviour before the cache).
+static bool BindSchemaCacheEnabled(ClientContext &context) {
+	Value enabled;
+	return !(context.TryGetCurrentSetting("fabricator_bind_schema_cache", enabled) && !enabled.IsNull() &&
+	         !enabled.GetValue<bool>());
+}
+
 // The kill switch, and the reference oracle the differential gate runs against.
 static bool PartitionStatsEnabled(ClientContext &context) {
 	Value enabled;
@@ -1332,13 +1340,43 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 
 	// Build the Arrow column converters + verify the result schema.
 	vector<LogicalType> return_types;
-	// PopulateReturnSchema reports column names as Identifiers (its callers are mostly 2.0 binds); this is
-	// an internal path that works in strings, so convert once here.
-	vector<Identifier> schema_names;
-	fabricator::PopulateReturnSchema(context, *data, return_types, schema_names);
 	vector<string> names;
-	for (auto &n : schema_names) {
-		names.push_back(n.GetIdentifierName());
+	// The describe is one provider round trip per table reference per statement. Where the provider declares
+	// it side-effect-free, the entry's FIRST describe serves every later bind (see bind_schema_cached_). It is
+	// never skipped elsewhere: on a Delta native_read catalog the describe seeds the statement's snapshot pin.
+	// ⚠ Never for a time-travel reference: its describe is AS OF the requested instant, and one entry serves
+	// both kinds of reference, so a cached latest schema must not answer an AT bind (or the reverse).
+	const bool reuse_describe =
+	    parent_catalog.BindSchemaCacheable() && at_unit.empty() && BindSchemaCacheEnabled(context);
+	bool reused = false;
+	if (reuse_describe) {
+		lock_guard<mutex> guard(bind_schema_lock_);
+		if (bind_schema_cached_) {
+			return_types = bind_schema_types_;
+			names = bind_schema_names_;
+			data->return_types = bind_schema_types_;
+			data->names = bind_schema_names_;
+			data->column_nullable = bind_schema_nullable_;
+			reused = true;
+		}
+	}
+	if (!reused) {
+		// PopulateReturnSchema reports column names as Identifiers (its callers are mostly 2.0 binds); this is
+		// an internal path that works in strings, so convert once here.
+		vector<Identifier> schema_names;
+		fabricator::PopulateReturnSchema(context, *data, return_types, schema_names);
+		for (auto &n : schema_names) {
+			names.push_back(n.GetIdentifierName());
+		}
+		if (reuse_describe) {
+			lock_guard<mutex> guard(bind_schema_lock_);
+			if (!bind_schema_cached_) {
+				bind_schema_types_ = data->return_types;
+				bind_schema_names_ = data->names;
+				bind_schema_nullable_ = data->column_nullable;
+				bind_schema_cached_ = true;
+			}
+		}
 	}
 
 	// Align the cached NDV map to the column order (parallel to names; -1 = unknown).

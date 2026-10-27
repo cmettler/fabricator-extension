@@ -1060,6 +1060,16 @@ this session* (you get a clean "table does not exist"). If you had read it, the 
 server's own error — e.g. SQL Server `208: Invalid object name`. Refresh after out-of-band DDL and neither
 case arises.
 
+A table **altered** by another process or connection works the same way: this catalog keeps the columns it
+read, so an added column stays invisible until you refresh. A dropped, renamed or retyped column makes the
+next statement fail once with a clear error (`207: Invalid column name …`, or *"column 'a' of 't' is BIGINT
+on the provider but INTEGER in the catalog — the table was changed outside this session"*); that failure
+drops the cached entries, so the statement after it sees the new schema.
+
+On SQL Server a table's result schema is also read **once per catalog entry** instead of once per table
+reference in every statement — about 40% fewer round trips for metadata-heavy workloads such as a DuckLake
+catalog. `SET fabricator_bind_schema_cache = false` restores the per-statement read.
+
 ### `fabricator_server_info(catalog) -> TABLE(property, value)`
 
 The detected server capability profile for an attached catalog (edition, version, collation, and the

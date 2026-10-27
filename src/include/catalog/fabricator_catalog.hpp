@@ -78,6 +78,11 @@ public:
 		return null_order_expressible_;
 	}
 
+	//! Whether a table entry may reuse its first bind-time describe (capability `bind_schema_cacheable`).
+	bool BindSchemaCacheable() const {
+		return bind_schema_cacheable_;
+	}
+
 	//! DuckDB 2.0 nested schemas: whether a dotted schema string may denote a PATH (`a.b` = schema `b`
 	//! inside schema `a`) rather than a literal schema named "a.b". Provider-declared through the
 	//! capability doc's `supports_nested_schemas`; DuckDB's own default is false and so is ours.
@@ -219,6 +224,7 @@ private:
 	std::atomic<bool> schema_may_change_ {false};
 	bool string_order_pushable_ = false;
 	bool null_order_expressible_ = false;
+	bool bind_schema_cacheable_ = false;
 	bool supports_nested_schemas_ = false;
 	//! The provider runs a pushed SELECT (capability `remote_select`); see Supports().
 	bool remote_select_ = false;

@@ -54,6 +54,11 @@ internal static class HostSettings
     /// differential gate compares against.</summary>
     public const string PartitionStatsName = "fabricator_partition_stats";
 
+    /// <summary>Reuse a table entry's first bind-time describe for later binds of the same entry, on a provider
+    /// that declares the describe side-effect-free (capability <c>bind_schema_cacheable</c>). Off, every bind
+    /// describes again, which is the reference oracle.</summary>
+    public const string BindSchemaCacheName = "fabricator_bind_schema_cache";
+
     public static IEnumerable<ProviderSetting> Settings { get; } = new[]
     {
         new ProviderSetting(
@@ -84,6 +89,13 @@ internal static class HostSettings
             Description: "Answer an ungrouped COUNT(*), MIN or MAX from table metadata (Delta: the log's per-file " +
                          "counts and statistics) instead of scanning. On by default; turn it off to always scan, " +
                          "which is also the reference oracle for it."),
+        new ProviderSetting(
+            BindSchemaCacheName,
+            ProviderSettingType.Bool,
+            Default: true,
+            Description: "Reuse a table's result schema across binds instead of asking the provider again on " +
+                         "every statement (providers that declare it safe: SQL Server). On by default; turn it " +
+                         "off to describe on every bind, which is also the reference oracle for it."),
     };
 
     /// <summary>

@@ -143,3 +143,33 @@ SNAPSHOT transaction).
   A Fabric SQL database is Azure SQL underneath and enforces keys. ⚠ Unverified live: that its
   `SERVERPROPERTY('EngineEdition')` is outside `ServerProfile.IsWarehouse` (editions 6 and 11), which decides
   whether we emit enforced keys.
+
+## 8. Round trips per commit, and the bind-time describe cache (2026-10-27)
+
+One writer, 100 single-row commits + 20 reads, Fabric-like database, local docker (so latency is near zero and
+these are LOWER bounds for a remote server):
+
+| configuration | wall | SQL statements | of which `WHERE 1 = 0` describes |
+|---|---|---|---|
+| default, before the cache | 7.2–7.4 s | 3210 (~26 per operation) | 1264 |
+| `META_READ_ISOLATION 'snapshot'` | 8.0–8.7 s | 3210 | — |
+| `META_REMOTE_PUSHDOWN 'true'` | 7.3–7.5 s | 2802 (120 of DuckLake's joins pushed as one statement) | — |
+| **describe cache (now the default)** | **6.35 s** | **1995 (~16 per operation)** | **49** |
+
+- `read_isolation` is SLOWER: by default reads already run on POOLED connections in parallel, without MARS; the
+  opt-in moves every read of the transaction onto ONE pinned connection.
+- Remote pushdown is off unless asked for (`META_REMOTE_PUSHDOWN 'true'`); with these tiny tables it saves
+  statements but no time. Expected to matter once the metadata tables are large — not measured.
+- **The describe cache.** Every table reference in every statement asked SQL Server for the table's Arrow schema
+  (`SELECT * FROM t WHERE 1 = 0`) — 40% of all statements. A table entry now reuses its FIRST describe for later
+  binds, on a provider declaring the describe side-effect-free (capability `bind_schema_cacheable`, SQL Server
+  only; the Delta describe seeds the statement's snapshot pin and keeps running). Never for an AT reference.
+  Kill switch `SET fabricator_bind_schema_cache = false`. It lives exactly as long as the entry, and every DDL
+  through the catalog, a ROLLBACK and the cache functions replace the entry.
+- **Another process changing the table.** The entry's column list was ALWAYS stale until a refresh — the
+  per-bind describe never refreshed it, it only produced a second, disagreeing schema, and a changed column type
+  (and, without the cache, a dropped column) then failed inside `Vector::Reference` with an INTERNAL error that
+  INVALIDATED THE DATABASE. The scan now refuses a type mismatch with a clear error; the failed statement's
+  rollback drops the entries, so the next statement sees the new schema. Gate `verify_bind_schema_cache` (85,
+  service tier; three mutants: a cache outliving the entry dies at the first ALTER, an ignored kill switch at
+  its positive control, the missing type guard at the out-of-band type change).
