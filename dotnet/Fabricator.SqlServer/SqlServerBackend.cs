@@ -4925,6 +4925,16 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             sb.Append(", INDEX ").Append(Quote(ColumnstoreIndexName(qualified))).Append(" CLUSTERED COLUMNSTORE");
         }
+        // The hidden row id is what every rowid UPDATE/DELETE looks rows up by, so it gets a unique index: on a
+        // heap each lookup is a full scan (measured, 200k rows: UPDATE of 2000 rows 115 s -> 1.8 s, DELETE of 5000
+        // 6.7 s -> 0.46 s). Clustered — the values only grow, so inserts append — unless the columnstore is the
+        // clustered index. Not on a warehouse, which has no indexes. RowIdSql finds it as the smallest unique
+        // index, i.e. the same column it resolved before.
+        if (hiddenIdentity && !profile.IsWarehouse)
+        {
+            sb.Append(", INDEX ").Append(Quote("ix" + HiddenRowIdColumn)).Append(" UNIQUE")
+              .Append(cci ? " NONCLUSTERED" : " CLUSTERED").Append(" (").Append(Quote(HiddenRowIdColumn)).Append(')');
+        }
         string keyKind = cci ? " NONCLUSTERED" : "";
         var pk = ParseIndexGroup(primaryKey);
         if (pk.Count > 0)

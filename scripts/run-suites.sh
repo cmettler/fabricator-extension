@@ -1494,7 +1494,9 @@ case "$TIER" in
         # controls (+15), and six routing suites run a second time with FABRICATOR_REMOTE_PUSHDOWN=false (+346).
         # 2026-10-27: 5018 -> 5147, from a green 73-run tier: +verify_sql_variant_mssql (129, new): sql_variant reads
         # and writes as VARIANT, each value exact or refused by name. Five mutants killed. Nothing else moved.
-        : "${MIN_ASSERTIONS:=5147}"
+        # 2026-10-27: 5147 -> 5164, from a green 73-run tier: verify_hidden_rowid 87 -> 104 — the hidden row id gets a
+        # unique index (clustered; nonclustered beside a columnstore). One mutant killed. Nothing else moved.
+        : "${MIN_ASSERTIONS:=5164}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

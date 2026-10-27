@@ -456,7 +456,9 @@ What the profile drives automatically:
   a table created with no PRIMARY KEY, UNIQUE or IDENTITY marker (CREATE and CTAS) gets a `BIGINT IDENTITY`
   column `[__fabricator_rowid]` that DuckDB never sees: `DESCRIBE`, `SELECT *` and `RETURNING *` leave it out,
   and it becomes the table's `rowid`. So `UPDATE`/`DELETE` work on such a table, including set-based ones with
-  a join or a subquery. It is hidden rather than visible because a positional `INSERT INTO t VALUES (…)` would
+  a join or a subquery. The column carries a unique index (clustered, or nonclustered beside a clustered
+  columnstore; none on a warehouse), so those statements find their rows without scanning the table. It is
+  hidden rather than visible because a positional `INSERT INTO t VALUES (…)` would
   otherwise fail with *"table has N columns but M values were supplied"*. A column with that name is hidden on
   every catalog, with or without the option, so a catalog attached without it still sees the same table. This
   is what makes SQL Server usable as a [DuckLake](docs/ducklake-catalog.md) metadata catalog — attach it as

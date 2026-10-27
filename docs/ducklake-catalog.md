@@ -88,6 +88,13 @@ without a key gets a `BIGINT IDENTITY` column `[__fabricator_rowid]`. C#-only, n
   the first version of the gate missed it because its RETURNING ran before the ALTER, where the column is last.
 - It is created only with the option and only on a table with no PRIMARY KEY / UNIQUE / IDENTITY marker; it is
   hidden on every catalog, so an attach without the option sees the same columns and still uses it as rowid.
+- **It carries a unique index (2026-10-27).** Every row-id UPDATE/DELETE looks rows up by it (one UPDATE
+  statement per row, DELETE in batches of 500), and on a heap each lookup is a full scan. Measured on 200,000
+  rows: UPDATE of 2,000 rows **115 s → 1.8 s**, DELETE of 5,000 rows **6.7 s → 0.46 s**. The index is
+  `UNIQUE CLUSTERED` (the values only grow, so inserts append), `NONCLUSTERED` when the table is a clustered
+  columnstore, and absent on a warehouse, which has no indexes. `RowIdSql` finds it as the smallest unique index,
+  i.e. the same column as before. It speeds up our row-id DML only — DuckLake's own filters and joins run on its
+  own columns (`table_id`, snapshot ranges) and are not affected.
 
 **Measured with DuckLake `417a9117f5`, default data inlining, fresh metadata database:**
 

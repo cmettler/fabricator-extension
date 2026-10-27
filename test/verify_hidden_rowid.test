@@ -33,6 +33,9 @@ DROP TABLE IF EXISTS db.dbo.fabricator_hr_ctas;
 statement ok
 DROP TABLE IF EXISTS db.dbo.fabricator_hr_plain;
 
+statement ok
+DROP TABLE IF EXISTS db.dbo.fabricator_hr_cci;
+
 # --- 1. a keyless table: DuckDB sees only its own columns, the server has the identity column ---
 statement ok
 CREATE TABLE db.dbo.fabricator_hr_t (a INTEGER, b VARCHAR);
@@ -52,6 +55,17 @@ SELECT name, is_identity FROM fabricator_query('db',
 a	0
 b	0
 __fabricator_rowid	1
+
+# ... with a unique clustered index on it: every rowid UPDATE/DELETE looks rows up by it, and on a heap each lookup
+# is a full scan (200k rows: UPDATE of 2000 rows 115 s without, 1.8 s with)
+query TTT
+SELECT c, kind, uq FROM fabricator_query('db',
+  'SELECT CAST(c.name AS NVARCHAR(40)) AS c, CAST(i.type_desc AS NVARCHAR(40)) AS kind, CAST(i.is_unique AS INT) AS uq
+   FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+   JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+   WHERE i.object_id = OBJECT_ID(''dbo.fabricator_hr_t'')');
+----
+__fabricator_rowid	CLUSTERED	1
 
 # --- 2. the positional INSERT a visible extra column would break ---
 statement ok
@@ -163,6 +177,44 @@ SELECT string_agg(b, ',' ORDER BY a) FROM db.dbo.fabricator_hr_ctas;
 ----
 odd,v2,odd,v4,odd
 
+# the bulk path's CREATE carries the index as well
+query TT
+SELECT kind, uq FROM fabricator_query('db',
+  'SELECT CAST(i.type_desc AS NVARCHAR(40)) AS kind, CAST(i.is_unique AS INT) AS uq FROM sys.indexes i
+   JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+   WHERE i.object_id = OBJECT_ID(''dbo.fabricator_hr_ctas'') AND COL_NAME(ic.object_id, ic.column_id) = ''__fabricator_rowid''');
+----
+CLUSTERED	1
+
+# --- 7b. under a clustered columnstore the columnstore is the clustered index, so the row-id index is nonclustered ---
+statement ok
+SET mssql_default_table_type = 'clustered columnstore';
+
+statement ok
+CREATE TABLE db.dbo.fabricator_hr_cci (a INTEGER, b VARCHAR);
+
+statement ok
+SET mssql_default_table_type = '';
+
+query TT
+SELECT kind, uq FROM fabricator_query('db',
+  'SELECT CAST(i.type_desc AS NVARCHAR(40)) AS kind, CAST(i.is_unique AS INT) AS uq FROM sys.indexes i
+   WHERE i.object_id = OBJECT_ID(''dbo.fabricator_hr_cci'') ORDER BY i.index_id');
+----
+CLUSTERED COLUMNSTORE	0
+NONCLUSTERED	1
+
+statement ok
+INSERT INTO db.dbo.fabricator_hr_cci VALUES (1, 'x'), (2, 'y');
+
+statement ok
+UPDATE db.dbo.fabricator_hr_cci SET b = v.nb FROM (VALUES (2, 'Y')) v(k, nb) WHERE fabricator_hr_cci.a = v.k;
+
+query T
+SELECT string_agg(b, ',' ORDER BY a) FROM db.dbo.fabricator_hr_cci;
+----
+x,Y
+
 # --- 8. a catalog attached WITHOUT the option: hides it all the same, and uses it as the rowid ---
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS plain (TYPE fabricator);
@@ -211,6 +263,9 @@ DROP TABLE db.dbo.fabricator_hr_gen;
 
 statement ok
 DROP TABLE db.dbo.fabricator_hr_ctas;
+
+statement ok
+DROP TABLE db.dbo.fabricator_hr_cci;
 
 statement ok
 DROP TABLE plain.dbo.fabricator_hr_plain;
