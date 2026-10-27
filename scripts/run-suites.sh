@@ -1027,7 +1027,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=64}"   # 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
+        : "${MIN_SUITES:=65}"   # 2026-10-27: +verify_hidden_rowid; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1481,7 +1481,9 @@ case "$TIER" in
         #   verify_mssql_s3_polybase 267 -> 268.
         # 2026-10-26: 4409 -> 4421. verify_merge_into_mssql 106 -> 118: the same MERGE into a non-default schema
         #   (SQL Server failed it with "Cannot access destination table '[].[t]'").
-        : "${MIN_ASSERTIONS:=4421}"
+        # 2026-10-27: 4421 -> 4508. +verify_hidden_rowid (87, new): the hidden_rowid ATTACH option (a hidden
+        # IDENTITY row id on keyless tables, the DuckLake metadata-catalog prerequisite). Two mutants killed.
+        : "${MIN_ASSERTIONS:=4508}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

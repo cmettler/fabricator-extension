@@ -648,6 +648,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // when none is otherwise specified. The mssql_add_identity SET setting overrides this per session (turn OFF
     // for fact tables that don't need a surrogate key). Resolved by ResolveAddIdentity().
     private readonly bool _addIdentityOnCreate;
+    // ATTACH option `hidden_rowid true`: a table created WITHOUT any key (no PRIMARY KEY, no UNIQUE, no IDENTITY)
+    // gets a BIGINT IDENTITY column named HiddenRowIdColumn that DuckDB never sees. It serves as the table's row
+    // id, so UPDATE/DELETE work on keyless tables. ⚠ It must be HIDDEN, not merely added: a client that inserts
+    // positionally (INSERT INTO t VALUES (...) without a column list — DuckLake does this on its metadata
+    // tables) fails with "table has N columns but M values were supplied" on any extra visible column.
+    private readonly bool _hiddenRowId;
     // Ambient Fabric-notebook credential (token-service-backed, refreshing) — set in the ctor when the
     // connstr carries no credential AND the process runs on Fabric compute. Applied per connection open via
     // SqlConnection.AccessTokenCallback (so tokens refresh, unlike the static _accessToken).
@@ -781,6 +787,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         break;
                     case "add_identity":
                         _addIdentityOnCreate = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
+                        break;
+                    case "hidden_rowid":
+                        _hiddenRowId = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
                         break;
                     // API_WORKSPACE / API_ITEM: the workspace and item the `fabric.*` REST functions act on.
                     // ⚠ NAMED FOR THE API, NOT FOR THE ATTACH, and that distinction is the point. They do NOT
@@ -2268,7 +2277,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 // the auto surrogate key is engine-generated and absent from the SELECT, so the bulk copy skips it.
                 create.CommandText = $"IF OBJECT_ID({objectLiteral}, 'U') IS NULL " +
                                      BuildCreateTable(qualified, data.Schema, Profile, null, null, null, sortColumns,
-                                                      null, ResolveAddIdentity(), withOpts);
+                                                      null, ResolveAddIdentity(), withOpts, _hiddenRowId);
                 // Logged because it was previously invisible: the bulk path's DDL is issued inside SqlBulkCopy's
                 // own sequence, so a Debug trace showed only "bulk <table>: create=True" and not the statement.
                 // Diagnosing the Fabric in-transaction rename failure needed exactly this text.
@@ -2692,11 +2701,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 // The OUTPUT result set is the inserted rows; materialize them as Arrow
                 // batches (borrowed connection — only the reader/command are disposed).
                 using var stream = new DbDataReaderArrowStream(connection, cmd, rdr, ownsConnection: false);
-                outputSchema ??= stream.Schema;
+                outputSchema ??= WithoutHiddenRowId(stream.Schema);
                 RecordBatch? rb;
                 while ((rb = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
                 {
-                    outputBatches.Add(rb);
+                    outputBatches.Add(WithoutHiddenRowId(rb));
                 }
                 batch.Clear();
             }
@@ -3272,6 +3281,21 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     internal IArrowArrayStream ScanFromSource(string source, IReadOnlyList<SqlParameter> sourceParams, string? specJson,
                                              IArrowArrayStream? filterValues, string? touchKey = null)
     {
+        var stream = ScanFromSourceCore(source, sourceParams, specJson, filterValues, touchKey);
+        // A `SELECT *` (no projection: the bind-time describe, or a scan that names no columns) returns the hidden
+        // row-id column too, and the host maps those columns BY POSITION against the table's schema — so with the
+        // column anywhere but last (an ALTER ADD COLUMN puts new columns after it) every later column shifts and
+        // DuckDB fails with "Vector::Reference used on vector of different type". An explicit projection keeps it:
+        // that is how the host asks for it as the virtual rowid.
+        return touchKey is not null && ScanSpec.Parse(specJson)?.Columns is not { Count: > 0 }
+            ? new HiddenRowIdStream(stream)
+            : stream;
+    }
+
+    private IArrowArrayStream ScanFromSourceCore(string source, IReadOnlyList<SqlParameter> sourceParams,
+                                                 string? specJson, IArrowArrayStream? filterValues,
+                                                 string? touchKey)
+    {
         var spec = ScanSpec.Parse(specJson);
         // Only a CATALOG TABLE scan passes a touchKey — a TVF source has no table identity to compare.
         // ⚠ A SCHEMA PROBE IS CHECKED TOO, and excluding it was measured wrong: it reads no rows, so ROW
@@ -3842,7 +3866,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                     }
                 }
                 cmd.CommandText = BuildCreateTable(qualified, columns, Profile, null, null, defaults, sortColumns,
-                                                   identityColumns, ResolveAddIdentity(), withOpts);
+                                                   identityColumns, ResolveAddIdentity(), withOpts,
+                                                   hiddenRowId: false); // this branch always declares a key
                 Log.LogDebug("ddl create [txn={Txn} own={Own}] {Table}: {Sql}",
                             AmbientTransaction.Current, owns, qualified, Trunc(cmd.CommandText));
                 cmd.ExecuteNonQuery();
@@ -3855,7 +3880,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             }
 
             string create = BuildCreateTable(qualified, columns, Profile, primaryKey, uniques, defaults, sortColumns,
-                                              identityColumns, ResolveAddIdentity(), withOpts);
+                                              identityColumns, ResolveAddIdentity(), withOpts,
+                                              _hiddenRowId && pk.Count == 0 && uniqueGroups.Count == 0);
             using var cmd0 = connection.CreateCommand();
             cmd0.Transaction = transaction;
             cmd0.CommandText = ifNotExists
@@ -4775,6 +4801,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // IDENTITY column clause. Fabric Warehouse supports only bare BIGINT IDENTITY (no seed/increment); box /
     // Azure SQL take IDENTITY(1,1). Identity columns are always BIGINT here (Fabric requires it) and implicitly
     // NOT NULL, and can carry no DEFAULT.
+    /// <summary>The reserved name of the hidden row-id column (see the hidden_rowid ATTACH option). A column with
+    /// this name is left out of every table schema reported to DuckDB, whether or not the option is set, so a
+    /// catalog attached without it still sees the same columns. Its rowid then resolves to no visible column,
+    /// which the host treats as a VIRTUAL BIGINT rowid.</summary>
+    internal const string HiddenRowIdColumn = "__fabricator_rowid";
+
     private static string IdentityClause(ServerProfile profile) =>
         profile.IsWarehouse ? " BIGINT IDENTITY" : " BIGINT IDENTITY(1,1)";
 
@@ -4782,7 +4814,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                                            string? uniques, string? defaults,
                                            IReadOnlyList<string>? clusterColumns = null,
                                            IReadOnlyList<string>? identityColumns = null, bool addIdentity = false,
-                                           SqlServerWithOptions? with = null)
+                                           SqlServerWithOptions? with = null, bool hiddenRowId = false)
     {
         var defaultMap = ParseDefaults(defaults);
         // Columns marked IDENTITY (a DuckDB GENERATED-column marker), matched by name (case-insensitive).
@@ -4794,6 +4826,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // and no column already carries the target name (<table>_id). Skipped otherwise ("ignored if present").
         string autoIdentityName = TableNameFromQualified(qualified) + "_id";
         bool autoIdentity = addIdentity && identitySet.Count == 0 && !existingNames.Contains(autoIdentityName);
+        // hidden_rowid: only for a table that would otherwise have no row identity at all. The caller has already
+        // ruled out PRIMARY KEY / UNIQUE (on a warehouse they arrive as separate ALTERs, not as arguments here).
+        bool hiddenIdentity = hiddenRowId && identitySet.Count == 0 && !autoIdentity
+                              && !existingNames.Contains(HiddenRowIdColumn);
 
         var sb = new StringBuilder();
         sb.Append("CREATE TABLE ").Append(qualified).Append(" (");
@@ -4832,6 +4868,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         if (autoIdentity)
         {
             sb.Append(", ").Append(Quote(autoIdentityName)).Append(IdentityClause(profile));
+        }
+        if (hiddenIdentity)
+        {
+            sb.Append(", ").Append(Quote(HiddenRowIdColumn)).Append(IdentityClause(profile));
         }
         // Clustered columnstore (mssql_default_table_type='clustered columnstore'). Box / Azure SQL only:
         // emit an inline INDEX … CLUSTERED COLUMNSTORE so the table is columnstore. Fabric/Synapse tables

@@ -60,7 +60,7 @@ public sealed partial class SqlServerCatalog
         {
             using var probe = ExecuteMetadataQuery(
                 $"SELECT * FROM {Quote(schemaName)}.{Quote(tableName)} WHERE 1 = 0");
-            return probe.Schema;
+            return WithoutHiddenRowId(probe.Schema);
         }
         catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == InvalidObjectNameError)
         {
@@ -76,6 +76,45 @@ public sealed partial class SqlServerCatalog
             }
             throw new ObjectNotFoundException("table", $"{schemaName}.{tableName}", ex);
         }
+    }
+
+    private static int HiddenRowIdIndex(Schema schema)
+    {
+        for (int k = 0; k < schema.FieldsList.Count; k++)
+        {
+            if (string.Equals(schema.FieldsList[k].Name, HiddenRowIdColumn, StringComparison.OrdinalIgnoreCase))
+            {
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>The schema without the hidden row-id column (see <see cref="HiddenRowIdColumn"/>). Matched by
+    /// exact name, case-insensitively as SQL Server resolves it.</summary>
+    internal static Schema WithoutHiddenRowId(Schema schema)
+    {
+        int i = HiddenRowIdIndex(schema);
+        if (i < 0)
+        {
+            return schema;
+        }
+        var fields = schema.FieldsList.Where((_, k) => k != i).ToList();
+        return new Schema(fields, schema.Metadata);
+    }
+
+    /// <summary>The batch without the hidden row-id column, for results a statement returns to DuckDB
+    /// (INSERT … RETURNING reads OUTPUT INSERTED.*).</summary>
+    internal static RecordBatch WithoutHiddenRowId(RecordBatch batch)
+    {
+        int i = HiddenRowIdIndex(batch.Schema);
+        if (i < 0)
+        {
+            return batch;
+        }
+        var columns = Enumerable.Range(0, batch.ColumnCount).Where(k => k != i).Select(batch.Column).ToList();
+        (batch.Column(i) as IDisposable)?.Dispose(); // the new batch owns the rest; nothing else holds this one
+        return new RecordBatch(WithoutHiddenRowId(batch.Schema), columns, batch.Length);
     }
 
     /// <summary>TRUE if the object is present, FALSE if it is provably absent, NULL if the question could
@@ -465,4 +504,19 @@ SELECT s.name, o.name, c.name, dc.definition
             // routing's business.
         }
     }
+}
+
+/// <summary>A stream with the hidden row-id column removed from its schema and from every batch.</summary>
+internal sealed class HiddenRowIdStream(IArrowArrayStream inner) : IArrowArrayStream
+{
+    public Schema Schema { get; } = SqlServerCatalog.WithoutHiddenRowId(inner.Schema);
+
+    public async System.Threading.Tasks.ValueTask<RecordBatch?> ReadNextRecordBatchAsync(
+        System.Threading.CancellationToken cancellationToken = default)
+    {
+        var batch = await inner.ReadNextRecordBatchAsync(cancellationToken).ConfigureAwait(false);
+        return batch is null ? null : SqlServerCatalog.WithoutHiddenRowId(batch);
+    }
+
+    public void Dispose() => inner.Dispose();
 }

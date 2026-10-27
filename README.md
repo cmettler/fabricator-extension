@@ -449,6 +449,20 @@ What the profile drives automatically:
   its identity column (no PK/unique). Precedence flips by engine: a **warehouse prefers the identity** (Fabric
   PK/UNIQUE are non-enforced hints, but IDENTITY is engine-unique); **box / Azure SQL prefer the PK/unique** and
   fall back to the identity only when there's no key constraint.
+- **A hidden row id for keyless tables (`hidden_rowid`).** With `ATTACH … (TYPE fabricator, hidden_rowid true)`,
+  a table created with no PRIMARY KEY, UNIQUE or IDENTITY marker (CREATE and CTAS) gets a `BIGINT IDENTITY`
+  column `[__fabricator_rowid]` that DuckDB never sees: `DESCRIBE`, `SELECT *` and `RETURNING *` leave it out,
+  and it becomes the table's `rowid`. So `UPDATE`/`DELETE` work on such a table, including set-based ones with
+  a join or a subquery. It is hidden rather than visible because a positional `INSERT INTO t VALUES (…)` would
+  otherwise fail with *"table has N columns but M values were supplied"*. A column with that name is hidden on
+  every catalog, with or without the option, so a catalog attached without it still sees the same table. This
+  is what makes SQL Server usable as a [DuckLake](docs/ducklake-catalog.md) metadata catalog:
+  ```sql
+  ATTACH '...' AS db (TYPE fabricator, hidden_rowid true);
+  CREATE TABLE db.dbo.events (id INTEGER, note VARCHAR);   -- no key: gets the hidden row id
+  INSERT INTO db.dbo.events VALUES (1, 'a'), (2, 'b');
+  UPDATE db.dbo.events SET note = v.n FROM (VALUES (1, 'A')) v(k, n) WHERE events.id = v.k;
+  ```
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
   via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
 

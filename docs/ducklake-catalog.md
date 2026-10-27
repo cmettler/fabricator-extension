@@ -1,0 +1,145 @@
+# DuckLake with a SQL Server metadata catalog
+
+Status: **works on box SQL Server with `META_HIDDEN_ROWID true`** (2026-10-27, branch `feat/ducklake-catalog`;
+§6 is the as-built record). Goal: run DuckLake with its metadata in SQL Server, reached through our extension,
+**without changing the DuckLake extension**.
+
+Measured with the official signed DuckLake build `417a9117f5` (`INSTALL ducklake`) loaded into our
+`v2.0.0` build. The version string matters: a dev build (`v2.0.0-devNNN`) cannot load signed extensions.
+DuckLake source read at the same commit.
+
+## 1. How DuckLake reaches the metadata catalog
+
+- `ATTACH 'ducklake:fabricator:<SqlClient connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo')`.
+  DuckLake strips `ducklake:`, takes `fabricator` as the metadata TYPE and issues
+  `ATTACH OR REPLACE 'fabricator:<connstr>' AS __ducklake_metadata_lake (…)`, which reaches our storage
+  extension unchanged. Every `META_<x>` option on the outer ATTACH becomes `<x>` on the inner one, so our own
+  ATTACH options (PROVIDER, SECRET, …) can be passed.
+- DuckLake keeps a registry of metadata managers by catalog type (`postgres`, `sqlite`, `quack`). The Postgres
+  manager sends every statement as text through `postgres_execute`/`postgres_query`. **An unknown type gets the
+  default manager, which runs plain DuckDB SQL against the attached catalog** — so for us every metadata
+  statement goes through our binder-level DML/DDL. `DuckLakeMetadataManager::Register` exists, but it is C++
+  inside the DuckLake binary and cannot be called from another loadable extension.
+
+## 2. What works (measured)
+
+- ATTACH creates the metadata schema in an empty SQL Server database (30 tables; the five that DuckLake
+  declares with a PRIMARY KEY get one).
+- CREATE TABLE, INSERT, SELECT, re-attach, snapshot history (`ducklake_snapshots`).
+- **With `DATA_INLINING_ROW_LIMIT 0`: UPDATE and DELETE are correct** (delete files written, snapshots right).
+  The single-table UPDATEs on stats tables (`… WHERE table_id = n`) run through our predicate shortcut
+  (ABI v93/v94, logged as `update-where`), although those tables have no key.
+
+## 3. What fails, and why it is one class
+
+Every failure is a **set-based UPDATE/DELETE on a keyless metadata table whose WHERE our exact renderer does
+not take** (a join or a subquery). Our row-id path then needs a key and there is none:
+
+| trigger | statement shape | table |
+|---|---|---|
+| UPDATE/DELETE with data inlining (the default) | `UPDATE inlined SET end_snapshot = … FROM (VALUES …) WHERE row_id = …` | `ducklake_inlined_data_<t>_<v>` |
+| `ducklake_merge_adjacent_files`, `CHECKPOINT` | `UPDATE ducklake_table_stats SET file_size_bytes = (SELECT SUM(…) …) WHERE table_id = n` | `ducklake_table_stats` |
+| `ducklake_expire_snapshots` | `DELETE FROM t WHERE NOT EXISTS (SELECT … WHERE … = t.x)` | `ducklake_view`, `ducklake_macro_*`, … |
+
+The error surfaces as DuckLake's commit retry loop exhausting its 10 attempts, which reads like contention.
+
+## 4. Other findings
+
+- **Our catalog reports DuckDB's default schema `main`**, because `FabricatorCatalog` does not override
+  `Catalog::GetDefaultSchema()`; SQL Server's is `dbo`. DuckLake asks for it when `METADATA_SCHEMA` is not
+  given and fails with *schema "main" not found*. Workaround: `METADATA_SCHEMA 'dbo'`. Overriding it would also
+  change how `db.t` resolves for every SQL Server catalog, so it is a decision of its own.
+- Not yet measured: two writers committing concurrently (DuckLake detects a conflict through a PRIMARY KEY
+  violation on `ducklake_snapshot`), Fabric Warehouse as the metadata host, cloud data paths.
+
+## 5. Options for the failing class
+
+1. **A hidden row id for keyless tables our catalog creates** (generic, not DuckLake-specific): an
+   `IDENTITY` column the catalog uses as row id but does not report in the table schema. Our row-id code
+   already accepts an IDENTITY column as row id. Every failing statement then takes the existing row-id path.
+   Opt-in per ATTACH, reachable through DuckLake as a `META_` option.
+2. **Keys from DuckLake's schema knowledge**, added by a CREATE TABLE hook (e.g. `(_ducklake_row_id,
+   _ducklake_begin_snapshot)` on inlined tables). Couples us to DuckLake's schema version by version.
+3. **Push the whole DML statement to SQL Server** (2.0 remote optimizer + T-SQL for DELETE/UPDATE with
+   subqueries). Largest, and our Substrait path covers SELECT only.
+
+## 6. As built: `hidden_rowid` (option 1)
+
+`ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true)`.
+DuckLake hands `META_HIDDEN_ROWID` to our inner ATTACH as `hidden_rowid`, so every metadata table it creates
+without a key gets a `BIGINT IDENTITY` column `[__fabricator_rowid]`. C#-only, no ABI change, gate
+`verify_hidden_rowid` (service tier).
+
+- **Hidden, not visible — measured, not a preference.** DuckLake writes its commit with positional
+  `INSERT INTO … VALUES (…)` (no column list) in about a dozen places (`ducklake_staged_commit.cpp`), e.g. into
+  the keyless `ducklake_table_stats`. DuckDB refuses a missing trailing value even when the column has a
+  default (*"table "t" has 3 columns but 2 values were supplied"*), so a visible identity breaks every commit.
+- **Why not a UNIQUE index instead.** It needs to know which columns ARE unique, which only DuckLake knows
+  (option 2's coupling); SQL Server cannot index `VARCHAR(MAX)`, our default text type; a unique index admits one
+  NULL; and DuckLake updates exactly the columns (`end_snapshot`) a natural key would contain.
+- **What makes it small:** the host already treats a rowid name that matches no visible column as a VIRTUAL
+  BIGINT rowid (the Delta `_metadata.row_id` path), and `RowIdSql` already picks an IDENTITY column on a keyless
+  table. The provider only had to add the column at CREATE/CTAS and leave it out of what DuckDB sees.
+- **Three places hide it, and the third was found by the gate:** the table schema (`ColumnsSchemaCore`), the
+  `RETURNING` result (`OUTPUT INSERTED.*`), and every catalog scan that projects `*` — the bind-time describe
+  among them. ⚠ The host maps those columns BY POSITION, so with the hidden column anywhere but last (an
+  `ALTER … ADD COLUMN` puts new columns after it) every later column shifted and DuckDB raised
+  *"INTERNAL Error: Vector::Reference used on vector of different type"*. The same holds for `RETURNING`, and
+  the first version of the gate missed it because its RETURNING ran before the ALTER, where the column is last.
+- It is created only with the option and only on a table with no PRIMARY KEY / UNIQUE / IDENTITY marker; it is
+  hidden on every catalog, so an attach without the option sees the same columns and still uses it as rowid.
+
+**Measured with DuckLake `417a9117f5`, default data inlining, fresh metadata database:**
+
+- CREATE, inlined INSERT/UPDATE/DELETE, 2000-row INSERT + range DELETE/UPDATE: counts and sums exact
+  (1902 rows, sum 2004053, by hand).
+- `ducklake_flush_inlined_data` (14 rows), `ducklake_merge_adjacent_files` (4 files → 1), `rewrite_data_files`,
+  `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `CHECKPOINT`: all succeed, data exact
+  afterwards (4904 rows) and after a re-attach.
+- The statement that used to fail now takes the row-id path:
+  `UPDATE [dbo].[ducklake_table_stats] SET [file_size_bytes] = @s0 WHERE [__fabricator_rowid] = @k1`. Simple
+  single-table UPDATE/DELETEs still take the predicate shortcut (`update-where`, `delete-where`).
+
+**Still open:** a live Fabric SQL database (§7); the default schema (`METADATA_SCHEMA 'dbo'` is still needed,
+§4); Delta metadata over DuckLake's data files.
+
+## 7. Concurrent writers (measured 2026-10-27)
+
+Several duckdb PROCESSES commit to one DuckLake catalog at once (scratchpad harnesses `dl_race.sh`,
+`dl_race_dml.sh`). Three local variants of the metadata database: **box** (`SQL_Latin1_General_CP1_CI_AS`, RCSI
+off, i.e. locking READ COMMITTED), **Fabric-like** (`Latin1_General_100_CI_AS_SC_UTF8`, `READ_COMMITTED_SNAPSHOT
+ON`, `ALLOW_SNAPSHOT_ISOLATION ON` — the Azure SQL defaults a Fabric SQL database is expected to have), and
+Fabric-like with `META_READ_ISOLATION 'snapshot'` (the DuckDB transaction — every read and the writes — on one
+SNAPSHOT transaction).
+
+- **How DuckLake detects a conflict:** every commit inserts the next `snapshot_id`; a concurrent commit makes that a
+  PRIMARY KEY violation (SQL Server 2627), and DuckLake retries any error whose text contains `primary key`,
+  `unique`, `conflict` or `concurrent`. ⚠ A DEADLOCK (1205, "chosen as the deadlock victim") contains none of
+  them and would NOT be retried — none occurred in any run.
+- **Appends, 8 writers × 25 single-row INSERTs:** ~90 retried PK conflicts per run. With the default
+  `ducklake_max_retry_count` (10) about 4 commits fail LOUDLY (*"Exceeded the maximum retry count"*), with
+  `SET ducklake_max_retry_count = 100` all 200 land, `ducklake_snapshot` contiguous, no duplicates.
+  **Identical in all three variants.**
+- **DELETE + UPDATE of each writer's own rows in one shared table** (data files, and with 8 rows per writer the
+  INLINED table — 0 data files, so the hidden-rowid UPDATE path under concurrency): most commits fail with DuckLake's
+  own *"Transaction conflict - attempting to delete from table … but another transaction has inserted into it"*
+  (an UPDATE is a delete plus an insert, and DuckLake does not retry that). **DuckLake's SQLite backend under the
+  same load loses the same share with the same message** (e.g. 116 vs 120 of 160), so it is DuckLake's semantics,
+  not this catalog. Every run balances exactly: failed + applied = issued; nothing silently lost or doubled.
+- **⇒ The isolation level made no measurable difference**, and none was needed: READ COMMITTED, RCSI and
+  snapshot reads all behaved the same, with no deadlocks, no lock timeouts and no update conflicts (3960). Leave the
+  database at its defaults; do not set `read_isolation 'snapshot'` for DuckLake (no gain, and it pins a
+  connection per transaction).
+- **Which option sets which level (by design, not a defect):** `isolation_level` / `SET mssql_isolation_level`
+  scope table-in-out sessions ONLY. The DuckDB transaction's pinned connection — writes, and reads under the opt-in —
+  takes its level from ONE resolver (`ResolveTxnIsolation`): `read_isolation` when set, else the profile default
+  (`snapshot` on Fabric Warehouse / Synapse serverless, the server default on box / Azure SQL). Kept apart on
+  purpose: reusing `isolation_level` would have switched the per-transaction read pin on for anyone who had set it.
+  ⚠ So a first run with `META_ISOLATION_LEVEL 'snapshot'` was VOID (it changed nothing here), while the
+  `META_READ_ISOLATION 'snapshot'` run put reads AND writes under SNAPSHOT — confirmed in the trace
+  (`route=read_isolation pin`).
+- **Fabric SQL database, not Fabric Warehouse.** The Warehouse emits PK/UNIQUE as `NOT ENFORCED` hints, which
+  would remove the very PRIMARY KEY violation DuckLake's conflict detection rests on (reasoned, not measured).
+  A Fabric SQL database is Azure SQL underneath and enforces keys. ⚠ Unverified live: that its
+  `SERVERPROPERTY('EngineEdition')` is outside `ServerProfile.IsWarehouse` (editions 6 and 11), which decides
+  whether we emit enforced keys.
