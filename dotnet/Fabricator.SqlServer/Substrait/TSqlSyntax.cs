@@ -67,12 +67,13 @@ internal sealed class SqlExpr
 /// <summary>A column of a relation's output, as visible to Substrait field references.</summary>
 internal sealed class SqlColumn
 {
-    public SqlColumn(string name, SqlExpr expr, bool isBare, string? raw = null)
+    public SqlColumn(string name, SqlExpr expr, bool isBare, string? raw = null, string? unsupported = null)
     {
         Name = name;
         Expr = expr;
         IsBare = isBare;
         Raw = raw;
+        Unsupported = unsupported;
     }
 
     /// <summary>The name to give the column where a select list must name it.</summary>
@@ -96,9 +97,14 @@ internal sealed class SqlColumn
     /// </summary>
     public string? Raw { get; }
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Why a query that uses this column cannot be written, or null.
+    /// </summary>
+    public string? Unsupported { get; }
+
     public SqlColumn WithType(SType type) => new(Name, Expr.IsPredicate
         ? new SqlExpr(null, Expr.Predicate, type, Expr.Props)
-        : SqlExpr.Of(Expr.Value, type, Expr.Props), IsBare, Raw);
+        : SqlExpr.Of(Expr.Value, type, Expr.Props), IsBare, Raw, Unsupported);
 }
 
 /// <summary>An ORDER BY item: an expression and a direction.</summary>

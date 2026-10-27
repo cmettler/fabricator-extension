@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "catalog/fabricator_catalog.hpp"
+#include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -243,6 +244,9 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 
 	string json;
 	try {
+		// The provider decides with the transaction in view: a query it would have to run beside this
+		// transaction's own uncommitted writes is one it must decline (verify_mars_dynamic §3).
+		FabricatorSetActiveTxn(catalog.GetHandle(), context);
 		json = fabricator::RemoteTranslate(catalog.GetHandle(), plan_bytes);
 	} catch (std::exception &ex) {
 		reason = ErrorData(ex).RawMessage();

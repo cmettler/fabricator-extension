@@ -17,10 +17,12 @@
 
 require fabricator
 
+require json
+
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'false');
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS rp (TYPE fabricator, remote_pushdown 'true');
@@ -88,6 +90,29 @@ query II
 EXPLAIN SELECT k, count(*), sum(b) FROM rp.dbo.rs_t WHERE id > 0 AND (d IS NOT NULL OR NOT (k = 2)) GROUP BY k;
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
+
+# The DEFAULT is on (since 2026-10-27): an attach naming no option pushes the same query, `db` opts out above,
+# and a misspelled value is refused rather than read as either one.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dflt (TYPE fabricator);
+
+query II
+EXPLAIN SELECT count(*), sum(id) FROM dflt.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*), sum(id) FROM db.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+statement ok
+DETACH dflt;
+
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad (TYPE fabricator, remote_pushdown 'flase');
+----
+remote_pushdown must be 'true' or 'false'
 
 # A constant that converts LOSSLESSLY to the column type: 2.250 is DECIMAL(4,3), the column DECIMAL(10,2).
 query II
@@ -1337,3 +1362,130 @@ DELETE FROM rp.dbo.rs_t WHERE id = 1;
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_t; DROP TABLE dbo.rs_u; DROP TABLE dbo.rs_s;');
+
+# ═══ §7  Server types that take no COLLATE ═══════════════════════════════════════════════════════════
+# json, text and ntext surface as DuckDB strings, and the emitter gives every string its collation — which
+# SQL Server refuses for these types (Msg 447 / 4189). They are converted to nvarchar(max) first, which is
+# the text the scan returns. xml and sql_variant have no such conversion (the server writes <b/> where the
+# scan writes <b />), so a query that USES one runs locally; one that does not still goes to the server.
+# The catalog learns the types at refresh, like other metadata.
+
+statement ok
+SELECT fabricator_exec('db', 'IF OBJECT_ID(''dbo.rs_ty'') IS NOT NULL DROP TABLE dbo.rs_ty;
+  CREATE TABLE dbo.rs_ty (id int, x xml, j json, t text, n ntext, v sql_variant)');
+
+statement ok
+SELECT fabricator_exec('db', 'INSERT dbo.rs_ty (id, x, j, t, n, v) VALUES (1, ''<a>1</a>'', ''{"a":1}'', ''abc'', N''äbc'', CAST(42 AS sql_variant)),
+  (2, NULL, NULL, NULL, NULL, NULL), (3, ''<b/>'', ''[1,2]'', ''abc '', N''x'', CAST(''v'' AS sql_variant))');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+# (a plain filtered scan stays a table scan by design, so these use shapes the server answers)
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_ty WHERE j IS NOT NULL AND n IS NOT NULL;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_ty WHERE j IS NOT NULL AND n IS NOT NULL;
+----
+2
+
+# exact: 'abc ' is not 'abc' in DuckDB, though SQL Server's padding rules call them equal
+query I
+SELECT count(*) FROM rp.dbo.rs_ty WHERE t = 'abc';
+----
+1
+
+# SQL Server cannot group json, text or ntext at all; the converted text it can
+query II
+EXPLAIN SELECT j, t, n, count(*) FROM rp.dbo.rs_ty GROUP BY ALL;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (((SELECT j, t, n, count(*) AS c FROM rp.dbo.rs_ty GROUP BY ALL) EXCEPT ALL (SELECT j, t, n, count(*) AS c FROM db.dbo.rs_ty GROUP BY ALL))
+  UNION ALL ((SELECT j, t, n, count(*) AS c FROM db.dbo.rs_ty GROUP BY ALL) EXCEPT ALL (SELECT j, t, n, count(*) AS c FROM rp.dbo.rs_ty GROUP BY ALL)));
+----
+0
+
+# xml: used ⇒ local, and the scan's text
+query II
+EXPLAIN SELECT x, count(*) FROM rp.dbo.rs_ty GROUP BY x;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT x, count(*) FROM rp.dbo.rs_ty GROUP BY x ORDER BY x NULLS FIRST;
+----
+NULL	1
+<a>1</a>	1
+<b />	1
+
+query II
+EXPLAIN SELECT t, count(*) FROM rp.dbo.rs_ty GROUP BY t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT t, count(*) FROM rp.dbo.rs_ty GROUP BY t ORDER BY t NULLS FIRST;
+----
+NULL	1
+abc	1
+abc 	1
+
+# sql_variant likewise; a query that does not use these columns is still pushed
+query II
+EXPLAIN SELECT id, v FROM rp.dbo.rs_ty;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query IT
+SELECT id, v FROM rp.dbo.rs_ty ORDER BY id;
+----
+1	42
+2	NULL
+3	v
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_ty WHERE id > 1;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# ═══ §8  A transaction that holds a connection without MARS ══════════════════════════════════════════
+# The pushed query runs as a pooled read; beside this transaction's own uncommitted writes it would wait
+# for their locks forever (a whole service tier once hung in verify_mars_dynamic). So it runs locally, where
+# the scan routes or refuses it.
+
+statement ok
+SET mssql_mars = 'false';
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO rp.dbo.rs_ty (id) VALUES (4);
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_ty;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+statement ok
+ROLLBACK;
+
+# outside the transaction the same query is pushed again
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_ty;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+RESET mssql_mars;
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_ty');

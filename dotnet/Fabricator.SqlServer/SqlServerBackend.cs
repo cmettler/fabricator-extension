@@ -639,8 +639,27 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // ATTACH option `keep_nulls true|false` (default TRUE). See ResolveKeepNulls; a SET mssql_keep_nulls
     // overrides it per session, the same precedence as materialize and isolation_level.
     private readonly bool? _keepNulls;
-    // ATTACH option `remote_pushdown` (default false) — see CapabilitiesJson.
-    private readonly bool _remotePushdown;
+    // ATTACH option `remote_pushdown` (default TRUE since 2026-10-27) — see CapabilitiesJson. On by default because a
+    // query the translator cannot write exactly is declined and runs locally as before, while a declined default would
+    // leave patterns like `x = (SELECT MAX(x) FROM t)` as full scans (DuckLake: every commit linearly dearer).
+    // FABRICATOR_REMOTE_PUSHDOWN sets the default for an ATTACH that does not name the option, which is how
+    // scripts/run-suites.sh runs the routing suites a second time with pushdown off.
+    private readonly bool _remotePushdown = DefaultRemotePushdown();
+
+    private static bool DefaultRemotePushdown()
+    {
+        string? env = Environment.GetEnvironmentVariable("FABRICATOR_REMOTE_PUSHDOWN");
+        return string.IsNullOrEmpty(env) || ParseRemotePushdown(env, "FABRICATOR_REMOTE_PUSHDOWN");
+    }
+
+    // ⚠ Strict: an unknown spelling used to read as OFF; with the default now ON a typo of 'false' would
+    // silently leave pushdown running, so anything but true/false/1/0 throws.
+    private static bool ParseRemotePushdown(string value, string source) => value.Trim().ToLowerInvariant() switch
+    {
+        "true" or "1" => true,
+        "false" or "0" => false,
+        _ => throw new ArgumentException($"{source} must be 'true' or 'false', got '{value}'"),
+    };
     // ATTACH option `command_timeout <seconds>` (0 = infinite, default): the catalog default SqlCommand.CommandTimeout
     // for scans/DML/bulk. A SET mssql_command_timeout overrides it per session (ResolveCommandTimeout).
     private readonly int _commandTimeout;
@@ -770,7 +789,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                     // whole SELECT (aggregate / GROUP BY over one table) to the server. Read ONCE here because
                     // DuckDB latches it at ATTACH — it counts remote catalogs when the database is attached.
                     case "remote_pushdown":
-                        _remotePushdown = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
+                        _remotePushdown = ParseRemotePushdown(val, "remote_pushdown");
                         break;
                     // ⚠ ADDED WITH CHANGE B, and it RESTORES a capability that change would otherwise have
                     // removed. MARS used to be frozen per catalog at its first connect, so attaching twice
@@ -2874,10 +2893,27 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             return null;
         }
+        // The pushed query runs through fabricator_query, i.e. as a plain pooled read. Inside a transaction
+        // that holds a connection without MARS (and without the read_isolation pin), that read would sit
+        // beside the transaction's own uncommitted writes and wait forever for its locks. The local scan
+        // knows that case (EnsureScanCannotSelfBlock), so leave the query to it.
+        if (AmbientTransaction.Current != 0 && !TxnMars() && string.IsNullOrEmpty(ResolveReadIsolation()) &&
+            _txns.TryGet(AmbientTransaction.Current) is { } state)
+        {
+            lock (state)
+            {
+                if (state.Connection is not null)
+                {
+                    return RemoteQuery.Declined("this transaction holds a connection without MARS");
+                }
+            }
+        }
         try
         {
+            var special = UncollatableColumns();
             string sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
-                substraitPlan, HasIgnoreNulls, out int columnCount, out var orderDescending);
+                substraitPlan, HasIgnoreNulls, out int columnCount, out var orderDescending,
+                names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null);
             return new RemoteQuery(sql, columnCount, orderDescending);
         }
         catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)

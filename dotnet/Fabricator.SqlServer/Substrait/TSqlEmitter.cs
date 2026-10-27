@@ -41,6 +41,7 @@ internal sealed class TSqlEmitter
     private readonly bool _perRecordEvaluation;
     private readonly string? _collation;
     private readonly Func<IReadOnlyList<string>, string>? _tableName;
+    private readonly Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? _columnSqlTypes;
     private readonly List<IReadOnlyList<SqlColumn>> _outerScopes = new();
     private int _aliasCounter;
     private int _nameCounter;
@@ -48,11 +49,17 @@ internal sealed class TSqlEmitter
     /// <param name="perRecordEvaluation">The plan asks for execution context variables to be evaluated per record.</param>
     /// <param name="collation">The collation given to every string value, or null to use the database's collations.</param>
     /// <param name="tableName">Writes a named table's name, in place of its quoted name parts.</param>
-    public TSqlEmitter(bool perRecordEvaluation, string? collation, Func<IReadOnlyList<string>, string>? tableName = null)
+    /// <param name="columnSqlTypes">
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] For a named table, its columns whose server type takes no COLLATE
+    /// (xml, json, text, ntext, sql_variant, CLR types), keyed by column name with the type name as value.
+    /// </param>
+    public TSqlEmitter(bool perRecordEvaluation, string? collation, Func<IReadOnlyList<string>, string>? tableName = null,
+                       Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null)
     {
         _perRecordEvaluation = perRecordEvaluation;
         _collation = collation;
         _tableName = tableName;
+        _columnSqlTypes = columnSqlTypes;
     }
 
     /// <summary>The collation given to string values, or null.</summary>
@@ -178,6 +185,7 @@ internal sealed class TSqlEmitter
 
         string alias = NewAlias();
         var block = new SelectBlock();
+        IReadOnlyDictionary<string, string>? sqlTypes = null;
         if (rel.VirtualRows != null)
         {
             block.From = VirtualTable(rel, alias);
@@ -185,10 +193,13 @@ internal sealed class TSqlEmitter
         else
         {
             block.From = (_tableName?.Invoke(rel.TableNames) ?? string.Join(".", rel.TableNames.Select(TSql.Identifier))) + " AS " + alias;
+            sqlTypes = _columnSqlTypes?.Invoke(rel.TableNames); // [FABRICATOR-PATCH: OURS-BY-DESIGN]
         }
         for (int i = 0; i < rel.ColumnNames.Count; i++)
         {
-            block.Columns.Add(ColumnOf(alias, rel.ColumnNames[i], rel.ColumnTypes[i]));
+            string? sqlType = null;
+            sqlTypes?.TryGetValue(rel.ColumnNames[i], out sqlType);
+            block.Columns.Add(ColumnOf(alias, rel.ColumnNames[i], rel.ColumnTypes[i], sqlType));
         }
 
         // The filters apply to the base schema, before the projection.
@@ -208,6 +219,12 @@ internal sealed class TSqlEmitter
                 projected.Add(Column(block.Columns, index));
             }
             block.Columns = projected;
+        }
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] the filters above refused such a column through Column(); this
+        // covers one that would only be passed through.
+        if (block.Columns.FirstOrDefault(c => c.Unsupported != null) is { } unsupported)
+        {
+            throw new SubstraitTranslationException(unsupported.Unsupported!);
         }
         return block;
     }
@@ -930,9 +947,29 @@ internal sealed class TSqlEmitter
     }
 
     /// <summary>A column of a table or derived table; strings are given the query's collation.</summary>
-    private SqlColumn ColumnOf(string alias, string name, SType type)
+    private SqlColumn ColumnOf(string alias, string name, SType type, string? sqlType = null)
     {
         string reference = alias + "." + TSql.Identifier(name);
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] A server type that takes no COLLATE. json, text and ntext read as
+        // the same text the scan returns once converted to nvarchar(max). xml does NOT (the server writes
+        // <b/> where the scan's reader writes <b />), and sql_variant and the CLR types (hierarchyid,
+        // geometry, geography) have no matching conversion either, so a query that uses one runs locally.
+        if (sqlType != null)
+        {
+            switch (sqlType.ToLowerInvariant())
+            {
+                case "json":
+                case "text":
+                case "ntext":
+                    string text = "CAST(" + reference + " AS nvarchar(max))";
+                    return _collation != null && type.IsStringLike
+                        ? new SqlColumn(name, SqlExpr.Of(text + " COLLATE " + _collation, type, SqlProps.Column), isBare: true, raw: reference)
+                        : new SqlColumn(name, SqlExpr.Of(text, type, SqlProps.Column), isBare: true, raw: reference);
+                default:
+                    return new SqlColumn(name, SqlExpr.Of(reference, type, SqlProps.Column), isBare: true,
+                                         unsupported: $"column {name} is {sqlType} on the server");
+            }
+        }
         if (_collation != null && type.IsStringLike)
         {
             return new SqlColumn(name, SqlExpr.Of(reference + " COLLATE " + _collation, type, SqlProps.Column), isBare: true, raw: reference);
@@ -1091,6 +1128,10 @@ internal sealed class TSqlEmitter
         if (index < 0 || index >= scope.Count)
         {
             throw SubstraitTranslationException.MalformedPlan($"Field reference {index} is out of range; the input has {scope.Count} fields.");
+        }
+        if (scope[index].Unsupported is { } why) // [FABRICATOR-PATCH: OURS-BY-DESIGN]
+        {
+            throw new SubstraitTranslationException(why);
         }
         return scope[index];
     }

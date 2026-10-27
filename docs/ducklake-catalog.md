@@ -158,7 +158,7 @@ these are LOWER bounds for a remote server):
 
 - `read_isolation` is SLOWER: by default reads already run on POOLED connections in parallel, without MARS; the
   opt-in moves every read of the transaction onto ONE pinned connection.
-- Remote pushdown is off unless asked for (`META_REMOTE_PUSHDOWN 'true'`); with these tiny tables it saves
+- Remote pushdown was off by default when this was measured (it is ON since 2026-10-27, §9); with these tiny tables it saves
   statements but no time — but see §9: it is what keeps a commit's cost flat as the snapshot history grows.
 - **The describe cache.** Every table reference in every statement asked SQL Server for the table's Arrow schema
   (`SELECT * FROM t WHERE 1 = 0`) — 40% of all statements. A table entry now reuses its FIRST describe for later
@@ -199,5 +199,6 @@ Measured with synthetic history rows (negative ids, so MAX and the live chain ar
 
 Pushdown also holds under concurrency: the 8 × 25 append race lands 200/200 (21 s, against 37–40 s without it),
 and the inlined DELETE/UPDATE race balances exactly (failed + applied = issued, same DuckLake conflicts as §7).
-⇒ **Attach DuckLake with `META_REMOTE_PUSHDOWN 'true'`.** Local docker, so remote latency comes on top of both
-columns; the slope is the point.
+⇒ **`remote_pushdown` is therefore ON BY DEFAULT since 2026-10-27** (opt out with `remote_pushdown 'false'`,
+through DuckLake `META_REMOTE_PUSHDOWN 'false'`); a query the translator cannot write exactly still runs locally.
+Local docker, so remote latency comes on top of both columns; the slope is the point.

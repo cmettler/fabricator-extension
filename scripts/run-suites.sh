@@ -1027,7 +1027,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=66}"   # 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
+        : "${MIN_SUITES:=72}"   # 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1486,7 +1486,11 @@ case "$TIER" in
         # 2026-10-27: 4508 -> 4593. +verify_bind_schema_cache (85, new): a table entry reuses its first bind-time
         # describe on SQL Server, and a column-type change made outside the session fails cleanly instead of
         # invalidating the database. Three mutants killed.
-        : "${MIN_ASSERTIONS:=4593}"
+        # 2026-10-27: 4593 -> 4600. verify_remote_select_mssql 456 -> 463: remote_pushdown defaults to TRUE, the
+        # reference catalog opts out by name, a misspelled value is refused.
+        # 2026-10-27: 4600 -> 4647. verify_remote_select_mssql 463 -> 510: server types without COLLATE (§7) and the
+        # MARS-off transaction decline (§8), both found by turning the default on.
+        : "${MIN_ASSERTIONS:=4647}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -1611,6 +1615,23 @@ case "$TIER" in
     *)        ACCUMULATED='' ;;
 esac
 
+# The REMOTE-PUSHDOWN-OFF leg (2026-10-27). remote_pushdown defaults to ON, so every SQL Server suite that does
+# not name the option runs pushed shapes (aggregates, joins, ORDER BY ... LIMIT) as one T-SQL statement. The
+# scan path those shapes used to take is still what `remote_pushdown 'false'` gives, and its connection
+# routing (MARS on/off, read_isolation, the same-catalog read+write mark, in-out isolation) is where both
+# defects the default flip surfaced lived. So these suites run a SECOND time with FABRICATOR_REMOTE_PUSHDOWN=
+# false, the default for an ATTACH that does not name the option. The scan-pushdown suites need no leg: they
+# pin `remote_pushdown 'false'` themselves, with an EXPLAIN control.
+case "$TIER" in
+    service) PUSHDOWN_OFF='test/verify_connection_mode.test
+test/verify_inout_isolation.test
+test/verify_mars_dynamic.test
+test/verify_mars_off_same_catalog.test
+test/verify_read_isolation.test
+test/verify_read_write_same_catalog.test' ;;
+    *)       PUSHDOWN_OFF='' ;;
+esac
+
 entries=$(printf '%s\n' "$suites" | sed 's/$/\tdelta\t/')
 while read -r d; do
     [ -z "$d" ] && continue
@@ -1636,6 +1657,18 @@ $(printf '%s\tdelta\t122880' "$a")"
 done <<EOF
 $ACCUMULATED
 EOF
+# '-' stands for "no batch size": IFS tab is whitespace, so an empty field between two tabs would collapse.
+while read -r o; do
+    [ -z "$o" ] && continue
+    if ! printf '%s\n' "$suites" | grep -qxF "$o"; then
+        echo "ERROR: pushdown-off-leg suite '$o' is not in the $TIER set (renamed or reclassified?)." >&2
+        exit 1
+    fi
+    entries="$entries
+$(printf '%s\tdelta\t-\tfalse' "$o")"
+done <<EOF
+$PUSHDOWN_OFF
+EOF
 
 expected=$(printf '%s\n' "$entries" | wc -l | tr -d ' ')
 echo "Running $expected $TIER suite runs, one process each."
@@ -1658,8 +1691,14 @@ if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; th
     fixtures_before=$(git status --porcelain --untracked-files=all -- test/fixtures 2>/dev/null)
 fi
 
-while IFS="$(printf '\t')" read -r suite provider batchrows; do
+while IFS="$(printf '\t')" read -r suite provider batchrows pushdown; do
     [ -z "$suite" ] && continue
+    [ "$batchrows" = '-' ] && batchrows=''
+    if [ -n "$pushdown" ]; then
+        export FABRICATOR_REMOTE_PUSHDOWN="$pushdown"
+    else
+        unset FABRICATOR_REMOTE_PUSHDOWN
+    fi
     scratch=$(mktemp -d)
     export FABRICATOR_DELTA_WRITE_DIR="$scratch"
     export DELTA_PROVIDER="${provider:-delta}"
@@ -1677,6 +1716,7 @@ while IFS="$(printf '\t')" read -r suite provider batchrows; do
     label="$suite"
     [ "$DELTA_PROVIDER" != 'delta' ] && label="$suite [$DELTA_PROVIDER]"
     [ -n "$batchrows" ] && label="$suite [batch=$batchrows]"
+    [ -n "$pushdown" ] && label="$suite [remote_pushdown=$pushdown]"
 
     # THE UPDATE POST-IMAGE GROUPING NEEDS ITS THRESHOLD FORCED, or it ships with ZERO coverage.
     # DeltaReader.UpdateGroupBytes defaults to 64 MiB of Arrow data before an UPDATE's post-images are

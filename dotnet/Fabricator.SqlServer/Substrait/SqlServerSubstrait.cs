@@ -72,7 +72,8 @@ public static class SqlServerSubstrait
     /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Translates a plan for the remote pushdown (see
     /// <see cref="TSqlEmitter.EmitPushdown"/>).
     /// </summary>
-    internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending)
+    internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending,
+                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null)
     {
         if (plan == null || plan.Length == 0)
         {
@@ -81,7 +82,7 @@ public static class SqlServerSubstrait
         var decoder = new SubstraitPlanDecoder(plan);
         RootRel root = decoder.DecodePlan();
         // IGNORE NULLS and DATETRUNC arrived together, with SQL Server 2022
-        var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation) { SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls };
+        var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes) { SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls };
         return emitter.EmitPushdown(root, out columnCount, out orderDescending);
     }
 

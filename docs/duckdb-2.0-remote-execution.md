@@ -806,6 +806,36 @@ translate. Two host rules on top: a plan of scans / filters / projections / sort
 
 ### 4.1 The SELECT spike — BUILT (2026-10-24), `remote_pushdown` ATTACH option, off by default
 
+> ⚠ **Default flipped to ON on 2026-10-27** (user decision): a declined translation runs locally anyway, while
+> the old default left `x = (SELECT MAX(x) FROM t)` as two full scans — DuckLake's latest-snapshot read, linear in
+> the snapshot history (ducklake-catalog.md §9). `remote_pushdown 'false'` opts out; any other value is refused.
+>
+> ⚠⚠ **Turning it on by default found TWO defects the opt-in had hidden** (the full service tier, which until then
+> ran pushdown only in `verify_remote_select_mssql`):
+> - **A HANG, not an error.** The pushed query runs through `fabricator_query`, i.e. as a plain pooled read, so it
+>   never passed through the scan's routing. In a transaction that has written with MARS off, it waited forever
+>   on that transaction's own locks — `verify_mars_dynamic` §3 sat in `LCK_M_S` for eight hours, where the scan
+>   refuses cleanly (`EnsureScanCannotSelfBlock`). `remote_translate` now runs with the transaction ambient set
+>   and declines while the transaction holds a connection without MARS (and without the `read_isolation` pin);
+>   the local scan then routes or refuses. Gate §8.
+> - **`COLLATE` on a type that takes none.** The emitter collates every DuckDB string, and json, xml, text,
+>   ntext, sql_variant and the CLR types all surface as strings while SQL Server refuses COLLATE on each
+>   (Msg 447 / 4189) — `verify_json` failed. The provider now reads those columns once per refresh
+>   (`UncollatableColumns`) and the emitter converts json/text/ntext to `nvarchar(max)` first, which MEASURED
+>   equal to the scan's text. **xml is NOT** — the server serialises `<b/>`, the scan's reader `<b />`, found by
+>   the GROUP BY differential — so xml, sql_variant and the CLR types decline when a query uses them. Gate §7.
+>
+> ⚠⚠ **And the flip moved what the OTHER suites test, silently.** A suite that does not name the option now runs
+> its aggregates, joins and `ORDER BY … LIMIT` pushed, so the scan-pushdown suites (`verify_filter_pushdown`,
+> `_limit_`, `_orderby_`, `_projection_`, `verify_collation_pushdown`) were testing the remote path — one went red
+> (`ORDER BY [id]` is `[t0].[id]` there), the others passed on text that also proves nothing: their
+> `sys.dm_exec_query_stats` proofs read a SERVER-WIDE plan cache that outlives a run. Each now attaches with
+> `remote_pushdown 'false'`, asserts `Fabricator Scan` on a shape that would otherwise push (removing the pin dies
+> at that row), and clears the plan cache first. The scan path's ROUTING (MARS, `read_isolation`, the same-catalog
+> read+write mark, in-out isolation) gets a second run: `run-suites.sh` repeats those six suites with
+> `FABRICATOR_REMOTE_PUSHDOWN=false`, the default for an ATTACH that does not name the option. ⚠ When the join
+> filter work (§5) lands, its gate must pin the path the same way — EXPLAIN shows which one ran.
+
 `src/catalog/fabricator_remote_select.cpp`. No ABI change: the SQL Server provider reads its own
 `remote_pushdown` option and reports `"remote_select": true` in the capability doc (never on a warehouse
 profile — measured on box SQL Server only); `FabricatorCatalog::Supports` answers IS_REMOTE and

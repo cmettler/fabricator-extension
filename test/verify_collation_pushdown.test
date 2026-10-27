@@ -13,8 +13,28 @@ require fabricator
 
 require-env MSSQL_BINCOLL_DSN
 
+# This suite tests the SCAN's own pushdown, so it pins the scan path: with the remote pushdown on
+# (the default) DuckDB hands shapes like ORDER BY ... LIMIT to the provider as one query, and the
+# proofs below would test that path instead (or pass on its text). Pushed queries have their own
+# suite, verify_remote_select_mssql.
 statement ok
-ATTACH '${MSSQL_BINCOLL_DSN}' AS bdb (TYPE fabricator);
+ATTACH '${MSSQL_BINCOLL_DSN}' AS bdb (TYPE fabricator, remote_pushdown 'false');
+
+# The proofs read sys.dm_exec_query_stats, which outlives a run: clear it, so only statements of this
+# run can satisfy (or contradict) them.
+statement ok
+SELECT fabricator_exec('bdb', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');
+
+# Control: a shape the remote pushdown would take stays a table scan here.
+query II
+EXPLAIN SELECT name FROM bdb.dbo.names ORDER BY name LIMIT 2;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
+
+query II
+EXPLAIN SELECT name FROM bdb.dbo.names ORDER BY name LIMIT 2;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
 
 # Binary collation -> string ORDER BY pushdown enabled; UTF-8 collation -> text maps to VARCHAR.
 query T

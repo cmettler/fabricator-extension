@@ -6,8 +6,28 @@ require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
+# This suite tests the SCAN's own pushdown, so it pins the scan path: with the remote pushdown on
+# (the default) DuckDB hands shapes like ORDER BY ... LIMIT to the provider as one query, and the
+# proofs below would test that path instead (or pass on its text). Pushed queries have their own
+# suite, verify_remote_select_mssql.
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'false');
+
+# The proofs read sys.dm_exec_query_stats, which outlives a run: clear it, so only statements of this
+# run can satisfy (or contradict) them.
+statement ok
+SELECT fabricator_exec('db', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');
+
+# Control: a shape the remote pushdown would take stays a table scan here.
+query II
+EXPLAIN SELECT count(*) FROM db.dbo.TestSimplePK;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
+
+query II
+EXPLAIN SELECT count(*) FROM db.dbo.TestSimplePK;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
 
 # A bare LIMIT returns the right number of rows.
 query I

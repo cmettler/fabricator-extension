@@ -317,7 +317,50 @@ SELECT s.name, o.name, c.name, dc.definition
 
     /// <summary>Drops the cached comments so the next read reloads them. Called wherever a comment is
     /// written through this catalog, which is what makes read-your-own-writes hold.</summary>
-    internal void InvalidateMetadata() => _meta = null;
+    internal void InvalidateMetadata()
+    {
+        _meta = null;
+        _uncollatable = null;
+    }
+
+    private System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>>? _uncollatable;
+
+    /// <summary>
+    /// Columns of this database whose server type takes no COLLATE clause (json, text, ntext, xml,
+    /// sql_variant, CLR types), keyed by <see cref="ExternalKey"/>. The remote pushdown reads them: they surface
+    /// as DuckDB strings, and the T-SQL emitter gives every string its collation. Loaded once, dropped with the
+    /// other database-wide metadata (fabricator_refresh_cache / fabricator_invalidate_cache).
+    /// </summary>
+    internal System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>> UncollatableColumns()
+    {
+        if (_uncollatable is { } cached)
+        {
+            return cached;
+        }
+        var loaded = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        const string sql =
+            "SELECT s.name, o.name, c.name, TYPE_NAME(c.system_type_id) " +
+            "FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id " +
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+            "WHERE o.type IN ('U', 'V') AND (c.system_type_id IN (35, 98, 99, 240, 241) " +
+            "OR TYPE_NAME(c.system_type_id) = 'json')";
+        foreach (var row in ReadMetadataRows(sql, 4))
+        {
+            if (row[0] is null || row[1] is null || row[2] is null)
+            {
+                continue;
+            }
+            string key = ExternalKey(row[0]!, row[1]!);
+            if (!loaded.TryGetValue(key, out var columns))
+            {
+                columns = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                loaded[key] = columns;
+            }
+            columns[row[2]!] = row[3] ?? "clr";
+        }
+        _uncollatable = loaded;
+        return loaded;
+    }
 
     /// <summary>The table's own comment (the MS_Description extended property), or null.</summary>
     internal string? TableCommentCore(string schemaName, string tableName) =>

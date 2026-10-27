@@ -281,11 +281,14 @@ ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, keep_nulls false);
 -- DuckDB connection, so it would govern every catalog attached in it.
 ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, mars 'false');
 
--- EXPERIMENTAL, off by default: run whole queries (joins, aggregates, windows) on the server.
-ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, remote_pushdown 'true');
+-- On by default: whole queries (joins, aggregates, windows) run on the server. Opt out per catalog:
+ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, remote_pushdown 'false');
 ```
 
-**`remote_pushdown` (experimental, off by default).** With it, a `SELECT` over tables of this catalog runs as
+**`remote_pushdown` (on by default since 2026-10-27; `'false'` opts out, any other value is refused).** The
+environment variable `FABRICATOR_REMOTE_PUSHDOWN=false` changes the default for every ATTACH that does not name the
+option; an explicit option always wins. It applies
+on SQL Server 2019+ and Azure SQL, not on Fabric Warehouse / Synapse. A `SELECT` over tables of this catalog runs as
 ONE T-SQL statement, so only its result leaves the server; `EXPLAIN` shows `Fabricator Query` instead of
 `Fabricator Scan`. DuckDB binds the query itself, the plan travels as [Substrait](https://substrait.io) and is
 translated to T-SQL; the result keeps DuckDB's types and column names, and an `ORDER BY` is applied again
@@ -457,10 +460,10 @@ What the profile drives automatically:
   otherwise fail with *"table has N columns but M values were supplied"*. A column with that name is hidden on
   every catalog, with or without the option, so a catalog attached without it still sees the same table. This
   is what makes SQL Server usable as a [DuckLake](docs/ducklake-catalog.md) metadata catalog — attach it as
-  `ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true,
-  META_REMOTE_PUSHDOWN 'true')`. The pushdown matters there: DuckLake reads the latest snapshot with a subquery
-  that only remote pushdown keeps off a full scan, so without it every commit grows dearer with the snapshot
-  history (measured 78 → 335 ms per commit at 200,000 snapshots; flat with it).
+  `ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true)`.
+  Do not turn `remote_pushdown` off there: DuckLake reads the latest snapshot with a subquery that only remote
+  pushdown keeps off a full scan, so without it every commit grows dearer with the snapshot history (measured
+  78 → 335 ms per commit at 200,000 snapshots; flat with it).
   ```sql
   ATTACH '...' AS db (TYPE fabricator, hidden_rowid true);
   CREATE TABLE db.dbo.events (id INTEGER, note VARCHAR);   -- no key: gets the hidden row id
