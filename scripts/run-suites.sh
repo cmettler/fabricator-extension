@@ -203,7 +203,7 @@ case "$TIER" in
         # 85 since 2026-10-24: verify_delta_partition_stats, engine-doubled (+2 runs) — COUNT(*)/MIN/MAX
         # answered from the Delta log (ABI v95). Each answer is asserted twice, from metadata and with
         # `fabricator_partition_stats = false`, so the switch-off leg is the oracle for the other.
-        : "${MIN_SUITES:=86}"   # 2026-10-25: +verify_delta_delete_where
+        : "${MIN_SUITES:=87}"   # 2026-10-27: +verify_ducklake_delta_sync; 2026-10-25: +verify_delta_delete_where
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -963,7 +963,11 @@ case "$TIER" in
         # 2026-10-26: 10785 -> 10834. verify_delta_nested_schemas 94 -> 143 (ABI v97): functions, macros and views
         #   resolve at depth 2, a nested view body binds against its own path, a nested CTAS keeps its rows when the
         #   leaf names an existing table, and scoped invalidation matches the qualified name.
-        : "${MIN_ASSERTIONS:=10834}"
+        # 2026-10-27: 10834 -> 10951. A NEW suite, verify_ducklake_delta_sync (117): a DuckLake (DuckDB-file
+        #   metadata, so hermetic) mirrored to Delta and read back through both Delta readers, values AND row ids.
+        #   Needs ducklake statically linked (extension_config.cmake). Nothing else moved, which is the
+        #   behaviour-neutrality claim for DuckDbTableFileSystem preferring its CAPTURED opener.
+        : "${MIN_ASSERTIONS:=10951}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

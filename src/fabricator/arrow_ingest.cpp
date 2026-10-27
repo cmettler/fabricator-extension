@@ -59,6 +59,12 @@ struct ArrowStreamGlobalState : public GlobalTableFunctionState {
 	ArrowArrayStream stream {};
 	bool stream_initialized = false;
 	bool done = false;
+	//! The ClientContext this scan executes for — valid for the whole query. Re-established as the host-FS
+	//! opener before every pull, because a pull is NOT otherwise a crossing: it runs on a worker thread whose
+	//! ambient opener holds whatever the last crossing ON THAT THREAD left there, and after a nested host query
+	//! that is a destroyed context (measured: every Delta scan after ducklake_delta_sync failed in
+	//! fs_open_read). See docs/ducklake-catalog.md §11.6.
+	ClientContext *context = nullptr;
 	mutex main_mutex;
 	idx_t batch_index = 0;
 
@@ -185,6 +191,9 @@ BatchPull GetNextBatch(ArrowStreamGlobalState &gstate, ArrowStreamLocalState &ls
 	}
 
 	auto chunk = make_uniq<ArrowArrayWrapper>();
+	if (gstate.context) {
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(gstate.context), fabricator::SessionKeyFor(gstate.context));
+	}
 	int ret = gstate.stream.get_next(&gstate.stream, &chunk->arrow_array);
 	if (ret != 0) {
 		const char *msg = gstate.stream.get_last_error ? gstate.stream.get_last_error(&gstate.stream) : nullptr;
@@ -1503,6 +1512,7 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	// lakehouse reader) resolves DuckDB secrets while reading its data through the host FileSystem; SQL
 	// scans ignore it. The factory runs synchronously on this thread, so the per-thread ambient governs it.
 	SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), SessionKeyFor(&context));
+	gstate->context = &context;
 	bind_data.factory(request, gstate->stream);
 	gstate->stream_initialized = true;
 

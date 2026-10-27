@@ -103,6 +103,9 @@ internal static class CustomFunctions
         // HOST-FS WRITE spike: fabricator_delta_write_demo(path) writes a fixed 5-row Delta table via the host-FS
         // write callbacks (put-if-absent commit), returning (version, rows_written). Proves the write bridge.
         new Fabricator.Bridge.DeltaWriteDemoFunction(),
+        // ducklake_delta_sync(lake, …) — a Delta log next to every DuckLake table's data files, derived from
+        // the lake's metadata (docs/ducklake-catalog.md §11).
+        new Fabricator.Bridge.DuckLakeDeltaSyncFunction(),
         // fabricator_va_args(label, …) — a VARIADIC table function: one row per tail argument.
         new GfVaArgsFunction(),
     };

@@ -241,3 +241,203 @@ ATTACH 'ducklake:fabricator:Server=<host>,1433;Database=<db>;Encrypt=True' AS la
   exist yet. `CreateSchema` now adds `AUTHORIZATION [dbo]` when `DATABASE_PRINCIPAL_ID() = 0`; any other caller
   is unchanged (box with `sa` is principal 1 and still gets `dbo` the ordinary way). Not gated: no CI tier
   reaches Fabric.
+
+## 11. Delta metadata over DuckLake's data files (design, 2026-10-27 — nothing built yet)
+
+Goal: a reader that only knows Delta (Fabric's SQL endpoint, Spark, Power BI Direct Lake) reads a DuckLake table
+from the same Parquet files DuckLake wrote — with deletion vectors, row tracking and a change feed, not a bare
+JSON log. Delta is a DERIVED view: DuckLake stays the source of truth.
+
+### 11.1 One idempotent sync, whoever calls it
+
+`ducklake_delta_sync(lake [, table])` brings a table's Delta log up to a DuckLake snapshot. Everything it needs is
+in the metadata tables our catalog already hosts — files added and removed per snapshot, record counts,
+`row_id_start`, per-file column statistics, delete files, the column history (`ducklake_column`, with
+`begin/end_snapshot`), and `data_path` in `ducklake_metadata` — so it reads them with SQL on our own connection and
+depends on DuckLake's documented, versioned metadata schema, not on DuckLake's C++ (an unknown spec version is
+refused, never guessed).
+
+- One Delta version per DuckLake snapshot that touched the table, so Delta time travel lines up with DuckLake
+  snapshots; catching up over several snapshots may squash them into one commit.
+- The progress marker is the Delta log itself: every commit records its DuckLake snapshot id in `commitInfo`, so
+  an interrupted sync resumes from the last Delta version with no state of its own.
+
+**When.** (1) Manual first. (2) Then automatic, synchronously right after each DuckLake commit: every DuckLake
+commit is an `INSERT INTO ducklake_snapshot` through our catalog, so our transaction manager sees it; not inside
+the commit (OneLake IO is slow and a failing sync must not abort DuckLake's commit), not in the background (the
+cleanup ordering below). A flush of inlined data is itself a commit (`{flushed_inlined=[1]}`), so it needs no
+trigger of its own. (3) Lazy-on-read is impossible: the reader is a foreign engine. A hook into DuckLake itself is
+acceptable where it adds comfort or is the only way (user decision); none is needed for the trigger.
+
+### 11.2 Where the log lives — MEASURED: next to the data, with relative paths
+
+Fabric's Lakehouse SQL endpoint, five hand-made Delta tables in `Tables/dbo/`, polled for six minutes:
+
+| table | `add.path` | endpoint |
+|---|---|---|
+| `ctl_probe` (written by our provider) | relative | readable after ~2 min, 100 rows / sum 4950 |
+| `rel_probe` (hand-written log) | relative, file copied into the table folder | readable with the control |
+| `abs_probe` | `abfss://Test@onelake…/LH.Lakehouse/Files/…` | **never appears** |
+| `absguid_probe` | `abfss://<ws guid>@onelake…/<lakehouse guid>/Files/…` | **never appears** |
+| `abshttps_probe` | `https://onelake.dfs.fabric.microsoft.com/Test/LH.Lakehouse/Files/…` | **never appears** |
+
+The endpoint SILENTLY skips a Delta table whose data files are referenced by absolute path, in every spelling.
+The hand-written relative log is accepted, so the log format is not the problem. ⇒ **the `_delta_log` goes into
+DuckLake's own table folder (`<data_path>/<schema>/<table>/`), with relative paths.** (User: fine.)
+⚠ Our OWN Delta provider also fails on absolute `add` paths (`BlobNotFound`: it resolves them under the table root)
+— a gap against the Delta spec, irrelevant here, worth a known-limitations entry.
+
+### 11.3 ⚠ MEASURED: DuckLake's orphan cleanup deletes our Parquet files in that folder
+
+`ducklake_delete_orphaned_files` deletes every `.parquet` / `.puffin` under `data_path` its metadata does not know
+(`GetOrphanFilesForCleanup`, `read_blob(data_path || '**')`), and `CHECKPOINT` runs it last. Probe:
+`main/t/_delta_log/…10.checkpoint.parquet` was deleted with an orphan control file; `…10.json` survived. Delta
+fixes the `.checkpoint.parquet` name, and the cleanup changes no metadata, so we cannot even observe it. It hits
+everything Parquet we would write there: checkpoints AND change-data files. Deletion-vector files (`.bin`) and JSON
+commits are safe. (Without `cleanup_all`, only orphans older than `delete_older_than` go — later, not never.)
+
+**The way out — MEASURED 2026-10-27.** Orphan cleanup is skipped when the GLOBAL option `auto_compact` is false
+(*"orphans belong to no table, so only the global auto_compact option can turn their cleanup off"*), while
+compaction and the inlined flush read `auto_compact` per table, falling back schema → global. Probe (box metadata,
+local data path, `delete_older_than = '0 seconds'`): global `false` + `set_option('auto_compact', true, schema =>
+'main')`, three files in `main.t`, two in `s2.u`, then `CHECKPOINT`:
+
+| setting | `main.t` files | `s2.u` files | `_delta_log/…10.checkpoint.parquet`, two stray parquets |
+|---|---|---|---|
+| global false, `main` true | 3 → 1 | 2 → 2 | all three survive |
+| control: nothing set (global true) | 3 → 1 | 2 → 1 | all three deleted |
+
+So: global `auto_compact = false`, schema- or table-level `true` for what should be compacted, and our own orphan
+cleanup — DuckLake's rule minus the files our sync owns (`_delta_log/`, `_change_data/`, DV files). ⚠ The scoped
+setting must exist for EVERY schema: a schema created later inherits the global `false` and is never compacted, so
+the sync (or our catalog at `CREATE SCHEMA`) has to set it. `expire_snapshots` and `cleanup_old_files` are not
+gated and need not be — they only delete files DuckLake itself scheduled for deletion. The fallback is no longer
+needed: checkpoints and change-data files can live next to the data.
+
+### 11.4 What DuckLake writes, and what Delta can express — MEASURED
+
+Probe: one table through rename, drop + re-add, type widening, `ADD COLUMN … DEFAULT`, DELETE, UPDATE and
+`SET PARTITIONED BY`, reading every file's Parquet schema (name#field_id:type):
+
+| step | data file columns |
+|---|---|
+| create + insert | `a#1, b#2, s#3, x#4, y#5` |
+| `RENAME b → b2`, insert | `a#1, b2#2, …` — the CURRENT name, same field id |
+| `DROP a`, `ADD a`, insert | `b2#2, …, a#6` — new id; the OLD files still hold `a#1` |
+| `a` → `BIGINT`, insert | `a#6:INT64`, older files `a#6:INT32` |
+| `ADD d INTEGER DEFAULT 42` | old files lack `d`; DuckLake returns 42 for them (`initial_default`) |
+| DELETE | positional delete file `pos#…, file_path#…` |
+| UPDATE | new file with `_ducklake_internal_row_id` (the row keeps its id); every file has `row_id_start` |
+| `SET PARTITIONED BY (d)` | stored under `d=9/`, and the file STILL CONTAINS `d` |
+
+**Column mapping.** DuckLake reads by field id, so Delta `id` mode is faithful to every row above. But the Fabric
+SQL endpoint silently skips `id`-mode tables (known-limitations §3, measured 2026-10-24), so for Fabric it must be
+`name` mode — configurable per attach (`META_DELTA_COLUMN_MAPPING 'name' | 'id'`). In `name` mode Delta has ONE
+physical name per column for all files, which decides the DDL:
+
+| DuckLake DDL | `id` mode | `name` mode |
+|---|---|---|
+| ADD COLUMN | ✓ | ✓ |
+| DROP COLUMN | ✓ | ✓ (metadata only) |
+| RENAME COLUMN (also struct fields) | ✓ | ✗ old files carry the old name, new files the new one: one set reads NULL |
+| DROP + ADD under the same name | ✓ | ✗ **silently wrong**: the dropped column's old values reappear in the new one |
+| type widening (`INT → BIGINT`) | Delta `typeWidening` (Fabric reads it, §11.4a) | same |
+| ADD COLUMN with a non-NULL DEFAULT | ✗ old rows read NULL in Delta, the default in DuckLake | ✗ same |
+| partitioning, also changed later | ✓ declared UNPARTITIONED (the files contain the column) | same |
+
+⇒ in `name` mode the ✗ rows must be REFUSED, not mirrored wrong. Our catalog sees DuckLake's DDL as writes to
+`ducklake_column`, so it can fail that DuckLake commit for a mirrored table with a message naming the operation —
+an intrusion into DuckLake's commit, acceptable per the user's rule because it is the only way to prevent a
+silently wrong mirror. (The alternative, rewriting the old files under the new names, duplicates the data and
+writes Parquet into `data_path` — §11.3.)
+
+**Deletes → deletion vectors.** The sync reads each positional delete file and writes a DV (`.bin`, safe from the
+orphan cleanup). **Row tracking:** `row_id_start` → `baseRowId`; the `_ducklake_internal_row_id` column of
+UPDATE-written files → `delta.rowTracking.materializedRowIdColumnName`; the row commit version is the version of
+the Delta commit that added the file. **Change feed:** inserts and deletes follow from adds, removes and DVs; an
+UPDATE is only an update (pre/post image) with change-data files, which DuckLake's row ids make computable — and
+which are Parquet (§11.3). **Inlined rows** are invisible to Delta until flushed. **Types** Delta has no form for
+(HUGEINT, unsigned, …) make a table unmirrorable, refused by name.
+
+### 11.4a What Fabric's SQL endpoint reads — MEASURED 2026-10-27
+
+Five tables in `LH/Tables/dbo`, visible after ~1.5 min, every answer exact:
+
+| table | written by | features | endpoint |
+|---|---|---|---|
+| `dvi_probe` | our provider, 1000 rows, DELETE 100 | deletion vector INLINE (`storageType i`) | 900 / 494550 ✓ |
+| `dvf_probe` | our provider, 100000 rows, DELETE every second | deletion vector FILE (`storageType u`, `.bin`) | 50000 / 2500000000 ✓ |
+| `full_probe` | our provider, DELETE + UPDATE | DVs + column mapping `name` + row tracking + change data feed (reader 3 / writer 7) | 900 / 494550, 10 updated ✓ |
+| `tw_probe` | hand-written log, two files `a` INT32 and INT64 | `typeWidening` (reader + writer feature, `delta.typeChanges`) | 100 / 3000004851 ✓ |
+| `twn_probe` | same files, protocol 1/2, no `typeChanges` | none | 100 / 3000004851 ✓ — tolerated, but not spec-conforming; write `typeWidening` |
+
+⇒ everything §11.4 needs is readable by Fabric in `name` mode. Our own Delta provider cannot WRITE a type change
+(`ALTER COLUMN TYPE` is refused), but it reads `tw_probe` correctly.
+
+**Cleanup ordering.** If the sync lags and DuckLake compacts and cleans up, the latest Delta version points at
+deleted files; the synchronous post-commit sync rules that out, a manual sync must run before cleanup.
+
+### 11.5 Order
+
+1. ~~Measure: the scoped `auto_compact` override (§11.3); Fabric reading deletion vectors and `typeWidening`
+   (§11.4a).~~ Done, both hold.
+2. ~~Manual sync, append + DELETE (DVs) + row tracking + type widening, `name` mapping with the DDL refusals,
+   checkpoints.~~ Built, §11.6. No gate yet (DuckLake is not linked into `unittest`).
+3. Change-data files for UPDATE; the automatic post-commit trigger; our own orphan cleanup.
+
+### 11.6 As built — `ducklake_delta_sync` (2026-10-27, uncommitted)
+
+`SELECT * FROM ducklake_delta_sync('lake' [, table_name := 'schema.table'] [, column_mapping := 'name'|'id']
+[, timestamp_mapping := 'utc'|'ntz'] [, metadata_schema := '…'])` — a global table function in
+`Fabricator.Delta/DuckLakeDeltaSync.cs`, one row per Delta version written.
+
+- **Reads DuckLake through DuckDB**, so any metadata backend works: structure from `__ducklake_metadata_<lake>`
+  (⚠ attached HIDDEN — not in `duckdb_databases()`/`duckdb_tables()`, and `ducklake_settings()` does not name the
+  metadata schema, so it is probed: `main`, `dbo`, `public`, or `metadata_schema :=`). Deleted rows are asked of
+  DuckLake: `file_row_number` of a scan `AT (VERSION => s) WHERE filename IN (…)` are the live positions —
+  this covers parquet delete files with embedded snapshots (a second DELETE REPLACES the delete file, so its
+  `begin_snapshot` does not say when it changed — measured), puffin DVs and inlined deletes alike.
+  ⚠ `filename` comes back with BACKSLASHES for a local path on Windows; both spellings go into the filter.
+- **Writes commits itself** with `TransactionLog.WriteCommitAsync` (put-if-absent), not a `DeltaTransaction`:
+  a transaction assigns its own row ids and drops a staged `delta.rowTracking` domain. DVs via
+  `DeletionVectorWriter`, checkpoints via `DeltaTable.CheckpointAsync` — only when the global `auto_compact`
+  is `false` (§11.3).
+- **One Delta version per DuckLake snapshot that names the table** (`changes_made`), each a STATE diff, so an
+  expired snapshot just squashes. First sync of a table = one commit at the current snapshot. Progress = `txn`
+  (`appId` `ducklake`, version = snapshot); a Delta table there without that txn is refused, not taken over.
+- **Row tracking = DuckLake's ids**: `baseRowId` = `row_id_start`; a file without it (compaction merged UPDATE
+  files — measured) gets a fresh range and its ids come from `_ducklake_internal_row_id`, declared as
+  `materializedRowIdColumnName`. MEASURED: `rowid` (DuckLake) = `__delta_row_id` (our Delta reader) for every
+  row, through UPDATE, compaction and type widening.
+- **Refused, by name**: rename with live files under both names, drop + re-add under a live name, ADD COLUMN
+  with a non-NULL default (all in `name` mode; the rename is fine in `id` mode and when no new file followed),
+  unsupported widening, encrypted files, `add_data_files` files with a name mapping, and the types time / uuid /
+  interval / hugeint / unsigned / timestamp_ns|ms|s / variant.
+- **⚠ Fabric's SQL endpoint REFUSES `timestamp_ntz`** — the table appears without the column, and the Lakehouse
+  UI says *"Columns of the specified data types are not supported for (ColumnName: '[ts] TIMESTAMP_NTZ')"*
+  (measured 2026-10-27). So `timestamp_mapping` defaults to `'utc'` (user decision): a DuckDB `TIMESTAMP` is
+  declared as Delta `timestamp` (same microseconds, read as UTC), and Fabric reads 50/1225 and the exact
+  wall-clock bounds. A reader in another time zone shows it shifted; `'ntz'` keeps the spec's type. The
+  choice is persisted per table (`fabricator.ducklake.timestampMapping`). Our own Delta reader then reports
+  the column as `TIMESTAMPTZ`.
+- **MEASURED LIVE on Fabric** (DuckLake data on `LH/Tables/dbo`, metadata on box SQL Server): two inserts,
+  two deletes, an UPDATE of 10 rows, `id` INT → BIGINT, one more insert ⇒ the SQL endpoint reads
+  1398 / 5001108190 / 277048.75 / 10, the DuckLake values exactly.
+- **Locally**: 12 Delta versions on one table through inserts, deletes into files with and without a DV, UPDATE,
+  ADD COLUMN, type widening and two DuckLake `CHECKPOINT`s (compaction); counts, sums, values and row ids equal
+  via both our readers; a checkpoint at v10 survived the next DuckLake `CHECKPOINT`.
+- ⚠ **The cleanup ordering is real** (§11.4): a DuckLake `CHECKPOINT` that compacts and cleans up before the
+  next sync leaves the Delta log pointing at deleted files until that sync runs (measured with
+  `delete_older_than = '0 seconds'`; the next sync heals it).
+- ⚠ **FOUND ON THE WAY, pre-existing, fixed: a pull was not a crossing.** A streaming read runs `get_next` on a
+  WORKER thread, and `DuckDbTableFileSystem` reads the AMBIENT opener first — which on that thread is whatever
+  the last crossing ON IT left there: after a nested host query, a destroyed `ClientContext`. After a sync
+  every `fabricator_delta_scan` in the session failed (*"Attempted to dereference unique_ptr that is NULL"*).
+  Fixed in C++: `GetNextBatch` re-establishes the scan's own context before every pull. ⚠ Preferring the
+  CAPTURED opener instead was tried first and broke `verify_delta_catalog_s3` on both legs: a buffered Delta
+  transaction keeps a filesystem built at statement time until COMMIT, and the commit flush deliberately makes
+  its own short-lived connection the ambient. Same root cause on the managed side: a host query from managed
+  code clobbers the caller's ambients on its own thread, so the sync restores them after each query.
+- Not built: change-data files, the automatic trigger, our own orphan cleanup, partition declaration (files keep
+  the partition column, so the Delta table is unpartitioned), stats beyond ints/floats/decimals/exact
+  strings/dates.

@@ -43,3 +43,17 @@ duckdb_extension_load(httpfs
     GIT_TAG 77392a72077a85897db2519fae11e2c0da972b8a
 )
 duckdb_extension_statically_link(httpfs)
+
+# And `ducklake` — ducklake_delta_sync (docs/ducklake-catalog.md §11) reads a DuckLake through DuckDB, and its
+# gates need a lake in the test binaries. Pinned to the SAME sha DuckDB v2.0-cyanoptera's own CI uses
+# (duckdb/.github/config/extensions/ducklake.cmake), which is also the build the rest of the DuckLake work was
+# measured on (`ducklake_settings()` reports extension_version 417a9117f5). Statically linked, so a suite needs
+# `require ducklake` and no INSTALL — the hermetic tier forbids network.
+# ⚠ WITHOUT DuckDB's APPLY_PATCHES, deliberately: all six patches in duckdb/.github/patches/extensions/ducklake
+# touch only DuckLake's OWN tests (which we do not load), so the product code is identical — and applying them
+# needs GNU `patch` on PATH, which a vcvars shell on Windows does not have (the configure failed there).
+duckdb_extension_load(ducklake
+    GIT_URL https://github.com/duckdb/ducklake
+    GIT_TAG 417a9117f590e8141742ac0579d02f6a90162e37
+)
+duckdb_extension_statically_link(ducklake)

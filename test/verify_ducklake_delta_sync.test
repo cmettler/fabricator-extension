@@ -1,0 +1,395 @@
+# name: test/verify_ducklake_delta_sync.test
+# description: ducklake_delta_sync writes a Delta log next to a DuckLake table's data files, so a Delta-only
+#              reader reads the SAME Parquet files DuckLake wrote. Each section reads the result back through
+#              BOTH of our Delta readers (fabricator_delta_scan and a PROVIDER 'delta' catalog) and compares it
+#              with DuckLake itself — values AND row ids, since DuckLake's row_id_start is the Delta baseRowId.
+#              The lake's metadata is a DuckDB file here; the sync reads it through DuckDB, so the backend does
+#              not matter. See docs/ducklake-catalog.md §11. Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require ducklake
+
+require parquet
+
+require json
+
+require icu
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta.ducklake' AS lake (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl/', DATA_INLINING_ROW_LIMIT 0);
+
+# ============================================================================
+# 1. THE FIRST SYNC IS ONE COMMIT AT THE CURRENT SNAPSHOT — with deletion vectors for both delete forms (a
+#    delete into a file, then a second delete into the SAME file, which makes DuckLake REPLACE the delete
+#    file rather than add one) and an UPDATE (a new file carrying the original row id).
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.t (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO lake.t SELECT i, 'v' || i FROM range(1000) r(i);
+
+statement ok
+INSERT INTO lake.t SELECT i, 'w' || i FROM range(1000, 1500) r(i);
+
+statement ok
+DELETE FROM lake.t WHERE id IN (3, 7);
+
+statement ok
+DELETE FROM lake.t WHERE id BETWEEN 100 AND 199;
+
+statement ok
+UPDATE lake.t SET v = 'u' WHERE id = 1200;
+
+query TTIIII
+SELECT schema_name, table_name, delta_version, files_added, files_removed, deletion_vectors FROM ducklake_delta_sync('lake');
+----
+main	t	0	3	0	2
+
+query IIII
+SELECT count(*), sum(id), count(*) FILTER (WHERE v = 'u'), count(DISTINCT v) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t');
+----
+1398	1109290	1	1398
+
+query IIII
+SELECT count(*), sum(id), count(*) FILTER (WHERE v = 'u'), count(DISTINCT v) FROM lake.t;
+----
+1398	1109290	1	1398
+
+# The protocol and configuration the mirror declares, and that the timestamp default needs no feature here.
+query I
+SELECT content LIKE '%"readerFeatures":["columnMapping","deletionVectors"]%'
+   AND content LIKE '%"writerFeatures":["columnMapping","deletionVectors","domainMetadata","rowTracking"]%'
+   AND content LIKE '%"delta.columnMapping.mode":"name"%'
+   AND content LIKE '%"delta.rowTracking.materializedRowIdColumnName":"_ducklake_internal_row_id"%'
+   AND content LIKE '%"txn":{"appId":"ducklake"%'
+FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/_delta_log/00000000000000000000.json');
+----
+true
+
+# A sync with nothing new commits nothing.
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake');
+----
+0
+
+# ============================================================================
+# 2. ROW IDS: DuckLake's rowid IS the Delta row id, for every row — the updated row 1200 lives in a file whose
+#    baseRowId is 1500 and gets its id from the materialized _ducklake_internal_row_id column.
+# ============================================================================
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl' AS d (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query I
+SELECT count(*) FROM (
+  (SELECT id, v, rowid AS r FROM lake.t EXCEPT ALL SELECT id, v, __delta_row_id FROM d.main.t)
+  UNION ALL
+  (SELECT id, v, __delta_row_id FROM d.main.t EXCEPT ALL SELECT id, v, rowid FROM lake.t));
+----
+0
+
+query II
+SELECT id, __delta_row_id FROM d.main.t WHERE id IN (0, 1200, 1499) ORDER BY id;
+----
+0	0
+1200	1200
+1499	1499
+
+statement ok
+DETACH d;
+
+# ============================================================================
+# 3. INCREMENTAL: ONE DELTA VERSION PER DUCKLAKE SNAPSHOT — an insert, a delete into a file that already has a
+#    vector (the vector GROWS: remove + re-add), ADD COLUMN, and INT -> BIGINT, which writes typeWidening.
+# ============================================================================
+
+statement ok
+INSERT INTO lake.t SELECT i, 'x' || i FROM range(2000, 2300) r(i);
+
+statement ok
+DELETE FROM lake.t WHERE id BETWEEN 500 AND 509;
+
+statement ok
+ALTER TABLE lake.t ADD COLUMN n DOUBLE;
+
+statement ok
+ALTER TABLE lake.t ALTER COLUMN id SET DATA TYPE BIGINT;
+
+statement ok
+INSERT INTO lake.t VALUES (5000000000, 'big', 2.5);
+
+query IIIIII
+SELECT count(*), min(delta_version), max(delta_version), sum(files_added), sum(files_removed), sum(deletion_vectors)
+FROM ducklake_delta_sync('lake', table_name := 'main.t');
+----
+5	1	5	2	1	1
+
+query I
+SELECT content LIKE '%"typeWidening"%' AND content LIKE '%typeChanges%'
+FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/_delta_log/00000000000000000004.json');
+----
+true
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl' AS d (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query IIII
+SELECT count(*), sum(id), sum(n), typeof(any_value(id)) FROM d.main.t;
+----
+1689	5001749095	2.5	BIGINT
+
+query IIII
+SELECT count(*), sum(id), sum(n), typeof(any_value(id)) FROM lake.t;
+----
+1689	5001749095	2.5	BIGINT
+
+query I
+SELECT count(*) FROM (
+  (SELECT id, v, n, rowid AS r FROM lake.t EXCEPT ALL SELECT id, v, n, __delta_row_id FROM d.main.t)
+  UNION ALL
+  (SELECT id, v, n, __delta_row_id FROM d.main.t EXCEPT ALL SELECT id, v, n, rowid FROM lake.t));
+----
+0
+
+statement ok
+DETACH d;
+
+# ============================================================================
+# 4. CHECKPOINTS, AND DUCKLAKE'S OWN CHECKPOINT. A Delta checkpoint is Parquet in the table folder, which
+#    DuckLake's orphan cleanup deletes unless the GLOBAL auto_compact is false; so the sync writes one only
+#    then. With it false and the schema's true, a DuckLake CHECKPOINT still compacts and leaves ours alone.
+# ============================================================================
+
+statement ok
+CALL lake.set_option('auto_compact', false);
+
+statement ok
+CALL lake.set_option('auto_compact', true, schema => 'main');
+
+statement ok
+CALL lake.set_option('delete_older_than', '0 seconds');
+
+statement ok
+INSERT INTO lake.t VALUES (6001, 'c', 0);
+
+statement ok
+INSERT INTO lake.t VALUES (6002, 'c', 0);
+
+statement ok
+INSERT INTO lake.t VALUES (6003, 'c', 0);
+
+statement ok
+INSERT INTO lake.t VALUES (6004, 'c', 0);
+
+statement ok
+INSERT INTO lake.t VALUES (6005, 'c', 0);
+
+query II
+SELECT max(delta_version), bool_or(checkpoint) FROM ducklake_delta_sync('lake', table_name := 'main.t');
+----
+10	true
+
+statement ok
+CHECKPOINT lake;
+
+query I
+SELECT count(*) FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/_delta_log/*.checkpoint.parquet');
+----
+1
+
+# DuckLake compacted (files replaced) — and may already have deleted the old ones, so only a sync makes the
+# Delta log readable again (the cleanup ordering, docs/ducklake-catalog.md §11.4).
+query I
+SELECT sum(files_removed) > 0 FROM ducklake_delta_sync('lake', table_name := 'main.t');
+----
+true
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl' AS d (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query I
+SELECT count(*) FROM (
+  (SELECT id, v, n, rowid AS r FROM lake.t EXCEPT ALL SELECT id, v, n, __delta_row_id FROM d.main.t)
+  UNION ALL
+  (SELECT id, v, n, __delta_row_id FROM d.main.t EXCEPT ALL SELECT id, v, n, rowid FROM lake.t));
+----
+0
+
+query I
+SELECT count(*) FROM d.main.t;
+----
+1694
+
+statement ok
+DETACH d;
+
+# ============================================================================
+# 5. WHAT DELTA CANNOT EXPRESS IS REFUSED, NOT MIRRORED WRONG.
+# ============================================================================
+
+# A rename with no file written since is fine: the physical name stays the old one.
+statement ok
+CREATE TABLE lake.r1 (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.r1 VALUES (1, 'x'), (2, 'y');
+
+statement ok
+ALTER TABLE lake.r1 RENAME COLUMN b TO b2;
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake', table_name := 'main.r1');
+----
+1
+
+query IT
+SELECT a, b2 FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/r1') ORDER BY a;
+----
+1	x
+2	y
+
+# ... a file under the new name beside the old ones is not, in 'name' mapping.
+statement ok
+INSERT INTO lake.r1 VALUES (3, 'z');
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.r1');
+----
+was renamed and live data files use both names ('b', 'b2')
+
+# The same history in 'id' mapping mirrors fine.
+statement ok
+CREATE TABLE lake.r4 (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.r4 VALUES (1, 'x');
+
+statement ok
+ALTER TABLE lake.r4 RENAME COLUMN b TO b2;
+
+statement ok
+INSERT INTO lake.r4 VALUES (2, 'y');
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake', table_name := 'main.r4', column_mapping := 'id');
+----
+1
+
+query IT
+SELECT a, b2 FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/r4') ORDER BY a;
+----
+1	x
+2	y
+
+# Dropping a column and re-adding one under its name: the old values would come back.
+statement ok
+CREATE TABLE lake.r2 (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.r2 VALUES (1, 'old');
+
+statement ok
+ALTER TABLE lake.r2 DROP COLUMN b;
+
+statement ok
+ALTER TABLE lake.r2 ADD COLUMN b VARCHAR;
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.r2');
+----
+reuses the name of a dropped column whose values are still in live data files
+
+# A default for rows of older files: Delta would read NULL there.
+statement ok
+CREATE TABLE lake.r3 (a INTEGER);
+
+statement ok
+INSERT INTO lake.r3 VALUES (1);
+
+statement ok
+ALTER TABLE lake.r3 ADD COLUMN d INTEGER DEFAULT 42;
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.r3');
+----
+was added with a default (42)
+
+# A type Delta has no form for.
+statement ok
+CREATE TABLE lake.r5 (a INTEGER, t TIME);
+
+statement ok
+INSERT INTO lake.r5 VALUES (1, TIME '01:02:03');
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.r5');
+----
+column 't' has type time
+
+# ============================================================================
+# 6. TIMESTAMPS DEFAULT TO 'utc' — Fabric's SQL endpoint refuses timestamp_ntz (docs/ducklake-catalog.md
+#    §11.6) — so the value is declared a Delta timestamp, no timestampNtz feature, and reads back as the same
+#    wall clock in UTC. 'ntz' keeps the spec's type.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.ts1 (id INTEGER, ts TIMESTAMP);
+
+statement ok
+INSERT INTO lake.ts1 VALUES (1, TIMESTAMP '2024-05-06 07:08:09');
+
+statement ok
+CREATE TABLE lake.ts2 (id INTEGER, ts TIMESTAMP);
+
+statement ok
+INSERT INTO lake.ts2 VALUES (1, TIMESTAMP '2024-05-06 07:08:09');
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake', table_name := 'main.ts1');
+----
+1
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake', table_name := 'main.ts2', timestamp_mapping := 'ntz');
+----
+1
+
+query II
+SELECT content LIKE '%"fabricator.ducklake.timestampMapping":"utc"%', content LIKE '%timestampNtz%'
+FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/ts1/_delta_log/00000000000000000000.json');
+----
+true	false
+
+query II
+SELECT content LIKE '%"fabricator.ducklake.timestampMapping":"ntz"%', content LIKE '%timestampNtz%'
+FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/ts2/_delta_log/00000000000000000000.json');
+----
+true	true
+
+statement ok
+SET TimeZone = 'UTC';
+
+query T
+SELECT strftime(ts, '%Y-%m-%d %H:%M:%S') FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/ts1');
+----
+2024-05-06 07:08:09
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake', timestamp_mapping := 'local');
+----
+timestamp_mapping must be 'ntz' or 'utc'
+
+# ============================================================================
+# 7. NOT A LAKE.
+# ============================================================================
+
+statement error
+SELECT * FROM ducklake_delta_sync('nope');
+----
+is not an attached DuckLake catalog

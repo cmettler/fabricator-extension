@@ -90,7 +90,8 @@ runs:
         cd "$RUNNER_TEMP"
         # yyjson: OUR OWN JSON parser for the v73 ABI crossings (table_info/table_stats/get_capabilities) —
         # DuckDB's vendored copy is namespaced + not DUCKDB_API-exported, so a loadable cannot link it.
-        "$vcpkg" install "openssl:${{ inputs.triplet }}" "curl:${{ inputs.triplet }}" "yyjson:${{ inputs.triplet }}"
+        # roaring (CRoaring): the statically linked ducklake extension needs it (its own deletion vectors).
+        "$vcpkg" install "openssl:${{ inputs.triplet }}" "curl:${{ inputs.triplet }}" "yyjson:${{ inputs.triplet }}"           "roaring:${{ inputs.triplet }}"
 
     # protobuf + substrait-protobuf for the Substrait producer behind the remote pushdown
     # (third_party/duckdb-substrait). substrait-protobuf lives in the substrait-io registry, not vcpkg's own, so

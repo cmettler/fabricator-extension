@@ -94,6 +94,18 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     /// passes <c>Opener()</c>, which just returns the ambient) and becomes load-bearing the moment
     /// something is cached.
     /// </para>
+    /// <para>
+    /// ⚠⚠ <b>The ambient stays first, and a pull is now a crossing (2026-10-27).</b> A streaming read runs
+    /// <c>get_next</c> on a WORKER thread, whose ambient held whatever the last crossing ON IT left there — after
+    /// a nested host query, a destroyed <c>ClientContext</c> (measured: after <c>ducklake_delta_sync</c> every
+    /// <c>fabricator_delta_scan</c> in the session failed in <c>fs_open_read</c>). The host now sets the scan's
+    /// own context before every pull (<c>GetNextBatch</c> in arrow_ingest.cpp). ⚠ Preferring the CAPTURED
+    /// opener instead was tried and is WRONG: a buffered Delta transaction keeps a filesystem built at statement
+    /// time until COMMIT, and the commit flush deliberately makes its own short-lived connection the ambient —
+    /// captured-first sent the flush through the user's context, whose transaction had ended
+    /// (<i>"ActiveTransaction called without active transaction"</i> from the S3 secret lookup,
+    /// verify_delta_catalog_s3).
+    /// </para>
     /// </remarks>
     private nint Opener
     {

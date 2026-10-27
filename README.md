@@ -472,6 +472,31 @@ What the profile drives automatically:
   INSERT INTO db.dbo.events VALUES (1, 'a'), (2, 'b');
   UPDATE db.dbo.events SET note = v.n FROM (VALUES (1, 'A')) v(k, n) WHERE events.id = v.k;
   ```
+- **A Delta log for a DuckLake (`ducklake_delta_sync`).** `SELECT * FROM ducklake_delta_sync('lake')` writes a
+  Delta log into every DuckLake table's folder, so Fabric's SQL endpoint, Spark or Direct Lake read the table
+  from the same Parquet files DuckLake wrote. It works whatever database holds the lake's metadata. Run it
+  again after DuckLake commits: it writes one Delta version per DuckLake snapshot that touched the table, with
+  deletes as deletion vectors, DuckLake's row ids as Delta row tracking, and type widening (`INT` → `BIGINT`)
+  declared as such. Options: `table_name := 'schema.table'`, `column_mapping := 'name'` (default; what Fabric
+  reads) or `'id'`, `timestamp_mapping := 'utc'` (default) or `'ntz'`, `metadata_schema := '…'`.
+  - Put the lake's data under the Lakehouse's `Tables/` folder (`DATA_PATH '…/LH.Lakehouse/Tables/'`, a DuckLake
+    schema `dbo`): Fabric only reads a Delta table whose files sit inside its folder.
+  - Set `CALL lake.set_option('auto_compact', false)` and `true` per schema
+    (`schema => 'dbo'`), or Delta checkpoints are not written: DuckLake's orphan cleanup deletes any Parquet
+    file it does not know, a checkpoint included.
+  - Run the sync before DuckLake deletes old files, or the Delta log points at files that are gone until the
+    next sync.
+  - Refused rather than mirrored wrong, naming the column: with `'name'` mapping, a rename after which new
+    files were written, and dropping a column and re-adding one under its name; with either mapping, a column
+    added with a default, and the types `TIME`, `UUID`, `INTERVAL`, `HUGEINT`, unsigned integers and
+    `TIMESTAMP_NS`.
+  - `TIMESTAMP` becomes a Delta `timestamp` by default because Fabric's SQL endpoint does not read
+    `timestamp_ntz`. A reader in another time zone shows it shifted.
+  ```sql
+  ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH 'abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables/',
+      METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true);
+  SELECT * FROM ducklake_delta_sync('lake');   -- one row per Delta version written
+  ```
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
   via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
 
@@ -5295,9 +5320,9 @@ Branches mirror DuckDB's release lines and carry their names. The default branch
 the next release (2.1), so a weekly canary build (`.github/workflows/duckdb-main-canary.yml`) compiles this branch
 against it instead, and a `v2.1-…` branch follows once that line is released.
 
-`httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**, and the ABI's
-JSON crossings need yyjson:
-`vcpkg install openssl:x64-windows-static curl:x64-windows-static yyjson:x64-windows-static` (with `VCPKG_ROOT`
+`httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**, the ABI's
+JSON crossings need yyjson, and the linked `ducklake` needs CRoaring:
+`vcpkg install openssl:x64-windows-static curl:x64-windows-static yyjson:x64-windows-static roaring:x64-windows-static` (with `VCPKG_ROOT`
 set). The Substrait producer behind the remote pushdown needs protobuf + substrait-protobuf, which come from a
 manifest of their own (`deps/substrait`; substrait-protobuf lives in the substrait-io registry) into a root of
 their own — run it from outside the repo root:
