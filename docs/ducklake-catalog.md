@@ -1,7 +1,7 @@
 # DuckLake with a SQL Server metadata catalog
 
-Status: **works on box SQL Server with `META_HIDDEN_ROWID true`** (2026-10-27, branch `feat/ducklake-catalog`;
-§6 is the as-built record). Goal: run DuckLake with its metadata in SQL Server, reached through our extension,
+Status: **works on box SQL Server AND on a live Fabric SQL database with `META_HIDDEN_ROWID true`** (2026-10-27,
+branch `feat/ducklake-catalog`; §6 is the as-built record, §10 the Fabric run). Goal: run DuckLake with its metadata in SQL Server, reached through our extension,
 **without changing the DuckLake extension**.
 
 Measured with the official signed DuckLake build `417a9117f5` (`INSTALL ducklake`) loaded into our
@@ -100,7 +100,7 @@ without a key gets a `BIGINT IDENTITY` column `[__fabricator_rowid]`. C#-only, n
   `UPDATE [dbo].[ducklake_table_stats] SET [file_size_bytes] = @s0 WHERE [__fabricator_rowid] = @k1`. Simple
   single-table UPDATE/DELETEs still take the predicate shortcut (`update-where`, `delete-where`).
 
-**Still open:** a live Fabric SQL database (§7); the default schema (`METADATA_SCHEMA 'dbo'` is still needed,
+**Still open:** the default schema (`METADATA_SCHEMA 'dbo'` is still needed,
 §4); Delta metadata over DuckLake's data files.
 
 ## 7. Concurrent writers (measured 2026-10-27)
@@ -202,3 +202,30 @@ and the inlined DELETE/UPDATE race balances exactly (failed + applied = issued, 
 ⇒ **`remote_pushdown` is therefore ON BY DEFAULT since 2026-10-27** (opt out with `remote_pushdown 'false'`,
 through DuckLake `META_REMOTE_PUSHDOWN 'false'`); a query the translator cannot write exactly still runs locally.
 Local docker, so remote latency comes on top of both columns; the slope is the point.
+
+## 10. A live Fabric SQL database as the metadata host (measured 2026-10-27)
+
+A Fabric SQL database (`<id>.database.fabric.microsoft.com`) reached by the service principal of the
+`fabric_sp` secret (`TYPE azure`, so `LOAD azure` first; passed as `META_SECRET 'fabric_sp'`), data files on a
+local path:
+
+```sql
+ATTACH 'ducklake:fabricator:Server=<host>,1433;Database=<db>;Encrypt=True' AS lake
+  (DATA_PATH '…', METADATA_SCHEMA 'dbo', META_SECRET 'fabric_sp', META_HIDDEN_ROWID true);
+```
+
+- **Profile:** `EngineEdition` 12 (SQL Azure, 12.0.2000.8) ⇒ `is_warehouse = false`, so primary keys are created
+  ENFORCED, which DuckLake's conflict detection needs (§7). The database has `SQL_Latin1_General_CP1_CI_AS`
+  (not a UTF-8 collation, as §7 assumed), RCSI on, snapshot isolation allowed, compatibility level 170.
+- **The §6 sequence gives the same answers as on box:** inlined UPDATE/DELETE, 1902 rows / sum 2004053, flush,
+  merge, rewrite, expire, cleanup, orphan delete, CHECKPOINT, final 1904 / 2014054, the same after a re-attach.
+  31 metadata tables, 5 with a primary key. Single statements took 0.06–1.0 s (network latency included).
+- **8 writers × 25 inserts** (`SET ducklake_max_retry_count = 100`): 87 PK conflicts retried, 200/200 rows,
+  no duplicates, snapshots 0..201 without a gap, no deadlock, no timeout; 100 s (21 s against local docker).
+- **Found and fixed: `CREATE SCHEMA` failed for the service principal** — 33134 *"Principal … could not be
+  resolved … Server identity is not configured"*. The principal has no database user of its own (it is admitted
+  through its workspace role and runs as principal 0, `public`, while being a `db_owner` member), so the schema's
+  default owner cannot be resolved. It hit DuckLake as soon as `METADATA_SCHEMA` named a schema that did not
+  exist yet. `CreateSchema` now adds `AUTHORIZATION [dbo]` when `DATABASE_PRINCIPAL_ID() = 0`; any other caller
+  is unchanged (box with `sa` is principal 1 and still gets `dbo` the ordinary way). Not gated: no CI tier
+  reaches Fabric.

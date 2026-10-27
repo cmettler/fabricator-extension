@@ -3985,9 +3985,13 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     {
         // CREATE SCHEMA must be the first statement in its batch, so run it via
         // EXEC; that also lets us guard it with IF SCHEMA_ID(...) IS NULL.
-        string createExec = "EXEC('CREATE SCHEMA " + Quote(schemaName).Replace("'", "''") + "')";
+        // A caller without a database user of its own runs as principal 0 (public) — an Entra service principal
+        // admitted to a Fabric SQL database through its workspace role does (measured). The schema's owner then
+        // defaults to a principal SQL Server cannot resolve (33134), so it is owned by dbo instead.
+        string create = "CREATE SCHEMA " + Quote(schemaName).Replace("'", "''");
+        string createExec = $"IF DATABASE_PRINCIPAL_ID() = 0 EXEC('{create} AUTHORIZATION [dbo]') ELSE EXEC('{create}')";
         ExecuteNonQuery(ifNotExists
-            ? $"IF SCHEMA_ID(N'{schemaName.Replace("'", "''")}') IS NULL {createExec}"
+            ? $"IF SCHEMA_ID(N'{schemaName.Replace("'", "''")}') IS NULL BEGIN {createExec} END"
             : createExec);
     }
 
