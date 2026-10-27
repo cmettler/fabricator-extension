@@ -478,7 +478,8 @@ What the profile drives automatically:
   again after DuckLake commits: it writes one Delta version per DuckLake snapshot that touched the table, with
   deletes as deletion vectors, DuckLake's row ids as Delta row tracking, and type widening (`INT` → `BIGINT`)
   declared as such. Options: `table_name := 'schema.table'`, `column_mapping := 'name'` (default; what Fabric
-  reads) or `'id'`, `timestamp_mapping := 'utc'` (default) or `'ntz'`, `metadata_schema := '…'`.
+  reads), `'id'` or `'none'`, `deletion_vectors := false`, `timestamp_mapping := 'utc'` (default) or `'ntz'`,
+  `metadata_schema := '…'`.
   - Put the lake's data under the Lakehouse's `Tables/` folder (`DATA_PATH '…/LH.Lakehouse/Tables/'`, a DuckLake
     schema `dbo`): Fabric only reads a Delta table whose files sit inside its folder.
   - Set `CALL lake.set_option('auto_compact', false)` and `true` per schema
@@ -486,15 +487,31 @@ What the profile drives automatically:
     file it does not know, a checkpoint included.
   - Run the sync before DuckLake deletes old files, or the Delta log points at files that are gone until the
     next sync.
+  - Rows DuckLake keeps inlined in its metadata database are in no Parquet file, so the sync mirrors a
+    DuckLake snapshot only once it has none: a small insert reaches Delta when `ducklake_flush_inlined_data`
+    (or a DuckLake `CHECKPOINT`) moves it into a file, and then with its own snapshot.
+  - For SQL Server's DELTA reader (`OPENROWSET … FORMAT = 'DELTA'`, external tables), which reads neither column
+    mapping nor deletion vectors, sync with `column_mapping := 'none', deletion_vectors := false`. A DELETE then
+    reaches Delta only after `CALL ducklake_rewrite_data_files('lake', 'tbl', delete_threshold => 0)` has
+    rewritten the affected files, and a column rename is refused while files with the old name exist.
   - Refused rather than mirrored wrong, naming the column: with `'name'` mapping, a rename after which new
     files were written, and dropping a column and re-adding one under its name; with either mapping, a column
     added with a default, and the types `TIME`, `UUID`, `INTERVAL`, `HUGEINT`, unsigned integers and
     `TIMESTAMP_NS`.
   - `TIMESTAMP` becomes a Delta `timestamp` by default because Fabric's SQL endpoint does not read
     `timestamp_ntz`. A reader in another time zone shows it shifted.
+  - Several processes may sync the same lake at once: each catches the tables up to the current snapshot, and
+    one that loses the race for a Delta version re-reads and continues. On S3/ADLS/OneLake that needs a real
+    conditional write, so ATTACH the data path as a Delta catalog with a `SECRET` in the same session (on
+    Fabric compute the notebook's own credential is used); without one the sync refuses.
+  - Do not `VACUUM` these tables from Spark or Fabric: it would delete files DuckLake still keeps for its own
+    time travel. Clean up through DuckLake.
   ```sql
   ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH 'abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables/',
       METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true);
+  ATTACH 'abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables' AS lh
+      (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);   -- the conditional commit
+  CALL ducklake_flush_inlined_data('lake');
   SELECT * FROM ducklake_delta_sync('lake');   -- one row per Delta version written
   ```
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
@@ -1103,9 +1120,10 @@ Three things about the automatic mode that are easy to trip over:
   `fabricator_invalidate_cache('cat', 'sales\.eu\.orders')` touches that one table while `'orders'` still
   reaches every table of that name.
 
-Without the setting, one asymmetry is worth knowing: a table **created** out-of-band is invisible until you
-refresh, while a table **dropped** out-of-band is handled gracefully *only if you had not already read it in
-this session* (you get a clean "table does not exist"). If you had read it, the drop surfaces later as the
+Without the setting, one asymmetry is worth knowing: a table **created** out-of-band can be queried by name
+right away (the catalog asks the server about a name it has not seen), but it shows up in listings such as
+`duckdb_tables()` and `SHOW TABLES` only after a refresh. A table **dropped** out-of-band is handled gracefully
+*only if you had not already read it in this session* (you get a clean "table does not exist"). If you had read it, the drop surfaces later as the
 server's own error — e.g. SQL Server `208: Invalid object name`. Refresh after out-of-band DDL and neither
 case arises.
 

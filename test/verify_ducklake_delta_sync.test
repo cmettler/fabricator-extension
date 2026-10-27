@@ -17,6 +17,8 @@ require json
 
 require icu
 
+require httpfs
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
@@ -386,6 +388,82 @@ SELECT * FROM ducklake_delta_sync('lake', timestamp_mapping := 'local');
 timestamp_mapping must be 'ntz' or 'utc'
 
 # ============================================================================
+# 8. NO COORDINATOR: SEVERAL SYNCS AT ONCE. Each one reads the log, computes the next version and creates it
+#    put-if-absent; the losers re-read and continue from the winner. Afterwards every DuckLake snapshot is in
+#    the log EXACTLY ONCE and in ascending order, and the data equals the lake's.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.race (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO lake.race SELECT i, 'a' FROM range(100) r(i);
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake', table_name := 'main.race');
+----
+1
+
+loop i 0 12
+
+statement ok
+INSERT INTO lake.race VALUES (1000 + ${i}, 'b');
+
+endloop
+
+statement ok
+DELETE FROM lake.race WHERE id < 10;
+
+concurrentloop k 0 6
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.race');
+
+endloop
+
+# one version per snapshot, none twice, ascending with the version number
+query III
+WITH commits AS (
+  SELECT regexp_extract(filename, '(\d+)\.json$', 1)::BIGINT AS version,
+         regexp_extract(content, '"ducklakeSnapshot":"(\d+)"', 1)::BIGINT AS snapshot
+  FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/race/_delta_log/*.json'))
+SELECT count(*), count(DISTINCT snapshot),
+       bool_and(snapshot > coalesce(prev, -1))
+FROM (SELECT version, snapshot, lag(snapshot) OVER (ORDER BY version) AS prev FROM commits);
+----
+14	14	true
+
+query II
+SELECT count(*), sum(id) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/race');
+----
+102	16971
+
+query II
+SELECT count(*), sum(id) FROM lake.race;
+----
+102	16971
+
+# ============================================================================
+# 9. A REMOTE PATH NEEDS A CONDITIONAL COMMIT. Through the host filesystem an object store only checks for the
+#    file before writing it, so two syncs could both "win" a version. Without a credential from an attached
+#    Delta catalog covering the path, the sync refuses — before any IO, so this needs no endpoint.
+#    ⚠ Without the refusal the sync goes to the (unreachable) bucket and fails with an HTTP error, which this
+#    runner turns into a SKIP rather than a failure. scripts/run-suites.sh fails on any skip, so the tier
+#    catches that mutant; a bare unittest run shows it only as "skipped".
+# ============================================================================
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta2.ducklake' AS lake2 (DATA_PATH 's3://fabricator-nowhere/dl/');
+
+statement ok
+CREATE TABLE lake2.t (id INTEGER);
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake2');
+----
+no credential for a conditional commit was found
+
+# ============================================================================
 # 7. NOT A LAKE.
 # ============================================================================
 
@@ -393,3 +471,141 @@ statement error
 SELECT * FROM ducklake_delta_sync('nope');
 ----
 is not an attached DuckLake catalog
+
+# ============================================================================
+# 10. ONLY COMPLETE SNAPSHOTS ARE MIRRORED. With DuckLake's default inlining, small inserts live in the
+#     metadata database and in no Parquet file, so a Delta version taken while they are there would silently
+#     lack them. Such a snapshot is skipped; the next flush carries its rows. (This lake keeps the default
+#     inlining; every section above attaches with DATA_INLINING_ROW_LIMIT 0.)
+# ============================================================================
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta3.ducklake' AS lake3 (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl3/');
+
+statement ok
+CREATE TABLE lake3.t (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO lake3.t SELECT i, 'b' FROM range(2000) r(i);
+
+statement ok
+INSERT INTO lake3.t VALUES (5000, 'x'), (5001, 'y'), (5002, 'z');
+
+# the first sync takes the newest COMPLETE snapshot: the one before the inlined insert
+query III
+SELECT ducklake_snapshot, delta_version, files_added FROM ducklake_delta_sync('lake3', table_name := 't');
+----
+2	0	1
+
+query II
+SELECT count(*), max(id) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl3/main/t');
+----
+2000	1999
+
+statement ok
+CALL ducklake_flush_inlined_data('lake3');
+
+query III
+SELECT ducklake_snapshot, delta_version, files_added FROM ducklake_delta_sync('lake3', table_name := 't');
+----
+3	1	1
+
+query II
+SELECT count(*), max(id) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl3/main/t');
+----
+2003	5002
+
+# an inlined-only change writes nothing
+statement ok
+INSERT INTO lake3.t VALUES (6000, 'q');
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake3', table_name := 't');
+----
+0
+
+# an inlined DELETE of a flushed row is fine: it is mirrored as a deletion vector right away
+statement ok
+CALL ducklake_flush_inlined_data('lake3');
+
+statement ok
+DELETE FROM lake3.t WHERE id = 5000;
+
+# The insert of 6000 (snapshot 5) was skipped while its row was inlined. The flush (6) moved the row into a file
+# stamped with ITS OWN snapshot, so snapshot 5 is complete now and gets its own version; the flush itself changes
+# nothing, and the delete (7) is the third version. History stays per snapshot.
+query III
+SELECT ducklake_snapshot, delta_version, deletion_vectors FROM ducklake_delta_sync('lake3', table_name := 't') ORDER BY delta_version;
+----
+5	2	0
+7	3	1
+
+query II
+SELECT count(*), sum(id) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl3/main/t');
+----
+2003	2015003
+
+# ============================================================================
+# 11. column_mapping := 'none' + deletion_vectors := false: reader version 1, for readers without column
+#     mapping or deletion vectors (SQL Server's DELTA reader; the end-to-end read is in
+#     verify_mssql_s3_polybase §6d). A live delete waits for a rewrite; a rename with live old files is refused.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake3.p (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO lake3.p SELECT i, 'b' FROM range(1000) r(i);
+
+query II
+SELECT delta_version, deletion_vectors FROM ducklake_delta_sync('lake3', table_name := 'p', column_mapping := 'none', deletion_vectors := false);
+----
+0	0
+
+query II
+SELECT protocol.minReaderVersion, protocol.writerFeatures FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl3/main/p/_delta_log/00000000000000000000.json') WHERE protocol IS NOT NULL;
+----
+1	[domainMetadata, rowTracking]
+
+statement ok
+DELETE FROM lake3.p WHERE id < 5;
+
+# the choice is persisted: no options needed on later syncs, and the delete waits
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake3', table_name := 'p');
+----
+0
+
+query I
+SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl3/main/p');
+----
+1000
+
+statement ok
+CALL ducklake_rewrite_data_files('lake3', 'p', delete_threshold => 0);
+
+query IIII
+SELECT delta_version, files_added, files_removed, deletion_vectors FROM ducklake_delta_sync('lake3', table_name := 'p');
+----
+1	1	1	0
+
+query II
+SELECT count(*), min(id) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl3/main/p');
+----
+995	5
+
+statement ok
+ALTER TABLE lake3.p RENAME COLUMN v TO w;
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake3', table_name := 'p');
+----
+was renamed from 'v' and live data files still use the old name
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake3', table_name := 'p', column_mapping := 'x');
+----
+column_mapping must be 'name', 'id' or 'none'
+
+statement ok
+DETACH lake3;

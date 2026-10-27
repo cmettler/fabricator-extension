@@ -26,8 +26,8 @@ using Array = System.Array;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// <c>ducklake_delta_sync(lake [, table_name := 'schema.table'] [, column_mapping := 'name' | 'id']
-/// [, timestamp_mapping := 'utc' | 'ntz'] [, metadata_schema := '…'])</c> — writes a
+/// <c>ducklake_delta_sync(lake [, table_name := 'schema.table'] [, column_mapping := 'name' | 'id' | 'none']
+/// [, deletion_vectors := true | false] [, timestamp_mapping := 'utc' | 'ntz'] [, metadata_schema := '…'])</c> — writes a
 /// Delta log next to every DuckLake table's data files, so an engine that reads only Delta (Fabric's SQL
 /// endpoint, Spark, Direct Lake) reads the table from the SAME Parquet files DuckLake wrote. DuckLake stays
 /// the source of truth; the Delta log is derived from it and nothing else may write to it.
@@ -40,9 +40,15 @@ namespace Fabricator.Bridge;
 /// <see cref="TransactionLog"/> (put-if-absent), not through a <c>DeltaTransaction</c>, because the row ids
 /// must be DuckLake's (<c>row_id_start</c> → <c>baseRowId</c>) and a transaction assigns its own.</para>
 ///
-/// <para><b>One Delta version per DuckLake snapshot that touched the table</b>, each a STATE diff (the Delta
-/// table is brought to DuckLake's state at that snapshot), so a snapshot that expired in between is simply
-/// squashed into the next. The first sync of a table is one commit at the current snapshot. Progress is the
+/// <para><b>One Delta version per COMPLETE DuckLake snapshot that touched the table</b>, each a STATE diff (the
+/// Delta table is brought to DuckLake's state at that snapshot), so a snapshot that expired in between is simply
+/// squashed into the next. A snapshot is complete when the table holds no live INLINED rows at it: those live in
+/// the metadata database, not in any Parquet file, so a Delta version taken there would silently lack them. Such
+/// a snapshot is skipped and the next complete one (usually the next flush) carries its changes — which also
+/// keeps DuckLake's batching of small commits on the Delta side. With <c>deletion_vectors := false</c> a snapshot
+/// must also have no live deletes (rewrite them away with <c>ducklake_rewrite_data_files</c>), for readers that
+/// cannot read deletion vectors, e.g. SQL Server's DELTA reader. The first sync of a table is one commit at the
+/// newest complete snapshot. Progress is the
 /// <c>txn</c> action (<c>appId</c> <c>ducklake</c>, <c>version</c> = the DuckLake snapshot), so an interrupted
 /// sync resumes from the log alone. See docs/ducklake-catalog.md §11.</para>
 /// </summary>
@@ -57,6 +63,7 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
         Params.Named("column_mapping", StringType.Default),
         Params.Named("metadata_schema", StringType.Default),
         Params.Named("timestamp_mapping", StringType.Default),
+        Params.Named("deletion_vectors", BooleanType.Default),
     }, null);
 
     internal static readonly Schema ResultSchema = new(new[]
@@ -77,11 +84,12 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
             ?? throw new ArgumentException("ducklake_delta_sync: the lake (an attached DuckLake catalog) is required.");
         var table = FabricArgs.Str(args, 1);
         var mapping = (FabricArgs.Str(args, 2) ?? "name").Trim().ToLowerInvariant();
-        if (mapping is not ("name" or "id"))
+        if (mapping is not ("name" or "id" or "none"))
         {
             throw new ArgumentException(
-                $"ducklake_delta_sync: column_mapping must be 'name' or 'id', not '{mapping}'. 'name' is what Fabric's " +
-                "SQL endpoint reads; 'id' follows every DuckLake rename but Fabric silently skips such a table.");
+                $"ducklake_delta_sync: column_mapping must be 'name', 'id' or 'none', not '{mapping}'. 'name' is what " +
+                "Fabric's SQL endpoint reads; 'id' follows every DuckLake rename but Fabric silently skips such a table; " +
+                "'none' declares no column mapping at all, for readers without it (SQL Server's DELTA reader).");
         }
         var timestamps = (FabricArgs.Str(args, 4) ?? "utc").Trim().ToLowerInvariant();
         if (timestamps is not ("ntz" or "utc"))
@@ -89,7 +97,8 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
             throw new ArgumentException(
                 $"ducklake_delta_sync: timestamp_mapping must be 'ntz' or 'utc', not '{timestamps}'.");
         }
-        return new SyncBinding(lake, table, mapping, FabricArgs.Str(args, 3), timestamps);
+        bool deletionVectors = FabricArgs.Bool(args, 5) ?? true;
+        return new SyncBinding(lake, table, mapping, FabricArgs.Str(args, 3), timestamps, deletionVectors);
     }
 
     private sealed class SyncBinding : ITableFunctionBinding
@@ -99,10 +108,13 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
         private readonly string _mapping;
         private readonly string? _metadataSchema;
         private readonly string _timestamps;
+        private readonly bool _deletionVectors;
 
-        public SyncBinding(string lake, string? table, string mapping, string? metadataSchema, string timestamps)
+        public SyncBinding(string lake, string? table, string mapping, string? metadataSchema, string timestamps,
+            bool deletionVectors)
         {
             _timestamps = timestamps;
+            _deletionVectors = deletionVectors;
             _lake = lake;
             _table = table;
             _mapping = mapping;
@@ -118,7 +130,7 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
             // The work runs NOW, while the opener (this call's ClientContext) is valid; a lazy body would run
             // inside get_next, after the call returned. Connection-free → the host-FS path.
             AmbientAdlsCredential.Current = null;
-            var results = new DuckLakeDeltaSync(AmbientOpener.Current, _lake, _mapping, _timestamps).Run(_table, _metadataSchema, ct);
+            var results = new DuckLakeDeltaSync(AmbientOpener.Current, _lake, _mapping, _timestamps, _deletionVectors).Run(_table, _metadataSchema, ct);
             return Single(DuckLakeDeltaSync.ToBatch(results));
         }
 
@@ -149,6 +161,7 @@ internal sealed class DuckLakeDeltaSync
     private readonly string _meta;
     private readonly string _mapping;
     private readonly string _timestamps;
+    private readonly bool _deletionVectors;
     private string _ms = "";
 
     // What a DuckDB TIMESTAMP (no time zone) is declared as. 'utc' (the DEFAULT, user decision 2026-10-27)
@@ -161,8 +174,9 @@ internal sealed class DuckLakeDeltaSync
     internal sealed record Result(
         string Schema, string Table, long Snapshot, long Version, long Added, long Removed, long Dvs, bool Checkpoint);
 
-    public DuckLakeDeltaSync(nint opener, string lake, string mapping, string timestamps)
+    public DuckLakeDeltaSync(nint opener, string lake, string mapping, string timestamps, bool deletionVectors)
     {
+        _deletionVectors = deletionVectors;
         _opener = opener;
         _lake = lake;
         _meta = "__ducklake_metadata_" + lake;
@@ -283,7 +297,7 @@ internal sealed class DuckLakeDeltaSync
             _root = root;
             _current = current;
             _checkpointsSafe = checkpointsSafe;
-            _fs = TableFileSystems.Create(o._opener, root);
+            _fs = CommitFileSystem(o._opener, root);
         }
 
         public List<Result> Run(CancellationToken ct)
@@ -298,7 +312,34 @@ internal sealed class DuckLakeDeltaSync
                 })
                 .ToList();
 
+            // ⚠ NO COORDINATOR: several processes may sync the same table at once (each after its own DuckLake
+            // commit). They meet at the commit file, which is put-if-absent — the loser gets a conflict, reads
+            // the log again and continues from whatever the winner recorded. Every commit is a STATE diff against
+            // the version it was computed on, so recomputing it is always safe; and a sync never writes an older
+            // snapshot after a newer one, because each write targets exactly one version past what it read.
             var results = new List<Result>();
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    SyncAll(results, ct);
+                    return results;
+                }
+                catch (DeltaConflictException) when (attempt < MaxConflictRetries)
+                {
+                    // ⚠ the deletion vectors written for the lost commit stay behind as unreferenced .bin
+                    // files: engineered-wood owns the DV path scheme (DeletionVectorPath, internal), and DuckLake's
+                    // orphan cleanup only knows .parquet/.puffin. Rare, and harmless to every reader.
+                    _log.LogDebug("ducklake sync {Root}: lost a commit race (attempt {Attempt}), re-reading the log",
+                        _root, attempt + 1);
+                }
+            }
+        }
+
+        private const int MaxConflictRetries = 32;
+
+        private void SyncAll(List<Result> results, CancellationToken ct)
+        {
             var state = Open(ct);
             long last = -1;
             if (state is not null)
@@ -310,21 +351,117 @@ internal sealed class DuckLakeDeltaSync
                         "(no 'ducklake' txn action). Refusing to take it over.");
                 }
                 last = txn.Version;
+                if (last >= _current)
+                {
+                    return; // another process already brought it this far
+                }
             }
 
-            IEnumerable<long> snapshots = state is null
-                ? new[] { _current }
-                : RelevantSnapshots(last);
-            foreach (long s in snapshots)
+            if (state is null)
             {
-                var r = SyncTo(state, s, ct);
+                // A table's first sync is ONE commit, at the newest COMPLETE snapshot: the current one, or the
+                // latest earlier one when the current state holds inlined rows (or live deletes, without DVs).
+                long? first = null;
+                foreach (long s in new[] { _current }.Concat(RelevantSnapshots(-1).Where(x => x < _current).Reverse()))
+                {
+                    var r = SyncTo(null, s, ct, out bool skipped);
+                    if (r is not null)
+                    {
+                        results.Add(r);
+                        state = Open(ct);
+                        first = s;
+                        break;
+                    }
+                    if (!skipped)
+                    {
+                        return; // the table did not exist at s, so no earlier state of it is wanted either
+                    }
+                }
+                if (first is null)
+                {
+                    return; // no complete snapshot yet: nothing is mirrored until the next flush
+                }
+                last = first.Value;
+            }
+            foreach (long s in RelevantSnapshots(last))
+            {
+                // an incomplete snapshot is skipped; the next complete one carries its changes (a state diff)
+                var r = SyncTo(state, s, ct, out _);
                 if (r is not null)
                 {
                     results.Add(r);
                     state = Open(ct);
                 }
             }
-            return results;
+        }
+
+        // Whether the table has rows INLINED in the metadata database at snapshot s: rows that are in no Parquet
+        // file, so a Delta version taken at s would lack them. DuckLake lists its inlined-data tables (one per
+        // schema version) in ducklake_inlined_data_tables; a row is live from _ducklake_begin_snapshot until
+        // _ducklake_end_snapshot
+        // (set by a delete, an update or the flush that moved it into a file).
+        private bool HasLiveInlinedRows(long s)
+        {
+            if (!_o.Probe($"SELECT 1 FROM {_o.M("ducklake_inlined_data_tables")} LIMIT 0"))
+            {
+                return false;
+            }
+            foreach (var r in _o.Rows(
+                         $"SELECT DISTINCT table_name FROM {_o.M("ducklake_inlined_data_tables")} WHERE table_id = {_tableId}"))
+            {
+                string name = Str(r[0]);
+                if (_o.Probe($"SELECT 1 FROM {_o.M(name)} LIMIT 0")
+                    && _o.Rows($"SELECT 1 FROM {_o.M(name)} WHERE _ducklake_begin_snapshot <= {s} " +
+                               $"AND (_ducklake_end_snapshot IS NULL OR _ducklake_end_snapshot > {s}) LIMIT 1").Count > 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // The commit file must be created CONDITIONALLY, or two syncs racing on one version both "win" and the
+        // second silently replaces the first (measured on OneLake through the host filesystem: 41 of 48 commits
+        // kept, docs/delta-transactions.md §8.4) — after which a later commit of the first can remove files or
+        // vectors the log no longer holds. A local path is safe through the host filesystem (O_EXCL). A remote
+        // one needs the conditional-PUT filesystem, whose credential comes from an attached Delta catalog that
+        // covers the path (or, on Fabric compute, the notebook identity); without one it is refused.
+        private static ITableFileSystem CommitFileSystem(nint opener, string root)
+        {
+            bool remote = root.Contains("://");
+            if (!remote)
+            {
+                AmbientAdlsCredential.Current = null;
+                AmbientS3Credential.Current = null;
+                return TableFileSystems.Create(opener, root);
+            }
+            var found = DeltaCatalog.CredentialsFor(root);
+            var adls = found?.Adls;
+            if (adls is null && FabricLakehouse.IsOneLake(root) && FabricNotebookCredential.IsAvailable)
+            {
+                adls = AdlsCredential.FromToken(FabricCredentialResolver.AmbientChain());
+            }
+            bool isS3 = root.StartsWith("s3://", StringComparison.OrdinalIgnoreCase);
+            bool atomic = isS3 ? found?.S3 is not null : adls is not null && AdlsPath.IsAdlsGen2(root);
+            if (!atomic)
+            {
+                throw new InvalidOperationException(
+                    $"ducklake_delta_sync: {root} is on remote storage and no credential for a conditional commit was " +
+                    "found, so two syncs could overwrite each other's commit. Attach the lake's data path (or a folder " +
+                    "above it) as a Delta catalog with a SECRET, e.g. ATTACH '<data_path>' AS d (TYPE fabricator, " +
+                    "PROVIDER 'delta', SECRET <name>, READ_ONLY false), in the same session.");
+            }
+            AmbientAdlsCredential.Current = isS3 ? null : adls;
+            AmbientS3Credential.Current = isS3 ? found?.S3 : null;
+            try
+            {
+                return TableFileSystems.Create(opener, root);
+            }
+            finally
+            {
+                AmbientAdlsCredential.Current = null;
+                AmbientS3Credential.Current = null;
+            }
         }
 
         private EngineeredWood.DeltaLake.Snapshot.Snapshot? Open(CancellationToken ct)
@@ -367,8 +504,10 @@ internal sealed class DuckLakeDeltaSync
             return list;
         }
 
-        private Result? SyncTo(EngineeredWood.DeltaLake.Snapshot.Snapshot? delta, long s, CancellationToken ct)
+        private Result? SyncTo(EngineeredWood.DeltaLake.Snapshot.Snapshot? delta, long s, CancellationToken ct,
+            out bool skipped)
         {
+            skipped = false;
             var names = _o.Rows(
                 $"SELECT t.table_name, sc.schema_name FROM {_o.M("ducklake_table")} t JOIN {_o.M("ducklake_schema")} sc " +
                 $"ON sc.schema_id = t.schema_id WHERE t.table_id = {_tableId} AND {Active("t", s)} AND {Active("sc", s)}");
@@ -379,6 +518,14 @@ internal sealed class DuckLakeDeltaSync
             string table = Str(names[0][0]);
             string schema = Str(names[0][1]);
             string tableName = $"{schema}.{table}";
+
+            if (HasLiveInlinedRows(s))
+            {
+                skipped = true;
+                _log.LogDebug("ducklake sync {Table}: snapshot {Snapshot} holds inlined rows, waiting for a flush",
+                    tableName, s);
+                return null;
+            }
 
             var files = _o.Rows(
                     $"SELECT data_file_id, path, path_is_relative, record_count, file_size_bytes, row_id_start, begin_snapshot, " +
@@ -410,7 +557,11 @@ internal sealed class DuckLakeDeltaSync
             string timestamps = delta?.Metadata.Configuration is { } cfg2 && cfg2.TryGetValue(TimestampKey, out var tm)
                 ? tm
                 : _o._timestamps;
-            var schemaPlan = new SchemaPlan(tableName, _columns, files, s, mode, timestamps);
+            bool deletionVectors = delta?.Metadata.Configuration is { } cfg3
+                                   && cfg3.TryGetValue("delta.enableDeletionVectors", out var dvv)
+                ? string.Equals(dvv, "true", StringComparison.OrdinalIgnoreCase)
+                : _o._deletionVectors;
+            var schemaPlan = new SchemaPlan(tableName, _columns, files, s, mode, timestamps, deletionVectors);
 
             long version = delta is null ? 0 : delta.Version + 1;
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -440,6 +591,15 @@ internal sealed class DuckLakeDeltaSync
             var byId = files.ToDictionary(f => f.Id);
             candidates.IntersectWith(byId.Keys);
             var live = LiveCounts(schema, table, s, candidates.Select(id => byId[id]).ToList());
+            if (!deletionVectors && files.Any(f => live.TryGetValue(f.Id, out var l) && f.Records > l))
+            {
+                // A table mirrored without deletion vectors can only show a state with no live deletes. Rewriting
+                // the files (ducklake_rewrite_data_files with delete_threshold => 0) produces one.
+                skipped = true;
+                _log.LogDebug("ducklake sync {Table}: snapshot {Snapshot} has live deletes and the table has no " +
+                              "deletion vectors, waiting for a rewrite", tableName, s);
+                return null;
+            }
 
             var existing = new Dictionary<string, AddFile>(StringComparer.Ordinal);
             if (delta is not null)
@@ -809,14 +969,17 @@ internal sealed class DuckLakeDeltaSync
         private readonly long _s;
         private readonly string _mode;
         private readonly string _timestamps;
+        private readonly bool _deletionVectors;
         private readonly List<DlColumn> _active;
         private readonly Dictionary<long, string> _physical = new();
         private readonly Dictionary<long, List<(string From, string To)>> _typeChanges = new();
         private bool _needsNtz;
 
-        public SchemaPlan(string table, List<DlColumn> all, List<DlFile> files, long s, string mode, string timestamps)
+        public SchemaPlan(string table, List<DlColumn> all, List<DlFile> files, long s, string mode, string timestamps,
+            bool deletionVectors)
         {
             _timestamps = timestamps;
+            _deletionVectors = deletionVectors;
             _table = table;
             _all = all;
             _files = files;
@@ -827,7 +990,7 @@ internal sealed class DuckLakeDeltaSync
             {
                 Plan(c);
             }
-            if (_mode == "name")
+            if (_mode != "id")
             {
                 foreach (var group in _active.GroupBy(c => c.Parent))
                 {
@@ -870,13 +1033,19 @@ internal sealed class DuckLakeDeltaSync
             else if (namesInFiles.Count > 1)
             {
                 throw Refuse($"column '{c.Name}' was renamed and live data files use both names " +
-                             $"({string.Join(", ", namesInFiles.Select(n => "'" + n + "'"))}); in 'name' column mapping " +
+                             $"({string.Join(", ", namesInFiles.Select(n => "'" + n + "'"))}); in '{_mode}' column mapping " +
                              "one physical name must cover every file. Rewrite the old files (DuckLake compaction) or mirror " +
                              "with column_mapping := 'id'");
             }
             else
             {
                 physical = namesInFiles.Count == 1 ? namesInFiles.First() : c.Name;
+                if (_mode == "none" && physical != c.Name)
+                {
+                    throw Refuse($"column '{c.Name}' was renamed from '{physical}' and live data files still use the old " +
+                                 "name; without column mapping a Delta reader looks for the new name and finds nothing. " +
+                                 "Rewrite the old files (DuckLake compaction) or mirror with column_mapping := 'name'");
+                }
             }
             _physical[c.Id] = physical;
 
@@ -887,7 +1056,7 @@ internal sealed class DuckLakeDeltaSync
                     throw Refuse($"column '{c.Name}' was added with a default ({c.InitialDefault}); DuckLake returns it " +
                                  "for rows of older files, a Delta reader returns NULL");
                 }
-                if (_mode == "name")
+                if (_mode != "id")
                 {
                     foreach (var f in _files)
                     {
@@ -900,7 +1069,7 @@ internal sealed class DuckLakeDeltaSync
                         if (clash is not null)
                         {
                             throw Refuse($"column '{c.Name}' reuses the name of a dropped column whose values are still in " +
-                                         "live data files; in 'name' column mapping a Delta reader would return those old " +
+                                         $"live data files; in '{_mode}' column mapping a Delta reader would return those old " +
                                          "values for it. Rewrite the old files or mirror with column_mapping := 'id'");
                         }
                     }
@@ -1023,8 +1192,11 @@ internal sealed class DuckLakeDeltaSync
                 WriteType(w, c);
                 w.WriteBoolean("nullable", c.Nullable);
                 w.WriteStartObject("metadata");
-                w.WriteNumber("delta.columnMapping.id", c.Id);
-                w.WriteString("delta.columnMapping.physicalName", _physical[c.Id]);
+                if (_mode != "none")
+                {
+                    w.WriteNumber("delta.columnMapping.id", c.Id);
+                    w.WriteString("delta.columnMapping.physicalName", _physical[c.Id]);
+                }
                 if (_typeChanges.TryGetValue(c.Id, out var changes) && changes.Count > 0)
                 {
                     w.WriteStartArray("delta.typeChanges");
@@ -1086,9 +1258,20 @@ internal sealed class DuckLakeDeltaSync
         public ProtocolAction Protocol(ProtocolAction? existing)
         {
             SchemaString(); // resolves _needsNtz
-            var reader = new SortedSet<string>(StringComparer.Ordinal) { "columnMapping", "deletionVectors" };
-            var writer = new SortedSet<string>(StringComparer.Ordinal)
-                { "columnMapping", "deletionVectors", "rowTracking", "domainMetadata" };
+            // Only what the table needs: a reader without column mapping or deletion vectors (SQL Server's DELTA
+            // reader) can then read it at reader version 1. Row tracking is a writer-only feature.
+            var reader = new SortedSet<string>(StringComparer.Ordinal);
+            var writer = new SortedSet<string>(StringComparer.Ordinal) { "rowTracking", "domainMetadata" };
+            if (_mode != "none")
+            {
+                reader.Add("columnMapping");
+                writer.Add("columnMapping");
+            }
+            if (_deletionVectors)
+            {
+                reader.Add("deletionVectors");
+                writer.Add("deletionVectors");
+            }
             if (_needsNtz)
             {
                 reader.Add("timestampNtz");
@@ -1110,9 +1293,9 @@ internal sealed class DuckLakeDeltaSync
             }
             return new ProtocolAction
             {
-                MinReaderVersion = 3,
+                MinReaderVersion = reader.Count > 0 ? 3 : 1,
                 MinWriterVersion = 7,
-                ReaderFeatures = reader.ToList(),
+                ReaderFeatures = reader.Count > 0 ? reader.ToList() : null,
                 WriterFeatures = writer.ToList(),
             };
         }
@@ -1129,14 +1312,17 @@ internal sealed class DuckLakeDeltaSync
             }
             config["delta.columnMapping.mode"] = _mode;
             config[TimestampKey] = _timestamps;
-            long maxId = _all.Count == 0 ? 0 : _all.Max(c => c.Id);
-            if (config.TryGetValue("delta.columnMapping.maxColumnId", out var prev)
-                && long.TryParse(prev, NumberStyles.Integer, CultureInfo.InvariantCulture, out var p))
+            if (_mode != "none")
             {
-                maxId = Math.Max(maxId, p);
+                long maxId = _all.Count == 0 ? 0 : _all.Max(c => c.Id);
+                if (config.TryGetValue("delta.columnMapping.maxColumnId", out var prev)
+                    && long.TryParse(prev, NumberStyles.Integer, CultureInfo.InvariantCulture, out var p))
+                {
+                    maxId = Math.Max(maxId, p);
+                }
+                config["delta.columnMapping.maxColumnId"] = maxId.ToString(CultureInfo.InvariantCulture);
             }
-            config["delta.columnMapping.maxColumnId"] = maxId.ToString(CultureInfo.InvariantCulture);
-            config["delta.enableDeletionVectors"] = "true";
+            config["delta.enableDeletionVectors"] = _deletionVectors ? "true" : "false";
             config["delta.enableRowTracking"] = "true";
             config["delta.rowTracking.materializedRowIdColumnName"] = MaterializedRowId;
             config["delta.rowTracking.materializedRowCommitVersionColumnName"] = MaterializedRowCommitVersion;

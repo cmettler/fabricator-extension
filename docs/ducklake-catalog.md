@@ -242,7 +242,7 @@ ATTACH 'ducklake:fabricator:Server=<host>,1433;Database=<db>;Encrypt=True' AS la
   is unchanged (box with `sa` is principal 1 and still gets `dbo` the ordinary way). Not gated: no CI tier
   reaches Fabric.
 
-## 11. Delta metadata over DuckLake's data files (design, 2026-10-27 — nothing built yet)
+## 11. Delta metadata over DuckLake's data files (2026-10-27 — the manual sync is built, §11.6)
 
 Goal: a reader that only knows Delta (Fabric's SQL endpoint, Spark, Power BI Direct Lake) reads a DuckLake table
 from the same Parquet files DuckLake wrote — with deletion vectors, row tracking and a change feed, not a bare
@@ -382,10 +382,23 @@ deleted files; the synchronous post-commit sync rules that out, a manual sync mu
 1. ~~Measure: the scoped `auto_compact` override (§11.3); Fabric reading deletion vectors and `typeWidening`
    (§11.4a).~~ Done, both hold.
 2. ~~Manual sync, append + DELETE (DVs) + row tracking + type widening, `name` mapping with the DDL refusals,
-   checkpoints.~~ Built, §11.6. No gate yet (DuckLake is not linked into `unittest`).
-3. Change-data files for UPDATE; the automatic post-commit trigger; our own orphan cleanup.
+   checkpoints.~~ Built, §11.6; gate `verify_ducklake_delta_sync` (DuckLake is statically linked since `330e9df`).
+3. ~~Concurrent syncs without a coordinator~~ (§11.7) and the stale-catalog read it surfaced (§11.8), fixed.
+4. ~~**Mirror only COMPLETE snapshots**~~ — built, §11.9.
+5. A maintenance procedure in the safe order: flush → (merge) → sync → cleanup (§11.3's ordering problem).
+6. The opt-in marker in the metadata database, so the CATALOG can refuse DDL that cannot be mirrored (today
+   only the next sync notices, after the DDL has committed). Change-data files for UPDATE; our own orphan
+   cleanup.
 
-### 11.6 As built — `ducklake_delta_sync` (2026-10-27, uncommitted)
+**No automatic sync on commit (decided 2026-10-27, user).** With inlining on, a sync per commit would have to
+flush per commit, which throws away the reason for inlining — small commits bundled into one Parquet file —
+and floods Delta readers with small files; without the flush the mirror is inconsistent (an UPDATE of a
+flushed row deletes the old version as a DV while the new one sits inlined, so the row vanishes from Delta
+until the next flush). With `DATA_INLINING_ROW_LIMIT 0` every commit writes Parquet anyway, so a per-commit
+sync would cost only latency (one more Delta commit + `.crc` per DuckLake commit, ~180 ms per request on
+OneLake); that is the only setting where it makes sense, and it is not built.
+
+### 11.6 As built — `ducklake_delta_sync` (2026-10-27, `330e9df`; concurrency §11.7)
 
 `SELECT * FROM ducklake_delta_sync('lake' [, table_name := 'schema.table'] [, column_mapping := 'name'|'id']
 [, timestamp_mapping := 'utc'|'ntz'] [, metadata_schema := '…'])` — a global table function in
@@ -441,3 +454,106 @@ deleted files; the synchronous post-commit sync rules that out, a manual sync mu
 - Not built: change-data files, the automatic trigger, our own orphan cleanup, partition declaration (files keep
   the partition column, so the Delta table is unpartitioned), stats beyond ints/floats/decimals/exact
   strings/dates.
+
+### 11.7 Several processes, no coordinator (2026-10-27)
+
+Whoever syncs catches the table up to the current snapshot — not "its own" snapshots: the state diff does not
+care which process committed in DuckLake. Two syncs running at once race for the same Delta version file.
+
+- **The commit is put-if-absent, and the loser retries.** `WriteCommitAsync` throws `DeltaConflictException`
+  when the version exists; the sync then re-reads the Delta table (its `txn` says how far the winner got) and
+  continues from there, up to 32 times. MEASURED: six concurrent syncs over 12 inserts + a delete land 14
+  versions, contiguous, and the table reads the DuckLake values exactly (suite §8; a mutant without the retry
+  dies there).
+- **⚠ That needs a REAL conditional write.** A local file uses `O_EXCL` (atomic). On an object store the host
+  filesystem only checks for the file before writing it — measured: 40 of 48 commits silently lost on S3,
+  7 of 48 on ADLS (delta-transactions.md §8.3, §8.4). So on a remote path the sync takes a credential and uses the
+  provider's own conditional write (ADLS `If-None-Match: *` via `AdlsGen2TableFileSystem`, S3 `If-None-Match`
+  via `S3CommitFileSystem`), found from a Delta catalog ATTACHed with a `SECRET` whose root covers the path —
+  or, on OneLake from Fabric compute, the ambient notebook credential. Without either it REFUSES before any IO
+  rather than risk a silently lost version (suite §9).
+  MEASURED LIVE on OneLake (metadata on box, data under `LH/Tables/dbo`, the Delta catalog attached with
+  `SECRET fabric_sp`): four concurrent `duckdb.exe` processes on a fresh table — one wrote v0, three logged
+  *"lost a commit race"* and wrote nothing; then 14 more DuckLake snapshots and four again — one wrote v1/v2,
+  the others lost twice each. Versions contiguous, the file rows exact (75 / 4650). Not in CI (live account).
+- **⚠⚠ INLINED ROWS ARE MISSING FROM THE MIRROR, SILENTLY — found by that run.** DuckLake inlines small
+  inserts and update post-images into the metadata database by default (`DATA_INLINING_ROW_LIMIT`), and the
+  sync mirrors files only. Same table: DuckLake 98 rows / 34841, the Delta table 75 / 4650 — the 23 inlined
+  rows were absent with no error. The suite never saw it because it attaches with `DATA_INLINING_ROW_LIMIT 0`.
+  Inlining stays on (user decision); since §11.9 the sync mirrors only complete snapshots, so inlined rows
+  reach Delta when they are flushed instead of being silently absent.
+- ⚠ A lost race can leave an orphan deletion-vector file (written before the commit was judged; EW's
+  `DeletionVectorPath` is internal, so we cannot name it to delete it). Harmless to readers.
+- **⚠ Do not VACUUM the mirror from Spark or Fabric.** Their VACUUM deletes every file the CURRENT Delta
+  version does not reference — including files DuckLake still holds for its own time travel. DuckLake owns the
+  files; clean up through DuckLake (`ducklake_cleanup_old_files`).
+
+
+### 11.8 Flush races and a stale-catalog read — MEASURED + FIXED 2026-10-27
+
+Asked because flushing inlined rows inside the sync would turn it into a DuckLake writer. Harness: one user
+process (INSERT / DELETE / UPDATE / all three, each autocommit or in `BEGIN … COMMIT`, 60 operations) against one
+or two processes looping `ducklake_flush_inlined_data` (autocommit or explicit), DuckDB 2.0 wheel + our loadable,
+metadata on box SQL Server and, as the control, on SQLite. Expected state is replayed from the user's successful
+operations and compared row by row.
+
+- **Flush vs user: no conflict at all.** 60 of 60 user commits succeeded in every variant, both backends, and the
+  table matched exactly.
+- **Flush vs flush: one conflict per run** (`Failed to commit DuckLake transaction`, not retried), identical on
+  SQLite. The loser fails, the data stays exact.
+- **⚠⚠ THE FIRST READING SAID "EVERY DELETE LOST, EVERY UPDATE DUPLICATED" ON SQL SERVER, AND IT WAS A STALE
+  READ, NOT A WRITE.** The verifying connection had attached before the race. DuckLake creates helper tables
+  lazily (`ducklake_inlined_delete_<id>` on the first delete of a flushed row), and our catalog treats a name
+  missing from its ATTACH-time list as absent (`FabricatorSchemaEntry` lookup, no object filter). MEASURED in
+  isolation: a connection attached before another process deletes reads 11 rows (deleted row back, updated row
+  twice); a fresh connection reads 9; SQLite reads 9 on both. Writes from the stale connection were correct.
+  Verified with a fresh connection, every scenario is exact.
+- ⇒ Any long-lived session on a SQL Server metadata catalog (a dbt run, a notebook, an automatic sync) can read
+  WRONG DATA, silently, after another process deletes or updates flushed rows for the first time. Harness:
+  scratchpad `flushrace/` (`run.py`, `worker.py`, `stale.py`, `stalew.py`).
+- **FIXED 2026-10-27 (C++ only, no ABI):** `FabricatorSchemaEntry::GetOrCreateEntry` fetches a name missing from
+  the discovered list BY NAME, with or without an object filter (the filter-only flag is gone). DuckLake asks
+  via `Connection::TableInfo` and caches the answer itself (EXISTS for good, DOES_NOT_EXIST only up to the
+  snapshot it was asked at), so a miss reaches us about once per table and new snapshot; on SQL Server a
+  genuine miss costs two round trips (describe, then `OBJECT_ID`). Enumeration is unchanged: the table appears
+  in `duckdb_tables()` only after a refresh. Gates: `verify_ducklake_mssql` (new, service; two ATTACHes of one
+  metadata schema stand in for two processes) and `verify_exec_invalidate_cache` (out-of-band CREATE). Mutant
+  (the old early return) dies at both: 11 rows instead of 9 after a delete, and *"Table with name
+  ducklake_inlined_data_1_2 does not exist"* after an ALTER in the other catalog — so the ALTER path failed
+  loudly, the delete path silently.
+
+### 11.9 Complete snapshots, and a mirror SQL Server can read (built 2026-10-27, uncommitted)
+
+**Only complete snapshots are mirrored.** A snapshot is complete when the table has no live INLINED rows at it
+(`ducklake_inlined_data_tables` lists the inlined tables; a row is live between `_ducklake_begin_snapshot` and
+`_ducklake_end_snapshot`). An incomplete snapshot is skipped and re-examined by the next sync; a table's FIRST
+sync takes the newest complete snapshot instead of the current one. Inlined DELETES are fine — they are
+mirrored as deletion vectors right away.
+
+- **⚠ MEASURED, and better than designed: a flush makes the skipped snapshot complete RETROACTIVELY.**
+  DuckLake moves inlined rows into a file stamped with the rows' OWN snapshot, so after a flush the snapshot
+  of the original small insert has its data in a file, and the next sync gives it its own Delta version (gate:
+  the insert of 6000 at snapshot 5 is skipped, flushed at 6, then mirrored as snapshot 5). History stays per
+  snapshot; nothing is squashed except while rows are actually inlined.
+
+**`column_mapping := 'none'` + `deletion_vectors := false` — a mirror at reader version 1**, for readers
+without column mapping or deletion vectors. SQL Server's DELTA reader is the one that matters (19725 for column
+mapping, 19726 for a materialized vector, both pinned in `verify_mssql_s3_polybase`); row tracking is writer-only, and
+`verify_mssql_s3_polybase` §5c already showed SQL Server reads it, extra row-id column included.
+
+- `'none'` declares no column mapping; the Delta field name must be the name every live file uses. A rename
+  while files with the old name live is REFUSED (a reader would find nothing under the new name).
+- `deletion_vectors := false` neither declares the feature nor writes a vector: a snapshot with live deletes
+  is skipped like an incomplete one. `ducklake_rewrite_data_files(lake, table, delete_threshold => 0)` folds
+  the deletes into new files (the default threshold 0.95 rewrites only nearly-empty files, and
+  `ducklake_merge_adjacent_files` skips every file that has deletes — read in DuckLake's source); the next sync
+  mirrors that as remove + add. ⚠ That is copy-on-write: every file with a single deleted row is rewritten.
+- Both choices are persisted in the table's configuration, so later syncs need no options.
+- **MEASURED END TO END (MinIO, gate `verify_mssql_s3_polybase` §6d):** a DuckLake table with data on S3,
+  mirrored with these options, read by SQL Server through `OPENROWSET(FORMAT='DELTA')`: 1000 rows while one
+  row sat inlined, 1001 after the flush, still 1001 after a DELETE (waiting), 991 with the exact sum after the
+  rewrite. Protocol `minReaderVersion` 1.
+- Not refused, not readable by SQL Server: type widening and `timestamp_ntz` (both reader features). Partition
+  columns would read as NULL through an external table (an MS limitation); the mirror declares no partitions.
+- Mutants: the delete rule off (dies in both suites), the completeness check off (dies in the hermetic suite;
+  SQL Server sees the same current state either way), column mapping declared under `'none'` (dies in both).

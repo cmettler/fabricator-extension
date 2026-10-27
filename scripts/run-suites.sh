@@ -966,8 +966,13 @@ case "$TIER" in
         # 2026-10-27: 10834 -> 10951. A NEW suite, verify_ducklake_delta_sync (117): a DuckLake (DuckDB-file
         #   metadata, so hermetic) mirrored to Delta and read back through both Delta readers, values AND row ids.
         #   Needs ducklake statically linked (extension_config.cmake). Nothing else moved, which is the
-        #   behaviour-neutrality claim for DuckDbTableFileSystem preferring its CAPTURED opener.
-        : "${MIN_ASSERTIONS:=10951}"
+        #   behaviour-neutrality claim for GetNextBatch re-establishing the scan's context per pull.
+        # 2026-10-27: 10951 -> 10983. verify_ducklake_delta_sync 117 -> 149: concurrent syncs race for a Delta
+        #   version and the losers retry (section 8), a remote path without a conditional-commit credential is
+        #   refused (section 9). Nothing else moved, which covers the credential registry in DeltaCatalog.
+        # 2026-10-27: 10983 -> 11030. verify_ducklake_delta_sync 149 -> 196: only complete snapshots are mirrored
+        #   (no live inlined rows), and column_mapping none + deletion_vectors false give a reader-v1 mirror.
+        : "${MIN_ASSERTIONS:=11030}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -1031,7 +1036,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=73}"   # 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
+        : "${MIN_SUITES:=74}"   # 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1502,7 +1507,12 @@ case "$TIER" in
         # unique index (clustered; nonclustered beside a columnstore). One mutant killed. Nothing else moved.
         # 2026-10-27: 5164 -> 5171, from a green 73-run tier: verify_hidden_rowid 104 -> 111 — the rowid UPDATE goes 500
         # statements to a SqlBatch round trip; 1201 rows span two full batches and a partial one. Two mutants killed.
-        : "${MIN_ASSERTIONS:=5171}"
+        # 2026-10-27: 5171 -> 5215, from a green 74-run tier: +verify_ducklake_mssql (32, new) and
+        # verify_exec_invalidate_cache 21 -> 33. A table-name miss is fetched by name, so a session sees tables
+        # another process created after its ATTACH (DuckLake read wrong data before). Nothing else moved.
+        # 2026-10-27: 5215 -> 5244, from a green 74-run tier: verify_mssql_s3_polybase 268 -> 297 (§6d, SQL Server
+        # reads a DuckLake table mirrored by ducklake_delta_sync). Nothing else moved.
+        : "${MIN_ASSERTIONS:=5244}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

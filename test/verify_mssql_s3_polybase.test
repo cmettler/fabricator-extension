@@ -21,11 +21,17 @@ require httpfs
 # the bare case with an empty USERPROFILE (see CLAUDE.md).
 require parquet
 
+require ducklake
+
+require json
+
 require-env MSSQL_TESTDB_DSN
 
 require-env FABRICATOR_S3_ENDPOINT
 
 require-env FABRICATOR_S3_SQL_ENDPOINT
+
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # The test rig's MinIO serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
 # curl-based httpfs verifies against the system store) — disable verification GLOBALLY (the transaction
@@ -763,6 +769,119 @@ DROP TABLE sqldb.dbo.cetas_full;
 
 statement ok
 DROP TABLE sqldb.dbo.cetas_id;
+
+# ---- 6d. A DUCKLAKE table, mirrored to Delta by ducklake_delta_sync, read by SQL Server. SQL Server's DELTA
+#      reader takes protocol 1.0 only: no column mapping (19725), no deletion vector (19726). The sync's
+#      column_mapping := 'none' + deletion_vectors := false give it that, and mirror only snapshots with no
+#      inlined rows and no live deletes — the deletes become visible once ducklake_rewrite_data_files has
+#      folded them into new files (docs/ducklake-catalog.md §11.9). ----
+
+# The Delta catalog over the lake's data path is what gives the sync its conditional commit on S3 (the
+# credential registry); it also clears what an earlier run left in the folder.
+statement ok
+ATTACH 's3://fabricator/polybase-dl' AS dlc (TYPE fabricator, PROVIDER 'delta', READ_ONLY false, SECRET minio_s3,
+                                            schemas 'onelevel');
+
+# ⚠ the lake lays tables out as <data_path>/<schema>/<table>/, so the catalog needs schemas 'onelevel' to see
+# main.dlt; without it the DROP finds nothing, the old log survives, and the next run's sync believes the table
+# is already mirrored (measured: the second run failed at the first sync)
+statement ok
+DROP TABLE IF EXISTS dlc.main.dlt;
+
+query I
+SELECT count(*) FROM glob('s3://fabricator/polybase-dl/main/dlt/_delta_log/*');
+----
+0
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/pb.ducklake' AS pdl (DATA_PATH 's3://fabricator/polybase-dl/');
+
+statement ok
+CREATE TABLE pdl.dlt (id INTEGER, name VARCHAR, amount BIGINT);
+
+statement ok
+INSERT INTO pdl.dlt SELECT i, 'n' || i, i * 10 FROM range(1, 1001) r(i);
+
+# one row INLINED in the metadata (DuckLake's default inlining): in no Parquet file yet
+statement ok
+INSERT INTO pdl.dlt VALUES (5000, 'inl', 1);
+
+query II
+SELECT delta_version, files_added FROM ducklake_delta_sync('pdl', table_name := 'dlt', column_mapping := 'none', deletion_vectors := false);
+----
+0	1
+
+# reader version 1: no reader features at all
+query I
+SELECT protocol.minReaderVersion FROM read_json('s3://fabricator/polybase-dl/main/dlt/_delta_log/00000000000000000000.json') WHERE protocol IS NOT NULL;
+----
+1
+
+# the mirrored snapshot is the last one WITHOUT inlined rows: 1000 rows, not 1001
+query II
+SELECT cnt, total FROM fabricator_query('sqldb',
+  'SELECT count(*) AS cnt, sum(amount) AS total FROM OPENROWSET(BULK ''/fabricator/polybase-dl/main/dlt'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+1000	5005000
+
+statement ok
+CALL ducklake_flush_inlined_data('pdl');
+
+query I
+SELECT delta_version FROM ducklake_delta_sync('pdl', table_name := 'dlt');
+----
+1
+
+query II
+SELECT cnt, total FROM fabricator_query('sqldb',
+  'SELECT count(*) AS cnt, sum(amount) AS total FROM OPENROWSET(BULK ''/fabricator/polybase-dl/main/dlt'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+1001	5005001
+
+# a delete is a LIVE delete until the files are rewritten: the sync waits instead of writing a vector
+statement ok
+DELETE FROM pdl.dlt WHERE id <= 10;
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('pdl', table_name := 'dlt');
+----
+0
+
+query I
+SELECT cnt FROM fabricator_query('sqldb',
+  'SELECT count(*) AS cnt FROM OPENROWSET(BULK ''/fabricator/polybase-dl/main/dlt'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+1001
+
+statement ok
+CALL ducklake_rewrite_data_files('pdl', 'dlt', delete_threshold => 0);
+
+query II
+SELECT delta_version, deletion_vectors FROM ducklake_delta_sync('pdl', table_name := 'dlt');
+----
+2	0
+
+query III
+SELECT cnt, total, mn FROM fabricator_query('sqldb',
+  'SELECT count(*) AS cnt, sum(amount) AS total, min(id) AS mn FROM OPENROWSET(BULK ''/fabricator/polybase-dl/main/dlt'',
+     FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r');
+----
+991	5004451	11
+
+# DuckLake agrees
+query II
+SELECT count(*), sum(amount) FROM pdl.dlt;
+----
+991	5004451
+
+statement ok
+DETACH pdl;
+
+statement ok
+DETACH dlc;
 
 # ---- 7. teardown (external objects; the delta data stays for re-runs — CREATE OR REPLACE resets it) ----
 statement ok

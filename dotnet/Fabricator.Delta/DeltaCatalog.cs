@@ -221,6 +221,34 @@ public sealed class DeltaCatalog : IProviderCatalog
     // For an s3:// root ATTACHed with an s3 SECRET: the commit-rename conditional-PUT credential
     // (multi-writer safety). Null => host-FS rename (single-writer, the documented httpfs caveat).
     private readonly S3CommitCredential? _s3Credential;
+
+    // The open catalogs that hold a storage credential, so a component with no ATTACH of its own (ducklake_delta_sync)
+    // can commit through the same conditional-PUT filesystem for a path under one of their roots. See
+    // CredentialsFor.
+    private static readonly List<DeltaCatalog> _withCredentials = new();
+
+    /// <summary>
+    /// The storage credentials of the open Delta catalog whose root is the longest prefix of <paramref name="path"/>,
+    /// or null when no catalog with a credential covers it. A credential belongs to an account, so a root that
+    /// contains the path is enough; the longest one wins when several do.
+    /// </summary>
+    internal static (AdlsCredential? Adls, S3CommitCredential? S3)? CredentialsFor(string path)
+    {
+        string p = Normalize(path).TrimEnd('/') + "/";
+        DeltaCatalog? best = null;
+        lock (_withCredentials)
+        {
+            foreach (var c in _withCredentials)
+            {
+                if (p.StartsWith(c._root + "/", System.StringComparison.OrdinalIgnoreCase)
+                    && (best is null || c._root.Length > best._root.Length))
+                {
+                    best = c;
+                }
+            }
+        }
+        return best is null ? null : (best._adlsCredential, best._s3Credential);
+    }
     // Lazily-resolved OneLake shape (schema-enabled flag + discovered tables); null for non-OneLake roots.
     private FabricLakehouse.OneLakeInfo? _oneLake;
     private bool _oneLakeResolved;
@@ -505,6 +533,13 @@ public sealed class DeltaCatalog : IProviderCatalog
         if (_adlsCredential is null && FabricLakehouse.IsOneLake(_root) && FabricNotebookCredential.IsAvailable)
         {
             _adlsCredential = AdlsCredential.FromToken(FabricCredentialResolver.AmbientChain());
+        }
+        if (_adlsCredential is not null || _s3Credential is not null)
+        {
+            lock (_withCredentials)
+            {
+                _withCredentials.Add(this);
+            }
         }
         // Deletion vectors are the DEFAULT DML mode (the modern Delta standard: DELETE marks rows in a DV bitmap
         // instead of rewriting the whole file — cheap, and it preserves row-tracking ids/versions for free).
@@ -6281,6 +6316,10 @@ public sealed class DeltaCatalog : IProviderCatalog
     // STATIC registry simply leaked until the 4096-entry panic clear.
     public void Dispose()
     {
+        lock (_withCredentials)
+        {
+            _withCredentials.Remove(this);
+        }
         foreach (var txn in _txns.Drain())
         {
             try { txn.Complete(commit: false); }
