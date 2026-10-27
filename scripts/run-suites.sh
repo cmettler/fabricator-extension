@@ -1490,7 +1490,9 @@ case "$TIER" in
         # reference catalog opts out by name, a misspelled value is refused.
         # 2026-10-27: 4600 -> 4647. verify_remote_select_mssql 463 -> 510: server types without COLLATE (§7) and the
         # MARS-off transaction decline (§8), both found by turning the default on.
-        : "${MIN_ASSERTIONS:=4647}"
+        # 2026-10-27: 4647 -> 5018, from a green 72-run tier: the scan-pushdown suites pin the scan path with EXPLAIN
+        # controls (+15), and six routing suites run a second time with FABRICATOR_REMOTE_PUSHDOWN=false (+346).
+        : "${MIN_ASSERTIONS:=5018}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
