@@ -324,6 +324,39 @@ correct bound). Gate `verify_delta_statistics` §9: the counts, the bound as the
 that pruning still WORKS (an all-`true` file is rightly skipped for `= false`). The reverted fix dies at the first
 row with `0 15`, the original symptom.
 
+### 1.30 A SQL Server `sql_variant` column reads as VARCHAR, through .NET `ToString()` — lossy (measured 2026-10-27, NOT fixed)
+
+`sql_variant` has no case in `SqlArrowMapping.MapType`, so it falls through to the CLR type (`object`) and lands
+as `StringType`; the appender then writes `o.ToString()` with the process culture. Measured on SQL Server 2025,
+one value per base type:
+
+| base type | stored | what DuckDB reads |
+|---|---|---|
+| `varbinary` | `0xCAFE` | `System.Byte[]` — **the bytes are gone** |
+| `datetime2` | `2026-10-27 13:14:15.1234567` | `10/27/2026 1:14:15 PM` — fractional seconds gone |
+| `date` | `2026-10-27` | `10/27/2026 12:00:00 AM` |
+| `datetime` | `… 13:14:15.123` | `10/27/2026 1:14:15 PM` |
+| `bit` | `1` | `True` |
+| `datetimeoffset` | `… +02:00` | `10/27/2026 1:14:15 PM +02:00` |
+| `int` / `decimal(10,3)` / `float` / `money` / `uniqueidentifier` / `nvarchar` | | `42` / `1.500` / `2.25` / `12.3456` / the GUID / the text — usable, but typed VARCHAR |
+
+⚠ The date and number formats follow the CULTURE of the process (`o.ToString()` takes no format provider), so the
+same row can read differently on another machine. The remote pushdown declines a query that uses such a column
+(it runs locally), so both paths agree on this — on the wrong answer.
+
+**Planned (2026-10-27, user-agreed): map `sql_variant` ⇄ DuckDB `VARIANT`** (Arrow `arrow.parquet.variant`,
+which DuckDB 2.0 imports natively; the Delta path already crosses it), after the mapping in mssql-adbc
+(`src/Clast.Drivers.SqlServer/Arrow/VariantDecoders.cs` / `VariantEncoders.cs`): each value as the variant <!-- check-docs:ignore (a path in the mssql-adbc repository) -->
+primitive of its own base type. Read side first; it is a bug fix for the rows above. ⚠ SqlClient returns
+`date` / `datetime` / `smalldatetime` / `datetime2` all as `DateTime`, so the base type must come from
+`GetSqlValue` or `SQL_VARIANT_PROPERTY(v, 'BaseType')` — to be measured before building. Write side after: a
+VARIANT holding an object, an array or a string above `sql_variant`'s 8000-byte limit is REFUSED, naming the
+row and column and pointing at `v::JSON` (which lands as `nvarchar(max)` / native `json`); no silent JSON
+conversion inside `sql_variant`. The CTAS must leave no table behind when that refusal fires — verify.
+2.0 line only; breaking (the column type changes from VARCHAR to VARIANT).
+
+---
+
 ## 2. Claimed but NOT measured — treat as unproven
 
 | # | claim | why it is unproven, and what would settle it |
