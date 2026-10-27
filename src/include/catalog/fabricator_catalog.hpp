@@ -43,7 +43,7 @@ public:
 	//! Scoped invalidation: drop materialized entries whose name matches the icase regex `pattern`, keeping
 	//! the discovered name lists (lazy re-fetch on next access). UNBOUNDED by the ATTACH object filter — a
 	//! targeted refresh reaches any object by name (the filter bounds enumeration, not targeted access; see
-	//! HasObjectFilter). Backs fabricator_invalidate_cache(catalog, name_regex). Throws on a bad regex.
+	//! FabricatorSchemaEntry::GetOrCreateEntry). Backs fabricator_invalidate_cache(catalog, name_regex). Throws on a bad regex.
 	void InvalidateMatching(const string &pattern);
 
 	FabricatorHandle GetHandle() const {
@@ -96,20 +96,6 @@ public:
 	//! resolve `a.b` against a catalog that cannot express it.
 	bool SupportsNestedSchemas() const override {
 		return supports_nested_schemas_;
-	}
-
-	//! Whether an ATTACH object filter (schema_filter / table_filter / function_filter) is active. When set,
-	//! the discovered name list (per schema) is a FILTERED SUBSET, so a targeted lookup miss is ambiguous —
-	//! it may be a real object the filter merely excluded from ENUMERATION. The filter bounds enumeration
-	//! (SHOW TABLES / full refresh), NOT targeted-by-name access: FabricatorSchemaEntry::GetOrCreateEntry
-	//! lazily fetches an out-of-enumeration table by name when this is true (cached in entries_, never added
-	//! to the enumerated set). With no filter, the discovery list is authoritative so a miss is genuinely
-	//! absent (no wasted round-trip). Set at ATTACH from the presence of a filter option.
-	void SetObjectFilter(bool has_filter) {
-		has_object_filter_ = has_filter;
-	}
-	bool HasObjectFilter() const {
-		return has_object_filter_;
 	}
 
 	//! Records that a provider function's EXECUTION performed DDL (ABI v81's `tablefn_execute`
@@ -219,7 +205,6 @@ private:
 	FabricatorHandle handle_;
 	string db_path_;
 	//! Whether the database collation is binary (detected at LoadCatalog) => string ORDER BY is pushable.
-	bool has_object_filter_ = false;
 	//! Set by MarkSchemaMayChange (a provider function did DDL); consumed at the next transaction start.
 	std::atomic<bool> schema_may_change_ {false};
 	bool string_order_pushable_ = false;

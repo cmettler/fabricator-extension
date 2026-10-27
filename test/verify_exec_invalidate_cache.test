@@ -103,3 +103,59 @@ SELECT fabricator_exec('oob', 'DROP TABLE dbo.oob_stale');
 
 statement ok
 DETACH oob;
+
+# ============================================================================
+# OUT-OF-BAND CREATE: a table created AFTER the ATTACH listed this catalog is reachable BY NAME without a
+# refresh. The discovered list is a snapshot taken at ATTACH, so a name missing from it is not proof of
+# absence: the lookup asks the provider. It used to answer "does not exist" here, and DuckLake on a SQL
+# Server metadata catalog then read WRONG DATA, because it creates its helper tables lazily and asks for them
+# by name (docs/ducklake-catalog.md §11.8; the end-to-end gate is verify_ducklake_mssql).
+# Enumeration is deliberately unchanged: the table shows up there only after a refresh.
+# ============================================================================
+
+# A failed earlier run can leave the table behind, and then it would be DISCOVERED at ATTACH and prove nothing.
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.oob_created'') IS NOT NULL DROP TABLE dbo.oob_created');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS oob (TYPE fabricator);
+
+# Positive control: the name really is absent from this attach's discovered list.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'oob' AND table_name = 'oob_created';
+----
+0
+
+statement ok
+SELECT fabricator_exec('oob', 'IF OBJECT_ID(''dbo.oob_created'') IS NOT NULL DROP TABLE dbo.oob_created; CREATE TABLE dbo.oob_created (id INT); INSERT INTO dbo.oob_created VALUES (7), (8)');
+
+query II
+SELECT count(*), sum(id) FROM oob.dbo.oob_created;
+----
+2	15
+
+# Still not enumerated: the by-name entry is cached, not added to the discovered list.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'oob' AND table_name = 'oob_created';
+----
+0
+
+statement ok
+SELECT fabricator_refresh_cache('oob');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'oob' AND table_name = 'oob_created';
+----
+1
+
+# A name that is absent on the server too still reads as absent (now after a provider round trip).
+statement error
+SELECT count(*) FROM oob.dbo.oob_never_created;
+----
+does not exist
+
+statement ok
+SELECT fabricator_exec('oob', 'DROP TABLE dbo.oob_created');
+
+statement ok
+DETACH oob;

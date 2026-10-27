@@ -424,16 +424,15 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 			return cached->second.get();
 		}
 	}
-	auto type_it = table_types_.find(table_name);
-	if (type_it == table_types_.end() && !catalog.Cast<FabricatorCatalog>().HasObjectFilter()) {
-		// No object filter: the discovered name list is the FULL enumeration, so a miss is genuinely absent.
-		return nullptr;
-	}
-	// A miss WITH an object filter active is ambiguous: the discovered list is a filtered subset, so this may
-	// be a real table the filter merely excluded from ENUMERATION. The filter bounds enumeration, not targeted
-	// access — so fetch by name. A genuine absence throws in FetchTableSchema below and is treated as
-	// not-found. The entry is cached in entries_ (fast repeat access) but NOT added to table_types_, so it
-	// stays out of enumeration (SHOW TABLES / full refresh keep the filtered view).
+	// A name missing from the discovered list is NOT proof of absence, so it is fetched by name. Two reasons:
+	// an object filter bounds ENUMERATION, never targeted access; and the list is a snapshot taken at ATTACH,
+	// so a table another process created since then is real and missing from it. The second one returned
+	// WRONG DATA: DuckLake creates its helper tables lazily (ducklake_inlined_delete_<id> on the first delete
+	// of a flushed row, ducklake_inlined_data_<t>_<v> per schema version) and asks for them by name, so a
+	// session attached before another process created one read deleted rows as live and updated rows twice
+	// (docs/ducklake-catalog.md §11.8). A genuine absence throws in FetchTableSchema below and is treated as
+	// not-found. The entry is cached in entries_ (fast repeat access) but NOT added to table_types_, so
+	// enumeration (SHOW TABLES, duckdb_tables) still shows the discovered list until a refresh.
 
 	// Open the table SESSION first (ABI v72): a cheap handle around the stateless definition (+ the AT
 	// clause, which is part of the handle's identity — the AT entry's schema answer is the provider's own
