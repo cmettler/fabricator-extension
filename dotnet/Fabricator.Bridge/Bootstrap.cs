@@ -583,7 +583,13 @@ public static unsafe class Bootstrap
             // from enumeration on this status — right for a table dropped out-of-band, catastrophic for a
             // table that merely could not be read (its data is intact and it would silently vanish). Only a
             // provider that has ESTABLISHED absence throws this; everything else falls through below.
-            SetError(err, ex);
+            // An answer, not a failure, so it is not logged as a warning: since a missing name is looked up
+            // BY NAME, every existence probe (DuckLake checks its helper tables this way) lands here.
+            BridgeLog.LogDebug("abi TableSchema: {Message}", ex.Message);
+            if (err is not null)
+            {
+                *err = (byte*)Marshal.StringToCoTaskMemUTF8(FormatError(ex));
+            }
             return FabricatorStatus.NotFound;
         }
         catch (Exception ex)

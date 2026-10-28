@@ -56,6 +56,38 @@ services:
       retries: 12
       start_period: 20s
 
+  # SQL Server 2025 WITH PolyBase, for the DuckLake-over-ODBC experiment (docs/ducklake-catalog.md §12).
+  # OPT-IN: only `docker compose --profile polybase up -d` starts it, so the service tier and CI are untouched.
+  # Its own port, volume and image (docker/polybase/Dockerfile). The ODBC side — the DuckDB ODBC driver, our
+  # loadable + managed payload, odbc.ini and the session init file — is staged on the host into
+  # docker/polybase/stage (gitignored, see docker/polybase/stage.sh) and mounted read-only.
+  # ⚠ PolyBase on Linux refuses a hostname longer than 15 characters, hence the explicit one.
+  sqlpoly:
+    build: ./polybase
+    image: fabricator-sqlpoly:dev
+    profiles: ["polybase"]
+    restart: unless-stopped
+    container_name: mssql-fabricator-polybase
+    hostname: sqlpoly
+    # gdb can attach to the External Execution Service (a test rig: its threads were the thing to debug)
+    cap_add: ["SYS_PTRACE"]
+    ports:
+      - "1434:1433"
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=Arrow_Net_123!
+    volumes:
+      - mssql-poly-data:/var/opt/mssql
+      - ./certs/public.crt:/var/opt/mssql/security/ca-certificates/minio.crt:ro
+      - ./polybase/stage:/opt/duckodbc:ro
+      - ./polybase/stage/odbc.ini:/etc/odbc.ini:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
   minio:
     # ⚠⚠ THIS IMAGE HAS MOVED TWICE, BOTH TIMES BECAUSE THE PUBLISHER WITHDREW IT — treat the registry as
     # the fragile part of this rig, not the software. 2026-09-13: `minio/minio` + `minio/mc` on Docker Hub
@@ -109,3 +141,4 @@ services:
 volumes:
   mssql-data:
   minio-data:
+  mssql-poly-data:

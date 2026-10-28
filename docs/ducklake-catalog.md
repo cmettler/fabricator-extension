@@ -557,3 +557,114 @@ mapping, 19726 for a materialized vector, both pinned in `verify_mssql_s3_polyba
   columns would read as NULL through an external table (an MS limitation); the mirror declares no partitions.
 - Mutants: the delete rule off (dies in both suites), the completeness check off (dies in the hermetic suite;
   SQL Server sees the same current state either way), column mapping declared under `'none'` (dies in both).
+
+## 12. SQL Server reading DuckLake directly: PolyBase over the DuckDB ODBC driver (experiment, 2026-10-27)
+
+A different route from §11's Delta mirror: SQL Server's PolyBase reads a generic ODBC source (Windows since
+2019, **Linux too since SQL Server 2025**), and the DuckDB ODBC driver can be made to attach the lake at connect.
+DuckDB then reads DuckLake itself — current state, inlined rows and deletes included, no sync and no rewrite.
+Whether anyone runs this in production is doubtful; the question here is whether it works technically.
+
+**Measured in WSL (Ubuntu 24.04), DuckDB ODBC driver 2.0.0.0 + our v2.0.0 linux loadable, metadata on box:**
+
+- **Our extension loads inside the ODBC driver**: `LOAD '<path>/fabricator.duckdb_extension'` with
+  `allow_unsigned_extensions=true`, CoreCLR starts in the driver's host process, `INSTALL ducklake` and
+  `ATTACH 'ducklake:fabricator:<connstr>'` work. The loadable needs the `v2.0.0` footer (configure with
+  `-DOVERRIDE_GIT_DESCRIBE=v2.0.0`) and the managed payload in a `fabricator/` folder beside it.
+- **The attach comes from `session_init_sql_file`**, a driver option naming a SQL file: the part before
+  `/* DUCKDB_CONNECTION_INIT_BELOW_MARKER */` runs once per database instance, the part after on every
+  connection; `session_init_sql_file_sha256` pins its content. ⚠ **Accepted only from a DSN (odbc.ini or the
+  registry), refused in a connection string** ("can only be specified in DSN configuration"). A user DSN
+  (`~/.odbc.ini`) needs no admin; PolyBase runs as a service account, so on Windows that means a system DSN.
+- **⚠⚠ On Linux the released driver cannot run that file — a driver bug.** The init runs through the driver's
+  own `SQLAllocHandle`, which binds to the driver MANAGER's `SQLAllocHandle` in `libodbc.so` (measured with
+  `LD_DEBUG=bindings`): *"Connection init error: cannot allocate statement handle"*. The driver's CMakeLists
+  means to prevent exactly that with `-Bsymbolic -Bsymbolic-functions`, but passes them WITHOUT `-Wl,`, so gcc
+  reads `-Bsymbolic` as its own `-B<dir>` search-path option and the linker never sees it. Rebuilt with
+  `-Wl,-Bsymbolic -Wl,-Bsymbolic-functions` (two lines in `duckdb-odbc` v2.0.0.0's CMakeLists.txt) it works.
+  Worth an upstream issue. ⚠ `readelf -d` shows no `SYMBOLIC` flag even after the fix (`-Bsymbolic-functions`
+  comes last and binds at link time without setting it); the binding trace is the right check.
+- **End to end over ODBC (pyodbc, `DSN=…`)**: CTAS 1000 rows, DELETE 10, an inlined INSERT, an UPDATE, then a
+  second connection on a fresh in-memory instance: 991 rows, sum 504455, the updated value, both times.
+  Connect + init 1.8 s the first time (CoreCLR boot), ~0 s after.
+
+**PolyBase end to end — WORKS in the docker rig (2026-10-27).** SQL Server 2025 CU10 (17.0.5035.5) on Linux
+→ PolyBase → External Execution Service → DuckDB ODBC driver → our extension (a SECOND CoreCLR, inside EES's own
+.NET 8 process) → DuckLake with its metadata in that same SQL Server and its data on MinIO. Measured on a
+100,000-row table with a delete, an inlined insert and an update: `count`/`sum(id)`/the updated value exact
+(99991 / 5000449955 / `upd`), a `TOP 3 … WHERE … ORDER BY` exact, a full 99991-row scan with
+`OPTION (DISABLE EXTERNALPUSHDOWN)` exact (sum of a DECIMAL column 7499924933.5, min/max date), and a row
+committed from another process afterwards visible at once, without restarting anything. PolyBase pushes
+aggregates down (`SELECT "Expr1003" …`) and projects only the needed columns otherwise. A query takes 2–6 s.
+
+The rig: `docker compose --profile polybase up -d sqlpoly` (port 1434), image `docker/polybase/Dockerfile`, the
+ODBC side staged by `docker/polybase/stage.sh` (run in WSL). What it took:
+
+- **EES has to be started by hand.** `mssql-server-polybase` installs the External Execution Service — the .NET 8
+  app `/opt/mssql/lib/ExternalExecutionService.dll`, port 25100, which is what serves ODBC sources on Linux —
+  only when systemd exists, so a container never gets it. The Dockerfile runs
+  `/opt/mssql/bin/installexecutionservice.sh --non-interactive` (downloads .NET 8.0.418 into
+  `/opt/mssql-ees-dotnet`, creates `mssql_ees`), and `docker/polybase/start.sh` does what the systemd unit
+  does (certificates, then the service as `mssql_ees`) before starting SQL Server. Then
+  `sp_configure 'polybase enabled', 1`. ⚠ Do not replace `/etc/odbcinst.ini` with a mount: it holds the
+  Microsoft ODBC Driver 18 that sqlcmd needs — the driver entry is appended instead.
+- **⚠ PolyBase always passes the FIRST part of `LOCATION` as `Database=`** (`'t'` → `database=t`,
+  `'main.t'` → `database=main`), and the DuckDB driver opens that as a database FILE relative to the working
+  directory (EES runs in `/` ⇒ *Cannot open file "/lake"*, reported to SQL Server as IM003). So EES starts in
+  a writable directory, the external table says `LOCATION = 'lake.main.t'`, and the init file moves off the
+  empty file database it got, detaches it and attaches the lake under that name
+  (`ATTACH ':memory:' AS polybase_home; USE polybase_home; DETACH DATABASE IF EXISTS lake; ATTACH 'ducklake:…' AS lake`).
+- **⚠⚠ Two more driver bugs, both in block fetches — every PolyBase row query crashed EES (SIGSEGV).**
+  PolyBase fetches with row-wise binding (`SQL_ATTR_ROW_BIND_TYPE` = the row size) and 126 rows per call.
+  (1) A column may be bound WITHOUT a length/indicator buffer (PolyBase does that for a NOT NULL `BIGINT`), and
+  the driver added the row offset to the null pointer — a write to address 0x103 at the second row.
+  (2) Buffers and the row-status array were indexed by the row's position in DuckDB's 2048-row CHUNK, not in the
+  rowset, which runs past every buffer from the second rowset of a chunk on. Single-row fetches (isql, pyodbc)
+  never reach either. **And a wrong answer with no error:** `SQL_C_NUMERIC` dropped an all-zero fraction
+  (`30.0` → digits `30`) but kept `scale = 1`, so every whole DECIMAL value arrived divided by ten (the sum of
+  the test column came back 4124992459.6). All three fixes plus the `-Wl,-Bsymbolic` one are in
+  `docker/polybase/duckdb-odbc.patch` (against duckdb-odbc v2.0.0.0); worth upstream issues.
+- Found on the way, ours, fixed: since table names missing from the list are looked up by name (§11.8), every
+  existence probe DuckLake makes for its helper tables crossed the bridge, failed with "not found" and was
+  LOGGED AS A WARNING — a screenful per CREATE. An established absence is an answer, so it is logged at
+  Debug now.
+
+**Where the time goes, MEASURED 2026-10-28 (ODBC trace with timestamps + two timing markers in the init file).**
+A warm query takes ~1.7 s, and the query itself (execute + fetch) is 80–200 ms of it. PolyBase opens and
+closes the DuckDB connection ~11 times per query, ~1.2 s together; ~4–5 of those build a NEW DuckDB instance
+(unixODBC frees the driver environment with the last connection, and the instance lives on it) and re-run the
+whole init file: ~60 ms instance + LOAD fabricator, ~40 ms httpfs/ducklake/secret/ATTACH, ~140 ms for the
+first `USE lake` (DuckLake reads its catalog from SQL Server). A connect onto a live instance costs ~45 ms.
+PolyBase's catalog calls (`SQLTables`/`SQLColumns`) ~70 ms, PolyBase-internal ~300 ms.
+⚠ **unixODBC pooling does NOT help, structurally**: EES allocates a FRESH ODBC environment per connection, and
+unixODBC's pool lives on the environment. `Pooling=Yes` + `CPTimeout` measured: still 11 connects per query.
+
+**⚠⚠ OURS, FOUND HERE AND FIXED: a use-after-free on the host database (2026-10-28).** EES died with SIGSEGV in
+`HostLogService` → `LogManager::GlobalLogger`. `g_host_db` (src/fabricator_host_query.cpp) was a raw pointer to
+the instance of the last LOAD, documented as *"valid for the extension's lifetime"* — false in any process that
+closes DuckDB instances while the extension library and the CLR live on, which the ODBC driver does on every
+disconnect. A managed log call (or host_query) between an instance's teardown and the next LOAD read freed
+memory. It is a `weak_ptr` now (`shared_from_this`), guarded by a mutex because a LOAD can replace it while
+another thread logs. Intermittent, so UNGATED: 40 control runs on the old build did not reproduce it; the core
+dump's stack is the evidence. Hermetic 87/87 — 11030, identical. Core dumps of a crashing EES land on Windows
+under `%LOCALAPPDATA%\Temp\wsl-crashes` (WSL's kernel `core_pattern`); open them with gdb INSIDE the container,
+where the matching libraries are. The two dumps from 2026-10-27 are the driver's fetch bug (checked).
+
+**SQL Server connections: no leak from us (2026-10-28).** Our SqlClient sessions on the metadata database stayed
+at exactly 4 over 60 queries (~300 instance teardowns); SqlClient's pool is per process and connection string,
+so new instances share it.
+
+**⚠⚠ NOT OURS, NOT FIXED: EES leaks DuckDB instances and dies of it.** EES's memory grows ~40 MB per query and
+it ended with *"Out of memory. Aborted"* at ~4 GB after ~200 queries. Controls in the rig: with a plain
+in-memory DuckDB source (no fabricator at all) it grows the same; with Microsoft's ODBC Driver 18 against SQL
+Server it stays flat (25 threads, +1 MB/query). gdb on the live EES (the compose service has `SYS_PTRACE` for
+this): the extra threads are DuckDB workers (`TaskSchedulerPool::Wait`, 80 per scheduler) — the schedulers
+count up over time, so whole instances stay alive, though not every connect leaks one. ⚠ The threads are named
+`.NET TP Worker` only because a thread inherits its creator's name. A single-threaded replay of EES's call
+pattern with ctypes (fresh environment per connect, wide-char connect, SQLTables/SQLColumns, environment never
+freed) does NOT leak — every instance is torn down — so the exact sequence that keeps an instance alive in EES
+is still unknown. Practical consequence: the rig needs a restart every ~100–200 queries.
+
+Open: the Windows server with PolyBase (system DSN in the registry, the Windows loadable + payload — the
+official driver should not have the `-Bsymbolic` bug, the fetch and numeric bugs are platform-independent),
+type mapping beyond BIGINT/VARCHAR/DECIMAL/DATE, and throughput on a large scan.

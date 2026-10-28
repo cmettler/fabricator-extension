@@ -87,3 +87,6 @@ docker/certs/CAs/
 # /!\ ANCHORED: an unanchored `artifacts` would also ignore any subdirectory of that name, and this is
 # specifically the repo-root staging folder a plugin points a local feed at.
 /artifacts/
+
+# staged ODBC side of the PolyBase/DuckLake experiment (docker/polybase/stage.sh)
+docker/polybase/stage/

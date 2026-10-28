@@ -9,6 +9,7 @@ chown mssql_ees:mssql /var/opt/mssql/log/polybase-ees-log
 chmod 775 /var/opt/mssql/log/polybase-ees-log /var/opt/mssql/duckdb
 chown mssql:mssql /var/opt/mssql/duckdb
 /opt/mssql/bin/generateeescerts.sh || echo "EES certificates not generated; EES falls back to plain gRPC"
+cd /var/opt/mssql/duckdb
 runuser -u mssql_ees -- env DOTNET_ROOT=/opt/mssql-ees-dotnet TMPDIR=/var/tmp/dotnettmp \
   /opt/mssql-ees-dotnet/dotnet /opt/mssql/lib/ExternalExecutionService.dll \
   >> /var/opt/mssql/log/polybase-ees-log/ees-stdout.log 2>&1 &
