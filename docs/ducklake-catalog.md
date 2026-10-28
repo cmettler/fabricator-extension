@@ -637,7 +637,8 @@ whole init file: ~60 ms instance + LOAD fabricator, ~40 ms httpfs/ducklake/secre
 first `USE lake` (DuckLake reads its catalog from SQL Server). A connect onto a live instance costs ~45 ms.
 PolyBase's catalog calls (`SQLTables`/`SQLColumns`) ~70 ms, PolyBase-internal ~300 ms.
 ⚠ **unixODBC pooling does NOT help, structurally**: EES allocates a FRESH ODBC environment per connection, and
-unixODBC's pool lives on the environment. `Pooling=Yes` + `CPTimeout` measured: still 11 connects per query.
+unixODBC's pool lives on the environment. `Pooling=Yes` + `CPTimeout` measured: still 11 connects per query —
+  and a `CPTimeout` makes it worse, see the retraction below.
 
 **⚠⚠ OURS, FOUND HERE AND FIXED: a use-after-free on the host database (2026-10-28).** EES died with SIGSEGV in
 `HostLogService` → `LogManager::GlobalLogger`. `g_host_db` (src/fabricator_host_query.cpp) was a raw pointer to
@@ -654,16 +655,30 @@ where the matching libraries are. The two dumps from 2026-10-27 are the driver's
 at exactly 4 over 60 queries (~300 instance teardowns); SqlClient's pool is per process and connection string,
 so new instances share it.
 
-**⚠⚠ NOT OURS, NOT FIXED: EES leaks DuckDB instances and dies of it.** EES's memory grows ~40 MB per query and
-it ended with *"Out of memory. Aborted"* at ~4 GB after ~200 queries. Controls in the rig: with a plain
-in-memory DuckDB source (no fabricator at all) it grows the same; with Microsoft's ODBC Driver 18 against SQL
-Server it stays flat (25 threads, +1 MB/query). gdb on the live EES (the compose service has `SYS_PTRACE` for
-this): the extra threads are DuckDB workers (`TaskSchedulerPool::Wait`, 80 per scheduler) — the schedulers
-count up over time, so whole instances stay alive, though not every connect leaks one. ⚠ The threads are named
-`.NET TP Worker` only because a thread inherits its creator's name. A single-threaded replay of EES's call
-pattern with ctypes (fresh environment per connect, wide-char connect, SQLTables/SQLColumns, environment never
-freed) does NOT leak — every instance is torn down — so the exact sequence that keeps an instance alive in EES
-is still unknown. Practical consequence: the rig needs a restart every ~100–200 queries.
+**⚠⚠ RETRACTED: "EES leaks DuckDB instances" — it was MY OWN pooling configuration (2026-10-28).** I had
+recorded that EES grows ~40 MB per query and dies at ~4 GB, with or without fabricator, and not with Microsoft's
+ODBC Driver 18. Every measurement reproduces, the conclusion did not: they were all taken AFTER I had added
+`Pooling=Yes` and `CPTimeout=300` to the container's `/etc/odbcinst.ini` for the pooling attempt above, and a
+`docker restart` keeps that file. Recreating the container (for `SYS_PTRACE`) silently removed it, and the
+"leak" was gone: 150 lake queries without a restart, RSS +140 MB, threads between 137 and 351.
+- **The mechanism, measured with gdb breakpoints on `DatabaseInstance`'s constructor and destructor:** EES
+  itself turns pooling on (`SQLSetEnvAttr(NULL, SQL_ATTR_CONNECTION_POOLING)` before every connect, then
+  `SQL_ATTR_CP_MATCH` on the env). So `SQLDisconnect` does not reach the driver; unixODBC parks the connection,
+  and the driver keeps its instance on the driver env (`dbc->env->db`), i.e. the parked connection keeps the
+  WHOLE DuckDB instance (one worker per core, the init file's in-memory data). Expired entries are reaped only
+  inside a LATER connect — the destructor's stack is `SQLDriverConnectW → libodbc → duckdb::FreeHandle`.
+- **Control that settles it:** `CPTimeout=30` reproduces the old curve EXACTLY (1306 / 2506 / 3706 threads
+  after 5 / 10 / 15 queries, the old numbers to the thread); 45 s idle changes nothing (the reaper needs a
+  connect); one more query then drops it to 345 threads and 674 → 204 MB. Without a `CPTimeout` the parked
+  instance is released at the next connect. MS ODBC 18 stayed flat because a parked TDS connection is cheap.
+- ⇒ **Do not set `CPTimeout` for the DuckDB driver.** With a fresh env per connect EES never reuses a pooled
+  connection anyway, so pooling can only retain instances, never save one.
+- Side finding, harmless: EES frees only ~16 of ~90 environment handles it allocates (ODBC trace). It does
+  not keep an instance alive — unixODBC frees the driver env with its last connection (measured with a
+  ctypes replay that never frees the env) — so it costs a few bytes per connect, nothing more.
+- ⚠ The lesson is the one CLAUDE.md keeps recording: a runtime change to a container survives
+  `docker restart` and vanishes on recreate, so it silently splits measurements into two worlds. Record every
+  such change next to the numbers it produced.
 
 Open: the Windows server with PolyBase (system DSN in the registry, the Windows loadable + payload — the
 official driver should not have the `-Bsymbolic` bug, the fetch and numeric bugs are platform-independent),
