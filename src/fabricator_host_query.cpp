@@ -980,8 +980,20 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 }
 
 // The host DatabaseInstance the C#-callable `host_query` opens a fresh connection on (captured at load —
-// the host service has no per-call context, unlike the fs callbacks). Valid for the extension's lifetime.
-static DatabaseInstance *g_host_db = nullptr;
+// the host service has no per-call context, unlike the fs callbacks).
+// ⚠ Held WEAKLY. The extension library and the CLR live as long as the PROCESS, a DuckDB instance does not:
+// the DuckDB ODBC driver frees its instance on the last disconnect and the next connect LOADs us into a new
+// one. As a raw pointer this outlived its instance, and the next managed log call read freed memory
+// (measured: PolyBase's EES died with SIGSEGV in HostLogService -> LogManager::GlobalLogger). Between an
+// instance's teardown and the next LOAD the services now answer "not available" instead. The mutex guards
+// the weak_ptr itself, which a LOAD may replace while another thread is logging.
+static mutex g_host_db_lock;
+static weak_ptr<DatabaseInstance> g_host_db;
+
+static shared_ptr<DatabaseInstance> HostDb() {
+	lock_guard<mutex> guard(g_host_db_lock);
+	return g_host_db.lock();
+}
 
 // Duplicate a message into a malloc'd C string for the managed side (freed via the host-services free_str).
 static char *DupErr(const string &msg) {
@@ -1001,7 +1013,8 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
                          FabricatorHandle client_context, FabricatorHandle connection, int64_t batch_rows,
                          ArrowArrayStream *out, void **out_interrupt, char **err) {
 	try {
-		if (!g_host_db) {
+		auto db = HostDb();
+		if (!db) {
 			throw IOException("fabricator host_query: host database not available");
 		}
 		vector<HostQueryInput> in;
@@ -1028,7 +1041,7 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 			pinned = *reinterpret_cast<shared_ptr<HostConnection> *>(connection);
 		}
 		shared_ptr<ClientContext> ctx;
-		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), params, in, *out,
+		MakeHostQueryStream(*db, sql ? string(sql) : string(), params, in, *out,
 		                    out_interrupt ? &ctx : nullptr, session_ptr, std::move(pinned),
 		                    batch_rows > 0 ? (idx_t)batch_rows : 0);
 		if (out_interrupt) {
@@ -1054,14 +1067,15 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 // THROUGH the pin sticks for the connection's life, which is one of the reasons to pin at all.
 int32_t HostConnectionOpenService(FabricatorHandle client_context, FabricatorHandle *out_connection, char **err) {
 	try {
-		if (!g_host_db) {
+		auto db = HostDb();
+		if (!db) {
 			throw IOException("fabricator host_connection_open: host database not available");
 		}
 		if (!out_connection) {
 			throw IOException("fabricator host_connection_open: out_connection is null");
 		}
 		auto pin = make_shared_ptr<HostConnection>();
-		pin->conn = shared_ptr<Connection>(new Connection(*g_host_db));
+		pin->conn = shared_ptr<Connection>(new Connection(*db));
 		if (client_context) {
 			auto session = CaptureSession(*reinterpret_cast<ClientContext *>(client_context));
 			ApplyHostQuerySession(*pin->conn, &session);
@@ -1141,7 +1155,8 @@ static unique_ptr<TableRef> NamedSourceReplacement(ClientContext &, ReplacementS
 // session with the bridge's Debug chatter. With the gate, semantics are DuckDB-native: silence until
 // `CALL enable_logging(...)`; the .test duckdb_logs pins on Debug messages enable with `level := 'debug'`.
 static void HostLogService(int32_t level, const char *log_type, const char *message) {
-	if (!g_host_db) {
+	auto db = HostDb();
+	if (!db) {
 		return;
 	}
 	LogLevel lvl;
@@ -1166,7 +1181,7 @@ static void HostLogService(int32_t level, const char *log_type, const char *mess
 		break;
 	}
 	try {
-		auto &logger = Logger::Get(*g_host_db);
+		auto &logger = Logger::Get(*db);
 		const char *type = log_type ? log_type : "Fabricator";
 		if (!logger.ShouldLog(type, lvl)) {
 			return;
@@ -1177,7 +1192,10 @@ static void HostLogService(int32_t level, const char *log_type, const char *mess
 }
 
 void RegisterHostQuery(ExtensionLoader &loader) {
-	g_host_db = &loader.GetDatabaseInstance();
+	{
+		lock_guard<mutex> guard(g_host_db_lock);
+		g_host_db = loader.GetDatabaseInstance().shared_from_this();
+	}
 	// Make host_query (+ its v66 interrupt pair) callable from C# (patched onto the host-services block).
 	fabricator::SetHostQueryService(HostQueryService, HostQueryInterruptService, HostQueryInterruptFreeService);
 	// The v84 pinned-connection pair: several host_query calls on ONE connection (TEMP tables, settings).
