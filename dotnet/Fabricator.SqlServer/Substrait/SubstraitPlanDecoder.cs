@@ -307,6 +307,36 @@ sealed class SubstraitPlanDecoder
     /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A WriteRel: the target named table, the columns written
     /// (<c>table_schema</c>, matched by the input's columns in order), the operation and the output mode.
     /// </summary>
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A WriteRel's advanced extension: the one enhancement understood is
+    /// <c>fabricator.merge</c> (the host's MERGE, see TSqlEmitter.EmitMerge); any other changes the rel's meaning in
+    /// a way this consumer does not know, so the plan is refused.
+    /// </summary>
+    static void ReadWriteEnhancement(ProtoReader r, WriteRel rel)
+    {
+        while (r.Next(out int field, out int wire))
+        {
+            if (field != F.AdvancedExtension_Enhancement)
+            {
+                r.Skip(wire);
+                continue;
+            }
+            var any = r.ReadMessage(wire);
+            string? typeUrl = null;
+            string value = "";
+            while (any.Next(out int af, out int aw))
+            {
+                if (af == F.Any_TypeUrl) typeUrl = any.ReadString(aw);
+                else if (af == F.Any_Value) value = System.Text.Encoding.UTF8.GetString(any.ReadBytes(aw));
+                else any.Skip(aw);
+            }
+            if (typeUrl != F.Enhancement_FabricatorMerge)
+                throw SubstraitTranslationException.Unsupported($"WriteRel carries the enhancement '{typeUrl}', which changes its semantics.");
+            rel.Enhancement = typeUrl;
+            rel.EnhancementValue = value;
+        }
+    }
+
     WriteRel ReadWriteRel(ProtoReader r)
     {
         var rel = new WriteRel();
@@ -336,7 +366,7 @@ sealed class SubstraitPlanDecoder
                 case F.WriteRel_Output: rel.Output = r.ReadInt32(wire); break;
                 case F.WriteRel_Common: rel.Emit = ReadRelCommon(r.ReadMessage(wire), "WriteRel"); break;
                 case F.WriteRel_CreateMode: rel.CreateMode = r.ReadInt32(wire); break;
-                case F.WriteRel_AdvancedExtension: CheckAdvancedExtension(r.ReadMessage(wire), "WriteRel"); break;
+                case F.WriteRel_AdvancedExtension: ReadWriteEnhancement(r.ReadMessage(wire), rel); break;
                 default: throw SubstraitTranslationException.UnexpectedField("WriteRel", field);
             }
         }

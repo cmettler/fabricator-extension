@@ -28,11 +28,19 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "catalog/fabricator_table_entry.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -251,7 +259,8 @@ unique_ptr<TableRef> RemoteDmlRef(FabricatorCatalog &catalog, const string &sql)
 //! (INSERT: the named columns; UPDATE: the assigned ones; DELETE: none, or — `modified_records` — the deleted columns
 //! it outputs). Empty, with `reason`, on failure.
 string WrapInWrite(const string &plan_bytes, substrait::WriteRel::WriteOp op, const string &schema,
-                   const string &table, const vector<string> &columns, string &reason, bool modified_records = false) {
+                   const string &table, const vector<string> &columns, string &reason, bool modified_records = false,
+                   const string &enhancement = "", const string &enhancement_value = "") {
 	substrait::Plan plan;
 	if (!plan.ParseFromString(plan_bytes)) {
 		reason = "the pushed plan does not parse";
@@ -275,6 +284,13 @@ string WrapInWrite(const string &plan_bytes, substrait::WriteRel::WriteOp op, co
 	                      : substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_NO_OUTPUT);
 	write->mutable_named_table()->add_names(schema);
 	write->mutable_named_table()->add_names(table);
+	if (!enhancement.empty()) {
+		// Substrait's way to say "this rel means something the spec does not define": the consumer must understand
+		// the enhancement or refuse the plan
+		auto any = write->mutable_advanced_extension()->mutable_enhancement();
+		any->set_type_url(enhancement);
+		any->set_value(enhancement_value);
+	}
 	auto table_schema = write->mutable_table_schema();
 	for (auto &column : columns) {
 		table_schema->add_names(column);
@@ -781,6 +797,314 @@ unique_ptr<TableRef> SubstraitMoved(ClientContext &context, FabricatorCatalog &c
 	return RemoteDmlRef(catalog, sql);
 }
 
+//! MERGE INTO as ONE provider statement. Substrait has no MERGE, and T-SQL's MERGE takes at most one UPDATE and one
+//! DELETE per match class while DuckDB takes any number of clauses, first true one wins. So DuckDB's whole decision
+//! is computed in ONE query over target and source, which is translated like any pushed query:
+//!   SELECT <target key>, tp, op, u_<col>…, i_<col>…
+//!     FROM (SELECT *, 1 AS __fab_t FROM target) t <FULL | RIGHT | INNER> JOIN (SELECT *, 1 AS __fab_s FROM source) s
+//!       ON <condition>
+//!     WHERE op IS NOT NULL
+//! where op is 1 (UPDATE) / 2 (DELETE) / 3 (INSERT) from the first clause whose class and condition hold (NULL for DO NOTHING or none),
+//! u_<col> the new value of a column some UPDATE assigns (CAST to the column type, as DuckDB assigns; the old value
+//! when this row's clause does not assign it) and i_<col> the value an INSERT writes. The provider wraps it in a
+//! fixed-shape MERGE that matches by the target's KEY: `WHEN MATCHED AND op = 1 THEN UPDATE …`, `… = 2 THEN DELETE`,
+//! `WHEN NOT MATCHED AND op = 3 THEN INSERT …` — DuckDB's NOT MATCHED BY SOURCE rows are matched rows there (they
+//! carry their key). The WriteRel says so with the enhancement `fabricator.merge`; its table_schema names the columns'
+//! roles (`k:<key column>`, `tp`, `op`, `u:<column>`, `i:<column>`). Null, with `reason`, when anything declines.
+unique_ptr<TableRef> SubstraitMerge(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
+                                    const Identifier &default_schema, string &reason) {
+	auto copy = node.Copy();
+	RestoreCatalog(*copy, catalog.GetName(), default_schema);
+	auto &merge = copy->Cast<MergeQueryNode>();
+	if (!merge.returning_list.empty() || !merge.cte_map.map.empty()) {
+		reason = "MERGE … RETURNING / WITH keeps the rowid path";
+		return nullptr;
+	}
+	if (!merge.target || merge.target->type != TableReferenceType::BASE_TABLE || !merge.source) {
+		reason = "the MERGE target is not a table";
+		return nullptr;
+	}
+	auto &target_ref = merge.target->Cast<BaseTableRef>();
+	auto &target_name = target_ref.GetQualifiedName();
+	auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, target_name.Schema(), target_name.Name(),
+	                              OnEntryNotFound::RETURN_NULL);
+	if (!entry) {
+		reason = "the MERGE target is not found"; // the binder reports it
+		return nullptr;
+	}
+	auto &table = entry->Cast<FabricatorTableEntry>();
+	if (!table.HasRowId() || table.HasVirtualRowId()) {
+		reason = "the MERGE target has no key to match by";
+		return nullptr;
+	}
+	string t_alias = target_ref.alias.empty() ? target_name.Name().GetIdentifierName() : target_ref.alias.GetIdentifierName();
+	string s_alias;
+	if (!merge.source->alias.empty()) {
+		s_alias = merge.source->alias.GetIdentifierName();
+	} else if (merge.source->type == TableReferenceType::BASE_TABLE) {
+		s_alias = merge.source->Cast<BaseTableRef>().GetQualifiedName().Name().GetIdentifierName();
+	} else {
+		reason = "the MERGE source has no name";
+		return nullptr;
+	}
+	if (StringUtil::CIEquals(t_alias, s_alias)) {
+		reason = "target and source share a name";
+		return nullptr;
+	}
+	auto column = [](const string &alias, const string &name) {
+		return make_uniq<ColumnRefExpression>(Identifier(name), Identifier(alias));
+	};
+	auto is_null = [](unique_ptr<ParsedExpression> e, bool null) -> unique_ptr<ParsedExpression> {
+		return make_uniq<OperatorExpression>(null ? ExpressionType::OPERATOR_IS_NULL : ExpressionType::OPERATOR_IS_NOT_NULL,
+		                                     std::move(e));
+	};
+	auto both = [](unique_ptr<ParsedExpression> a, unique_ptr<ParsedExpression> b) -> unique_ptr<ParsedExpression> {
+		if (!a) {
+			return b;
+		}
+		return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(a), std::move(b));
+	};
+	auto class_guard = [&](MergeActionCondition condition) -> unique_ptr<ParsedExpression> {
+		switch (condition) {
+		case MergeActionCondition::WHEN_MATCHED:
+			return both(is_null(column(t_alias, "__fab_t"), false), is_null(column(s_alias, "__fab_s"), false));
+		case MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET:
+			return is_null(column(t_alias, "__fab_t"), true);
+		default:
+			return is_null(column(s_alias, "__fab_s"), true);
+		}
+	};
+	// the clauses in DuckDB's order of evaluation; the match classes are disjoint, so their order does not matter
+	struct Clause {
+		MergeActionCondition condition;
+		const MergeIntoAction *action;
+	};
+	vector<Clause> clauses;
+	bool by_target = false, by_source = false, matched_delete = false;
+	for (auto &kv : merge.actions) {
+		for (auto &action : kv.second) {
+			if (action->action_type == MergeActionType::MERGE_ERROR) {
+				reason = "a THEN ERROR action";
+				return nullptr;
+			}
+			clauses.push_back({kv.first, action.get()});
+			if (action->action_type == MergeActionType::MERGE_DO_NOTHING) {
+				continue;
+			}
+			by_target |= kv.first == MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET;
+			by_source |= kv.first == MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE;
+			matched_delete |= kv.first == MergeActionCondition::WHEN_MATCHED &&
+			                  action->action_type == MergeActionType::MERGE_DELETE;
+		}
+	}
+	auto guard = [&](const Clause &clause) {
+		auto g = class_guard(clause.condition);
+		if (clause.action->condition) {
+			g = both(std::move(g), clause.action->condition->Copy());
+		}
+		return g;
+	};
+	// op
+	auto op = make_uniq<CaseExpression>();
+	for (auto &clause : clauses) {
+		CaseCheck check;
+		check.when_expr = guard(clause);
+		switch (clause.action->action_type) {
+		case MergeActionType::MERGE_UPDATE:
+			check.then_expr = ConstantExpression::Integer(1);
+			break;
+		case MergeActionType::MERGE_DELETE:
+			check.then_expr = ConstantExpression::Integer(2);
+			break;
+		case MergeActionType::MERGE_INSERT:
+			check.then_expr = ConstantExpression::Integer(3);
+			break;
+		default:
+			check.then_expr = ConstantExpression::Null(); // DO NOTHING ends the evaluation too
+			break;
+		}
+		op->CaseChecksMutable().push_back(std::move(check));
+	}
+	op->ElseMutable() = ConstantExpression::Null();
+	// the columns some UPDATE assigns, and the columns the INSERT writes
+	vector<const ColumnDefinition *> updated;
+	vector<const ColumnDefinition *> inserted;
+	bool have_insert = false;
+	for (auto &clause : clauses) {
+		auto &action = *clause.action;
+		if (action.action_type == MergeActionType::MERGE_UPDATE) {
+			if (!action.update_info || action.update_info->condition || action.update_info->columns.empty()) {
+				reason = "an UPDATE without SET (UPDATE SET *)";
+				return nullptr;
+			}
+			for (idx_t i = 0; i < action.update_info->columns.size(); i++) {
+				auto &name = action.update_info->columns[i];
+				if (!table.ColumnExists(name)) {
+					reason = "SET names a column the table does not have"; // the binder reports it
+					return nullptr;
+				}
+				if (action.update_info->expressions[i]->GetExpressionClass() == ExpressionClass::DEFAULT) {
+					reason = "SET … = DEFAULT";
+					return nullptr;
+				}
+				auto &col = table.GetColumn(name);
+				if (std::find(updated.begin(), updated.end(), &col) == updated.end()) {
+					updated.push_back(&col);
+				}
+			}
+		} else if (action.action_type == MergeActionType::MERGE_INSERT) {
+			if (action.default_values || action.column_order != InsertColumnOrder::INSERT_BY_POSITION ||
+			    !action.exclude_columns.empty() || action.expressions.empty()) {
+				reason = "an INSERT that is not INSERT (columns) VALUES (…)";
+				return nullptr;
+			}
+			vector<const ColumnDefinition *> columns;
+			if (action.insert_columns.empty()) {
+				for (auto &col : table.GetColumns().Logical()) {
+					if (col.Generated()) {
+						reason = "the MERGE target has a generated column";
+						return nullptr;
+					}
+					columns.push_back(&col);
+				}
+			} else {
+				for (auto &name : action.insert_columns) {
+					if (!table.ColumnExists(name)) {
+						reason = "INSERT names a column the table does not have";
+						return nullptr;
+					}
+					columns.push_back(&table.GetColumn(name));
+				}
+			}
+			if (columns.size() != action.expressions.size()) {
+				reason = "INSERT writes a different number of columns than values"; // the binder reports it
+				return nullptr;
+			}
+			for (auto &expr : action.expressions) {
+				if (expr->GetExpressionClass() == ExpressionClass::DEFAULT) {
+					reason = "INSERT … DEFAULT";
+					return nullptr;
+				}
+			}
+			if (have_insert && columns != inserted) {
+				// one T-SQL INSERT clause: a column one insert names and another omits would get NULL, not its default
+				reason = "two INSERT actions write different columns";
+				return nullptr;
+			}
+			inserted = columns;
+			have_insert = true;
+		}
+	}
+	auto select = make_uniq<SelectNode>();
+	vector<string> roles;
+	auto names = table.GetColumns().GetColumnNames();
+	for (auto idx : table.RowIdColumnIndices()) {
+		select->select_list.push_back(column(t_alias, names[idx]));
+		roles.push_back("k:" + names[idx]);
+	}
+	select->select_list.push_back(column(t_alias, "__fab_t"));
+	roles.push_back("tp");
+	select->select_list.push_back(op->Copy());
+	roles.push_back("op");
+	for (auto col : updated) {
+		auto value = make_uniq<CaseExpression>();
+		for (auto &clause : clauses) {
+			CaseCheck check;
+			check.when_expr = guard(clause);
+			check.then_expr = column(t_alias, col->Name().GetIdentifierName());
+			if (clause.action->action_type == MergeActionType::MERGE_UPDATE) {
+				auto &info = *clause.action->update_info;
+				for (idx_t i = 0; i < info.columns.size(); i++) {
+					if (&table.GetColumn(info.columns[i]) == col) {
+						check.then_expr = make_uniq<CastExpression>(col->Type(), info.expressions[i]->Copy());
+					}
+				}
+			}
+			value->CaseChecksMutable().push_back(std::move(check));
+		}
+		value->ElseMutable() = column(t_alias, col->Name().GetIdentifierName());
+		select->select_list.push_back(std::move(value));
+		roles.push_back("u:" + col->Name().GetIdentifierName());
+	}
+	for (idx_t j = 0; j < inserted.size(); j++) {
+		// read only where op = 3, so the last INSERT's value is the ELSE: no untyped NULL, which would reach the
+		// server as a cast the translation refuses
+		vector<unique_ptr<ParsedExpression>> guards, values;
+		for (auto &clause : clauses) {
+			if (clause.action->action_type == MergeActionType::MERGE_INSERT) {
+				guards.push_back(guard(clause));
+				values.push_back(make_uniq<CastExpression>(inserted[j]->Type(), clause.action->expressions[j]->Copy()));
+			}
+		}
+		unique_ptr<ParsedExpression> value = std::move(values.back());
+		if (values.size() > 1) {
+			auto chosen = make_uniq<CaseExpression>();
+			for (idx_t k = 0; k + 1 < values.size(); k++) {
+				CaseCheck check;
+				check.when_expr = std::move(guards[k]);
+				check.then_expr = std::move(values[k]);
+				chosen->CaseChecksMutable().push_back(std::move(check));
+			}
+			chosen->ElseMutable() = std::move(value);
+			value = std::move(chosen);
+		}
+		select->select_list.push_back(std::move(value));
+		roles.push_back("i:" + inserted[j]->Name().GetIdentifierName());
+	}
+	// FROM: target and source, each with a marker column that says the row exists on that side
+	auto marked = [](unique_ptr<TableRef> ref, const string &marker, const string &alias) {
+		auto inner = make_uniq<SelectNode>();
+		inner->select_list.push_back(make_uniq<StarExpression>());
+		auto one = ConstantExpression::Integer(1);
+		one->SetAlias(Identifier(marker));
+		inner->select_list.push_back(std::move(one));
+		inner->from_table = std::move(ref);
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(inner);
+		return make_uniq<SubqueryRef>(std::move(statement), Identifier(alias));
+	};
+	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join->type = by_source ? JoinType::OUTER : by_target ? JoinType::RIGHT : JoinType::INNER;
+	join->left = marked(std::move(merge.target), "__fab_t", t_alias);
+	join->right = marked(std::move(merge.source), "__fab_s", s_alias);
+	if (merge.join_condition) {
+		join->condition = std::move(merge.join_condition);
+	} else if (!merge.using_columns.empty()) {
+		unique_ptr<ParsedExpression> condition;
+		for (auto &name : merge.using_columns) {
+			condition = both(std::move(condition),
+			                 make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                 column(t_alias, name.GetIdentifierName()),
+			                                                 column(s_alias, name.GetIdentifierName())));
+		}
+		join->condition = std::move(condition);
+	} else {
+		reason = "a MERGE without a join condition";
+		return nullptr;
+	}
+	select->from_table = std::move(join);
+	select->where_clause = is_null(std::move(op), false);
+	string plan_bytes;
+	vector<LogicalType> types;
+	vector<Identifier> bound_names;
+	if (!BindToSubstrait(context, catalog, *select, default_schema, /*require_worth=*/false, plan_bytes, types,
+	                     bound_names, reason)) {
+		return nullptr;
+	}
+	auto bytes = WrapInWrite(plan_bytes, substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_UNSPECIFIED,
+	                         target_name.Schema().GetIdentifierName(), target_name.Name().GetIdentifierName(), roles,
+	                         reason, false, "fabricator.merge", matched_delete ? "check_duplicates" : "");
+	if (bytes.empty()) {
+		return nullptr;
+	}
+	auto sql = TranslateWrite(context, catalog, bytes, reason);
+	if (sql.empty()) {
+		return nullptr;
+	}
+	RemoteTrace("remote: " + sql);
+	return RemoteDmlRef(catalog, sql);
+}
+
 //! Follows each output column of `op` down to the column of the pushed query it is, `c<j>` -> j, through the
 //! projections and the ORDER BY the pushdown wraps a query in. False for anything else in between — a filter,
 //! a computed expression — and for a scan that is not fabricator_query. ⚠ Called from physical planning, where
@@ -946,10 +1270,34 @@ bool FabricatorCatalog::Supports(RemoteCapability capability) const {
 	}
 }
 
+bool FabricatorCatalog::SupportsPushdown(const ParsedExpression &expression) {
+	// A call of one of THIS catalog's functions (a SQL Server UDF or aggregate, a catalog-bound macro) keeps the
+	// statement local. It does not translate anyway — and the optimizer strips the catalog from the call before
+	// RemoteExecute sees it (`db.dbo.f(x)` arrives as `dbo.f(x)`), which no decline can restore with certainty: a
+	// bare `f` may as well be a built-in. Measured: `SELECT db.dbo.f(id) FROM db.dbo.t` failed with "Scalar Function
+	// with name f does not exist" under remote_pushdown before this veto.
+	QualifiedName name;
+	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		name = expression.Cast<FunctionExpression>().GetQualifiedName();
+	} else if (expression.GetExpressionClass() == ExpressionClass::WINDOW) {
+		name = expression.Cast<WindowExpression>().GetQualifiedName();
+	} else {
+		return true;
+	}
+	auto ours = GetName().GetIdentifierName();
+	return !(StringUtil::CIEquals(name.Catalog().GetIdentifierName(), ours) ||
+	         (name.Catalog().empty() && StringUtil::CIEquals(name.Schema().GetIdentifierName(), ours)));
+}
+
 bool FabricatorCatalog::SupportsPushdown(const TableRef &ref) {
-	// A plain table or a join of them. A catalog-bound table function (a TVF, a stored procedure) has a path of
-	// its own; an AT clause is the catalog's time travel.
-	if (ref.type == TableReferenceType::JOIN) {
+	// A plain table, a join of them, or a derived table over them (`FROM (SELECT …) AS x`, the usual MERGE
+	// source): whatever it contains is bound and translated with the statement, which declines what does not
+	// translate exactly. A catalog-bound table function (a TVF, a stored procedure) has a path of its own; an AT
+	// clause is the catalog's time travel.
+	// So are the constructs that read nothing — a SELECT without FROM, a VALUES list — when they appear beside this
+	// catalog's tables (alone they are never pushed: no catalog is referenced).
+	if (ref.type == TableReferenceType::JOIN || ref.type == TableReferenceType::SUBQUERY ||
+	    ref.type == TableReferenceType::EMPTY_FROM || ref.type == TableReferenceType::EXPRESSION_LIST) {
 		return true;
 	}
 	return ref.type == TableReferenceType::BASE_TABLE && !ref.Cast<BaseTableRef>().at_clause;
@@ -960,8 +1308,7 @@ bool FabricatorCatalog::SupportsPushdown(const SQLStatement &statement) {
 }
 
 bool FabricatorCatalog::SupportsPushdown(const QueryNode &node) {
-	// SELECT and set operations; RemoteExecute binds them and declines what does not translate. MERGE keeps the
-	// rowid path (Substrait has no MERGE).
+	// SELECT and set operations; RemoteExecute binds them and declines what does not translate.
 	// A data-modifying CTE (DuckDB 2.0): only the rows MOVED within this catalog are one statement (SubstraitMoved);
 	// every other shape runs locally, where DuckDB evaluates the CTE and the rowid path writes.
 	if (DmlCte(node)) {
@@ -983,6 +1330,10 @@ bool FabricatorCatalog::SupportsPushdown(const QueryNode &node) {
 		auto &update = node.Cast<UpdateQueryNode>();
 		return update.returning_list.empty() && !update.from_table;
 	}
+	// MERGE as one statement (SubstraitMerge); RETURNING keeps the rowid path, which returns each action's rows
+	if (node.type == QueryNodeType::MERGE_QUERY_NODE) {
+		return node.Cast<MergeQueryNode>().returning_list.empty();
+	}
 	// INSERT … SELECT reading a table of this catalog: one INSERT … SELECT on the server, no rows travel. Only that
 	// shape — an INSERT … VALUES gains nothing and keeps the host's own insert untouched, and RETURNING / ON
 	// CONFLICT / DEFAULT VALUES are not translated.
@@ -998,9 +1349,10 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 	Identifier default_schema(GetDefaultSchema().value_or(Identifier("dbo")));
 	string reason;
 	const bool is_insert = node->type == QueryNodeType::INSERT_QUERY_NODE;
+	const bool is_merge = node->type == QueryNodeType::MERGE_QUERY_NODE;
 	const bool is_dml = node->type == QueryNodeType::DELETE_QUERY_NODE || node->type == QueryNodeType::UPDATE_QUERY_NODE;
 	Value dml_enabled;
-	if ((is_insert || is_dml) && context.TryGetCurrentSetting("fabricator_dml_pushdown", dml_enabled) &&
+	if ((is_insert || is_dml || is_merge) && context.TryGetCurrentSetting("fabricator_dml_pushdown", dml_enabled) &&
 	    !dml_enabled.IsNull() && !dml_enabled.GetValue<bool>()) {
 		// the switch exists for the case where streaming the rows through DuckDB is FASTER (a parallel plan the
 		// server would not choose for an INSERT … SELECT) — and it is the reference oracle of the differential gate
@@ -1011,6 +1363,10 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 		}
 	} else if (is_dml) {
 		if (auto pushed = SubstraitDml(context, *this, *node, default_schema, reason)) {
+			return pushed;
+		}
+	} else if (is_merge) {
+		if (auto pushed = SubstraitMerge(context, *this, *node, default_schema, reason)) {
 			return pushed;
 		}
 	} else if (auto pushed = SubstraitPushdown(context, *this, *node, default_schema, reason)) {

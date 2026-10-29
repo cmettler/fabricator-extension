@@ -20,7 +20,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | `UPDATE` | as `DELETE`, every `SET` value translates (U1); not `UPDATE … FROM` | `FABRICATOR_REMOTE_DML` | `Mssql Net Update`: scan, update by key (U2) |
 | `… RETURNING` | not as one pushed statement: `DELETE` / `UPDATE` take the key path, the rows come from T-SQL `OUTPUT` | `Mssql Net Delete` / `Update` / `Insert` | see [RETURNING](#returning) |
 | `WITH moved AS (DELETE … RETURNING …) INSERT INTO … SELECT … FROM moved` | source and target are tables of the same catalog, the columns keep their types (R4) | `FABRICATOR_REMOTE_DML` | the `DELETE … RETURNING` (R2), then the regular insert (R5) |
-| `MERGE` | — | — | merge by key, see [MERGE](#merge) |
+| `MERGE` | its conditions and values translate exactly; any number of `WHEN` clauses (M1) | `FABRICATOR_REMOTE_DML` | merge by key (M2), see [MERGE](#merge) |
 
 ## Seeing what happens
 
@@ -246,7 +246,37 @@ attached database"*), and nothing is deleted. ⚠ DuckDB does not take a `MERGE`
 
 ## MERGE
 
-`MERGE INTO` works on every SQL Server table with a row id (a primary key, a unique index or an IDENTITY column): DuckDB joins source and target and
-applies each action by key. It is not pushed as a T-SQL `MERGE` (Substrait, the plan format the translation uses,
-has no MERGE, and T-SQL's `MERGE` differs in places that have to be measured first). `MERGE … RETURNING` works
-(see [RETURNING](#returning)).
+`MERGE INTO` works on every SQL Server table with a row id (a primary key, a unique index or an IDENTITY column).
+When its parts translate exactly it runs as ONE T-SQL `MERGE` (`EXPLAIN`: `FABRICATOR_REMOTE_DML`); otherwise DuckDB
+joins source and target and applies each action by key (`Mssql Net Update` / `Delete` / `Insert`).
+
+**M1 — one statement.** Any number of `WHEN` clauses, `WHEN NOT MATCHED BY SOURCE` included, with DuckDB's rule that
+the first clause whose condition holds wins:
+
+```sql
+MERGE INTO mssql.dbo.pg_sales AS t
+USING (SELECT id, amount FROM mssql.dbo.pg_sales_eu) AS src ON t.id = src.id
+WHEN MATCHED AND src.amount > 100 THEN DELETE
+WHEN MATCHED THEN UPDATE SET amount = src.amount
+WHEN NOT MATCHED THEN INSERT (id, region, amount) VALUES (src.id, 'EU', src.amount);
+```
+
+T-SQL's own `MERGE` takes at most one UPDATE and one DELETE per match class, so the statement is not translated
+clause by clause: one query over target and source decides, per row, the action and the new values, and a fixed
+`MERGE … ON <key> WHEN MATCHED AND op = 1 THEN UPDATE … WHEN MATCHED AND op = 2 THEN DELETE WHEN NOT MATCHED AND op = 3
+THEN INSERT …` applies it. The `ON` and `WHEN` conditions and the values follow the rules of a pushed `SELECT`:
+strings compare exactly as in DuckDB (no trailing-space padding, case-sensitive), a value is converted the DuckDB way
+(`2.5` into an `INT` column is `3`, not T-SQL's `2`). A target row that two source rows would change is refused, as
+DuckDB refuses it — T-SQL would quietly delete such a row.
+
+**M2 — when the MERGE runs in DuckDB instead:**
+
+| Case | Why |
+|---|---|
+| `RETURNING` | the key path returns each action's rows (see [RETURNING](#returning)) |
+| a condition or value does not translate exactly (e.g. `\|\|`), or `SET fabricator_dml_pushdown = false` | as for any pushed statement |
+| `THEN ERROR`, `UPDATE` without `SET`, `INSERT` without values, `DEFAULT`, two `INSERT` clauses naming different columns | not translated |
+| the target has an enabled trigger | a T-SQL `MERGE` fires it per action; the key path fires UPDATE / DELETE triggers per statement and none for its bulk insert |
+| an `INSERT` names the `IDENTITY` column, or `SET mssql_keep_nulls = false` | the INSERT rules (see [INSERT … SELECT](#insert--select-and-create-table--as)) |
+| the source is made of constants only (`USING (SELECT 1 AS id)`) | DuckDB's Substrait producer cannot write a SELECT without FROM |
+| the target is an external (PolyBase) table, or the catalog is a warehouse (no pushdown there) | not translated |

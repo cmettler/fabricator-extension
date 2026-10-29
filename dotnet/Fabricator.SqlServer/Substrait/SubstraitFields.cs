@@ -99,6 +99,12 @@ internal static class SubstraitFields
     public const int WriteOp_Delete = 2;
     public const int WriteOp_Update = 3;
     public const int WriteOp_Ctas = 4;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Not a spec value: what TranslatePushdown reports for a WriteRel
+    /// carrying the <c>fabricator.merge</c> enhancement.</summary>
+    public const int WriteOp_FabricatorMerge = -1;
+    public const string Enhancement_FabricatorMerge = "fabricator.merge";
+    public const int Any_TypeUrl = 1;
+    public const int Any_Value = 2;
     public const int WriteOutput_Unspecified = 0;
     public const int WriteOutput_NoOutput = 1;
     public const int WriteOutput_ModifiedRecords = 2;

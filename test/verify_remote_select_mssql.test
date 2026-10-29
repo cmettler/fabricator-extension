@@ -1346,6 +1346,32 @@ SELECT count(*) FROM (((SELECT count(*) AS n FROM rp.dbo.rs_t WHERE date_trunc('
 ----
 0
 
+# ═══ §5b A call of the catalog's own function keeps the statement local ═════════════════════════════════
+# It does not translate, and the optimizer strips the catalog from the call before RemoteExecute sees it
+# (`rp.dbo.f(x)` arrives as `dbo.f(x)`), so a decline could not restore it: this failed with "Scalar Function with
+# name rs_fn does not exist" under remote_pushdown, over a table and over a derived table alike.
+
+statement ok
+SELECT fabricator_exec('rp', 'CREATE OR ALTER FUNCTION dbo.rs_fn(@a INT) RETURNS INT AS BEGIN RETURN @a + 100 END', refresh_cache := true);
+
+query II
+EXPLAIN SELECT rp.dbo.rs_fn(id) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT min(rp.dbo.rs_fn(id)) - min(id) FROM rp.dbo.rs_t WHERE id < 1000;
+----
+100
+
+query I
+SELECT min(rp.dbo.rs_fn(x)) - min(x) FROM (SELECT id AS x FROM rp.dbo.rs_t WHERE id < 1000) s;
+----
+100
+
+statement ok
+SELECT fabricator_exec('rp', 'DROP FUNCTION dbo.rs_fn', refresh_cache := true);
+
 # ═══ §6  DML through the remote optimizer ════════════════════════════════════════════════════════════
 # A DELETE / UPDATE without RETURNING runs as ONE server statement (verify_remote_dml_mssql gates it) and
 # still reports the affected-row count; with remote_pushdown off it keeps the plan-less shortcut (ABI v93).

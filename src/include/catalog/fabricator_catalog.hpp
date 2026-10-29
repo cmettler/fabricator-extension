@@ -207,6 +207,7 @@ public:
 	//! only when the provider reports `remote_select` (SQL Server with the `remote_pushdown` ATTACH option),
 	//! and latched at ATTACH: DuckDB counts remote catalogs when the database is attached.
 	bool Supports(RemoteCapability capability) const override;
+	bool SupportsPushdown(const ParsedExpression &expression) override;
 	bool SupportsPushdown(const TableRef &ref) override;
 	bool SupportsPushdown(const QueryNode &node) override;
 	bool SupportsPushdown(const SQLStatement &statement) override;

@@ -1176,7 +1176,62 @@ THROW`), which keeps the T-SQL statement and DuckDB's refusal. ⚠ Not yet measu
 action's trigger once; the rowid path fires UPDATE/DELETE triggers but its INSERT is a bulk copy that fires none),
 `RETURNING` order (equal sets, different order — DuckDB promises none), and Fabric Warehouse (it has MERGE, and no
 `OUTPUT`: §6.8 of warehouse-support.md). Substrait has no MERGE, so the plan needs our own encoding — the open
-design question for building it.
+design question for building it. → §4.9.
+
+### 4.9 MERGE as ONE T-SQL `MERGE` — BUILT (2026-10-29)
+
+`SupportsPushdown(MERGE)` says yes without RETURNING; `SubstraitMerge` (C++) and `TSqlEmitter.EmitMerge` (C#) do the
+rest. No ABI change. Gate NEW `verify_merge_pushdown_mssql` (90, service).
+
+- **The design, chosen over translating clause by clause.** T-SQL's MERGE takes at most one UPDATE and one DELETE per
+  match class (§4.8), DuckDB any number with first-true-wins. So DuckDB's whole decision is computed in ONE query:
+  `SELECT <target key>, tp, op, u_<col>…, i_<col>… FROM (SELECT *, 1 AS __fab_t FROM target) t <FULL|RIGHT|INNER>
+  JOIN (SELECT *, 1 AS __fab_s FROM source) s ON <cond> WHERE op IS NOT NULL`. `op` (1 UPDATE / 2 DELETE / 3 INSERT,
+  NULL for DO NOTHING) is a CASE over every clause in order, guarded by its match class (the two markers) and its
+  condition; `u_<col>` is the CAST value of the first UPDATE clause that assigns the column (the old value when the
+  row's clause does not); `i_<col>` the INSERT values. That query is bound and translated like any pushed query, so
+  every exactness rule holds for every condition and value. The provider wraps it in a fixed MERGE that matches by
+  the target's KEY (the rowid columns, null-safe, plus `tp = 1`) — DuckDB's NOT MATCHED BY SOURCE rows carry their
+  key and are ordinary matches there, so T-SQL never needs its own BY SOURCE clause or more than three clauses.
+- **The encoding.** A WriteRel with op UNSPECIFIED and the advanced-extension ENHANCEMENT `fabricator.merge` — the
+  spec's way to give a rel a meaning it does not define, which a consumer must understand or refuse (the decoder
+  refuses any other enhancement). `table_schema` names each column's role: `k:<key>`, `tp`, `op`, `u:<col>`,
+  `i:<col>`. The enhancement's value `check_duplicates` (set when a WHEN MATCHED … DELETE exists) puts an
+  `IF EXISTS (… GROUP BY <key> HAVING COUNT(*) > 1) THROW` before the MERGE: T-SQL deletes a row two source rows
+  match without complaint (§4.8), DuckDB refuses to change a target row twice — and DuckDB's rule counts CHANGES
+  only (measured: matches that do nothing are no error), which is why the check reads `op IN (1, 2)` rows. Two
+  UPDATEs on one row T-SQL refuses itself (8672).
+- **Declines** (each runs on the rowid path): RETURNING; THEN ERROR; UPDATE without SET; INSERT without values,
+  BY NAME, DEFAULT, or two INSERT clauses naming different columns (one T-SQL INSERT clause would write NULL where
+  DuckDB writes the default); a target without a key, with a virtual rowid, with an enabled trigger (T-SQL MERGE
+  fires it per action, the rowid path per statement and not at all for its bulk insert), external; an INSERT naming
+  the IDENTITY column; `mssql_keep_nulls = false`; whatever does not translate exactly.
+- ⚠ **Two first-run defects, both found by the route column, not by the answers.** (1) `op` as STRING constants
+  next to `NULL` became a cast of an untyped NULL to a string, which the translation refuses — every MERGE fell back,
+  and the 18 scenarios still matched DuckDB because they all ran locally. `op` is an integer now, and the INSERT
+  values' ELSE is the last INSERT's value instead of NULL. (2) `SupportsPushdown(TableRef)` admitted base tables and
+  joins only, so a SUBQUERY source (`USING (SELECT …) AS src`, the usual MERGE source) never reached us — and with
+  it any statement with a derived table in FROM. SUBQUERY, EMPTY_FROM and EXPRESSION_LIST are admitted now; what
+  they contain is translated or declined like the rest. ⚠ A source of constants only still declines: DuckDB's
+  Substrait producer writes a FROM-less SELECT as a ReadRel without a schema.
+- ⚠⚠ **A PRE-EXISTING DEFECT THAT WIDENING EXPOSED, FIXED: a call of the catalog's OWN function failed under
+  `remote_pushdown` (the default since 2026-10-27).** `SELECT db.dbo.f(id) FROM db.dbo.t` → *"Scalar Function with
+  name f does not exist"*. The optimizer strips the catalog from the call (`db.dbo.f` → `dbo.f`) before
+  `RemoteExecute`; a UDF does not translate, the statement declines, and `RestoreCatalog` restores TABLE names only
+  — and cannot restore a function with certainty (a bare `f` may be a built-in). Invisible until now because the
+  suites call catalog functions mostly without FROM, which the old `SupportsPushdown(TableRef)` vetoed
+  (EMPTY_FROM); admitting it turned five suites red (scalar / custom functions, aggregates, function_filter, cdc).
+  Fix: `SupportsPushdown(ParsedExpression)` vetoes a FUNCTION / WINDOW call that names this catalog, so such a
+  statement is never pushed and stays exactly as written. Gate `verify_remote_select_mssql` §5b (512 -> 518), over a
+  table and over a derived table; mutant (no veto) killed at its EXPLAIN row.
+- Gate: routing (pushed; RETURNING, a `||` condition, THEN ERROR, UPDATE without SET, a trigger target, the switch,
+  a constant source all local — the declined ones also EXECUTE, which proves the subquery decline path for MERGE);
+  duplicate matches (UPDATE and DELETE refused, no-op matches fine); an IDENTITY-keyed table without a PK; the
+  three-way differential over six steps (upsert; three WHEN MATCHED with first-true-wins; NOT MATCHED BY SOURCE with
+  a conditional DELETE then an UPDATE; DECIMAL into INT + a NULL condition + DO NOTHING + a conditional INSERT;
+  strings in ON against `'B'` and `'f'`; two INSERT clauses); a transaction rolled back. Five mutants killed: no
+  duplicate check, no CAST in SET, WHEN conditions dropped, MERGE never pushed, BY SOURCE without the outer join.
+  `verify_merge_into_mssql` (120) runs pushed now too and is unchanged; guide M1/M2 (76 -> 80).
 
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 

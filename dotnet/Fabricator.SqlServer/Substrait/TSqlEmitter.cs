@@ -223,6 +223,81 @@ internal sealed class TSqlEmitter
                "\nFROM " + block.From + where;
     }
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] The host's MERGE (a WriteRel with the <c>fabricator.merge</c> enhancement):
+    /// its input is ONE query that has already decided, per row, what DuckDB's MERGE does — the target's key, whether
+    /// the target row exists (<c>tp</c>), the action (<c>op</c>: 1 UPDATE / 2 DELETE / 3 INSERT) and the new values — its table_schema names
+    /// each column's role (<c>k:&lt;key&gt;</c>, <c>tp</c>, <c>op</c>, <c>u:&lt;column&gt;</c>, <c>i:&lt;column&gt;</c>). Written as a
+    /// fixed-shape T-SQL MERGE that matches by the key (null-safe: a unique index may hold one NULL):
+    /// <c>MERGE target AS [T] USING (…) AS [S] ON [S].[tp] = 1 AND &lt;key&gt; WHEN MATCHED AND [S].[op] = 1 THEN UPDATE …
+    /// WHEN MATCHED AND [S].[op] = 2 THEN DELETE WHEN NOT MATCHED BY TARGET AND [S].[op] = 3 THEN INSERT …;</c>
+    /// With the value <c>check_duplicates</c> (a WHEN MATCHED … DELETE exists) a check precedes it: T-SQL deletes a row
+    /// that two source rows match without complaint, DuckDB refuses to change a target row more than once.
+    /// </summary>
+    public string EmitMerge(WriteRel write)
+    {
+        if (write.Enhancement != F.Enhancement_FabricatorMerge || write.Emit != null || write.Output == F.WriteOutput_ModifiedRecords)
+        {
+            throw SubstraitTranslationException.Unsupported("a MERGE WriteRel with an output.");
+        }
+        var block = EmitRel(write.Input);
+        if (block.Columns.Count != write.ColumnNames.Count)
+        {
+            throw SubstraitTranslationException.MalformedPlan($"the MERGE names {write.ColumnNames.Count} roles but its input has {block.Columns.Count} columns.");
+        }
+        var names = Enumerable.Range(0, block.Columns.Count).Select(i => "c" + i.ToString(CultureInfo.InvariantCulture)).ToList();
+        string source = Render(block, SelectList(block, names), keepOrder: false);
+        var keys = new List<(string Column, string Name)>();
+        var updates = new List<(string Column, string Name)>();
+        var inserts = new List<(string Column, string Name)>();
+        string? tp = null, op = null;
+        for (int i = 0; i < write.ColumnNames.Count; i++)
+        {
+            string role = write.ColumnNames[i];
+            string name = TSql.Identifier(names[i]);
+            if (role == "tp") tp = name;
+            else if (role == "op") op = name;
+            else if (role.StartsWith("k:", StringComparison.Ordinal)) keys.Add((role.Substring(2), name));
+            else if (role.StartsWith("u:", StringComparison.Ordinal)) updates.Add((role.Substring(2), name));
+            else if (role.StartsWith("i:", StringComparison.Ordinal)) inserts.Add((role.Substring(2), name));
+            else throw SubstraitTranslationException.MalformedPlan($"the MERGE column role '{role}' is unknown.");
+        }
+        if (tp == null || op == null || keys.Count == 0)
+        {
+            throw SubstraitTranslationException.MalformedPlan("the MERGE has no key, tp or op column.");
+        }
+        string target = _tableName?.Invoke(write.TableNames) ?? string.Join(".", write.TableNames.Select(TSql.Identifier));
+        var sb = new StringBuilder();
+        if (write.EnhancementValue == "check_duplicates")
+        {
+            sb.Append("IF EXISTS (SELECT 1 FROM (").Append(source).Append(") AS [S] WHERE [S].").Append(op)
+              .Append(" IN (1, 2) AND [S].").Append(tp).Append(" = 1 GROUP BY ")
+              .Append(string.Join(", ", keys.Select(k => "[S]." + k.Name)))
+              .Append(" HAVING COUNT(*) > 1)\n  THROW 50000, N'MERGE INTO command cannot affect the same target row more than once. ")
+              .Append("A target row matched more than one source row; ensure the source rows are deduplicated or the ON condition is unique.', 1;\n");
+        }
+        sb.Append("MERGE ").Append(target).Append(" AS [T]\nUSING (").Append(source).Append(") AS [S]\nON [S].").Append(tp).Append(" = 1");
+        foreach (var k in keys)
+        {
+            string t = "[T]." + TSql.Identifier(k.Column), s = "[S]." + k.Name;
+            sb.Append(" AND (").Append(t).Append(" = ").Append(s).Append(" OR (").Append(t).Append(" IS NULL AND ").Append(s).Append(" IS NULL))");
+        }
+        if (updates.Count > 0)
+        {
+            sb.Append("\nWHEN MATCHED AND [S].").Append(op).Append(" = 1 THEN UPDATE SET ")
+              .Append(string.Join(", ", updates.Select(u => TSql.Identifier(u.Column) + " = [S]." + u.Name)));
+        }
+        sb.Append("\nWHEN MATCHED AND [S].").Append(op).Append(" = 2 THEN DELETE");
+        if (inserts.Count > 0)
+        {
+            sb.Append("\nWHEN NOT MATCHED BY TARGET AND [S].").Append(op).Append(" = 3 THEN INSERT (")
+              .Append(string.Join(", ", inserts.Select(i => TSql.Identifier(i.Column)))).Append(") VALUES (")
+              .Append(string.Join(", ", inserts.Select(i => "[S]." + i.Name))).Append(')');
+        }
+        sb.Append(';');
+        return sb.ToString();
+    }
+
     /// <summary>How often <paramref name="part"/> occurs in <paramref name="from"/> outside parentheses, quoted
     /// identifiers and string literals — i.e. as a table of the FROM itself, not of a derived table.</summary>
     private static int TopLevelOccurrences(string from, string part)

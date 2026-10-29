@@ -3284,7 +3284,27 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 return $"{table[0]}.{table[1]} has the {row[0]} {row[1]}, which OUTPUT … INTO does not allow";
             }
         }
-        if (op != Clast.Drivers.SqlServer.Substrait.SubstraitFields.WriteOp_Insert)
+        if (op == Clast.Drivers.SqlServer.Substrait.SubstraitFields.WriteOp_FabricatorMerge)
+        {
+            // MERGE against the host's rowid MERGE: that one runs UPDATE / DELETE statements (triggers fire per
+            // statement) and inserts through the bulk copy (no trigger fires) — a T-SQL MERGE fires each action's
+            // trigger once, so an enabled trigger declines. Its INSERT then follows the INSERT rules below.
+            const string mergeProbe =
+                "SELECT N'external', name FROM sys.external_tables WHERE object_id = OBJECT_ID(@obj) " +
+                "UNION ALL SELECT N'trigger', name FROM sys.triggers WHERE parent_id = OBJECT_ID(@obj) AND is_disabled = 0";
+            var mergeTarget = new[] { new SqlParameter("@obj", Quote(table[0]) + "." + Quote(table[1])) };
+            foreach (var row in ReadMetadataRows(mergeProbe, 2, mergeTarget))
+            {
+                return row[0] == "external"
+                    ? $"{table[0]}.{table[1]} is an external table"
+                    : $"{table[0]}.{table[1]} has the enabled trigger {row[1]}, which a T-SQL MERGE fires differently";
+            }
+            if (columns.Count == 0)
+            {
+                return null; // no INSERT action
+            }
+        }
+        else if (op != Clast.Drivers.SqlServer.Substrait.SubstraitFields.WriteOp_Insert)
         {
             // A DELETE / UPDATE is compared with the host's ROWID path, which is itself T-SQL DELETE / UPDATE
             // statements: triggers fire and a NULL is a NULL there too. Only an external table differs — its rowid

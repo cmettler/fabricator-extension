@@ -313,6 +313,10 @@ sealed class WriteRel : Rel
     public int Op;
     public int Output;
     public int CreateMode;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The type URL of the rel's advanced-extension enhancement, which
+    /// gives it a meaning the spec does not define (<c>fabricator.merge</c>), and its value.</summary>
+    public string? Enhancement;
+    public string EnhancementValue = "";
     public Rel Input = null!;
 }
 

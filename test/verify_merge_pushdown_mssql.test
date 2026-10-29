@@ -1,0 +1,343 @@
+# name: test/verify_merge_pushdown_mssql.test
+# description: MERGE INTO a SQL Server table as ONE T-SQL MERGE (remote pushdown). Substrait has no MERGE and T-SQL's
+#              MERGE takes at most one UPDATE and one DELETE per match class, so DuckDB's whole decision is computed in
+#              ONE query over target and source — per row the target key, the action (the first clause whose class and
+#              condition hold) and the new values — and wrapped in a fixed-shape MERGE that matches by the key
+#              (docs/duckdb-2.0-remote-execution.md §4.9). Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THREE-WAY DIFFERENTIAL: every step runs on `on` (pushed), `off` (`fabricator_dml_pushdown = false`:
+#              DuckDB joins, the rowid operators write) and `loc` (DuckDB tables). The steps aim at what §4.8 measured
+#              T-SQL to do differently — clause shapes T-SQL cannot write, DECIMAL -> INT (truncates vs rounds), string
+#              ON conditions (padding, case), a DELETE matched twice — and every expected count is DuckDB's own,
+#              computed by running the same sequence on DuckDB tables.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'true');
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.mgp_on; DROP TABLE IF EXISTS dbo.mgp_off; DROP TABLE IF EXISTS dbo.mgp_src; DROP TABLE IF EXISTS dbo.mgp_r; DROP TABLE IF EXISTS dbo.mgp_rs; DROP TABLE IF EXISTS dbo.mgp_trg; DROP TABLE IF EXISTS dbo.mgp_id; DROP TABLE IF EXISTS dbo.mgp_isrc; DROP TABLE IF EXISTS dbo.mgp_tx;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.mgp_on (id INT PRIMARY KEY, v INT NULL, s VARCHAR(10)); INSERT INTO dbo.mgp_on VALUES (1,10,''a''),(2,20,''b''),(3,30,''c''),(4,NULL,''d''),(5,50,''e '');
+CREATE TABLE dbo.mgp_off (id INT PRIMARY KEY, v INT NULL, s VARCHAR(10)); INSERT INTO dbo.mgp_off VALUES (1,10,''a''),(2,20,''b''),(3,30,''c''),(4,NULL,''d''),(5,50,''e '');
+CREATE TABLE dbo.mgp_src (step INT, id INT NULL, v INT NULL, s VARCHAR(10)); INSERT INTO dbo.mgp_src VALUES (1,2,200,''B''),(1,6,60,''f''),(2,1,500,''x''),(2,2,80,''y''),(2,3,5,''z''),(3,2,7,''q''),(3,6,8,''r''),(4,6,9,''s''),(4,7,NULL,''n''),(4,8,3,''g''),(5,9,1,''b''),(5,9,2,''f ''),(5,9,3,''g''),(6,6,1,''u''),(6,10,100,''h''),(6,11,-1,''i'');
+CREATE TABLE dbo.mgp_r (id INT PRIMARY KEY, v INT NULL, s VARCHAR(10)); INSERT INTO dbo.mgp_r VALUES (1,10,''a''),(2,20,''b''),(3,30,''c'');
+CREATE TABLE dbo.mgp_rs (id INT NULL, v INT NULL, s VARCHAR(10)); INSERT INTO dbo.mgp_rs VALUES (2,21,''x''),(2,22,''y''),(4,40,''d'');
+CREATE TABLE dbo.mgp_trg (id INT PRIMARY KEY, v INT NULL, s VARCHAR(10)); INSERT INTO dbo.mgp_trg VALUES (1,10,''a'');
+CREATE TABLE dbo.mgp_id (rid INT IDENTITY(1,1), code VARCHAR(10), v INT NULL); INSERT INTO dbo.mgp_id (code, v) VALUES (''a'',1),(''b'',2);
+CREATE TABLE dbo.mgp_isrc (rid INT, code VARCHAR(10), v INT); INSERT INTO dbo.mgp_isrc VALUES (0,''b'',20),(0,''c'',30),(9,''z'',0);
+CREATE TABLE dbo.mgp_tx (id INT PRIMARY KEY, v INT NULL, s VARCHAR(10)); INSERT INTO dbo.mgp_tx VALUES (1,10,''a''),(2,20,''b'');');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TRIGGER dbo.mgp_trg_t ON dbo.mgp_trg AFTER UPDATE AS SET NOCOUNT ON;');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+CREATE TABLE loc (id INT PRIMARY KEY, v INT, s VARCHAR(10));
+
+statement ok
+INSERT INTO loc VALUES (1,10,'a'),(2,20,'b'),(3,30,'c'),(4,NULL,'d'),(5,50,'e ');
+
+statement ok
+CREATE TABLE loc_src (step INT, id INT, v INT, s VARCHAR(10));
+
+statement ok
+INSERT INTO loc_src VALUES (1,2,200,'B'),(1,6,60,'f'),(2,1,500,'x'),(2,2,80,'y'),(2,3,5,'z'),(3,2,7,'q'),(3,6,8,'r'),(4,6,9,'s'),(4,7,NULL,'n'),(4,8,3,'g'),(5,9,1,'b'),(5,9,2,'f '),(5,9,3,'g'),(6,6,1,'u'),(6,10,100,'h'),(6,11,-1,'i');
+
+# ═══ §1  Routing ═══════════════════════════════════════════════════════════════════════════════════════
+
+# a MERGE whose parts translate: one statement
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 2) AS src ON t.id = src.id WHEN MATCHED AND src.v > 100 THEN DELETE WHEN MATCHED AND src.v > 50 THEN UPDATE SET v = src.v WHEN MATCHED THEN UPDATE SET s = 'small';
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# RETURNING keeps the rowid path, which returns each action's rows
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s) RETURNING merge_action, id;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# || is not in the Substrait producer: the MERGE declines and runs locally — inside a subquery, which must work
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED AND src.s || '' = 'x' THEN UPDATE SET v = src.v;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# THEN ERROR, UPDATE without SET, INSERT naming no values: local
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED AND src.v > 1000 THEN ERROR;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED THEN UPDATE;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# a target with an enabled trigger: a T-SQL MERGE fires it differently from the rowid path — local, and it still works
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_trg AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_trg AS t USING (SELECT * FROM db.dbo.mgp_rs WHERE id = 4) AS src ON t.id = src.id WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+1
+
+# the switch
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 2) AS src ON t.id = src.id WHEN MATCHED AND src.v > 100 THEN DELETE WHEN MATCHED AND src.v > 50 THEN UPDATE SET v = src.v WHEN MATCHED THEN UPDATE SET s = 'small';
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# two source rows match one target row: DuckDB refuses to change it twice — T-SQL refuses an UPDATE itself (8672) and
+# a DELETE only through the check that precedes the MERGE; nothing changes either way
+statement error
+MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v;
+----
+<REGEX>:.*(8672|more than once).*
+
+statement error
+MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED THEN DELETE;
+----
+<REGEX>:.*cannot affect the same target row more than once.*
+
+# …while two source rows that match it and do nothing are no error (DuckDB's rule: only a change counts)
+query I
+MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED AND src.v > 1000 THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+1
+
+query T
+SELECT string_agg(id || ':' || v || ':' || s, ' ' ORDER BY id) FROM db.dbo.mgp_r;
+----
+1:10:a 2:20:b 3:30:c 4:40:d
+
+# a table whose key is its IDENTITY column (no primary key): matched by the key, and an INSERT naming the IDENTITY
+# column declines (the bulk copy keeps the value; a T-SQL INSERT would need IDENTITY_INSERT)
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_id AS t USING (SELECT code, v FROM db.dbo.mgp_isrc WHERE rid = 0) AS src ON t.code = src.code WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED THEN INSERT (code, v) VALUES (src.code, src.v);
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_id AS t USING (SELECT code, v FROM db.dbo.mgp_isrc WHERE rid = 0) AS src ON t.code = src.code WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED THEN INSERT (code, v) VALUES (src.code, src.v);
+----
+2
+
+query ITI
+SELECT rid, code, v FROM db.dbo.mgp_id ORDER BY rid;
+----
+1	a	1
+2	b	20
+3	c	30
+
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_id AS t USING (SELECT rid, code FROM db.dbo.mgp_isrc WHERE rid = 9) AS src ON t.code = src.code WHEN NOT MATCHED THEN INSERT VALUES (src.rid, src.code, 0);
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# a source of constants only declines (DuckDB's Substrait producer writes a FROM-less SELECT as a ReadRel without a
+# schema) — and runs locally
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_id AS t USING (SELECT 'a' AS code, 7 AS v) AS src ON t.code = src.code WHEN MATCHED THEN UPDATE SET v = src.v;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_id AS t USING (SELECT 'a' AS code, 7 AS v) AS src ON t.code = src.code WHEN MATCHED THEN UPDATE SET v = src.v;
+----
+1
+
+# ═══ §2  The differential — on (pushed) / off (local) / loc (DuckDB) ═══════════════════════════════════
+
+# K1 upsert
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 1) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v, s = src.s WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 1) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v, s = src.s WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+2
+
+# K2 three WHEN MATCHED clauses, first true wins
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 2) AS src ON t.id = src.id WHEN MATCHED AND src.v > 100 THEN DELETE WHEN MATCHED AND src.v > 50 THEN UPDATE SET v = src.v WHEN MATCHED THEN UPDATE SET s = 'small';
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 2) AS src ON t.id = src.id WHEN MATCHED AND src.v > 100 THEN DELETE WHEN MATCHED AND src.v > 50 THEN UPDATE SET v = src.v WHEN MATCHED THEN UPDATE SET s = 'small';
+----
+3
+
+# K3 NOT MATCHED BY SOURCE: a conditional DELETE, then an UPDATE
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 3) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED BY SOURCE AND t.v IS NULL THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET s = 'orphan';
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 3) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED BY SOURCE AND t.v IS NULL THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET s = 'orphan';
+----
+5
+
+# K4 a DECIMAL into INT (DuckDB rounds), NULL in a condition
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 4) AS src ON t.id = src.id WHEN MATCHED AND src.v > t.v THEN UPDATE SET v = src.v * 1.5 WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v IS NOT NULL THEN INSERT (id, v, s) VALUES (src.id, src.v * 1.5, src.s);
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 4) AS src ON t.id = src.id WHEN MATCHED AND src.v > t.v THEN UPDATE SET v = src.v * 1.5 WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v IS NOT NULL THEN INSERT (id, v, s) VALUES (src.id, src.v * 1.5, src.s);
+----
+2
+
+# K5 strings in ON: exact, as DuckDB compares (no padding, case-sensitive)
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 5) AS src ON t.s = src.s WHEN MATCHED THEN UPDATE SET v = 777;
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 5) AS src ON t.s = src.s WHEN MATCHED THEN UPDATE SET v = 777;
+----
+1
+
+# K6 two INSERT clauses and DO NOTHING
+query II
+EXPLAIN MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 6) AS src ON t.id = src.id WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v < 0 THEN INSERT VALUES (src.id, 0, 'neg') WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+MERGE INTO db.dbo.mgp_on AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 6) AS src ON t.id = src.id WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v < 0 THEN INSERT VALUES (src.id, 0, 'neg') WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+2
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+MERGE INTO db.dbo.mgp_off AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 1) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v, s = src.s WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+2
+
+query I
+MERGE INTO db.dbo.mgp_off AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 2) AS src ON t.id = src.id WHEN MATCHED AND src.v > 100 THEN DELETE WHEN MATCHED AND src.v > 50 THEN UPDATE SET v = src.v WHEN MATCHED THEN UPDATE SET s = 'small';
+----
+3
+
+query I
+MERGE INTO db.dbo.mgp_off AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 3) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED BY SOURCE AND t.v IS NULL THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET s = 'orphan';
+----
+5
+
+query I
+MERGE INTO db.dbo.mgp_off AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 4) AS src ON t.id = src.id WHEN MATCHED AND src.v > t.v THEN UPDATE SET v = src.v * 1.5 WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v IS NOT NULL THEN INSERT (id, v, s) VALUES (src.id, src.v * 1.5, src.s);
+----
+2
+
+query I
+MERGE INTO db.dbo.mgp_off AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 5) AS src ON t.s = src.s WHEN MATCHED THEN UPDATE SET v = 777;
+----
+1
+
+query I
+MERGE INTO db.dbo.mgp_off AS t USING (SELECT id, v, s FROM db.dbo.mgp_src WHERE step = 6) AS src ON t.id = src.id WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v < 0 THEN INSERT VALUES (src.id, 0, 'neg') WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+2
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+MERGE INTO loc AS t USING (SELECT id, v, s FROM loc_src WHERE step = 1) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v, s = src.s WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+2
+
+query I
+MERGE INTO loc AS t USING (SELECT id, v, s FROM loc_src WHERE step = 2) AS src ON t.id = src.id WHEN MATCHED AND src.v > 100 THEN DELETE WHEN MATCHED AND src.v > 50 THEN UPDATE SET v = src.v WHEN MATCHED THEN UPDATE SET s = 'small';
+----
+3
+
+query I
+MERGE INTO loc AS t USING (SELECT id, v, s FROM loc_src WHERE step = 3) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED BY SOURCE AND t.v IS NULL THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET s = 'orphan';
+----
+5
+
+query I
+MERGE INTO loc AS t USING (SELECT id, v, s FROM loc_src WHERE step = 4) AS src ON t.id = src.id WHEN MATCHED AND src.v > t.v THEN UPDATE SET v = src.v * 1.5 WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v IS NOT NULL THEN INSERT (id, v, s) VALUES (src.id, src.v * 1.5, src.s);
+----
+2
+
+query I
+MERGE INTO loc AS t USING (SELECT id, v, s FROM loc_src WHERE step = 5) AS src ON t.s = src.s WHEN MATCHED THEN UPDATE SET v = 777;
+----
+1
+
+query I
+MERGE INTO loc AS t USING (SELECT id, v, s FROM loc_src WHERE step = 6) AS src ON t.id = src.id WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND src.v < 0 THEN INSERT VALUES (src.id, 0, 'neg') WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, src.s);
+----
+2
+
+# the three agree, row for row, both ways
+query T
+SELECT string_agg(id || ':' || coalesce(v::VARCHAR, 'null') || ':' || s, ' ' ORDER BY id) FROM loc;
+----
+2:7:B 3:30:orphan 5:50:orphan 6:14:f 8:777:g 10:100:h 11:0:neg
+
+query IIII
+SELECT (SELECT count(*) FROM ((SELECT * FROM db.dbo.mgp_on) EXCEPT ALL (SELECT * FROM loc))),
+       (SELECT count(*) FROM ((SELECT * FROM loc) EXCEPT ALL (SELECT * FROM db.dbo.mgp_on))),
+       (SELECT count(*) FROM ((SELECT * FROM db.dbo.mgp_off) EXCEPT ALL (SELECT * FROM loc))),
+       (SELECT count(*) FROM ((SELECT * FROM loc) EXCEPT ALL (SELECT * FROM db.dbo.mgp_off)));
+----
+0	0	0	0
+
+# ═══ §3  Transactions: on the transaction's connection ═════════════════════════════════════════════════
+
+statement ok
+BEGIN;
+
+query I
+MERGE INTO db.dbo.mgp_tx AS t USING (SELECT 1 AS id, 99 AS v UNION ALL SELECT 3, 30) AS src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, 'n') WHEN NOT MATCHED BY SOURCE THEN DELETE;
+----
+3
+
+query T
+SELECT string_agg(id || ':' || v, ' ' ORDER BY id) FROM db.dbo.mgp_tx;
+----
+1:99 3:30
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT string_agg(id || ':' || v, ' ' ORDER BY id) FROM db.dbo.mgp_tx;
+----
+1:10 2:20
+
+# ═══ §4  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.mgp_on; DROP TABLE IF EXISTS dbo.mgp_off; DROP TABLE IF EXISTS dbo.mgp_src; DROP TABLE IF EXISTS dbo.mgp_r; DROP TABLE IF EXISTS dbo.mgp_rs; DROP TABLE IF EXISTS dbo.mgp_trg; DROP TABLE IF EXISTS dbo.mgp_id; DROP TABLE IF EXISTS dbo.mgp_isrc; DROP TABLE IF EXISTS dbo.mgp_tx;');

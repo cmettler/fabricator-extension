@@ -221,6 +221,21 @@ SELECT (SELECT count(*) FROM mssql.dbo.pg_sales), (SELECT string_agg(id::VARCHAR
 ----
 2	1
 
+# M1: MERGE as one statement — several WHEN clauses, first true one wins
+query II
+EXPLAIN MERGE INTO mssql.dbo.pg_sales AS t USING (SELECT id, amount FROM mssql.dbo.pg_sales_eu) AS src ON t.id = src.id
+WHEN MATCHED AND src.amount > 100 THEN DELETE WHEN MATCHED THEN UPDATE SET amount = src.amount
+WHEN NOT MATCHED THEN INSERT (id, region, amount) VALUES (src.id, 'EU', src.amount);
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# M2: with RETURNING it runs in DuckDB (merge by key)
+query II
+EXPLAIN MERGE INTO mssql.dbo.pg_sales AS t USING (SELECT id, amount FROM mssql.dbo.pg_sales_eu) AS src ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET amount = src.amount RETURNING merge_action, id;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
 # ═══ Switches ══════════════════════════════════════════════════════════════════════════════════════════
 
 statement ok

@@ -94,6 +94,16 @@ public static class SqlServerSubstrait
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes) { SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls };
         if (root.Input is WriteRel writeRel)
         {
+            if (writeRel.Enhancement == SubstraitFields.Enhancement_FabricatorMerge)
+            {
+                string merge = emitter.EmitMerge(writeRel);
+                // the columns the MERGE inserts, for the INSERT rules (identity, keep_nulls)
+                var insertColumns = writeRel.ColumnNames.Where(c => c.StartsWith("i:", StringComparison.Ordinal)).Select(c => c.Substring(2)).ToList();
+                write = (SubstraitFields.WriteOp_FabricatorMerge, writeRel.TableNames, insertColumns, null);
+                columnCount = 1;
+                orderDescending = new List<bool>();
+                return merge;
+            }
             string sql = writeRel.Op == SubstraitFields.WriteOp_Insert
                 ? emitter.EmitInsert(writeRel)
                 : emitter.EmitDeleteOrUpdate(writeRel);

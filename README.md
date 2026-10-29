@@ -838,9 +838,12 @@ outright](https://ducklake.select/docs/stable/duckdb/usage/upserting). We serve 
 `DESCRIBE HISTORY` will not match on `MERGE`. Wrap any merge in `BEGIN … COMMIT` if you want it atomic
 regardless of how many actions it carries.
 
-On SQL Server the actions run as per-row DML on the transaction's pinned connection (this is *not*
-translated into a server-side T-SQL `MERGE`), so an explicit transaction is likewise what makes the
-statement atomic.
+On SQL Server, with `remote_pushdown` (the default), a MERGE whose conditions and values translate exactly runs as
+ONE T-SQL `MERGE` — any number of `WHEN` clauses, `NOT MATCHED BY SOURCE` included, DuckDB's first-clause-wins rule,
+exact string comparison and DuckDB's conversions (`EXPLAIN` shows `FABRICATOR_REMOTE_DML`); it is atomic in itself.
+Otherwise — `RETURNING`, a target with an enabled trigger, a condition that does not translate, a source of constants
+only — the actions run as per-row DML on the transaction's pinned connection, and an explicit transaction is what
+makes the statement atomic. Details and examples: [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md#merge).
 
 `INSERT … ON CONFLICT` is **not supported**. DuckDB lowers it to a MERGE keyed on a unique constraint,
 and fabricator tables advertise no indexes, so it fails at bind with *"no UNIQUE/PRIMARY KEY constraints
