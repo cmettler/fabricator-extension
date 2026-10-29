@@ -996,7 +996,7 @@ PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, Physical
                                               LogicalDelete &op, PhysicalOperator &plan) {
 	// RETURNING: the provider returns the deleted rows from the DELETE itself (ABI v98) — where it declares it can
 	if (op.return_chunk && !dml_returning_) {
-		throw NotImplementedException("fabricator: DELETE ... RETURNING is not supported yet");
+		throw NotImplementedException("fabricator: DELETE ... RETURNING is not supported by this catalog (its provider cannot return the changed rows)");
 	}
 	auto target = FabricatorBuildModifyTarget(op.table);
 	// The rowid's position in the child chunk comes from the bound row-identifier expression — NOT
@@ -1079,7 +1079,7 @@ PhysicalOperator &FabricatorCatalog::PlanUpdate(ClientContext &context, Physical
                                               LogicalUpdate &op, PhysicalOperator &plan) {
 	// RETURNING: the provider returns the new values from the UPDATE itself (ABI v98) — where it declares it can
 	if (op.return_chunk && !dml_returning_) {
-		throw NotImplementedException("fabricator: UPDATE ... RETURNING is not supported yet");
+		throw NotImplementedException("fabricator: UPDATE ... RETURNING is not supported by this catalog (its provider cannot return the changed rows)");
 	}
 	auto target = FabricatorBuildModifyTarget(op.table);
 	FabricatorFillUpdateSetColumns(op.table, op.columns, op.expressions, target);

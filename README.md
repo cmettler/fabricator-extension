@@ -706,7 +706,7 @@ violation fails just like a classic INSERT (CTAS/COPY skip constraint checking f
 `IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
 otherwise. `UPDATE`, `DELETE` and `MERGE` support `RETURNING` on SQL Server: the rows come from the statement's own
 `OUTPUT` clause (through a table variable when the table has an enabled trigger), and a `DELETE` returns its key as
-`rowid`. The DuckDB 2.0 data-modifying CTE that moves rows between two tables of the same catalog —
+`rowid`. ⚠ Fabric Warehouse has no `OUTPUT` clause, so `RETURNING` is refused there (before anything is written). The DuckDB 2.0 data-modifying CTE that moves rows between two tables of the same catalog —
 `WITH moved AS (DELETE … RETURNING *) INSERT INTO dst SELECT * FROM moved` — runs as ONE server statement,
 `DELETE … OUTPUT DELETED.* INTO dst`, so the rows never leave the server (`FABRICATOR_REMOTE_DML`); a target with a
 trigger, a foreign key or a CHECK constraint, or a column whose type changes, keeps the two-step path. Moving into

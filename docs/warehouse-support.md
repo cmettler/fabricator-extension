@@ -565,6 +565,17 @@ the query so the object is never named; both obey the same rule.
 plumbing. Post-fix enumeration answers 59 (= 53 + 6), and `dbt run --target fabric --threads 4` is PASS=4/4
 in 49 s, which it had never been.
 
+## 6.8 No `OUTPUT` on Fabric Warehouse, so no `RETURNING` (2026-10-29, user-raised, MEASURED live)
+
+Every DML `RETURNING` on SQL Server comes from T-SQL `OUTPUT` (ABI v98). Fabric Warehouse answers *"OUTPUT is not
+supported."* to `DELETE … OUTPUT`, `UPDATE … OUTPUT`, `INSERT … OUTPUT` and `MERGE … OUTPUT` alike, while a plain
+`MERGE` works. The capability `dml_returning` is therefore `false` on a warehouse profile (`Profile.IsWarehouse`):
+`DELETE` / `UPDATE` / `MERGE … RETURNING` are refused at PLAN time, and `INSERT … RETURNING` is refused before any
+statement reaches the server — the general rule of §6.5, since a failing statement would abort the transaction.
+Measured on the dbt `fabric` target: all four refused with a clear message, a later `UPDATE` + `COMMIT` in the same
+session commits, `MERGE` without `RETURNING` runs on the rowid path. ⚠ Synapse dedicated is in the same profile
+family and gated with it, unmeasured. No CI tier reaches a warehouse, so this is a manual measurement only.
+
 ## 7. Open decisions
 
 - **Naive-`datetime2` semantic:** RESOLVED — keep naive↔naive (validated under a non-UTC session zone, §3.1;

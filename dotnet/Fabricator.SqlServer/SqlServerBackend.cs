@@ -2960,6 +2960,15 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
 
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows)
     {
+        if (Profile.IsWarehouse)
+        {
+            // refused BEFORE any statement reaches the server: on Fabric a failing statement aborts the whole
+            // transaction (warehouse-support.md §6.5)
+            rows.Dispose();
+            throw new NotSupportedException(
+                "INSERT ... RETURNING is not supported on a warehouse engine (Fabric Warehouse / Synapse have no "
+                + "OUTPUT clause) — use a plain INSERT.");
+        }
         RecordTouch(schemaName, tableName, schemaChanged: false);
         if (DetectExternalTable(schemaName, tableName) is not null)
         {
@@ -3174,7 +3183,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // spliced: a schema name is user-controlled text.
     public string CapabilitiesJson
         => "{\"bind_schema_cacheable\":true," +
-           "\"dml_returning\":true," +
+           // RETURNING comes from T-SQL OUTPUT, which a warehouse engine does not have (measured on Fabric Warehouse:
+           // "OUTPUT is not supported." on DELETE, UPDATE, INSERT and MERGE alike) — the host then refuses at plan time
+           $"\"dml_returning\":{(Profile.IsWarehouse ? "false" : "true")}," +
            $"\"default_schema\":{JsonSerializer.Serialize(Profile.DefaultSchema)}," +
            $"\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
            $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";

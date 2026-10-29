@@ -208,7 +208,9 @@ UPDATE mssql.dbo.pg_sales SET amount = 1 WHERE id = 2 RETURNING id, amount; -- R
 `RETURNING` keeps a `DELETE` / `UPDATE` on the key path: the one-statement forms return only a count.
 On a table with an enabled trigger, where SQL Server refuses `OUTPUT` on its own, the rows go `OUTPUT … INTO` a table
 variable that the same batch reads back — the trigger fires as for any other statement. Not on an external
-(PolyBase) table: its writes go to storage, which returns no rows.
+(PolyBase) table: its writes go to storage, which returns no rows. ⚠ **Not on Fabric Warehouse** (nor Synapse): it
+has no `OUTPUT` clause at all, so every `… RETURNING` is refused there with a message, before anything is written
+([warehouse-support.md §6.8](warehouse-support.md#68-no-output-on-fabric-warehouse-so-no-returning-2026-10-29-user-raised-measured-live)).
 
 **R4 — moving rows with a data-modifying CTE (DuckDB 2.0).** A CTE body can be a `DELETE … RETURNING`, and the
 statement that follows consumes what it returned. When both tables belong to the same SQL Server catalog this is ONE

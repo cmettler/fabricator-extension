@@ -1143,6 +1143,41 @@ same SQL Server catalog, runs as `DELETE [t0] OUTPUT DELETED.[c…] INTO dst ([d
   row), no type check (the type-change row), the shape never recognised (routing), the CTE not marked (the first
   decline). `verify_pushdown_guide_mssql` R4 asserts the route, R5 lists the declines (74 -> 76).
 
+### 4.8 T-SQL `MERGE` against DuckDB's `MERGE INTO` — MEASURED (2026-10-29), nothing built
+
+The user-agreed precondition for a server-side MERGE: measure where the two disagree. Eighteen scenarios, each run as
+DuckDB `MERGE INTO` on DuckDB tables and as the hand-written T-SQL `MERGE` on box SQL Server from the same data
+(target `id INT PRIMARY KEY, v INT, s VARCHAR`; source without a key; harness in the session scratchpad, `merge/gen.py`).
+
+| Scenario | DuckDB | T-SQL | |
+|---|---|---|---|
+| upsert (MATCHED UPDATE + NOT MATCHED INSERT) | as T-SQL | as DuckDB | equal |
+| two source rows match one target, UPDATE | error | error 8672 | equal (both refuse) |
+| **two source rows match one target, DELETE** | **error** | **deletes, no error** | ⚠ T-SQL is more lenient |
+| two source rows insert one key / match + insert one key | PK violation | PK violation | equal |
+| NULL in the `ON` condition | not matched | not matched | equal |
+| **three `WHEN MATCHED` clauses / two `WHEN MATCHED … UPDATE`** | first true clause wins | **refused** (at most one UPDATE and one DELETE) | ⚠ shape T-SQL cannot write |
+| two `WHEN MATCHED` (conditional DELETE, then UPDATE) | as T-SQL | as DuckDB | equal |
+| `WHEN NOT MATCHED BY SOURCE` DELETE / `AND cond` UPDATE | as T-SQL | as DuckDB | equal |
+| NULL in a `WHEN … AND` condition | clause skipped | clause skipped | equal |
+| UPDATE that changes the join key | as T-SQL | as DuckDB | equal |
+| `DO NOTHING` / clause omitted | as T-SQL | as DuckDB | equal |
+| empty source + `NOT MATCHED BY SOURCE DELETE` | deletes all | deletes all | equal |
+| `WHEN NOT MATCHED AND cond` INSERT | as T-SQL | as DuckDB | equal |
+| **`SET v = 2.5` into an INT** | **3** (rounds) | **2** (truncates) | ⚠ conversion |
+| **`ON t.s = src.s` with `'a '` / `'B'` against `'a'` / `'b'`** | **no match** | **both match** (padding, case-insensitive collation) | ⚠ string semantics |
+
+So the clause semantics agree; the differences are four, and each has a known answer from the paths already built:
+conversion — the CAST into the column type that the UPDATE pushdown (§4.6) emits; strings — the exact-string
+rendering of §4.3 (BIN2 + sentinel) in the `ON` and `WHEN` conditions; the clause shapes T-SQL cannot write — decline
+(or fold several conditional UPDATEs into one `CASE`, later); the DELETE that T-SQL lets match twice — decline unless
+the source is provably unique on the join key, or guard with a duplicate check in the same batch (`IF EXISTS (…)
+THROW`), which keeps the T-SQL statement and DuckDB's refusal. ⚠ Not yet measured: triggers (T-SQL MERGE fires each
+action's trigger once; the rowid path fires UPDATE/DELETE triggers but its INSERT is a bulk copy that fires none),
+`RETURNING` order (equal sets, different order — DuckDB promises none), and Fabric Warehouse (it has MERGE, and no
+`OUTPUT`: §6.8 of warehouse-support.md). Substrait has no MERGE, so the plan needs our own encoding — the open
+design question for building it.
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

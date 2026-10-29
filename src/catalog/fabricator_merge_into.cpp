@@ -146,7 +146,7 @@ PhysicalOperator &FabricatorCatalog::PlanMergeInto(ClientContext &context, Physi
 	// RETURNING (ABI v98): each action operator returns its rows from the provider's OUTPUT clause — where the
 	// provider declares it can (capability `dml_returning`); refused here otherwise, before any action writes
 	if (op.return_chunk && !SupportsDmlReturning()) {
-		throw NotImplementedException("fabricator: MERGE INTO ... RETURNING is not supported yet");
+		throw NotImplementedException("fabricator: MERGE INTO ... RETURNING is not supported by this catalog (its provider cannot return the changed rows)");
 	}
 	// Row identity is required by EVERY merge, including one whose only action is an INSERT: DuckDB decides
 	// matched-vs-not by testing the rowid column for NULL, so without one there is nothing to test.
