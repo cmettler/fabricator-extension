@@ -35,7 +35,11 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
@@ -191,24 +195,96 @@ bool ReadsTable(QueryNode &node) {
 	return found;
 }
 
-//! The pushed query as the provider's own, through Substrait (ABI v96; docs/duckdb-2.0-remote-execution.md §3.12):
-//! DuckDB binds a copy, the vendored to_substrait serializes the plan, the provider translates it. Null when
-//! anything on the way declines — `reason` says why — and the statement then runs locally.
-//!   SELECT CAST(c0 AS <bound type>) AS <bound name>, … FROM fabricator_query('<catalog>', '<query>') __fab_remote
-//!     ORDER BY __fab_remote.k0 <dir> <nulls lowest>, …
-unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
-                                       const Identifier &default_schema, string &reason) {
+//! A write the provider translated: fabricator_remote_dml runs it on this transaction's own connection when the
+//! statement EXECUTES and yields its changed-row count as DuckDB's own DML does (one BIGINT column, CHANGED_ROWS).
+unique_ptr<TableRef> RemoteDmlRef(FabricatorCatalog &catalog, const string &sql) {
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(ConstantExpression::String(catalog.GetName().GetIdentifierName()));
+	args.push_back(ConstantExpression::String(sql));
+	auto dml = make_uniq<TableFunctionRef>();
+	dml->function = make_uniq<FunctionExpression>(Identifier("fabricator_remote_dml"), std::move(args));
+	return std::move(dml);
+}
+
+//! A pushed query's plan wrapped in a WriteRel on schema.table: `columns` are the table columns the input writes
+//! (INSERT: the named columns; UPDATE: the assigned ones; DELETE: none). Empty, with `reason`, on failure.
+string WrapInWrite(const string &plan_bytes, substrait::WriteRel::WriteOp op, const string &schema,
+                   const string &table, const vector<string> &columns, string &reason) {
+	substrait::Plan plan;
+	if (!plan.ParseFromString(plan_bytes)) {
+		reason = "the pushed plan does not parse";
+		return "";
+	}
+	substrait::RelRoot *root = nullptr;
+	for (auto &rel : *plan.mutable_relations()) {
+		if (rel.has_root()) {
+			root = rel.mutable_root();
+		}
+	}
+	if (!root) {
+		reason = "the pushed plan has no root";
+		return "";
+	}
+	auto write_rel = make_uniq<substrait::Rel>();
+	auto write = write_rel->mutable_write();
+	write->set_op(op);
+	write->set_output(substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_NO_OUTPUT);
+	write->mutable_named_table()->add_names(schema);
+	write->mutable_named_table()->add_names(table);
+	auto table_schema = write->mutable_table_schema();
+	for (auto &column : columns) {
+		table_schema->add_names(column);
+	}
+	write->set_allocated_input(root->release_input());
+	root->set_allocated_input(write_rel.release());
+	root->clear_names();
+	return plan.SerializeAsString();
+}
+
+//! The provider's statement for a write plan (WrapInWrite) — empty, with `reason`, when it declines.
+string TranslateWrite(ClientContext &context, FabricatorCatalog &catalog, const string &plan_bytes, string &reason) {
+	DumpPlan(plan_bytes);
+	string json;
+	try {
+		FabricatorSetActiveTxn(catalog.GetHandle(), context);
+		json = fabricator::RemoteTranslate(catalog.GetHandle(), plan_bytes);
+	} catch (std::exception &ex) {
+		reason = ErrorData(ex).RawMessage();
+		return "";
+	}
+	auto doc = yyjson_read(json.data(), json.size(), 0);
+	if (!doc) {
+		reason = "remote_translate returned malformed JSON";
+		return "";
+	}
+	auto obj = yyjson_doc_get_root(doc);
+	auto sql_value = yyjson_obj_get(obj, "sql");
+	auto writes_value = yyjson_obj_get(obj, "changes_rows");
+	auto reason_value = yyjson_obj_get(obj, "reason");
+	string sql = yyjson_is_str(sql_value) ? yyjson_get_str(sql_value) : "";
+	bool writes = yyjson_is_bool(writes_value) && yyjson_get_bool(writes_value);
+	reason = yyjson_is_str(reason_value) ? yyjson_get_str(reason_value) : "the provider declined the write";
+	yyjson_doc_free(doc);
+	if (sql.empty() || !writes) {
+		return "";
+	}
+	return sql;
+}
+
+//! Binds a copy of `node` (this catalog's name restored on its tables) and serializes the plan as Substrait, the
+//! root's columns named c0…; false, with `reason`, when anything on the way declines. `require_worth`: decline a plan
+//! of scans, filters, projections and sorts only — the table scan already does that much.
+bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
+                     const Identifier &default_schema, bool require_worth, string &plan_bytes,
+                     vector<LogicalType> &types, vector<Identifier> &names, string &reason) {
 	// binding the copy runs the binder, never the remote optimizer, but guard anyway: a nested call declines
 	static thread_local int depth = 0;
 	if (depth > 0) {
 		reason = "re-entered while binding";
-		return nullptr;
+		return false;
 	}
 	auto copy = node.Copy();
 	RestoreCatalog(*copy, catalog.GetName(), default_schema);
-	vector<LogicalType> types;
-	vector<Identifier> names;
-	string plan_bytes;
 	depth++;
 	try {
 		auto binder = Binder::CreateBinder(context);
@@ -238,10 +314,10 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 			}
 			return false;
 		};
-		if (!worth_pushing(*plan)) {
+		if (require_worth && !worth_pushing(*plan)) {
 			depth--;
 			reason = "a plain scan keeps the table scan";
-			return nullptr;
+			return false;
 		}
 		plan->ResolveOperatorTypes();
 		ColumnBindingResolver resolver; // column refs to positional refs, which to_substrait reads
@@ -257,20 +333,36 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 		types = bound.types;
 		names = bound.names;
 		depth--;
-		// ⚠ DuckDB re-wraps a pushed node as `SELECT * FROM <our ref>` (RemotePushdownOptimizer::FinishPushdown),
-		// and a binding cannot hold two columns of one name, so `SELECT a.id, b.id` would come back as id, id_1
-		// where DuckDB answers id, id. Such a query runs locally.
-		case_insensitive_set_t seen;
-		for (auto &name : names) {
-			if (!seen.insert(name.GetIdentifierName()).second) {
-				reason = "two result columns are named " + name.GetIdentifierName();
-				return nullptr;
-			}
-		}
 	} catch (std::exception &ex) {
 		depth--;
 		reason = ErrorData(ex).RawMessage();
+		return false;
+	}
+	return true;
+}
+
+//! The pushed query as the provider's own, through Substrait (ABI v96; docs/duckdb-2.0-remote-execution.md §3.12):
+//!   SELECT CAST(c0 AS <bound type>) AS <bound name>, … FROM fabricator_query('<catalog>', '<query>') __fab_remote
+//!     ORDER BY __fab_remote.k0 <dir> <nulls lowest>, …
+//! — or, for a write (INSERT … SELECT), fabricator_remote_dml. Null, with `reason`, when anything declines.
+unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
+                                       const Identifier &default_schema, string &reason) {
+	vector<LogicalType> types;
+	vector<Identifier> names;
+	string plan_bytes;
+	if (!BindToSubstrait(context, catalog, node, default_schema, /*require_worth=*/true, plan_bytes, types, names,
+	                     reason)) {
 		return nullptr;
+	}
+	// ⚠ DuckDB re-wraps a pushed node as `SELECT * FROM <our ref>` (RemotePushdownOptimizer::FinishPushdown),
+	// and a binding cannot hold two columns of one name, so `SELECT a.id, b.id` would come back as id, id_1
+	// where DuckDB answers id, id. Such a query runs locally.
+	case_insensitive_set_t seen;
+	for (auto &name : names) {
+		if (!seen.insert(name.GetIdentifierName()).second) {
+			reason = "two result columns are named " + name.GetIdentifierName();
+			return nullptr;
+		}
 	}
 
 	string json;
@@ -322,14 +414,7 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 	}
 
 	if (changes_rows) {
-		// A write: fabricator_remote_dml runs it on this transaction's own connection when the statement EXECUTES
-		// and yields its changed-row count as DuckDB's own DML does (one BIGINT column, CHANGED_ROWS).
-		vector<unique_ptr<ParsedExpression>> dml_args;
-		dml_args.push_back(ConstantExpression::String(catalog.GetName().GetIdentifierName()));
-		dml_args.push_back(ConstantExpression::String(sql));
-		auto dml = make_uniq<TableFunctionRef>();
-		dml->function = make_uniq<FunctionExpression>(Identifier("fabricator_remote_dml"), std::move(dml_args));
-		return std::move(dml);
+		return RemoteDmlRef(catalog, sql);
 	}
 
 	// ⚠ Every reference to the server's columns is QUALIFIED with the function's alias, so a user alias can never
@@ -364,6 +449,92 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 	auto statement = make_uniq<SelectStatement>();
 	statement->node = std::move(wrapper);
 	return make_uniq<SubqueryRef>(std::move(statement));
+}
+
+//! DELETE / UPDATE as ONE provider statement. The statement is rewritten as the SELECT over its target that DuckDB
+//! would evaluate — DELETE: `SELECT 1 FROM <target> [, <using>…] WHERE <condition>`; UPDATE: `SELECT CAST(<value> AS
+//! <column type>), … FROM <target> WHERE <condition>` (the cast is the conversion DuckDB applies when it assigns) —
+//! bound and serialized like any pushed query, and wrapped in a WriteRel DELETE / UPDATE on the target. The provider
+//! writes it against the target's own row in the query, so every exactness rule of a pushed SELECT holds for the
+//! condition and the new values. Null, with `reason`, when anything declines; the statement then runs locally.
+unique_ptr<TableRef> SubstraitDml(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
+                                  const Identifier &default_schema, string &reason) {
+	auto copy = node.Copy();
+	RestoreCatalog(*copy, catalog.GetName(), default_schema);
+	auto select = make_uniq<SelectNode>();
+	unique_ptr<TableRef> target;
+	vector<string> columns;
+	auto op = substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_DELETE;
+	if (copy->type == QueryNodeType::DELETE_QUERY_NODE) {
+		auto &del = copy->Cast<DeleteQueryNode>();
+		target = std::move(del.table);
+		select->select_list.push_back(ConstantExpression::Integer(1));
+		unique_ptr<TableRef> from = target->Copy();
+		for (auto &using_clause : del.using_clauses) {
+			auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+			join->left = std::move(from);
+			join->right = std::move(using_clause);
+			from = std::move(join);
+		}
+		select->from_table = std::move(from);
+		select->where_clause = std::move(del.condition);
+	} else {
+		auto &upd = copy->Cast<UpdateQueryNode>();
+		op = substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_UPDATE;
+		target = std::move(upd.table);
+		if (!target || target->type != TableReferenceType::BASE_TABLE || !upd.set_info) {
+			reason = "the UPDATE target is not a table";
+			return nullptr;
+		}
+		auto &name = target->Cast<BaseTableRef>().GetQualifiedName();
+		auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, name.Schema(), name.Name(),
+		                              OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			reason = "the UPDATE target is not found";
+			return nullptr;
+		}
+		auto &table = entry->Cast<TableCatalogEntry>();
+		auto &set_info = *upd.set_info;
+		for (idx_t i = 0; i < set_info.columns.size(); i++) {
+			auto &expr = set_info.expressions[i];
+			if (expr->GetExpressionClass() == ExpressionClass::DEFAULT) {
+				reason = "SET … = DEFAULT";
+				return nullptr;
+			}
+			if (!table.ColumnExists(set_info.columns[i])) {
+				reason = "SET names a column the table does not have"; // the binder reports it
+				return nullptr;
+			}
+			auto &column = table.GetColumn(set_info.columns[i]);
+			columns.push_back(column.Name().GetIdentifierName());
+			select->select_list.push_back(make_uniq<CastExpression>(column.Type(), std::move(expr)));
+		}
+		select->from_table = target->Copy();
+		select->where_clause = std::move(set_info.condition);
+	}
+	if (!target || target->type != TableReferenceType::BASE_TABLE) {
+		reason = "the target is not a table";
+		return nullptr;
+	}
+	auto &target_name = target->Cast<BaseTableRef>().GetQualifiedName();
+	string plan_bytes;
+	vector<LogicalType> types;
+	vector<Identifier> names;
+	if (!BindToSubstrait(context, catalog, *select, default_schema, /*require_worth=*/false, plan_bytes, types, names,
+	                     reason)) {
+		return nullptr;
+	}
+	auto bytes = WrapInWrite(plan_bytes, op, target_name.Schema().GetIdentifierName(),
+	                         target_name.Name().GetIdentifierName(), columns, reason);
+	if (bytes.empty()) {
+		return nullptr;
+	}
+	auto sql = TranslateWrite(context, catalog, bytes, reason);
+	if (sql.empty()) {
+		return nullptr;
+	}
+	RemoteTrace("remote: " + sql);
+	return RemoteDmlRef(catalog, sql);
 }
 
 //! Follows each output column of `op` down to the column of the pushed query it is, `c<j>` -> j, through the
@@ -508,56 +679,13 @@ string FabricatorCatalog::RemoteInsertForCtas(ClientContext &context, LogicalOpe
 		return "";
 	}
 	// its plan, wrapped in a WriteRel INSERT into the new table — the same translation an INSERT … SELECT gets
-	substrait::Plan plan;
-	if (!plan.ParseFromString(plan_bytes)) {
-		reason = "the pushed plan does not parse";
+	auto bytes = WrapInWrite(plan_bytes, substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_INSERT, schema, table,
+	                         columns, reason);
+	if (bytes.empty()) {
 		return "";
 	}
-	substrait::RelRoot *root = nullptr;
-	for (auto &rel : *plan.mutable_relations()) {
-		if (rel.has_root()) {
-			root = rel.mutable_root();
-		}
-	}
-	if (!root) {
-		reason = "the pushed plan has no root";
-		return "";
-	}
-	auto write_rel = make_uniq<substrait::Rel>();
-	auto write = write_rel->mutable_write();
-	write->set_op(substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_INSERT);
-	write->set_output(substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_NO_OUTPUT);
-	write->mutable_named_table()->add_names(schema);
-	write->mutable_named_table()->add_names(table);
-	for (auto &column : columns) {
-		write->mutable_table_schema()->add_names(column);
-	}
-	write->set_allocated_input(root->release_input());
-	root->set_allocated_input(write_rel.release());
-	root->clear_names();
-
-	string json;
-	try {
-		FabricatorSetActiveTxn(GetHandle(), context);
-		json = fabricator::RemoteTranslate(GetHandle(), plan.SerializeAsString());
-	} catch (std::exception &ex) {
-		reason = ErrorData(ex).RawMessage();
-		return "";
-	}
-	auto doc = yyjson_read(json.data(), json.size(), 0);
-	if (!doc) {
-		reason = "remote_translate returned malformed JSON";
-		return "";
-	}
-	auto obj = yyjson_doc_get_root(doc);
-	auto sql_value = yyjson_obj_get(obj, "sql");
-	auto writes_value = yyjson_obj_get(obj, "changes_rows");
-	auto reason_value = yyjson_obj_get(obj, "reason");
-	string sql = yyjson_is_str(sql_value) ? yyjson_get_str(sql_value) : "";
-	bool writes = yyjson_is_bool(writes_value) && yyjson_get_bool(writes_value);
-	reason = yyjson_is_str(reason_value) ? yyjson_get_str(reason_value) : "the provider declined the insert";
-	yyjson_doc_free(doc);
-	if (sql.empty() || !writes) {
+	auto sql = TranslateWrite(context, *this, bytes, reason);
+	if (sql.empty()) {
 		return "";
 	}
 	RemoteTrace("remote ctas: " + sql);
@@ -588,11 +716,20 @@ bool FabricatorCatalog::SupportsPushdown(const SQLStatement &statement) {
 }
 
 bool FabricatorCatalog::SupportsPushdown(const QueryNode &node) {
-	// SELECT and set operations; RemoteExecute binds them and declines what does not translate. DELETE and UPDATE
-	// keep the plan-less shortcut (ABI v93/v94), which keeps DuckDB's binding and its affected-row count; MERGE
-	// keeps the rowid path.
+	// SELECT and set operations; RemoteExecute binds them and declines what does not translate. MERGE keeps the
+	// rowid path (Substrait has no MERGE).
 	if (node.type == QueryNodeType::SELECT_NODE || node.type == QueryNodeType::SET_OPERATION_NODE) {
 		return true;
+	}
+	// DELETE / UPDATE as one statement (SubstraitDml). RETURNING keeps the rowid path, which returns the rows from
+	// the statement's own OUTPUT; UPDATE … FROM keeps it too — a target row the join matches twice would be updated
+	// with whichever match SQL Server takes. A declined one still gets the plan-less shortcut (ABI v93/v94).
+	if (node.type == QueryNodeType::DELETE_QUERY_NODE) {
+		return node.Cast<DeleteQueryNode>().returning_list.empty();
+	}
+	if (node.type == QueryNodeType::UPDATE_QUERY_NODE) {
+		auto &update = node.Cast<UpdateQueryNode>();
+		return update.returning_list.empty() && !update.from_table;
 	}
 	// INSERT … SELECT reading a table of this catalog: one INSERT … SELECT on the server, no rows travel. Only that
 	// shape — an INSERT … VALUES gains nothing and keeps the host's own insert untouched, and RETURNING / ON
@@ -609,12 +746,17 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 	Identifier default_schema(GetDefaultSchema().value_or(Identifier("dbo")));
 	string reason;
 	const bool is_insert = node->type == QueryNodeType::INSERT_QUERY_NODE;
+	const bool is_dml = node->type == QueryNodeType::DELETE_QUERY_NODE || node->type == QueryNodeType::UPDATE_QUERY_NODE;
 	Value dml_enabled;
-	if (is_insert && context.TryGetCurrentSetting("fabricator_dml_pushdown", dml_enabled) && !dml_enabled.IsNull() &&
-	    !dml_enabled.GetValue<bool>()) {
+	if ((is_insert || is_dml) && context.TryGetCurrentSetting("fabricator_dml_pushdown", dml_enabled) &&
+	    !dml_enabled.IsNull() && !dml_enabled.GetValue<bool>()) {
 		// the switch exists for the case where streaming the rows through DuckDB is FASTER (a parallel plan the
 		// server would not choose for an INSERT … SELECT) — and it is the reference oracle of the differential gate
 		reason = "fabricator_dml_pushdown = false";
+	} else if (is_dml) {
+		if (auto pushed = SubstraitDml(context, *this, *node, default_schema, reason)) {
+			return pushed;
+		}
 	} else if (auto pushed = SubstraitPushdown(context, *this, *node, default_schema, reason)) {
 		return pushed;
 	}

@@ -1346,12 +1346,17 @@ SELECT count(*) FROM (((SELECT count(*) AS n FROM rp.dbo.rs_t WHERE date_trunc('
 ----
 0
 
-# ═══ §6  DML keeps its own paths ══════════════════════════════════════════════════════════════════════
-# The remote optimizer would also take DELETE / UPDATE nodes; this catalog refuses them, so the plan-less
-# shortcut (ABI v93) still runs them and still reports DuckDB's affected-row count.
+# ═══ §6  DML through the remote optimizer ════════════════════════════════════════════════════════════
+# A DELETE / UPDATE without RETURNING runs as ONE server statement (verify_remote_dml_mssql gates it) and
+# still reports the affected-row count; with remote_pushdown off it keeps the plan-less shortcut (ABI v93).
 
 query II
 EXPLAIN DELETE FROM rp.dbo.rs_t WHERE id = 1;
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN DELETE FROM db.dbo.rs_t WHERE id = 1;
 ----
 physical_plan	<REGEX>:.*Fabricator Delete Where.*
 

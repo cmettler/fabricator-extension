@@ -117,29 +117,65 @@ physical_plan	<REGEX>:.*Mssql Net Create Table As.*
 
 # ═══ D / U — DELETE and UPDATE ═════════════════════════════════════════════════════════════════════════
 
-# D1: a predicate on exact types: one DELETE … WHERE on the server
+# D1: a predicate on exact types: one DELETE on the server
 query II
 EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-01-01';
 ----
-physical_plan	<REGEX>:.*Fabricator Delete Where.*
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
 
-# D2: a string comparison (its meaning depends on the collation): scan, then delete by key
+# D2: a string comparison, compared exactly as DuckDB does (case- and trailing-space-sensitive): one DELETE
 query II
 EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE region = 'US';
 ----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# D3: a subquery over another table of the catalog: one DELETE … WHERE EXISTS
+query II
+EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE region IN (SELECT region FROM mssql.dbo.pg_regions WHERE name = 'Americas');
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# D4: a function with no exact T-SQL: scan, then delete by key
+query II
+EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^l');
+----
 physical_plan	<REGEX>:.*Mssql Net Delete.*
 
-# U1: DECIMAL arithmetic in SET is not rendered: scan, then update by key
+# U1: DECIMAL arithmetic in SET: one UPDATE on the server
 query II
 EXPLAIN UPDATE mssql.dbo.pg_sales SET amount = amount * 2 WHERE id = 1;
 ----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# U2: UPDATE … FROM another table: scan, then update by key (a target row the join matched twice would be updated
+# with whichever match SQL Server takes)
+query II
+EXPLAIN UPDATE mssql.dbo.pg_sales SET note = r.name FROM mssql.dbo.pg_regions r WHERE pg_sales.region = r.region;
+----
 physical_plan	<REGEX>:.*Mssql Net Update.*
 
-# U2: a constant SET value and an exact predicate: one UPDATE … WHERE on the server
+# U3: with remote_pushdown off, a predicate on exact types is still one statement — the plan-less shortcut
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_np (TYPE fabricator, remote_pushdown 'false');
+
 query II
-EXPLAIN UPDATE mssql.dbo.pg_sales SET amount = 12.50 WHERE id = 1;
+EXPLAIN UPDATE mssql_np.dbo.pg_sales SET amount = 12.50 WHERE id = 1;
 ----
 physical_plan	<REGEX>:.*Fabricator Update Where.*
+
+statement ok
+DETACH mssql_np;
+
+# the guide's DELETE / UPDATE examples answer as DuckDB would
+query I
+UPDATE mssql.dbo.pg_sales SET amount = amount * 2 WHERE id = 1;
+----
+1
+
+query I
+SELECT amount FROM mssql.dbo.pg_sales WHERE id = 1;
+----
+20.00
 
 # R1: INSERT … RETURNING
 query I

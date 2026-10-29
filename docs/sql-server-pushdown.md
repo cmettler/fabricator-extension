@@ -16,8 +16,8 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | `INSERT … SELECT` | the `SELECT` reads tables of the same catalog and translates exactly (I1) | `FABRICATOR_REMOTE_DML` | `Mssql Net Insert`: DuckDB streams the rows into a bulk copy — and still pushes the `SELECT` when worth it |
 | `INSERT … VALUES` | never — a bulk copy is already the fast path (I2) | — | `Mssql Net Insert` |
 | `CREATE TABLE … AS` | its query is pushed (C1) | `Fabricator Remote Ctas` | `Mssql Net Create Table As`: rows stream into a bulk copy (C2) |
-| `DELETE` | the whole `WHERE` is exact: integer, DECIMAL, BIT, DATE comparisons, `IN`, `BETWEEN`, `IS NULL`, `AND`/`OR` (D1) | `Fabricator Delete Where` | `Mssql Net Delete`: scan the keys, delete by key (D2) |
-| `UPDATE` | as `DELETE`, and every `SET` value is a constant, an exact column, or integer `+ - *` (U2) | `Fabricator Update Where` | `Mssql Net Update`: scan, update by key (U1) |
+| `DELETE` | the `WHERE` translates exactly — strings, subqueries over the catalog, `USING` included (D1–D3) | `FABRICATOR_REMOTE_DML` | `Mssql Net Delete`: scan the keys, delete by key (D4) |
+| `UPDATE` | as `DELETE`, every `SET` value translates (U1); not `UPDATE … FROM` | `FABRICATOR_REMOTE_DML` | `Mssql Net Update`: scan, update by key (U2) |
 | `… RETURNING` | not as one pushed statement: `DELETE` / `UPDATE` take the key path, the rows come from T-SQL `OUTPUT` | `Mssql Net Delete` / `Update` / `Insert` | see [RETURNING](#returning) |
 | `MERGE` | — | — | merge by key, see [MERGE](#merge) |
 
@@ -145,22 +145,47 @@ DuckDB into a bulk copy (`Mssql Net Create Table As` over `Fabricator Scan`). Th
 
 ## DELETE and UPDATE
 
-**D1 — pushed.** The whole `WHERE` translates exactly, so it is one `DELETE … WHERE` on the server — no scan, no keys:
+A `DELETE` / `UPDATE` whose condition and new values translate exactly is ONE statement on the server — no scan, no
+keys travel. DuckDB's statement is evaluated as the query over its target (`SELECT … FROM target WHERE …`), which is
+translated like any pushed `SELECT`, and written as `DELETE [t0] FROM … WHERE …` / `UPDATE [t0] SET … FROM … WHERE …`.
+A new value is first cast to the column's type exactly as DuckDB casts it when it assigns (a DECIMAL rounds into an
+INTEGER column; T-SQL alone would truncate).
+
+**D1 — pushed.** `DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-01-01';` — `FABRICATOR_REMOTE_DML`.
+
+**D2 — pushed: a string comparison.** `region = 'US'` matches only `'US'`, not `'us'` or `'US '` — DuckDB's
+comparison, whatever the column's collation. The T-SQL carries the plain comparison too, so an index on the column
+can still be used:
 
 ```sql
-DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-01-01';
--- EXPLAIN: Fabricator Delete Where
+DELETE FROM mssql.dbo.pg_sales WHERE region = 'US';
+-- T-SQL: DELETE [t0] FROM [dbo].[pg_sales] AS [t0]
+--        WHERE (([t0].[region] = 'US') AND (<the same comparison in a binary collation>))
 ```
 
-**D2 — not pushed: a string comparison.** `region = 'US'` depends on the column's collation on SQL Server (`'us'`,
-`'US '` may match there), so DuckDB scans the matching keys and deletes by key (`Mssql Net Delete`). This needs a
-primary key or unique index; on a table without one, use `fabricator_exec`.
+**D3 — pushed: a subquery over the catalog** becomes `WHERE EXISTS (…)` (`NOT IN` keeps its NULL semantics):
 
-**U1 — not pushed: DECIMAL arithmetic in SET.** `SET amount = amount * 2` on a DECIMAL column is not rendered (scale
-and rounding would have to match DuckDB's exactly), so it updates by key (`Mssql Net Update`).
+```sql
+DELETE FROM mssql.dbo.pg_sales WHERE region IN (SELECT region FROM mssql.dbo.pg_regions WHERE name = 'Americas');
+```
 
-**U2 — pushed.** `UPDATE … SET amount = 12.50 WHERE id = 1`: a constant and an exact predicate, one `UPDATE … WHERE`
-(`Fabricator Update Where`).
+`DELETE … USING other_table WHERE …` is pushed the same way; a row the join matches twice is deleted, and counted, once.
+
+**D4 — not pushed: a function without an exact T-SQL equivalent** (here `regexp_matches`): DuckDB scans the matching
+keys and deletes by key (`Mssql Net Delete`). This needs a primary key, unique index or IDENTITY column; on a table
+without one, use `fabricator_exec`.
+
+**U1 — pushed.** `UPDATE mssql.dbo.pg_sales SET amount = amount * 2 WHERE id = 1;` — DECIMAL arithmetic, cast back
+to `DECIMAL(10,2)`.
+
+**U2 — not pushed: `UPDATE … FROM`.** A target row the join matches twice would get whichever match SQL Server takes,
+where DuckDB's answer is fixed; it updates by key instead (`Mssql Net Update`).
+
+**U3 — with `remote_pushdown 'false'`**, a `DELETE` / `UPDATE` whose predicate uses only integer, DECIMAL, BIT and DATE
+comparisons (and whose `SET` values are constants, such columns or integer `+ - *`) is still one statement — the
+older shortcut, `Fabricator Delete Where` / `Fabricator Update Where`. It also catches what the translation declines.
+
+`RETURNING` keeps a `DELETE` / `UPDATE` on the key path — see the next section.
 
 ## RETURNING
 
@@ -179,7 +204,7 @@ DELETE FROM mssql.dbo.pg_sales WHERE id = 4 RETURNING id, note;          -- R2: 
 UPDATE mssql.dbo.pg_sales SET amount = 1 WHERE id = 2 RETURNING id, amount; -- R3: 2 | 1.00
 ```
 
-`RETURNING` keeps a `DELETE` / `UPDATE` off the one-statement shortcut (D1, U2): that shortcut returns only a count.
+`RETURNING` keeps a `DELETE` / `UPDATE` on the key path: the one-statement forms return only a count.
 On a table with an enabled trigger, where SQL Server refuses `OUTPUT` on its own, the rows go `OUTPUT … INTO` a table
 variable that the same batch reads back — the trigger fires as for any other statement. Not on an external
 (PolyBase) table: its writes go to storage, which returns no rows.

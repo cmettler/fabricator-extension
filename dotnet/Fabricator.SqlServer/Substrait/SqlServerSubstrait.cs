@@ -76,11 +76,11 @@ public static class SqlServerSubstrait
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null)
         => TranslatePushdown(plan, ignoreNulls, out columnCount, out orderDescending, out _, columnSqlTypes);
 
-    /// <param name="write">For a plan that writes (an INSERT … SELECT), the target table and the columns it
-    /// names; the query is then a statement with no result, and <paramref name="columnCount"/> is 1 — the
-    /// affected-row count the host reports. Null for a query.</param>
+    /// <param name="write">For a plan that writes (INSERT … SELECT, DELETE, UPDATE), the operation, the target table
+    /// and the columns it writes; the query is then a statement with no result, and <paramref name="columnCount"/>
+    /// is 1 — the affected-row count the host reports. Null for a query.</param>
     internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending,
-                                             out (IReadOnlyList<string> Table, IReadOnlyList<string> Columns)? write,
+                                             out (int Op, IReadOnlyList<string> Table, IReadOnlyList<string> Columns)? write,
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null)
     {
         if (plan == null || plan.Length == 0)
@@ -93,8 +93,10 @@ public static class SqlServerSubstrait
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes) { SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls };
         if (root.Input is WriteRel writeRel)
         {
-            string sql = emitter.EmitInsert(writeRel);
-            write = (writeRel.TableNames, writeRel.ColumnNames);
+            string sql = writeRel.Op == SubstraitFields.WriteOp_Insert
+                ? emitter.EmitInsert(writeRel)
+                : emitter.EmitDeleteOrUpdate(writeRel);
+            write = (writeRel.Op, writeRel.TableNames, writeRel.ColumnNames);
             columnCount = 1;
             orderDescending = new List<bool>();
             return sql;

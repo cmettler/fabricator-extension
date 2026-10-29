@@ -21,8 +21,11 @@ require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
+# ⚠ remote_pushdown OFF: with it on, the remote optimizer takes a DELETE / UPDATE first and runs it as one translated
+# statement (verify_remote_dml_mssql). This suite gates the plan-less shortcut, which is what a catalog without remote
+# pushdown — and every statement the translation declines — still gets.
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'false');
 
 # ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
 # Two identical tables, created SERVER-SIDE so their types are SQL Server's own (BIT, DECIMAL(10,2), DATE).

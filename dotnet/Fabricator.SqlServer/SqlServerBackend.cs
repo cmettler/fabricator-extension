@@ -3196,7 +3196,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         string sql;
         int columnCount;
         List<bool> orderDescending;
-        (IReadOnlyList<string> Table, IReadOnlyList<string> Columns)? write;
+        (int Op, IReadOnlyList<string> Table, IReadOnlyList<string> Columns)? write;
         try
         {
             var special = UncollatableColumns();
@@ -3212,7 +3212,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             // A write runs on the transaction's own connection (the host's fabricator_remote_dml), so the no-MARS
             // concern below does not apply; what must hold instead is that it does what the host's insert would.
-            return WriteDeclineReason(target.Table, target.Columns) is { } reason
+            return WriteDeclineReason(target.Op, target.Table, target.Columns) is { } reason
                 ? RemoteQuery.Declined(reason)
                 : new RemoteQuery(sql, columnCount, orderDescending) { ChangesRows = true };
         }
@@ -3242,11 +3242,20 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// to storage, not to SQL Server), and <c>mssql_keep_nulls = false</c> (the bulk copy then writes a
     /// column's default for a NULL).
     /// </summary>
-    private string? WriteDeclineReason(IReadOnlyList<string> table, IReadOnlyList<string> columns)
+    private string? WriteDeclineReason(int op, IReadOnlyList<string> table, IReadOnlyList<string> columns)
     {
         if (table.Count != 2)
         {
-            return "the insert target is not a schema-qualified table";
+            return "the write target is not a schema-qualified table";
+        }
+        if (op != Clast.Drivers.SqlServer.Substrait.SubstraitFields.WriteOp_Insert)
+        {
+            // A DELETE / UPDATE is compared with the host's ROWID path, which is itself T-SQL DELETE / UPDATE
+            // statements: triggers fire and a NULL is a NULL there too. Only an external table differs — its rowid
+            // DML is routed to storage, where a T-SQL statement cannot reach.
+            return DetectExternalTable(table[0], table[1]) is not null
+                ? $"{table[0]}.{table[1]} is an external table"
+                : null;
         }
         if (!ResolveKeepNulls())
         {

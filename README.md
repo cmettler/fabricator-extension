@@ -709,8 +709,14 @@ otherwise. `UPDATE`, `DELETE` and `MERGE` support `RETURNING` on SQL Server: the
 `rowid`. Examples, and the DuckDB 2.0 data-modifying CTE that moves rows between tables:
 [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md#returning).
 
-A DELETE or UPDATE runs as ONE `DELETE FROM … WHERE …` / `UPDATE … SET … WHERE …` on SQL Server — no scan,
-no row ids, so it also works on a table without a key — when **every** part of it translates exactly:
+A DELETE or UPDATE runs as ONE statement on SQL Server — no scan, no row ids, so it also works on a table without a
+key — in two ways:
+
+- **with `remote_pushdown` (the default):** when its condition and new values translate exactly, like a pushed
+  `SELECT` — string comparisons (exact, as DuckDB compares), subqueries over the catalog's tables, `DELETE … USING`,
+  DECIMAL arithmetic. Not `RETURNING` and not `UPDATE … FROM`. `EXPLAIN` shows `FABRICATOR_REMOTE_DML`.
+  Examples: [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md#delete-and-update).
+- **otherwise** (and for what the translation declines), the narrower shortcut below, when **every** part translates:
 
 - the WHERE: comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR` over columns of type BOOLEAN, the
   integer types, DECIMAL or DATE;

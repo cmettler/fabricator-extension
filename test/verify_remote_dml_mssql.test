@@ -1,0 +1,364 @@
+# name: test/verify_remote_dml_mssql.test
+# description: DELETE and UPDATE as ONE SQL Server statement through Substrait (remote pushdown): the statement is
+#              rewritten as the SELECT over its target DuckDB would evaluate, translated, and written as
+#              `DELETE [t0] FROM … WHERE …` / `UPDATE [t0] SET … FROM … WHERE …`. This is what pushes string
+#              predicates, subqueries, DELETE … USING and DECIMAL arithmetic, which the v93/v94 shortcut refuses.
+#              Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THREE-WAY DIFFERENTIAL. Every statement runs on THREE copies of the same rows: `on` (pushed),
+#              `off` (`fabricator_dml_pushdown = false`: the rowid path, i.e. DuckDB evaluates the predicate), and
+#              `loc` (a DuckDB table — the semantics both must reproduce). Counts and contents must agree. The data
+#              is adversarial for exactly the things a T-SQL translation gets wrong: case, trailing spaces, NULLs,
+#              NOT IN over a NULL, a DELETE … USING that matches one row twice, and DECIMAL -> INTEGER rounding.
+#              Every expected count is DuckDB's own, computed by running the same sequence on a DuckDB table.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'true');
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rd_on; DROP TABLE IF EXISTS dbo.rd_off; DROP TABLE IF EXISTS dbo.rd_k; DROP TABLE IF EXISTS dbo.rd_kn;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rd_on (id INT PRIMARY KEY, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2), d DATE);
+INSERT INTO dbo.rd_on SELECT value,
+  CASE value % 6 WHEN 0 THEN ''EU'' WHEN 1 THEN ''eu'' WHEN 2 THEN ''EU '' WHEN 3 THEN NULL WHEN 4 THEN ''US'' ELSE ''Ü'' END,
+  CASE WHEN value % 7 = 0 THEN NULL ELSE value % 5 END, value * 1.25, DATEADD(day, value, ''2026-01-01'')
+FROM GENERATE_SERIES(1, 60);
+SELECT * INTO dbo.rd_off FROM dbo.rd_on; ALTER TABLE dbo.rd_off ADD PRIMARY KEY (id);
+CREATE TABLE dbo.rd_k (k INT); INSERT INTO dbo.rd_k VALUES (1), (2), (2), (3), (50);
+CREATE TABLE dbo.rd_kn (k INT); INSERT INTO dbo.rd_kn VALUES (4), (NULL);', refresh_cache := true);
+
+statement ok
+CREATE TABLE loc AS SELECT * FROM db.dbo.rd_on;
+
+statement ok
+CREATE TABLE loc_k AS SELECT * FROM db.dbo.rd_k;
+
+statement ok
+CREATE TABLE loc_kn AS SELECT * FROM db.dbo.rd_kn;
+
+# ═══ §1  Routing ═══════════════════════════════════════════════════════════════════════════════════════
+
+query II
+EXPLAIN DELETE FROM db.dbo.rd_on WHERE s = 'EU';
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN UPDATE db.dbo.rd_on SET amount = amount * 2 WHERE id IN (SELECT k FROM db.dbo.rd_k);
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# the target read again in a subquery is pushed: only its read at the top of FROM is the row the DELETE removes
+query II
+EXPLAIN DELETE FROM db.dbo.rd_on WHERE id IN (SELECT id + 1 FROM db.dbo.rd_on WHERE s = 'US');
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# stays local: a self-join (which of the two reads is the target?), RETURNING (the rowid path returns the rows),
+# UPDATE … FROM, a function with no exact T-SQL
+query II
+EXPLAIN DELETE FROM db.dbo.rd_on USING db.dbo.rd_on b WHERE rd_on.id = b.id + 1 AND b.s = 'US';
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN DELETE FROM db.dbo.rd_on WHERE s = 'EU' RETURNING id;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN UPDATE db.dbo.rd_on SET n = k.k FROM db.dbo.rd_k k WHERE rd_on.id = k.k;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN DELETE FROM db.dbo.rd_on WHERE regexp_matches(s, '^E');
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# … and with the switch off
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN DELETE FROM db.dbo.rd_off WHERE s = 'EU';
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# ═══ §2  The differential — on (pushed) / off (rowid path) / loc (DuckDB) ══════════════════════════════
+
+# (1) string equality: case, a trailing space, NULL and a non-ASCII letter are all different values
+query I
+DELETE FROM db.dbo.rd_on WHERE s = 'EU' AND id < 20;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM db.dbo.rd_off WHERE s = 'EU' AND id < 20;
+----
+3
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+DELETE FROM loc WHERE s = 'EU' AND id < 20;
+----
+3
+
+# (2) IN over another table (duplicates in it must not matter)
+query I
+DELETE FROM db.dbo.rd_on WHERE id IN (SELECT k FROM db.dbo.rd_k);
+----
+4
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM db.dbo.rd_off WHERE id IN (SELECT k FROM db.dbo.rd_k);
+----
+4
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+DELETE FROM loc WHERE id IN (SELECT k FROM loc_k);
+----
+4
+
+# (3) NOT IN over a set holding NULL: matches nothing (x NOT IN (4, NULL) is never true)
+query I
+DELETE FROM db.dbo.rd_on WHERE id NOT IN (SELECT k FROM db.dbo.rd_kn);
+----
+0
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM db.dbo.rd_off WHERE id NOT IN (SELECT k FROM db.dbo.rd_kn);
+----
+0
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+DELETE FROM loc WHERE id NOT IN (SELECT k FROM loc_kn);
+----
+0
+
+# (4) DELETE … USING with a key matched twice: the row is deleted, and counted, once
+query I
+DELETE FROM db.dbo.rd_on USING db.dbo.rd_k k WHERE rd_on.id = k.k + 40;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM db.dbo.rd_off USING db.dbo.rd_k k WHERE rd_off.id = k.k + 40;
+----
+3
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+DELETE FROM loc USING loc_k k WHERE loc.id = k.k + 40;
+----
+3
+
+# (5) a correlated EXISTS and a LIKE prefix
+query I
+DELETE FROM db.dbo.rd_on WHERE s LIKE 'U%' AND EXISTS (SELECT 1 FROM db.dbo.rd_k k WHERE k.k = rd_on.n);
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM db.dbo.rd_off WHERE s LIKE 'U%' AND EXISTS (SELECT 1 FROM db.dbo.rd_k k WHERE k.k = rd_off.n);
+----
+5
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+DELETE FROM loc WHERE s LIKE 'U%' AND EXISTS (SELECT 1 FROM loc_k k WHERE k.k = loc.n);
+----
+5
+
+# (6) UPDATE with DECIMAL arithmetic and a date predicate
+query I
+UPDATE db.dbo.rd_on SET amount = amount * 2 + 0.5 WHERE d >= DATE '2026-02-15';
+----
+12
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+UPDATE db.dbo.rd_off SET amount = amount * 2 + 0.5 WHERE d >= DATE '2026-02-15';
+----
+12
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+UPDATE loc SET amount = amount * 2 + 0.5 WHERE d >= DATE '2026-02-15';
+----
+12
+
+# (7) UPDATE an INTEGER from a DECIMAL — DuckDB rounds where a T-SQL conversion truncates — and a string function
+query I
+UPDATE db.dbo.rd_on SET n = amount + 0.5, s = upper(s) WHERE id % 4 = 1;
+----
+13
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+UPDATE db.dbo.rd_off SET n = amount + 0.5, s = upper(s) WHERE id % 4 = 1;
+----
+13
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+UPDATE loc SET n = amount + 0.5, s = upper(s) WHERE id % 4 = 1;
+----
+13
+
+# (8) SET to NULL, under NOT IN over a set without NULL
+query I
+UPDATE db.dbo.rd_on SET d = NULL WHERE id NOT IN (SELECT k FROM db.dbo.rd_k WHERE k IS NOT NULL) AND n = 2;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+UPDATE db.dbo.rd_off SET d = NULL WHERE id NOT IN (SELECT k FROM db.dbo.rd_k WHERE k IS NOT NULL) AND n = 2;
+----
+3
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+UPDATE loc SET d = NULL WHERE id NOT IN (SELECT k FROM loc_k WHERE k IS NOT NULL) AND n = 2;
+----
+3
+
+# (9) the target read again in a subquery (SQL Server evaluates it before deleting, as DuckDB does)
+query I
+DELETE FROM db.dbo.rd_on WHERE id IN (SELECT id + 1 FROM db.dbo.rd_on WHERE s = 'US');
+----
+4
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM db.dbo.rd_off WHERE id IN (SELECT id + 1 FROM db.dbo.rd_off WHERE s = 'US');
+----
+4
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+DELETE FROM loc WHERE id IN (SELECT id + 1 FROM loc WHERE s = 'US');
+----
+4
+
+# the three agree, both ways
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.rd_on EXCEPT ALL SELECT * FROM loc) UNION ALL
+SELECT count(*) FROM (SELECT * FROM loc EXCEPT ALL SELECT * FROM db.dbo.rd_on) UNION ALL
+SELECT count(*) FROM (SELECT * FROM db.dbo.rd_off EXCEPT ALL SELECT * FROM loc) UNION ALL
+SELECT count(*) FROM (SELECT * FROM loc EXCEPT ALL SELECT * FROM db.dbo.rd_off);
+----
+0
+0
+0
+0
+
+# ... and not vacuously
+query III
+SELECT count(*), count(d), sum(n) FROM db.dbo.rd_on;
+----
+41	38	769
+
+# ═══ §3  Transactions: on the transaction's connection ═════════════════════════════════════════════════
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM db.dbo.rd_on WHERE s = 'Ü';
+----
+5
+
+query I
+SELECT count(*) FROM db.dbo.rd_on WHERE s = 'Ü';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM db.dbo.rd_on WHERE s = 'Ü';
+----
+5
+
+# EXPLAIN runs nothing
+statement ok
+EXPLAIN DELETE FROM db.dbo.rd_on;
+
+query I
+SELECT count(*) FROM db.dbo.rd_on;
+----
+41
+
+# a READ_ONLY attach refuses it
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dbro (TYPE fabricator, READ_ONLY, remote_pushdown 'true');
+
+statement error
+DELETE FROM dbro.dbo.rd_on WHERE s = 'EU';
+----
+read-only
+
+statement ok
+DETACH dbro;
+
+# ═══ §4  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rd_on; DROP TABLE IF EXISTS dbo.rd_off; DROP TABLE IF EXISTS dbo.rd_k; DROP TABLE IF EXISTS dbo.rd_kn;');

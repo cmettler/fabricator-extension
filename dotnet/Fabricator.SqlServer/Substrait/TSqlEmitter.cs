@@ -41,6 +41,9 @@ internal sealed class TSqlEmitter
     private readonly bool _perRecordEvaluation;
     private readonly string? _collation;
     private readonly Func<IReadOnlyList<string>, string>? _tableName;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Every named-table read, with its alias — a DELETE / UPDATE finds
+    /// its target's row in the input by it.</summary>
+    private readonly List<(IReadOnlyList<string> Names, string From)> _reads = new();
     private readonly Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? _columnSqlTypes;
     private readonly List<IReadOnlyList<SqlColumn>> _outerScopes = new();
     private int _aliasCounter;
@@ -129,6 +132,102 @@ internal sealed class TSqlEmitter
             orderDescending.Add(block.OrderBy[i].Descending);
         }
         return Render(block, items, keepOrder: true);
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Writes a WriteRel DELETE / UPDATE whose input is the query over the target
+    /// that DuckDB evaluates (the host builds it: DELETE <c>SELECT 1 FROM target … WHERE …</c>, UPDATE <c>SELECT
+    /// &lt;new value&gt;, … FROM target WHERE …</c>, the new values in the order of the WriteRel's columns):
+    /// <c>DELETE [t0] FROM &lt;from&gt; WHERE …</c> / <c>UPDATE [t0] SET [c] = &lt;value&gt;, … FROM &lt;from&gt; WHERE …</c>,
+    /// where [t0] is the target's row in that query. Refused when the target is read anywhere but once at the top
+    /// of the query's FROM (a derived table, a self-join), when the query groups, deduplicates, limits or windows,
+    /// and — UPDATE — when the FROM holds anything besides the target.
+    /// </summary>
+    public string EmitDeleteOrUpdate(WriteRel write)
+    {
+        bool update = write.Op == F.WriteOp_Update;
+        if (!update && write.Op != F.WriteOp_Delete)
+        {
+            throw SubstraitTranslationException.Unsupported($"WriteRel operation {write.Op}.");
+        }
+        if (write.Output == F.WriteOutput_ModifiedRecords || write.Emit != null)
+        {
+            throw SubstraitTranslationException.Unsupported("WriteRel output of the modified records (RETURNING).");
+        }
+        var block = EmitRel(write.Input);
+        if (!block.IsPlain)
+        {
+            throw SubstraitTranslationException.Unsupported("a DELETE / UPDATE over a grouped, distinct, limited or windowed query.");
+        }
+        string target = _tableName?.Invoke(write.TableNames) ?? string.Join(".", write.TableNames.Select(TSql.Identifier));
+        var atTop = _reads.Where(r => r.From.StartsWith(target + " AS ", StringComparison.Ordinal))
+                          .Select(r => r.From)
+                          .Where(from => TopLevelOccurrences(block.From, from) == 1)
+                          .ToList();
+        if (atTop.Count != 1)
+        {
+            throw SubstraitTranslationException.Unsupported("the target table is not read exactly once at the top of the query.");
+        }
+        string alias = atTop[0].Substring(target.Length + " AS ".Length);
+        string where = block.Where.Count > 0 ? "\nWHERE " + string.Join("\n  AND ", block.Where) : "";
+        if (!update)
+        {
+            return "DELETE " + alias + "\nFROM " + block.From + where;
+        }
+        if (block.From != atTop[0])
+        {
+            throw SubstraitTranslationException.Unsupported("an UPDATE joined with another table.");
+        }
+        if (block.Columns.Count != write.ColumnNames.Count || write.ColumnNames.Count == 0)
+        {
+            throw SubstraitTranslationException.MalformedPlan($"WriteRel assigns {write.ColumnNames.Count} columns but its input has {block.Columns.Count}.");
+        }
+        var assignments = write.ColumnNames.Select((c, i) => TSql.Identifier(c) + " = " + block.Columns[i].Expr.Value);
+        return "UPDATE " + alias + " SET " + string.Join(", ", assignments) + "\nFROM " + block.From + where;
+    }
+
+    /// <summary>How often <paramref name="part"/> occurs in <paramref name="from"/> outside parentheses, quoted
+    /// identifiers and string literals — i.e. as a table of the FROM itself, not of a derived table.</summary>
+    private static int TopLevelOccurrences(string from, string part)
+    {
+        int count = 0, depth = 0;
+        for (int i = 0; i < from.Length; i++)
+        {
+            char c = from[i];
+            if (c == '[')
+            {
+                int end = from.IndexOf(']', i + 1);
+                while (end >= 0 && end + 1 < from.Length && from[end + 1] == ']')
+                {
+                    end = from.IndexOf(']', end + 2);
+                }
+                if (depth == 0 && string.CompareOrdinal(from, i, part, 0, part.Length) == 0)
+                {
+                    count++;
+                }
+                i = end < 0 ? from.Length : end;
+                continue;
+            }
+            if (c == '\'')
+            {
+                int end = i + 1;
+                while (end < from.Length && !(from[end] == '\'' && (end + 1 >= from.Length || from[end + 1] != '\'')))
+                {
+                    end += from[end] == '\'' ? 2 : 1;
+                }
+                i = end;
+                continue;
+            }
+            if (c == '(')
+            {
+                depth++;
+            }
+            else if (c == ')')
+            {
+                depth--;
+            }
+        }
+        return count;
     }
 
     /// <summary>
@@ -236,6 +335,7 @@ internal sealed class TSqlEmitter
         else
         {
             block.From = (_tableName?.Invoke(rel.TableNames) ?? string.Join(".", rel.TableNames.Select(TSql.Identifier))) + " AS " + alias;
+            _reads.Add((rel.TableNames, block.From));
             sqlTypes = _columnSqlTypes?.Invoke(rel.TableNames); // [FABRICATOR-PATCH: OURS-BY-DESIGN]
         }
         for (int i = 0; i < rel.ColumnNames.Count; i++)

@@ -1058,7 +1058,47 @@ datetime2(7)) with equal counts, rows both ways and column types; a CTAS inside 
 ROLLBACK removes; CREATE OR REPLACE; IF NOT EXISTS over an existing table. Mutant (never remote) killed at 432.
 
 **Next, user-agreed:** DELETE / UPDATE beyond the v93/v94 shortcut (subqueries, `RETURNING` via `OUTPUT`). MERGE
-stays on the rowid path (Substrait has no MERGE).
+stays on the rowid path (Substrait has no MERGE). → RETURNING landed first on the rowid path (`bafd129`, ABI v98);
+the one-statement DELETE / UPDATE is §4.6.
+
+### 4.6 DELETE / UPDATE as ONE server statement through Substrait — BUILT (2026-10-29)
+
+`SupportsPushdown` now answers yes for a DELETE without RETURNING and an UPDATE without RETURNING and without
+`FROM`. `SubstraitDml` (src/catalog/fabricator_remote_select.cpp) rewrites the statement as the SELECT over its
+target that DuckDB would evaluate, binds and serializes it like any pushed query (`BindToSubstrait`, no worth
+check), wraps it in a WriteRel DELETE / UPDATE (`WrapInWrite`), lets the provider translate it (`TranslateWrite`)
+and runs it through `fabricator_remote_dml` (`EXPLAIN`: `FABRICATOR_REMOTE_DML`). No ABI change.
+
+- **The rewrite.** DELETE ⇒ `SELECT 1 FROM target [CROSS JOIN using…] WHERE condition`. UPDATE ⇒
+  `SELECT CAST(value AS column type), … FROM target WHERE condition` — the cast is the conversion DuckDB applies
+  when it assigns, so DECIMAL → INTEGER rounds the DuckDB way rather than T-SQL's truncation. `SET … = DEFAULT`
+  declines (it would need the column default rendered).
+- **The emitter** (`TSqlEmitter.EmitDeleteOrUpdate`) writes `DELETE [t0] FROM … WHERE …` /
+  `UPDATE [t0] SET [c] = …, … FROM … WHERE …`, where `[t0]` is the target's row in the query. It refuses unless the
+  target is read EXACTLY ONCE at the top of the FROM (`TopLevelOccurrences`, outside parentheses, brackets and
+  literals) — a self-reference in a subquery is fine, a self-join is not, because the statement must write the row
+  the condition was evaluated on. UPDATE also refuses any other table in the FROM: a target row matched twice
+  would get whichever match SQL Server takes. A grouped / distinct / limited / windowed input refuses.
+- **What it adds over the v93/v94 shortcut:** string predicates (through the exact-string rules of §4.3), subqueries
+  (`IN`, `EXISTS`, scalar), `DELETE … USING`, and DECIMAL arithmetic in SET — all of which the shortcut refuses.
+  Every decline falls back to the shortcut, and from there to the rowid path.
+- **Declines on the provider side** (`WriteDeclineReason`): only an EXTERNAL table, whose rowid DML is routed to
+  storage. Triggers and NULL handling need no decline here — the rowid path is itself a T-SQL DELETE / UPDATE.
+- **Switch:** `fabricator_dml_pushdown = false` declines INSERT and DML alike (it is the gate's reference oracle);
+  `remote_pushdown 'false'` on the ATTACH keeps the shortcut.
+- ⚠ `||` is not in the Substrait producer, so a SET with string concatenation stays local.
+
+Gate NEW `verify_remote_dml_mssql` (87, service): routing, then a THREE-WAY differential — `on` (pushed), `off`
+(the switch, i.e. the rowid path) and `loc` (a DuckDB table) — over adversarial data (case, trailing spaces, NULLs,
+`NOT IN` over a NULL, a `USING` that matches one row twice, DECIMAL → INTEGER rounding at .5). Every expected count
+was computed by running the same sequence on a DuckDB table, not by hand. Transactions: the statement runs on the
+transaction's connection, read-your-writes and ROLLBACK. Four mutants killed at their own rows: UPDATE without its
+WHERE, any read accepted as the target, no cast in SET, DELETE never pushed. `verify_dml_pushdown_mssql` now attaches
+`remote_pushdown 'false'`, since it gates the shortcut; `verify_remote_select_mssql` §6 asserts both routes.
+
+**Next, user-agreed:** the data-modifying "moved" CTE as ONE statement (`DELETE … OUTPUT DELETED.* INTO target`,
+declined on a target with triggers, FKs or CHECK), then server-side MERGE after measuring T-SQL MERGE against
+DuckDB's semantics.
 
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
