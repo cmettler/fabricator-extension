@@ -1036,7 +1036,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=74}"   # 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
+        : "${MIN_SUITES:=76}"   # 2026-10-29: +verify_session_context_mssql; 2026-10-29: +verify_default_schema_mssql; 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1512,7 +1512,12 @@ case "$TIER" in
         # another process created after its ATTACH (DuckLake read wrong data before). Nothing else moved.
         # 2026-10-27: 5215 -> 5244, from a green 74-run tier: verify_mssql_s3_polybase 268 -> 297 (§6d, SQL Server
         # reads a DuckLake table mirrored by ducklake_delta_sync). Nothing else moved.
-        : "${MIN_ASSERTIONS:=5244}"
+        # 2026-10-29: 5244 -> 5283, from a 75-run tier: +verify_default_schema_mssql (38, new) and
+        # verify_server_profile 16 -> 17 (+ the default_schema row). Every other suite equal to CI run 40854469959.
+        # 2026-10-29: 5283 -> 5361, from a green 76-run tier: +verify_session_context_mssql (51, new; the session
+        # tag function and its held-out suite are gone), verify_exec_invalidate_cache 33 -> 53 (refresh_cache :=),
+        # verify_raw_query 85 -> 92 (duplicate column names, the two signatures). Nothing else moved.
+        : "${MIN_ASSERTIONS:=5361}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

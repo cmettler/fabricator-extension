@@ -419,13 +419,40 @@ static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionB
 	auto bind_data = make_uniq<FabricatorQueryBindData>();
 	bind_data->handle = ResolveConnection(context, connection_string, bind_data->owns_handle);
 	auto handle = bind_data->handle;
-	bind_data->factory = [handle, sql, params, props](const fabricator::ArrowScanRequest &,
-	                                                  ArrowArrayStream &out) {
+
+	// `refresh_cache := true`: the query changed the attached catalog's objects (DDL inside it, or a
+	// preceding statement of the batch), so its metadata cache is rebuilt — deterministic, where the
+	// mssql_exec_invalidate_cache heuristic guesses from the text. The catalog is only MARKED here and
+	// rebuilt at the next transaction start (FabricatorCatalog::MarkSchemaMayChange): this query is still
+	// running when the mark is set, and an immediate rebuild could retire entries a running scan reads. It
+	// therefore applies from the next transaction on — inside an explicit BEGIN … COMMIT, after the COMMIT.
+	FabricatorCatalog *refresh_catalog = nullptr; // a plain pointer: a const optional_ptr capture yields a const catalog
+	auto refresh_entry = input.named_parameters.find("refresh_cache");
+	if (refresh_entry != input.named_parameters.end() && !refresh_entry->second.IsNull() &&
+	    BooleanValue::Get(refresh_entry->second.DefaultCastAs(LogicalType::BOOLEAN))) {
+		auto db = bind_data->owns_handle ? nullptr
+		                                 : DatabaseManager::Get(context).GetDatabase(context, Identifier(connection_string));
+		if (!db || !FabricatorCatalog::Is(db->GetCatalog())) {
+			throw BinderException("fabricator_query: refresh_cache := true needs the name of an attached fabricator "
+			                      "catalog as the first argument; '%s' has no catalog cache to refresh",
+			                      connection_string);
+		}
+		refresh_catalog = &db->GetCatalog().Cast<FabricatorCatalog>();
+	}
+	// The factory runs ONCE at bind (to read the schema) and again when the scan executes; only the second
+	// marks the catalog, so an EXPLAIN — which binds and never executes — leaves the cache alone.
+	auto executing = make_shared_ptr<bool>(false);
+	bind_data->factory = [handle, sql, params, props, refresh_catalog, executing](const fabricator::ArrowScanRequest &,
+	                                                                              ArrowArrayStream &out) {
 		auto param_stream = MakeParamsStream(params, props);
 		fabricator::ExecuteQuery(handle, sql, out, param_stream ? param_stream->Stream() : nullptr);
+		if (refresh_catalog && *executing) {
+			refresh_catalog->MarkSchemaMayChange();
+		}
 	};
 
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
+	*executing = true;
 	return std::move(bind_data);
 }
 
@@ -513,6 +540,18 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 		bool owns = true;
 		auto handle = ResolveConnection(context, conn_name, owns);
 		bool schema_may_change = false;
+		// `refresh_cache := true` rebuilds the cache whatever the statement looks like — the deterministic form of
+		// the mssql_exec_invalidate_cache heuristic, which guesses DDL from the text. Checked BEFORE running the
+		// statement: a refusal after it ran would read as "nothing happened" for a statement that did.
+		auto refresh_value = args.GetValue(args.ColumnCount() - 1, i);
+		bool refresh = !refresh_value.IsNull() && BooleanValue::Get(refresh_value);
+		if (refresh && owns) {
+			fabricator::CloseCatalog(handle);
+			throw InvalidInputException("fabricator_exec: refresh_cache := true needs the name of an attached "
+			                            "fabricator catalog as the first argument; '%s' has no catalog cache to "
+			                            "refresh",
+			                            conn_name);
+		}
 		try {
 			// fabricator_exec is a raw passthrough. In JOIN-ONLY mode it runs on the active transaction's pinned
 			// connection IFF a DuckDB-managed write is already in flight in this transaction (e.g. a dbt model's
@@ -529,8 +568,9 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 			// The optional third argument is the `params` bag (ABI v88). fabricator_exec is a SCALAR, and a
 			// DuckDB scalar has no named parameters at all, so it is POSITIONAL here where fabricator_query
 			// takes `params :=` — the two surfaces differ in spelling because DuckDB's function kinds do.
+			// Columns: catalog, sql, [params], refresh_cache — the keyword parameter is always bound last.
 			auto param_stream =
-			    args.ColumnCount() > 2 ? MakeParamsStream(args.GetValue(2, i), props) : nullptr;
+			    args.ColumnCount() > 3 ? MakeParamsStream(args.GetValue(2, i), props) : nullptr;
 			result_data[i] = fabricator::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change,
 			                                        param_stream ? param_stream->Stream() : nullptr);
 		} catch (...) {
@@ -544,7 +584,7 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 		}
 
 		// owns == false => the arg named an attached fabricator catalog whose cache we own.
-		if (invalidate_on_ddl && schema_may_change && !owns) {
+		if ((refresh || (invalidate_on_ddl && schema_may_change)) && !owns) {
 			auto db = DatabaseManager::Get(context).GetDatabase(context, Identifier(conn_name));
 			if (db && FabricatorCatalog::Is(db->GetCatalog())) {
 				db->GetCatalog().Cast<FabricatorCatalog>().RefreshCache(context);
@@ -673,6 +713,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// equivalent to absence here, because the marshalling already substitutes NULL for an omitted named
 	// argument; FillNamedDefaults simply does that substitution one layer earlier.
 query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY, Value());
+	// Rebuild the attached catalog's metadata cache after the query (see QueryBind). NULL default = off.
+	query_fn.GetSignature().AddKeywordOnly("refresh_cache", LogicalType::BOOLEAN, Value());
 	loader.RegisterFunction(query_fn);
 
 	// fabricator_functions(catalog|connstr) — lists discovered routines (diagnostic).
@@ -707,6 +749,10 @@ query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY, Value());
 		         {LogicalType::VARCHAR, LogicalType::VARCHAR},
 		         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}}) {
 			ScalarFunction exec_fn("fabricator_exec", signature, LogicalType::BIGINT, FabricatorExecFunction);
+			// `refresh_cache := true` (2.0 lets a scalar take a keyword parameter). Its default is bound as a
+			// constant ARGUMENT COLUMN after the positional ones, so the body reads it from the LAST column and
+			// knows the params bag is present only when there are four.
+			exec_fn.GetSignature().AddKeywordOnly("refresh_cache", LogicalType::BOOLEAN, Value::BOOLEAN(false));
 			exec_fn.SetStability(FunctionStability::VOLATILE);
 			exec_fn.SetFallible(); // see the note on fabricator_version
 			exec_set.AddFunction(exec_fn);

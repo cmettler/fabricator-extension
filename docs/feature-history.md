@@ -2967,13 +2967,13 @@ to this directory, so it still resolves from here.
   - **✅ PROVEN ON LINUX (integration run `32966403735`, dispatched on `e0523a1`): both suites pass at
     their FULL counts — `verify_raw_query` 34 and `verify_mssql_s3_polybase` 263** — where the
     scheduled run one commit earlier failed both. ⚠ **That run is nonetheless RED**, on
-    `verify_session_tag:146`, which is the recurring pre-existing flake recorded under the CI section
+    `verify_session_tag:146`, which is the recurring pre-existing flake recorded under the CI section <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
     and cannot be reached by an Arrow error-string change. **Read the per-suite lines, not the run's
     conclusion** — the tier's verdict says nothing about which suite moved.
 
 - **⚠⚠ THE TIERS REPORTED AND THE SERVICE ONE FOUND A REGRESSION IN THE `fabricator_query` FIX ITSELF —
   ✅ FIXED 2026-08-24, commit `00bd30e` (C#-only, no ABI). Hermetic was 74/74 — 8003 GREEN as predicted; service came back
-  52/54 with `verify_session_tag` failing at line 77, the assertion whose own comment says "this is what
+  52/54 with `verify_session_tag` failing at line 77, the assertion whose own comment says "this is what <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
   fails without the pin, and it fails by returning NULL rather than by erroring".**
   - **THE DEFECT: deferring the execution ACROSS A CROSSING dropped the ambients.** `AmbientTransaction` /
     `ProviderSettingsStore.CurrentSession` / `AmbientOpener` are `AsyncLocal` PER CROSSING. The old eager
@@ -3005,7 +3005,7 @@ to this directory, so it still resolves from here.
     pass/fail** — the identical signature `verify_read_isolation` once had, for the identical reason (a
     failing run never reaches its teardown). Fixed by giving §8 its own table created THROUGH the catalog;
     4/4 green from a cleaned server afterwards.
-  - ⚠ `verify_session_tag` then failed ONCE at line **146** — a DIFFERENT assertion, and it is the one-off
+  - ⚠ `verify_session_tag` then failed ONCE at line **146** — a DIFFERENT assertion, and it is the one-off <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
     flake already recorded further down this file. 25 assertions, green 3/3 afterwards. Do not conflate the
     two: line 77 was mine, line 146 is the pre-existing one.
 

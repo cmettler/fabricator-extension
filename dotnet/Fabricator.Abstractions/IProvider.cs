@@ -293,7 +293,9 @@ public interface IProviderCatalog : IDisposable
     /// and this default ("{}") is the correct answer for a provider with nothing to claim. Keys the host
     /// reads today: <c>exact_filter_pushdown</c> (pushed table filters are applied EXACTLY, never a
     /// superset => the scan may advertise filter_pushdown=true) and <c>is_binary_collation</c> (the
-    /// database collation sorts strings by byte value == DuckDB => string-keyed TopN pushdown). Each
+    /// database collation sorts strings by byte value == DuckDB => string-keyed TopN pushdown). One key is a
+    /// STRING, not a flag: <c>default_schema</c> names the schema an unqualified name resolves to
+    /// (<c>db.t</c>, <c>USE db</c>, DuckLake's metadata schema); absent => DuckDB's <c>main</c>. Each
     /// override must derive its answer from the SAME source as its diagnostic ServerInfo rows so the two
     /// surfaces cannot drift. May open a connection (called after the ambients are established, not from
     /// open_catalog).

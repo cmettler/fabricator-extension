@@ -76,9 +76,14 @@ struct FabricatorCapabilities {
 	//! The provider runs a whole SELECT pushed by DuckDB's remote optimizer (src/catalog/fabricator_remote_select.cpp).
 	//! Opt-in: SQL Server reports it only with the `remote_pushdown` ATTACH option.
 	bool remote_select = false;
+
+	//! The schema an unqualified name resolves to (FabricatorCatalog::GetDefaultSchema). Empty = the provider
+	//! names none and DuckDB's `main` stands (Delta, DAX). SQL Server reports the login's SCHEMA_NAME().
+	//! The one non-boolean key in the doc.
+	string default_schema;
 };
 
-//! Reads the catalog's capability doc (one flat JSON object of booleans). Called once at ATTACH
+//! Reads the catalog's capability doc (one flat JSON object, booleans plus `default_schema`). Called once at ATTACH
 //! (LoadCatalog). Throws on a failed crossing — the caller keeps the old best-effort behaviour by
 //! catching and leaving every capability off.
 FabricatorCapabilities FetchCapabilities(FabricatorHandle handle);

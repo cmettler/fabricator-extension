@@ -77,6 +77,12 @@ public sealed class SqlServerBackend : IProvider
                     "SqlBulkCopy. Unset = SqlBulkCopy. Ignored on engines with no COPY INTO. Overrides the " +
                     "per-catalog copy_into_staging ATTACH option"),
                 Str("mssql_mars", "fabricator: MARS mode — auto (default, per engine) | true | false"),
+                Str("mssql_session_context",
+                    "fabricator: a JSON object of keys and values, e.g. '{\"dbt_run_id\": \"…\"}', set with " +
+                    "sp_set_session_context on every connection this extension opens to SQL Server — so " +
+                    "Fabric's query insights / Capacity Metrics can attribute the work, and server code can " +
+                    "read it with SESSION_CONTEXT(N'key'). Values: string, number, boolean or null. Unset = " +
+                    "nothing is sent. Overrides the per-catalog session_context ATTACH option"),
                 // BOOLEAN, not the auto|true|false tri-state mssql_mars uses, and deliberately: there is no
                 // per-engine variation to express here. The default is always "materialise the scans the
                 // planner marked", so an `auto` state would be identical to `true` and the tri-state would
@@ -639,6 +645,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // ATTACH option `keep_nulls true|false` (default TRUE). See ResolveKeepNulls; a SET mssql_keep_nulls
     // overrides it per session, the same precedence as materialize and isolation_level.
     private readonly bool? _keepNulls;
+    // ATTACH option `session_context '<json object>'` — a fixed tag for this catalog; a SET
+    // mssql_session_context overrides it per session. Validated at ATTACH. See ResolveSessionContextText.
+    private readonly string? _sessionContext;
     // ATTACH option `remote_pushdown` (default TRUE since 2026-10-27) — see CapabilitiesJson. On by default because a
     // query the translator cannot write exactly is declined and runs locally as before, while a declined default would
     // leave patterns like `x = (SELECT MAX(x) FROM t)` as full scans (DuckLake: every commit linearly dearer).
@@ -784,6 +793,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         break;
                     case "keep_nulls":
                         _keepNulls = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
+                        break;
+                    // Validated here so a malformed tag fails the ATTACH that names it, not the first query.
+                    case "session_context":
+                        ParseSessionContext(val, "session_context ATTACH option");
+                        _sessionContext = val;
                         break;
                     // ATTACH option `remote_pushdown true` (default false): let DuckDB's remote optimizer push a
                     // whole SELECT (aggregate / GROUP BY over one table) to the server. Read ONCE here because
@@ -1059,6 +1073,21 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     private SqlConnection OpenRaw(string connectionString)
     {
         var connection = new SqlConnection(connectionString);
+        // The session context is resolved HERE, on the caller's thread and therefore in its settings session,
+        // and applied the moment the connection opens — StateChange fires for Open() and OpenAsync() alike, so
+        // every one of the call sites that open a connection is covered without touching them.
+        var contextText = ResolveSessionContextText();
+        if (contextText is not null)
+        {
+            var pairs = ParseSessionContext(contextText, "mssql_session_context");
+            connection.StateChange += (_, e) =>
+            {
+                if (e.CurrentState == ConnectionState.Open && e.OriginalState != ConnectionState.Open)
+                {
+                    ApplySessionContext(connection, null, pairs);
+                }
+            };
+        }
         if (_accessToken is not null)
         {
             connection.AccessToken = _accessToken;
@@ -1130,6 +1159,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         /// on the strength of a MARS-on answer is limitation 1.15's unbounded hang.
         /// </remarks>
         public bool MarsEnabled;
+        // The session-context JSON the pinned connection currently carries (see RefreshPinnedSessionContext).
+        public string? SessionContextText;
 
         /// <summary>
         /// Tables this transaction has written, keyed <c>[schema].[table]</c>; the value is true when the
@@ -1221,11 +1252,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
 
     private readonly TransactionManager<SqlServerTransaction> _txns = new(id => new SqlServerTransaction(id));
 
-    // Per catalog, because the function pins THIS catalog's transaction connection. Lazy so a catalog that
-    // never calls it pays nothing.
-    private SqlServerSessionTagFunction SessionTag => _sessionTag ??= new SqlServerSessionTagFunction(this);
-    private SqlServerSessionTagFunction? _sessionTag;
-
     // The connection + provider transaction are pinned lazily on the first write (BeginWrite), keyed by the
     // ambient transaction id; begin only records explicitness — an explicit BEGIN creates the (empty)
     // transaction object to carry the flag, an autocommit statement creates nothing. A read-only autocommit
@@ -1302,6 +1328,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 {
                     if (existing.Connection is not null)
                     {
+                        RefreshPinnedSessionContext(existing);
                         return (existing.Connection, existing.Transaction, false);
                     }
                 }
@@ -1315,6 +1342,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             var state = EnsureTxnConnection(txnId);
             lock (state)
             {
+                RefreshPinnedSessionContext(state);
                 return (state.Connection!, state.Transaction, false);
             }
         }
@@ -1342,6 +1370,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 // ⚠ The mode comes from the SAME call that chose the connection string, so the recorded
                 // value cannot disagree with the connection: every routing decision for this transaction
                 // reads it back rather than re-resolving a session setting that may since have changed.
+                state.SessionContextText = ResolveSessionContextText(); // what OpenRaw applies at Open()
                 var conn = OpenConnection(out bool mars);
                 conn.Open();
                 var level = ResolveTxnIsolation();
@@ -1365,107 +1394,174 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         }
     }
 
+    // ---- Session context (SET mssql_session_context / the session_context ATTACH option) -------------------
+
     /// <summary>
-    /// Sets a session-context key on THIS transaction's pinned connection and returns the identifiers Fabric's
-    /// monitoring keys on. Backs <c>db.dbo.fabricator_session_tag(key, value)</c> — see
-    /// <see cref="SqlServerSessionTagFunction"/> for why it cannot be done with <c>fabricator_exec</c>.
+    /// The session-context JSON to set on every connection this catalog opens: <c>SET mssql_session_context</c>
+    /// wins if set, else the catalog's <c>session_context</c> ATTACH option, else none (null).
     /// </summary>
     /// <remarks>
-    /// <para>The call goes through <see cref="BeginWrite"/> WITHOUT the join-only restriction, so it PINS the
-    /// transaction's connection (creating the <see cref="SqlServerTransaction"/> if the transaction has not written yet).
-    /// That is the point: everything the transaction does afterwards reuses that connection, so the tag applies
-    /// to the actual work rather than to a pooled connection that was handed straight back.</para>
-    /// <para>Rejected outside an explicit transaction on purpose. In autocommit the pin is committed and released
-    /// with this very statement, so the tag would be set and discarded — a silent no-op, which is the failure
-    /// mode this whole function exists to eliminate.</para>
-    /// <para>Key and value are PARAMETERS, never interpolated: they are user text, and a correlation id is
-    /// exactly the sort of value someone eventually builds by string concatenation.</para>
+    /// <para>It replaces <c>db.dbo.fabricator_session_tag()</c>, which set a key ONCE on a transaction's pinned
+    /// connection and so depended on transaction state surviving from one statement to the next: it worked only
+    /// inside an explicit transaction, that check failed intermittently right after BEGIN, and under dbt
+    /// <c>--threads &gt; 1</c> a model sometimes saw another run's tag. Here the context travels with every
+    /// connection that does work — the shape duckdb-postgres gives its per-statement setup ("preliminary
+    /// queries") — so no statement depends on what an earlier one left behind.</para>
+    /// <para>MEASURED: a pooled connection comes back from the pool with SESSION_CONTEXT cleared
+    /// (sp_reset_connection — the same spid read the key back as NULL on its next checkout), so an unset
+    /// context needs no clearing and costs nothing.</para>
     /// </remarks>
-    internal RecordBatch SetSessionTag(string key, string? value)
+    internal string? ResolveSessionContextText()
     {
-        long txnId = AmbientTransaction.Current;
-        if (!IsExplicitTxn(txnId))
+        var set = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_session_context");
+        var text = string.IsNullOrWhiteSpace(set) ? _sessionContext : set;
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static readonly ConcurrentDictionary<string, IReadOnlyList<KeyValuePair<string, string?>>>
+        ParsedSessionContexts = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Parses a session-context JSON object into (key, value) pairs. Values may be strings, numbers, booleans
+    /// (sent as their text) or null (clears the key); an object or array is refused, as are the limits of
+    /// <c>sp_set_session_context</c> (key 128 characters, value 4000). Cached per distinct text.
+    /// </summary>
+    internal static IReadOnlyList<KeyValuePair<string, string?>> ParseSessionContext(string text, string source)
+    {
+        if (ParsedSessionContexts.TryGetValue(text, out var cached))
         {
-            throw new NotSupportedException(
-                $"{SqlServerSessionTagFunction.FunctionName}: must be called inside an explicit transaction "
-                + "(BEGIN … COMMIT). In autocommit the connection it tags is released with this statement, so "
-                + "the tag would not apply to anything. In dbt, use a pre-hook on a transactional model.");
+            return cached;
         }
-        var (connection, transaction, owns) = BeginWrite();
+        var parsed = ParseSessionContextCore(text, source);
+        if (ParsedSessionContexts.Count > 256)
+        {
+            ParsedSessionContexts.Clear(); // one entry per distinct tag text; a run id per dbt run stays tiny
+        }
+        ParsedSessionContexts[text] = parsed;
+        return parsed;
+    }
+
+    private static IReadOnlyList<KeyValuePair<string, string?>> ParseSessionContextCore(string text, string source)
+    {
+        JsonDocument doc;
         try
         {
-            using (var set = connection.CreateCommand())
+            doc = JsonDocument.Parse(text);
+        }
+        catch (JsonException ex)
+        {
+            throw new ArgumentException(
+                $"{source}: expected a JSON object such as '{{\"dbt_run_id\": \"…\"}}' — {ex.Message}");
+        }
+        using (doc)
+        {
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
-                set.Transaction = transaction;
-                // The values ride as PARAMETERS (they are user text), which has one consequence worth the
-                // trailing comment: a parameterized EXEC is recorded in queryinsights as
-                // "EXEC sp_set_session_context @key, @value" with the VALUES ABSENT, so the tag would be
-                // invisible to anyone searching the history for it — measured. A caller who keeps the returned
-                // connection_id does not care, but a dbt pre-hook discards its result set, so the tag has to be
-                // findable from the history alone. The comment puts it back in `command` while the actual
-                // parameters stay parameters; `*/` is stripped so a hostile value cannot escape the comment.
-                set.CommandText = "EXEC sp_set_session_context @key, @value "
-                                  + $"/* fabricator_session_tag {CommentSafe(key)}={CommentSafe(value)} */";
-                set.Parameters.Add(new SqlParameter("@key", System.Data.SqlDbType.NVarChar, 128) { Value = key });
-                set.Parameters.Add(new SqlParameter("@value", System.Data.SqlDbType.NVarChar, 4000)
-                {
-                    Value = (object?)value ?? DBNull.Value,
-                });
-                set.CommandTimeout = ResolveCommandTimeout();
-                set.ExecuteNonQuery();
+                throw new ArgumentException(
+                    $"{source}: expected a JSON object such as '{{\"dbt_run_id\": \"…\"}}', got {doc.RootElement.ValueKind}");
             }
-            // Read the ids back on the SAME connection. connection_id joins the two queryinsights views (and is
-            // a GUID, unlike the reusable spid); dist_statement_id is the Capacity Metrics "Operation Id".
-            //
-            // connection_id comes from sys.dm_exec_CONNECTIONS, not dm_exec_requests, and that choice fixed a
-            // real flakiness: the request-level view describes the CURRENTLY EXECUTING request, so it
-            // intermittently had no row yet and MAX() returned NULL — the suite failed at a moving line about
-            // one run in three. The connection-level view always has a row for a live session. (Note box SQL
-            // Server returns SEVERAL rows per spid because MARS maps multiple logical connections onto one
-            // session; Fabric, which has no MARS, returns one. MAX picks deterministically either way, and only
-            // Fabric has the monitoring views this id is for.) dist_statement_id stays request-level and is
-            // legitimately NULL when no distributed statement is in flight.
-            string? connectionId = null, distStatementId = null;
-            int sessionId = 0;
-            try
+            var pairs = new List<KeyValuePair<string, string?>>();
+            foreach (var property in doc.RootElement.EnumerateObject())
             {
-                using var read = connection.CreateCommand();
-                read.Transaction = transaction;
-                read.CommandText =
-                    "SELECT @@SPID AS session_id, "
-                    + "(SELECT MAX(CONVERT(varchar(64), c.connection_id)) FROM sys.dm_exec_connections c "
-                    + "  WHERE c.session_id = @@SPID) AS connection_id, "
-                    + "(SELECT MAX(CONVERT(varchar(64), r.dist_statement_id)) FROM sys.dm_exec_requests r "
-                    + "  WHERE r.session_id = @@SPID) AS dist_statement_id";
-                read.CommandTimeout = ResolveCommandTimeout();
-                using var reader = read.ExecuteReader();
-                if (reader.Read())
+                string key = property.Name;
+                if (string.IsNullOrWhiteSpace(key))
                 {
-                    sessionId = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetValue(0));
-                    connectionId = reader.IsDBNull(1) ? null : reader.GetString(1);
-                    distStatementId = reader.IsDBNull(2) ? null : reader.GetString(2);
+                    throw new ArgumentException($"{source}: an empty key is not allowed");
+                }
+                if (key.Length > 128)
+                {
+                    throw new ArgumentException($"{source}: key '{key[..32]}…' exceeds the 128-character limit");
+                }
+                string? value = property.Value.ValueKind switch
+                {
+                    JsonValueKind.String => property.Value.GetString(),
+                    JsonValueKind.Number => property.Value.GetRawText(),
+                    JsonValueKind.True => "true",
+                    JsonValueKind.False => "false",
+                    JsonValueKind.Null => null,
+                    _ => throw new ArgumentException(
+                        $"{source}: the value of '{key}' must be a string, number, boolean or null, not " +
+                        $"{property.Value.ValueKind}"),
+                };
+                if (value is not null && value.Length > 4000)
+                {
+                    throw new ArgumentException($"{source}: the value of '{key}' exceeds the 4000-character limit");
+                }
+                pairs.Add(new KeyValuePair<string, string?>(key, value));
+            }
+            return pairs;
+        }
+    }
+
+    private static readonly IReadOnlyList<KeyValuePair<string, string?>> NoSessionContext =
+        System.Array.Empty<KeyValuePair<string, string?>>();
+
+    /// <summary>
+    /// Sets <paramref name="pairs"/> on <paramref name="connection"/> in ONE round trip, and clears every key of
+    /// <paramref name="previous"/> that the new set no longer names (a pinned connection whose context changed
+    /// mid-transaction).
+    /// </summary>
+    /// <remarks>
+    /// Keys and values are PARAMETERS — they are user text. A parameterized EXEC is recorded in Fabric's query
+    /// insights WITHOUT its values (measured for the former session-tag function), so the trailing comment
+    /// repeats them, `*/` stripped, to keep the tag findable from the history alone.
+    /// </remarks>
+    private void ApplySessionContext(SqlConnection connection, SqlTransaction? transaction,
+                                     IReadOnlyList<KeyValuePair<string, string?>> pairs,
+                                     IReadOnlyList<KeyValuePair<string, string?>>? previous = null)
+    {
+        var all = new List<KeyValuePair<string, string?>>(pairs);
+        if (previous is not null)
+        {
+            foreach (var old in previous)
+            {
+                if (!pairs.Any(p => string.Equals(p.Key, old.Key, StringComparison.Ordinal)))
+                {
+                    all.Add(new KeyValuePair<string, string?>(old.Key, null));
                 }
             }
-            catch (SqlException ex)
-            {
-                // The TAG is the point; these ids are diagnostics. Reading them needs VIEW SERVER STATE (or its
-                // Fabric equivalent), which a restricted principal may lack — losing the ids must not fail a tag
-                // that was actually set. The caller sees NULLs and can still correlate via the recorded comment.
-                Log.LogDebug(ex, "session_tag: could not read the session's monitoring ids");
-            }
-            Log.LogDebug("session_tag {Key}={Value} on connection {ConnectionId} (spid {Spid})",
-                         key, value, connectionId, sessionId);
-            return TagRow(connectionId, sessionId, distStatementId, key, value);
         }
-        finally
+        if (all.Count == 0)
         {
-            // `owns` is false here by construction (an explicit transaction always yields the pinned
-            // connection), but honour the contract rather than assuming it.
-            if (owns)
-            {
-                connection.Dispose();
-            }
+            return;
         }
+        using var cmd = connection.CreateCommand();
+        cmd.Transaction = transaction;
+        var text = new StringBuilder();
+        var comment = new StringBuilder("/* fabricator_session_context");
+        for (int i = 0; i < all.Count; i++)
+        {
+            text.Append($"EXEC sp_set_session_context @k{i}, @v{i}; ");
+            cmd.Parameters.Add(new SqlParameter($"@k{i}", SqlDbType.NVarChar, 128) { Value = all[i].Key });
+            cmd.Parameters.Add(new SqlParameter($"@v{i}", SqlDbType.NVarChar, 4000)
+            {
+                Value = (object?)all[i].Value ?? DBNull.Value,
+            });
+            comment.Append(' ').Append(CommentSafe(all[i].Key)).Append('=').Append(CommentSafe(all[i].Value));
+        }
+        cmd.CommandText = text.Append(comment).Append(" */").ToString();
+        cmd.CommandTimeout = ResolveCommandTimeout();
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Brings a transaction's PINNED connection up to the current session context. The connection got the
+    /// context it was opened with (OpenRaw); a <c>SET mssql_session_context</c> later in the same transaction
+    /// reaches it here, at its next write. Called under the transaction's lock.
+    /// </summary>
+    private void RefreshPinnedSessionContext(SqlServerTransaction state)
+    {
+        var now = ResolveSessionContextText();
+        if (state.Connection is null || string.Equals(now, state.SessionContextText, StringComparison.Ordinal))
+        {
+            return;
+        }
+        var previous = state.SessionContextText is null
+            ? null
+            : ParseSessionContext(state.SessionContextText, "mssql_session_context");
+        var current = now is null ? NoSessionContext : ParseSessionContext(now, "mssql_session_context");
+        ApplySessionContext(state.Connection, state.Transaction, current, previous);
+        state.SessionContextText = now;
     }
 
     // Makes a value safe to embed in a /* … */ comment: only the comment terminator can escape it, and a
@@ -1473,24 +1569,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // are still passed as parameters — but the comment must not be breakable.
     private static string CommentSafe(string? value) =>
         (value ?? "").Replace("*/", "* /").Replace('\r', ' ').Replace('\n', ' ');
-
-    private static RecordBatch TagRow(
-        string? connectionId, int sessionId, string? distStatementId, string key, string? value)
-    {
-        var cid = new StringArray.Builder();
-        var sid = new Int32Array.Builder();
-        var dsid = new StringArray.Builder();
-        var k = new StringArray.Builder();
-        var v = new StringArray.Builder();
-        cid.Append(connectionId);
-        sid.Append(sessionId);
-        dsid.Append(distStatementId);
-        k.Append(key);
-        v.Append(value);
-        return new RecordBatch(SqlServerSessionTagFunction.Columns,
-                               new IArrowArray[] { cid.Build(), sid.Build(), dsid.Build(), k.Build(), v.Build() },
-                               1);
-    }
 
     /// <summary>
     /// The result schema of <paramref name="sql"/> without executing it, via
@@ -2848,11 +2926,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             all.Add(new FunctionDeclaration(r[0]!, r[1]!, r[2]!,
                 int.Parse(r[3] ?? "0", System.Globalization.CultureInfo.InvariantCulture), r[4] ?? "", r[5] ?? ""));
         }
-        // The bespoke session-tag function: always present on a SQL Server catalog, and NOT in the function set
-        // because it must capture the live catalog (it pins that catalog's CONNECTION), which the per-catalog
-        // Functions set does not carry — it captures ATTACH context (Fabric workspace/item/credential), not a
-        // connection. Same "match the name first" pattern the DAX provider uses for daxeval.
-        all.Add(new FunctionDeclaration("dbo", SqlServerSessionTagFunction.FunctionName, "table", 2));
         all.AddRange(Functions.Declarations(ExpandAllSchemas));
         return _functionFilter is null ? all : all.FindAll(d => _functionFilter.IsMatch(d.Name));
     }
@@ -2905,8 +2978,13 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // of that entry. Every DDL through this catalog already REPLACES the entry, so the reuse lives exactly as
     // long as the entry's own column list. (Delta does not declare it: its describe seeds the statement's
     // snapshot pin, see verify_delta_autocommit_pin.)
+    // default_schema: the login's SCHEMA_NAME(), which the host reports as the catalog's DuckDB default schema
+    // (FabricatorCatalog::GetDefaultSchema), so `db.t`, `USE db` and DuckLake's metadata schema resolve to it
+    // instead of DuckDB's `main`, which a SQL Server database normally does not have. Serialized, not
+    // spliced: a schema name is user-controlled text.
     public string CapabilitiesJson
         => "{\"bind_schema_cacheable\":true," +
+           $"\"default_schema\":{JsonSerializer.Serialize(Profile.DefaultSchema)}," +
            $"\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
            $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";
 
@@ -4327,10 +4405,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // A custom function of any kind answers from the set (which tags a table/sqlgen function's NAMED
         // parameters, so an optional argument can be written `fn(x, flag := true)`); otherwise it is a
         // discovered routine and its parameters come from INFORMATION_SCHEMA.
-        if (SqlServerSessionTagFunction.Is(functionName))
-        {
-            return SessionTag.Parameters;
-        }
         // The per-row form declares exactly one parameter: the INPUT TABLE. Its per-row argument values come
         // from the input's COLUMNS, not from constant args, so there is nothing else to declare — and
         // answering here keeps its signature coming from a declaration like every other function's, instead of
@@ -4535,10 +4609,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // A custom table function's output schema may depend on the constant args (bound per call, then the
         // binding is discarded). `args` is null only for the in-out `_each` base-schema probe, which does not
         // apply to a pure-C# table function; a static function ignores it.
-        if (SqlServerSessionTagFunction.Is(functionName))
-        {
-            return SqlServerSessionTagFunction.Columns;
-        }
         var custom = Functions.OutputSchema(schemaName, functionName, args);
         if (custom is not null)
         {
@@ -4566,10 +4636,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
         // result by NAME (true); a discovered TVF pushes the projection into SQL (true); a stored proc is
         // projected positionally above the scan (false).
-        if (SqlServerSessionTagFunction.Is(functionName))
-        {
-            return new TableFunctionBindingAdapter(SessionTag.Bind(args!), supportsPushdown: true);
-        }
         var custom = Functions.TableFnBind(schemaName, functionName, args);
         if (custom is not null)
         {

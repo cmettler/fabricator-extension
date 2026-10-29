@@ -10,7 +10,8 @@ DuckLake source read at the same commit.
 
 ## 1. How DuckLake reaches the metadata catalog
 
-- `ATTACH 'ducklake:fabricator:<SqlClient connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo')`.
+- `ATTACH 'ducklake:fabricator:<SqlClient connstr>' AS lake (DATA_PATH '…')` (no `METADATA_SCHEMA` needed since
+  2026-10-29, §4).
   DuckLake strips `ducklake:`, takes `fabricator` as the metadata TYPE and issues
   `ATTACH OR REPLACE 'fabricator:<connstr>' AS __ducklake_metadata_lake (…)`, which reaches our storage
   extension unchanged. Every `META_<x>` option on the outer ATTACH becomes `<x>` on the inner one, so our own
@@ -45,10 +46,20 @@ The error surfaces as DuckLake's commit retry loop exhausting its 10 attempts, w
 
 ## 4. Other findings
 
-- **Our catalog reports DuckDB's default schema `main`**, because `FabricatorCatalog` does not override
-  `Catalog::GetDefaultSchema()`; SQL Server's is `dbo`. DuckLake asks for it when `METADATA_SCHEMA` is not
-  given and fails with *schema "main" not found*. Workaround: `METADATA_SCHEMA 'dbo'`. Overriding it would also
-  change how `db.t` resolves for every SQL Server catalog, so it is a decision of its own.
+- **FIXED 2026-10-29: our catalog reported DuckDB's default schema `main`**, because `FabricatorCatalog` did
+  not override `Catalog::GetDefaultSchema()`; SQL Server's is `dbo`. DuckLake asks for it when
+  `METADATA_SCHEMA` is not given (`DuckLakeTransaction::GetDefaultSchemaName`) and failed with *schema "main"
+  not found*; the same method made `db.t` fail and `USE db` refuse (*"No catalog + schema named db found"*),
+  measured before the change. Now the SQL Server provider reads the login's `SCHEMA_NAME()` at ATTACH
+  (`ServerProfile.DefaultSchema`, `dbo` when NULL) and reports it as the capability doc's one string key
+  `default_schema`; `FabricatorCatalog::GetDefaultSchema()` returns it, other providers keep `main`. No ABI
+  bump. Gate `verify_default_schema_mssql` (service, 38): a second login with default schema `ds_alt` reads
+  `ds_alt.t` where `dbo.t` holds a different value, and DuckLake without `METADATA_SCHEMA` creates its
+  metadata in `ds_alt`. Two mutants: the override returning the base dies at §1 with the original error,
+  a hardcoded `"dbo"` dies at §2. ⚠ What a service principal without a database user (principal 0, the
+  Fabric SQL database case in §10) gets from `SCHEMA_NAME()` is not measured; NULL falls back to `dbo`.
+  Side finding, not fixed: a login without `VIEW DATABASE PERFORMANCE STATE` prints a WARNING from the
+  best-effort stats query (`TableStats … permission denied`); the query itself works.
 - Not yet measured: two writers committing concurrently (DuckLake detects a conflict through a PRIMARY KEY
   violation on `ducklake_snapshot`), Fabric Warehouse as the metadata host, cloud data paths.
 
@@ -65,7 +76,7 @@ The error surfaces as DuckLake's commit retry loop exhausting its 10 attempts, w
 
 ## 6. As built: `hidden_rowid` (option 1)
 
-`ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true)`.
+`ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', META_HIDDEN_ROWID true)`.
 DuckLake hands `META_HIDDEN_ROWID` to our inner ATTACH as `hidden_rowid`, so every metadata table it creates
 without a key gets a `BIGINT IDENTITY` column `[__fabricator_rowid]`. C#-only, no ABI change, gate
 `verify_hidden_rowid` (service tier).
@@ -112,8 +123,7 @@ without a key gets a `BIGINT IDENTITY` column `[__fabricator_rowid]`. C#-only, n
   `UPDATE [dbo].[ducklake_table_stats] SET [file_size_bytes] = @s0 WHERE [__fabricator_rowid] = @k1`. Simple
   single-table UPDATE/DELETEs still take the predicate shortcut (`update-where`, `delete-where`).
 
-**Still open:** the default schema (`METADATA_SCHEMA 'dbo'` is still needed,
-§4); Delta metadata over DuckLake's data files.
+**Still open:** Delta metadata over DuckLake's data files. (The default schema is fixed since 2026-10-29, §4.)
 
 ## 7. Concurrent writers (measured 2026-10-27)
 

@@ -1192,7 +1192,7 @@ persistent), and `sp_cdc_enable_table` now auto-starts both jobs
 
 **It is behaviour-neutral for the existing tier.** The capture and cleanup jobs exist only for CDC-enabled
 databases, and no test database has CDC enabled. Spot-checked after the change — `verify_server_profile`
-**15**, `verify_exec_invalidate_cache` **21**, `verify_session_tag` **25**, `verify_columnstore` **20**,
+**15**, `verify_exec_invalidate_cache` **21**, `verify_session_tag` **25**, `verify_columnstore` **20**, <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
 `verify_time_travel` **14**, each at its expected count. ⚠ That is a REPRESENTATIVE SAMPLE, not the tier: the
 full service tier has not been re-run since the change and should be, once, before this is relied on.
 
@@ -4389,17 +4389,17 @@ to this directory, so it still resolves from here.
     assumed. The 2860 entry it supersedes:
   - **✅ THE SERVICE FLOOR WAS 2860, TAKEN FROM A GREEN RUN (2026-08-25, own commit)** — slices 9 and 8b took
     `verify_mssql_cdc` 476 → 559 → 604 and the clean tier came back **54/54 — 2860 ALL GREEN**, with
-    `verify_session_tag` at its full 25. ⚠ The arithmetic CORROBORATED it afterwards rather than producing
+    `verify_session_tag` at its full 25. ⚠ The arithmetic CORROBORATED it afterwards rather than producing <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
     it: 2732 + (604 − 476) = 2860 exactly, which is what shows no other suite moved. Hermetic is unchanged
     at **8003** (no hermetic suite touches SQL Server). The 2732 entry it supersedes:
   - **✅ THE SERVICE FLOOR WAS 2732, TAKEN FROM A GREEN RUN (2026-08-25, own commit).** `scripts/run-suites.sh`
     read `MIN_ASSERTIONS:=2607` — slice 7's number — while slice 8 had added 125 to `verify_mssql_cdc`
-    (351 → 476). The clean tier came back **54/54 — 2732 ALL GREEN**, with `verify_session_tag` at its full
+    (351 → 476). The clean tier came back **54/54 — 2732 ALL GREEN**, with `verify_session_tag` at its full <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
     25 (the recorded intermittent did not fire). Hermetic is unchanged at **8003** and needed no bump.
     - **⚠ THE NUMBER CAME FROM THE RUN, AND THE ARITHMETIC ONLY CORROBORATED IT AFTERWARDS** — which is the
       order that matters, because while the slice was being finished two arithmetic routes to it disagreed
       by 8. The earlier tier with CDC at 460 totalled 2716, and 2716 + 16 = 2732 ✓; the other data point
-      (2707, with `verify_session_tag` failing at 8 of 25) does NOT reconcile by adding back its 17, because
+      (2707, with `verify_session_tag` failing at 8 of 25) does NOT reconcile by adding back its 17, because <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
       a FAILING suite stops at the failure and its remaining assertions are never counted. **A total taken
       from a run with any failure in it is not a floor candidate at all** — it is an undercount of unknown
       size, and treating it as one is how a floor lands below the actual.
@@ -4410,7 +4410,7 @@ to this directory, so it still resolves from here.
     committing)**, **`7a4aae7` (slice 8, the initial-snapshot leg — + the pre-existing pooled
     snapshot-isolation leak it found, and the change read's pin opt-out; ⚠ the service FLOOR bump is a
     SEPARATE commit this time, because the tier that produced the number came back with the recorded
-    `verify_session_tag` intermittent and had to be re-run)**, `e85e011` (that floor bump, 2607 → **2732**
+    `verify_session_tag` intermittent and had to be re-run)**, `e85e011` (that floor bump, 2607 → **2732** <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
     from a green 54/54 run) and **slice 9** — as of 2026-08-25 (the user has not asked to push;
     `git log @{u}..HEAD` is the authority for both the count and the shas, not this list).
   - **Gates: `test/verify_mssql_cdc.test` 105 → 182 (slice 3) → 239 (slice 4) → 268 (slice 5) → 351

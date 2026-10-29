@@ -1,0 +1,190 @@
+# name: test/verify_session_context_mssql.test
+# description: SET mssql_session_context / the session_context ATTACH option: a JSON object whose keys are set
+#   with sp_set_session_context on every connection the SQL Server provider opens, so the server sees them
+#   through SESSION_CONTEXT(N'key') whatever path the work takes — a pooled autocommit statement, a
+#   transaction's pinned connection, the SqlBulkCopy behind INSERT. It replaces fabricator_session_tag(), which
+#   set a key once on a pinned connection and so worked only inside an explicit transaction.
+#   ⚠ Fabric's query insights / Capacity Metrics attribution is NOT reachable from this rig; that half is
+#   unmeasured here.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# A column whose DEFAULT is the session context records what the connection that WROTE the row carried. The
+# INSERTs below omit it, so the server applies the default on the writing connection itself.
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.sc_log; CREATE TABLE dbo.sc_log (id int, tag nvarchar(100) DEFAULT CAST(SESSION_CONTEXT(N''run'') AS nvarchar(100)))');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# ============================================================================
+# 1. Control: nothing set ⇒ nothing sent.
+# ============================================================================
+
+query T
+SELECT ctx FROM fabricator_query('db', 'SELECT CAST(SESSION_CONTEXT(N''run'') AS nvarchar(100)) AS ctx');
+----
+NULL
+
+# ============================================================================
+# 2. SET reaches a pooled autocommit statement — the case fabricator_session_tag refused.
+# ============================================================================
+
+statement ok
+SET mssql_session_context = '{"run": "r1", "n": 7, "flag": true}';
+
+query TTT
+SELECT a, b, c FROM fabricator_query('db', 'SELECT CAST(SESSION_CONTEXT(N''run'') AS nvarchar(100)) AS a, CAST(SESSION_CONTEXT(N''n'') AS nvarchar(100)) AS b, CAST(SESSION_CONTEXT(N''flag'') AS nvarchar(100)) AS c');
+----
+r1	7	true
+
+# The INSERT streams through SqlBulkCopy on its own connection.
+statement ok
+INSERT INTO db.dbo.sc_log (id) VALUES (1);
+
+query IT
+SELECT id, tag FROM db.dbo.sc_log ORDER BY id;
+----
+1	r1
+
+# ============================================================================
+# 3. Explicit transaction: the pinned connection carries it, and a SET between two writes reaches the second.
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO db.dbo.sc_log (id) VALUES (2);
+
+statement ok
+SET mssql_session_context = '{"run": "r2"}';
+
+statement ok
+INSERT INTO db.dbo.sc_log (id) VALUES (3);
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, tag FROM db.dbo.sc_log ORDER BY id;
+----
+1	r1
+2	r1
+3	r2
+
+# A key the new object no longer names is cleared on the pinned connection, not left behind.
+statement ok
+SET mssql_session_context = '{"run": "r3", "extra": "x"}';
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO db.dbo.sc_log (id) VALUES (4);
+
+statement ok
+SET mssql_session_context = '{"run": "r4"}';
+
+statement ok
+SELECT fabricator_exec('db', 'INSERT INTO dbo.sc_log (id, tag) SELECT 5, COALESCE(CAST(SESSION_CONTEXT(N''extra'') AS nvarchar(100)), N''cleared'')');
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, tag FROM db.dbo.sc_log WHERE id >= 4 ORDER BY id;
+----
+4	r3
+5	cleared
+
+# ============================================================================
+# 4. '{}' sends nothing; malformed values are refused naming the setting.
+# ============================================================================
+
+statement ok
+SET mssql_session_context = '{}';
+
+query T
+SELECT ctx FROM fabricator_query('db', 'SELECT CAST(SESSION_CONTEXT(N''run'') AS nvarchar(100)) AS ctx');
+----
+NULL
+
+statement ok
+SET mssql_session_context = 'not json';
+
+statement error
+SELECT * FROM fabricator_query('db', 'SELECT 1 AS one');
+----
+mssql_session_context: expected a JSON object
+
+statement ok
+SET mssql_session_context = '{"run": {"nested": 1}}';
+
+statement error
+SELECT * FROM fabricator_query('db', 'SELECT 1 AS one');
+----
+must be a string, number, boolean or null
+
+statement ok
+SET mssql_session_context = '{}';
+
+# ============================================================================
+# 5. The ATTACH option: a fixed tag per catalog, validated at ATTACH; SET outranks it.
+# ============================================================================
+
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad (TYPE fabricator, session_context '[1, 2]');
+----
+session_context ATTACH option: expected a JSON object
+
+statement ok
+RESET mssql_session_context;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS fixed (TYPE fabricator, session_context '{"run": "attached"}');
+
+query T
+SELECT ctx FROM fabricator_query('fixed', 'SELECT CAST(SESSION_CONTEXT(N''run'') AS nvarchar(100)) AS ctx');
+----
+attached
+
+statement ok
+SET mssql_session_context = '{"run": "session"}';
+
+query T
+SELECT ctx FROM fabricator_query('fixed', 'SELECT CAST(SESSION_CONTEXT(N''run'') AS nvarchar(100)) AS ctx');
+----
+session
+
+statement ok
+SET mssql_session_context = '';
+
+query T
+SELECT ctx FROM fabricator_query('fixed', 'SELECT CAST(SESSION_CONTEXT(N''run'') AS nvarchar(100)) AS ctx');
+----
+attached
+
+# ============================================================================
+# 6. The function this replaces is gone.
+# ============================================================================
+
+statement error
+SELECT * FROM db.dbo.fabricator_session_tag('k', 'v');
+----
+fabricator_session_tag
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.sc_log');
+
+statement ok
+DETACH fixed;
+
+statement ok
+DETACH db;

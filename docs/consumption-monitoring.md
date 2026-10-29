@@ -1,7 +1,17 @@
 # Consumption / CU monitoring on Fabric — what is reachable, and how to attribute it to a dbt run
 
+> ⚠⚠ **2026-10-29: `db.dbo.fabricator_session_tag()` is GONE, replaced by `SET mssql_session_context` (and the
+> `session_context` ATTACH option).** The function set a key ONCE on a transaction's pinned connection, so it
+> worked only inside an explicit transaction, that check failed intermittently right after BEGIN, and at dbt
+> `--threads > 1` a model sometimes saw another run's tag (§2.4c). The setting is applied on EVERY connection the
+> provider opens — pooled, pinned, bulk — the shape duckdb-postgres calls preliminary queries, so no statement
+> depends on state an earlier one left behind. MEASURED: a pooled connection returns from the pool with
+> SESSION_CONTEXT cleared (sp_reset_connection), so nothing stale can leak. Gate `verify_session_context_mssql`
+> (51, service, three mutants). The §2.4 sections below are the record of the function; the measurements about
+> what query insights records still hold. ⚠ The Fabric side of the new setting is NOT measured yet.
+
 **Status: analysis measured live 2026-07-31; TWO THINGS BUILT out of it** — the `application_name` fix (§2.2)
-and `db.dbo.fabricator_session_tag()` (§2.4b, gate `verify_session_tag`). The CU half remains analysis.** The question that prompted it: can a dbt run —
+and `db.dbo.fabricator_session_tag()` (§2.4b, gate `verify_session_tag`). The CU half remains analysis.** The question that prompted it: can a dbt run — <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
 a whole DAG, or one model — be monitored for consumption / CU cost, and can a Warehouse query be *tagged* so it
 can be found again in monitoring?
 
@@ -266,7 +276,7 @@ connection the work will use** — only the extension can force the pin.
 
 Hence **`db.dbo.fabricator_session_tag(key, value)`** (`SqlServerSessionTag.cs`), a catalog-bound table function
 that goes through `BeginWrite()` *without* the join-only restriction — pinning the transaction's connection — then
-returns `connection_id`, `session_id`, `dist_statement_id` and the tag it set. Gate: `verify_session_tag`
+returns `connection_id`, `session_id`, `dist_statement_id` and the tag it set. Gate: `verify_session_tag` <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
 (25 assertions, service tier).
 
 Four design points, each forced by something measured:
@@ -335,11 +345,11 @@ attribution, not per-model. Combined with `OPTION (LABEL)` for statement grain (
 this analysis actually ends up recommending for dbt.
 
 `fabricator_session_tag` remains correct **as specified and gated** — one transaction, one connection, verified
-by `verify_session_tag` — and is useful for scripted single-connection work. It is the dbt-at-concurrency case
+by `verify_session_tag` — and is useful for scripted single-connection work. It is the dbt-at-concurrency case <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
 that it does not safely serve.
 
 ⚠ **A second data point for the ambient/txn-id suspicion (2026-08-15, observed once, NOT diagnosed):**
-`verify_session_tag` itself FAILED once inside a full service-tier run — the call at its §7 (directly inside a
+`verify_session_tag` itself FAILED once inside a full service-tier run — the call at its §7 (directly inside a <!-- check-docs:ignore (verify_session_tag was deleted 2026-10-29 with fabricator_session_tag) -->
 `BEGIN;`) was refused with the function's own *"must be called inside an explicit transaction"*, thrown from the
 lazy FIRST-BATCH pull ("failed to read next batch from stream"). It passed standalone at its full 25 assertions
 immediately after, and the full tier re-run was 50/50 green — on a tree whose only change was a masking-proven

@@ -1,0 +1,183 @@
+# name: test/verify_default_schema_mssql.test
+# description: A SQL Server catalog reports the login's default schema (SCHEMA_NAME()) as its DuckDB default
+#   schema, through the capability doc's `default_schema` key and FabricatorCatalog::GetDefaultSchema. Before,
+#   DuckDB's `main` stood: `db.t` failed with "schema main does not exist", `USE db` was refused outright, and
+#   DuckLake without METADATA_SCHEMA failed the same way, because DuckLakeTransaction::GetDefaultSchemaName
+#   asks exactly this method. The same table name lives in `dbo` (value 1) and `ds_alt` (value 2), and a second
+#   login has `ds_alt` as its default schema, so a hardcoded "dbo" cannot pass this file.
+# group: [fabricator]
+
+require fabricator
+
+require ducklake
+
+require parquet
+
+require-env MSSQL_TESTDB_DSN
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# ds_alt is emptied first: DuckLake must create its metadata there on THIS run (a leftover lake would carry
+# a different DATA_PATH). The login, user and schema are idempotent; the user owns ds_alt so DuckLake can
+# create its tables there, and VIEW DATABASE PERFORMANCE STATE keeps the stats query quiet.
+statement ok
+SELECT fabricator_exec('db', 'IF SCHEMA_ID(''ds_alt'') IS NOT NULL BEGIN DECLARE @s nvarchar(max) = N''''; SELECT @s += N''DROP TABLE [ds_alt].'' + QUOTENAME(name) + N'';'' FROM sys.tables WHERE schema_id = SCHEMA_ID(''ds_alt''); EXEC(@s); END; IF SCHEMA_ID(''ds_alt'') IS NULL EXEC(''CREATE SCHEMA ds_alt''); IF SUSER_ID(''ds_alt_login'') IS NULL CREATE LOGIN ds_alt_login WITH PASSWORD = ''Ds_Alt_Pw_123!'', CHECK_POLICY = OFF; IF USER_ID(''ds_alt_user'') IS NULL CREATE USER ds_alt_user FOR LOGIN ds_alt_login WITH DEFAULT_SCHEMA = ds_alt; ALTER AUTHORIZATION ON SCHEMA::ds_alt TO ds_alt_user; GRANT CREATE TABLE TO ds_alt_user; GRANT VIEW DATABASE PERFORMANCE STATE TO ds_alt_user;');
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.ds_probe; DROP TABLE IF EXISTS dbo.ds_created; CREATE TABLE dbo.ds_probe (i int); INSERT INTO dbo.ds_probe VALUES (1); CREATE TABLE ds_alt.ds_probe (i int); INSERT INTO ds_alt.ds_probe VALUES (2); GRANT SELECT ON dbo.ds_probe TO ds_alt_user;');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# ============================================================================
+# 1. The sa login: default schema dbo.
+# ============================================================================
+
+query T
+SELECT value FROM fabricator_server_info('db') WHERE property = 'default_schema';
+----
+dbo
+
+# The case that failed before: "Table with name main.ds_probe does not exist because schema main does not exist".
+query I
+SELECT i FROM db.ds_probe;
+----
+1
+
+query I
+SELECT i FROM db.dbo.ds_probe;
+----
+1
+
+query I
+SELECT i FROM db.ds_alt.ds_probe;
+----
+2
+
+# Refused before: "SET schema: No catalog + schema named db found".
+statement ok
+USE db;
+
+query T
+SELECT current_schema();
+----
+dbo
+
+query I
+SELECT i FROM ds_probe;
+----
+1
+
+statement ok
+USE memory;
+
+# An unqualified CREATE lands in the default schema, asked of SQL Server itself.
+statement ok
+CREATE TABLE db.ds_created AS SELECT 1 AS x;
+
+query T
+SELECT s FROM fabricator_query('db', 'SELECT SCHEMA_NAME(schema_id) AS s FROM sys.tables WHERE name = ''ds_created''');
+----
+dbo
+
+statement ok
+DROP TABLE db.ds_created;
+
+# ============================================================================
+# 2. A login whose default schema is ds_alt. A later `User Id` in the connection string wins in SqlClient.
+# ============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};User Id=ds_alt_login;Password=Ds_Alt_Pw_123!' AS alt (TYPE fabricator);
+
+query T
+SELECT value FROM fabricator_server_info('alt') WHERE property = 'default_schema';
+----
+ds_alt
+
+query I
+SELECT i FROM alt.ds_probe;
+----
+2
+
+query I
+SELECT i FROM alt.dbo.ds_probe;
+----
+1
+
+statement ok
+USE alt;
+
+query T
+SELECT current_schema();
+----
+ds_alt
+
+statement ok
+USE memory;
+
+statement ok
+DETACH alt;
+
+# ============================================================================
+# 3. DuckLake without METADATA_SCHEMA: its metadata goes to the login's default schema. Before, this ATTACH
+#    failed with schema "main" not found.
+# ============================================================================
+
+statement ok
+ATTACH 'ducklake:fabricator:${MSSQL_TESTDB_DSN};User Id=ds_alt_login;Password=Ds_Alt_Pw_123!' AS lk (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl/', META_HIDDEN_ROWID true);
+
+statement ok
+CREATE TABLE lk.t AS SELECT range AS i FROM range(5);
+
+query II
+SELECT count(*), sum(i) FROM lk.t;
+----
+5	10
+
+query I
+SELECT count(*) FROM fabricator_query('db', 'SELECT 1 AS one FROM sys.tables WHERE name = ''ducklake_snapshot'' AND schema_id = SCHEMA_ID(''ds_alt'')');
+----
+1
+
+statement ok
+DETACH lk;
+
+# ============================================================================
+# 4. Control: a provider that names no default schema keeps DuckDB's `main` (the flat Delta layout).
+# ============================================================================
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/lake' AS dl (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE TABLE dl.t AS SELECT 1 AS x;
+
+query T
+SELECT table_schema FROM information_schema.tables WHERE table_catalog = 'dl' AND table_name = 't';
+----
+main
+
+statement ok
+USE dl;
+
+query T
+SELECT current_schema();
+----
+main
+
+statement ok
+USE memory;
+
+statement ok
+DETACH dl;
+
+# Leave ds_alt empty, so catalog enumeration in other suites does not see this file's DuckLake tables.
+statement ok
+SELECT fabricator_exec('db', 'DECLARE @s nvarchar(max) = N''''; SELECT @s += N''DROP TABLE [ds_alt].'' + QUOTENAME(name) + N'';'' FROM sys.tables WHERE schema_id = SCHEMA_ID(''ds_alt''); EXEC(@s); DROP TABLE IF EXISTS dbo.ds_probe;');
+
+statement ok
+DETACH db;

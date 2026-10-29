@@ -15,6 +15,7 @@
 #include "fabricator/scan_wait.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -324,6 +325,25 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 	vector<string> schema_names;
 	ReadSchemaColumns(context, bind_data.schema_root.arrow_schema, bind_data.arrow_table, return_types,
 	                  schema_names, &bind_data.column_nullable);
+	// DuckDB refuses a table function whose columns repeat a name ("duplicate column name"), and a raw query
+	// can return one: `SELECT 41 AS a, 42 AS a`, or a join selecting `t.id, s.id`. Repeats become `a_1`, `a_2`,
+	// … (duckdb-postgres does the same), compared case-insensitively because DuckDB's names are. Safe for the
+	// mapping: a path that maps BY NAME (push_projection — catalog scans, TVFs) reads a table or function,
+	// whose columns SQL Server already keeps unique, so it never reaches the rename; the raw-query paths map
+	// by position.
+	case_insensitive_set_t seen_names;
+	for (auto &n : schema_names) {
+		if (seen_names.insert(n).second) {
+			continue;
+		}
+		for (idx_t suffix = 1;; suffix++) {
+			auto candidate = n + "_" + to_string(suffix);
+			if (seen_names.insert(candidate).second) {
+				n = candidate;
+				break;
+			}
+		}
+	}
 	names.clear();
 	for (auto &n : schema_names) {
 		names.push_back(Identifier(n));

@@ -159,3 +159,84 @@ SELECT fabricator_exec('oob', 'DROP TABLE dbo.oob_created');
 
 statement ok
 DETACH oob;
+
+# ============================================================================
+# refresh_cache := true — the per-call, deterministic form of mssql_exec_invalidate_cache (which stays OFF
+# here). Enumeration is the discriminator: since the by-name lookup, a table created out of band is
+# reachable without a refresh, but duckdb_tables() lists it only after one.
+# ============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS rc (TYPE fabricator);
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+SELECT fabricator_exec('rc', 'DROP TABLE IF EXISTS dbo.rc_plain; DROP TABLE IF EXISTS dbo.rc_exec; DROP TABLE IF EXISTS dbo.rc_query; DROP TABLE IF EXISTS dbo.rc_explain');
+
+statement ok
+SELECT fabricator_refresh_cache('rc');
+
+# Control: without it, a CREATE through fabricator_exec is not enumerated.
+statement ok
+SELECT fabricator_exec('rc', 'CREATE TABLE dbo.rc_plain (i int)');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'rc' AND table_name = 'rc_plain';
+----
+0
+
+# fabricator_exec: rebuilt at once.
+statement ok
+SELECT fabricator_exec('rc', 'CREATE TABLE dbo.rc_exec (i int)', refresh_cache := true);
+
+query II
+SELECT count(*) FILTER (table_name = 'rc_exec'), count(*) FILTER (table_name = 'rc_plain') FROM duckdb_tables() WHERE database_name = 'rc';
+----
+1	1
+
+# EXPLAIN binds and never executes, so it must not refresh: rc_explain was created out of band before it.
+statement ok
+SELECT fabricator_exec('rc', 'CREATE TABLE dbo.rc_explain (i int)');
+
+statement ok
+EXPLAIN SELECT * FROM fabricator_query('rc', 'SELECT 1 AS one', refresh_cache := true);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'rc' AND table_name = 'rc_explain';
+----
+0
+
+# fabricator_query: the DDL runs inside the query; the cache is rebuilt from the next transaction on.
+query I
+SELECT one FROM fabricator_query('rc', 'CREATE TABLE dbo.rc_query (i int); SELECT 1 AS one', refresh_cache := true);
+----
+1
+
+query II
+SELECT count(*) FILTER (table_name = 'rc_query'), count(*) FILTER (table_name = 'rc_explain') FROM duckdb_tables() WHERE database_name = 'rc';
+----
+1	1
+
+# A connection string has no catalog cache: refused, and for fabricator_exec BEFORE the statement runs.
+statement error
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'CREATE TABLE dbo.rc_never (i int)', refresh_cache := true);
+----
+refresh_cache := true needs the name of an attached fabricator catalog
+
+query I
+SELECT count(*) FROM fabricator_query('rc', 'SELECT 1 AS one FROM sys.tables WHERE name = ''rc_never''');
+----
+0
+
+statement error
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}', 'SELECT 1 AS one', refresh_cache := true);
+----
+refresh_cache := true needs the name of an attached fabricator catalog
+
+statement ok
+SELECT fabricator_exec('rc', 'DROP TABLE IF EXISTS dbo.rc_plain; DROP TABLE IF EXISTS dbo.rc_exec; DROP TABLE IF EXISTS dbo.rc_query; DROP TABLE IF EXISTS dbo.rc_explain');
+
+statement ok
+DETACH rc;

@@ -241,6 +241,12 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 		caps.supports_nested_schemas = yyjson_get_bool(yyjson_obj_get(root, "supports_nested_schemas"));
 		caps.remote_select = yyjson_get_bool(yyjson_obj_get(root, "remote_select"));
 		caps.bind_schema_cacheable = yyjson_get_bool(yyjson_obj_get(root, "bind_schema_cacheable"));
+		// Absent or not a string reads as "no default schema of its own" — DuckDB's `main` then stands, which
+		// is what every catalog reported before this key existed.
+		auto *schema = yyjson_obj_get(root, "default_schema");
+		if (yyjson_is_str(schema)) {
+			caps.default_schema = string(yyjson_get_str(schema), yyjson_get_len(schema));
+		}
 	}
 	return caps;
 }

@@ -118,12 +118,22 @@ internal sealed class ServerProfile
     /// </summary>
     public string DefaultWriteIsolation => EngineEdition == EditionFabricOrSynapseServerless ? "snapshot" : string.Empty;
 
-    private ServerProfile(int engineEdition, int productMajorVersion, string? productVersion, string? collation)
+    /// <summary>
+    /// The login's default schema in this database (<c>SCHEMA_NAME()</c>) — where SQL Server itself resolves
+    /// an unqualified name, so it is what the catalog reports as its DuckDB default schema: <c>db.t</c>,
+    /// <c>USE db</c> and DuckLake's metadata schema all follow it. <c>dbo</c> when the server answers NULL
+    /// (a principal with no database user, e.g. a service principal on a Fabric SQL database).
+    /// </summary>
+    public string DefaultSchema { get; }
+
+    private ServerProfile(int engineEdition, int productMajorVersion, string? productVersion, string? collation,
+                          string? defaultSchema)
     {
         EngineEdition = engineEdition;
         ProductMajorVersion = productMajorVersion;
         ProductVersion = productVersion ?? string.Empty;
         Collation = collation ?? string.Empty;
+        DefaultSchema = string.IsNullOrEmpty(defaultSchema) ? "dbo" : defaultSchema;
 
         // Fabric Warehouse / Lakehouse SQL endpoint (the type-restricted family). Synapse dedicated
         // (6) keeps box-like types (nvarchar, datetimeoffset, datetime2(7)) but, like Fabric, lacks MARS.
@@ -144,8 +154,8 @@ internal sealed class ServerProfile
 
     /// <summary>Construct from raw values (used by <see cref="Detect"/> and directly in tests).</summary>
     public static ServerProfile FromValues(int engineEdition, int productMajorVersion, string? productVersion,
-                                            string? collation)
-        => new(engineEdition, productMajorVersion, productVersion, collation);
+                                            string? collation, string? defaultSchema = null)
+        => new(engineEdition, productMajorVersion, productVersion, collation, defaultSchema);
 
     /// <summary>
     /// The profile as ordered (property, value) text rows — surfaced by the <c>fabricator_server_info(catalog)</c>
@@ -170,6 +180,7 @@ internal sealed class ServerProfile
         ("is_binary_collation", Bool(IsBinaryCollation)),
         ("is_case_sensitive", Bool(IsCaseSensitive)),
         ("default_write_isolation", DefaultWriteIsolation.Length == 0 ? "(default)" : DefaultWriteIsolation),
+        ("default_schema", DefaultSchema),
     };
 
     private static string Bool(bool value) => value ? "true" : "false";
@@ -187,7 +198,8 @@ internal sealed class ServerProfile
             "SELECT CAST(SERVERPROPERTY('EngineEdition') AS int), " +
             "CAST(SERVERPROPERTY('ProductMajorVersion') AS int), " +
             "CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), " +
-            "CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS nvarchar(128))";
+            "CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS nvarchar(128)), " +
+            "SCHEMA_NAME()";
         using var reader = cmd.ExecuteReader();
         if (!reader.Read())
         {
@@ -197,7 +209,8 @@ internal sealed class ServerProfile
         string productVersion = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
         int productMajor = reader.IsDBNull(1) ? ParseLeadingInt(productVersion) : reader.GetInt32(1);
         string collation = reader.IsDBNull(3) ? string.Empty : reader.GetString(3);
-        return FromValues(engineEdition, productMajor, productVersion, collation);
+        string? defaultSchema = reader.IsDBNull(4) ? null : reader.GetString(4);
+        return FromValues(engineEdition, productMajor, productVersion, collation, defaultSchema);
     }
 
     // "16.0.4135.4" -> 16; 0 on anything unparseable.

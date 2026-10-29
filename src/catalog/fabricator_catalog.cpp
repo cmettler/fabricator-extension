@@ -201,6 +201,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
+		default_schema_ = caps.default_schema;
 	} catch (std::exception &ex) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;
@@ -208,6 +209,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = false;
 		remote_select_ = false;
 		bind_schema_cacheable_ = false;
+		default_schema_.clear();
 		// ⚠ IT WARNS NOW, and the silence was the defect. This catch guards TWO unrelated things: a provider
 		// that cannot answer (fine — defaults are the safe direction, superset-and-re-apply) and a TRANSIENT
 		// failure of whatever the provider needs to answer. The second one used to disable string ORDER BY
@@ -311,6 +313,19 @@ optional_ptr<SchemaCatalogEntry> FabricatorCatalog::LookupSchema(CatalogTransact
 }
 
 void FabricatorCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+	// A pending "schema may have changed" mark is consumed here TOO, not only at the next transaction start:
+	// duckdb_tables() / information_schema enumerate through this method WITHOUT starting a transaction on
+	// this catalog, so a listing right after `fabricator_query(…, refresh_cache := true)` or a CDC setup
+	// function stayed stale until some statement referenced the catalog by name — measured, and it is exactly
+	// what dbt runs first. Before the lock and before any schema is handed out, so nothing this call returns
+	// can be retired under it; entries other statements hold are kept alive by the graveyard. Best-effort, as
+	// in StartTransaction: a failed rebuild leaves the cache as it was.
+	if (ConsumeSchemaMayChange()) {
+		try {
+			RefreshCache(context);
+		} catch (...) {
+		}
+	}
 	lock_guard<mutex> lock(schema_lock_);
 	// ⚠ THE WHOLE TREE, not just the top level — `duckdb_schemas()` and `information_schema.schemata` are
 	// built on this, so reporting only the roots would make a nested schema queryable (the binder walks

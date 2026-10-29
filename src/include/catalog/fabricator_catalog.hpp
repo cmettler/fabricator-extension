@@ -98,6 +98,19 @@ public:
 		return supports_nested_schemas_;
 	}
 
+	//! The schema an unqualified name resolves to: `db.t`, `USE db`, and DuckLake's metadata schema when
+	//! METADATA_SCHEMA is not given (DuckLakeTransaction::GetDefaultSchemaName asks exactly this). The
+	//! provider names it in the capability doc (`default_schema`; SQL Server: the login's SCHEMA_NAME(), so
+	//! `dbo` in practice); otherwise DuckDB's `main` stands, which is right for the Delta layouts.
+	//! \warning Read on every unqualified name resolution and `const`, so it never asks the provider: the
+	//! value is captured once at LoadCatalog, before the catalog is reachable, and never written again.
+	optional<Identifier> GetDefaultSchema() const override {
+		if (default_schema_.empty()) {
+			return Catalog::GetDefaultSchema();
+		}
+		return Identifier(default_schema_);
+	}
+
 	//! Records that a provider function's EXECUTION performed DDL (ABI v81's `tablefn_execute`
 	//! schema_may_change out-flag), so this catalog's metadata cache must be rebuilt before anything binds
 	//! against it again.
@@ -211,6 +224,8 @@ private:
 	bool null_order_expressible_ = false;
 	bool bind_schema_cacheable_ = false;
 	bool supports_nested_schemas_ = false;
+	//! The provider's default schema (capability `default_schema`); empty => DuckDB's `main`.
+	string default_schema_;
 	//! The provider runs a pushed SELECT (capability `remote_select`); see Supports().
 	bool remote_select_ = false;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true

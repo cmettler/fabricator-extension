@@ -113,7 +113,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `include := 'snapshot'` / `'snapshot+changes'` — the whole table as of one consistent instant, then the changes after it, with no gap between the halves | ✅ |
 | | Before-images (`images := 'both'`, with `_update_mask` and a decoded `_changed_columns`) and wall-clock window bounds | ✅ |
 | | `on_schema_change := 'resync'` — re-capture and re-baseline when the capture instance no longer matches the source | ✅ |
-| **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
+| **Monitoring** | `SET mssql_session_context = '{"dbt_run_id": "…"}'` — tag every connection the provider opens so Fabric query insights can attribute its cost | ✅ |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
 | **Warehouse** | Auto-detected server profile (edition / version / collation) + `fabricator_server_info()` | ✅ Fabric Warehouse validated |
@@ -275,6 +275,9 @@ ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, materialize false);
 -- Per-catalog NULL-write semantics (see mssql_keep_nulls). Default true = a NULL is stored as NULL;
 -- false restores the older behaviour, where SqlBulkCopy replaces it with the column's DEFAULT.
 ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, keep_nulls false);
+
+-- A fixed session-context tag on every connection of this catalog (see mssql_session_context).
+ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, session_context '{"team": "finance"}');
 
 -- Per-catalog MARS mode: auto (default, the engine's capability) | true | false.
 -- Use this rather than SET mssql_mars when two catalogs must differ — a SET applies to the whole
@@ -462,7 +465,8 @@ What the profile drives automatically:
   otherwise fail with *"table has N columns but M values were supplied"*. A column with that name is hidden on
   every catalog, with or without the option, so a catalog attached without it still sees the same table. This
   is what makes SQL Server usable as a [DuckLake](docs/ducklake-catalog.md) metadata catalog — attach it as
-  `ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true)`.
+  `ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH '…', META_HIDDEN_ROWID true)`. DuckLake keeps its
+  metadata tables in the login's default schema (usually `dbo`); `METADATA_SCHEMA '…'` puts them elsewhere.
   Do not turn `remote_pushdown` off there: DuckLake reads the latest snapshot with a subquery that only remote
   pushdown keeps off a full scan, so without it every commit grows dearer with the snapshot history (measured
   78 → 335 ms per commit at 200,000 snapshots; flat with it).
@@ -508,7 +512,7 @@ What the profile drives automatically:
     time travel. Clean up through DuckLake.
   ```sql
   ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH 'abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables/',
-      METADATA_SCHEMA 'dbo', META_HIDDEN_ROWID true);
+      META_HIDDEN_ROWID true);
   ATTACH 'abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables' AS lh
       (TYPE fabricator, PROVIDER 'delta', SECRET fabric_sp, READ_ONLY false);   -- the conditional commit
   CALL ducklake_flush_inlined_data('lake');
@@ -531,7 +535,16 @@ SELECT table_name  FROM duckdb_tables()  WHERE database_name = 'mssql' AND schem
 -- Three-part naming + cross-catalog joins with local DuckDB tables
 SELECT s.name, o.amount
   FROM mssql.dbo.people s JOIN mssql.sales.orders o ON o.order_id = 1000 + s.id;
+
+-- A name without a schema resolves to the login's default schema (usually dbo)
+SELECT * FROM mssql.people;            -- mssql.dbo.people
+USE mssql;
+SELECT current_schema();               -- dbo
 ```
+
+> **The default schema is the login's, as SQL Server sees it** (`SCHEMA_NAME()`, read at ATTACH; `dbo` when the
+> server reports none). It is what `mssql.t`, `USE mssql` and an unqualified `CREATE TABLE mssql.t` use, and
+> `fabricator_server_info(catalog)` shows it as `default_schema`. Delta and DAX catalogs keep DuckDB's `main`.
 
 > **Objects the server cannot describe are skipped, not fatal.** The commonest case is an **invalid view**
 > on SQL Server — one whose underlying table or column has been dropped or renamed. Such an object is left
@@ -1033,6 +1046,10 @@ put through `fabricator_exec` it runs once and tells you how many rows it touche
 ⚠ A broken query now fails while *binding*, with SQL Server's own message (`Invalid column name 'x'`) — one
 phase earlier than before.
 
+**Repeated column names are renamed**, because DuckDB requires distinct names: `SELECT t.id, s.id …` returns
+`id` and `id_1`, a further repeat `id_2` (skipping a name the query already uses). Names compare
+case-insensitively, as in DuckDB, so `a` and `A` count as a repeat.
+
 ⚠ Inside an explicit `BEGIN … COMMIT`, `fabricator_query` **does** run on the transaction's connection once
 one exists, so it sees the transaction's own uncommitted writes. Note the asymmetry with `fabricator_exec`
 below, which joins only if a write has already pinned that connection.
@@ -1059,8 +1076,8 @@ already wrote.** `fabricator_exec` joins the transaction's pinned provider conne
 exists* — i.e. only if a DuckDB-managed write has pinned it. Otherwise it autocommits on its own connection,
 because a raw string-target exec never triggers the catalog's transaction lifecycle and nothing would ever
 commit that connection. If you need a statement to be reliably part of the transaction, make sure the
-transaction has written first, or use a purpose-built function (`db.dbo.fabricator_session_tag()` exists for
-exactly this reason).
+transaction has written first. (To tag connections for monitoring, use `SET mssql_session_context`, which
+needs no transaction at all.)
 
 #### Parameters
 
@@ -1099,11 +1116,19 @@ SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t (id INT)');
 SELECT fabricator_refresh_cache('mssql');
 SELECT * FROM mssql.dbo.t;
 
+-- ...or ask for it in the same call (needs an attached catalog as the first argument):
+SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t3 (id INT)', refresh_cache := true);
+SELECT * FROM fabricator_query('mssql', 'CREATE TABLE dbo.t4 (id INT); SELECT 1 AS ok', refresh_cache := true);
+
 -- ...or auto-invalidate after DDL run via fabricator_exec (off by default; DDL detected in C#):
 SET mssql_exec_invalidate_cache = true;
 SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t2 (id INT)');
 SELECT * FROM mssql.dbo.t2;   -- visible immediately
 ```
+
+`refresh_cache := true` rebuilds whatever the statement looks like. On `fabricator_exec` the rebuild is
+immediate; on `fabricator_query`, which is still running when it would happen, it takes effect at the catalog's
+next use — a statement naming it, or a listing such as `duckdb_tables()` — and an `EXPLAIN` triggers nothing.
 
 Three things about the automatic mode that are easy to trip over:
 
@@ -1516,42 +1541,41 @@ this handoff give unconditionally. Stop the capture job (`sys.sp_cdc_stop_job`) 
   on, and it refuses (use `'null'`, which needs no key). Both modes leave the capture instance alone — use
   `'resync'` if you want the columns genuinely captured from now on.
 
-### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
+### Session context: `SET mssql_session_context` (SQL Server / Fabric)
 
-Tags the transaction's provider connection with a session-context key, so the statements it causes can be
-correlated afterwards — e.g. attributing a dbt run's cost in Fabric's
-[query insights](https://learn.microsoft.com/en-us/fabric/data-warehouse/query-insights). Returns one row:
-`connection_id`, `session_id`, `dist_statement_id`, `tag_key`, `tag_value`.
-
-```sql
-BEGIN;
-SELECT * FROM db.dbo.fabricator_session_tag('dbt_run_id', '7f3c…');   -- e.g. a dbt pre-hook
-CREATE OR REPLACE TABLE db.dbo.orders AS SELECT * FROM staged;        -- attributed to that tag
-COMMIT;
-```
-
-On a Fabric Warehouse, every statement of that transaction — including the bulk load — then shares one
-`connection_id`, so you can total its cost:
+Sets keys with `sp_set_session_context` on **every connection** the SQL Server provider opens — the pooled one
+behind an autocommit statement, a transaction's pinned one, and the `SqlBulkCopy` behind `INSERT`/CTAS/`COPY`.
+The server sees them through `SESSION_CONTEXT(N'key')`, and Fabric's
+[query insights](https://learn.microsoft.com/en-us/fabric/data-warehouse/query-insights) records the call, so
+a dbt run's statements can be found and costed afterwards.
 
 ```sql
-SELECT count(*) AS statements, SUM(allocated_cpu_time_ms) AS cpu_ms
-FROM fabricator_query('db',
-  'SELECT allocated_cpu_time_ms FROM queryinsights.exec_requests_history
-    WHERE connection_id = ''<the connection_id returned above>''');
+SET mssql_session_context = '{"dbt_run_id": "7f3c…", "model": "orders"}';   -- e.g. a dbt pre-hook
+CREATE OR REPLACE TABLE db.dbo.orders AS SELECT * FROM staged;            -- every connection it uses is tagged
+
+-- a fixed tag for one catalog; a SET outranks it
+ATTACH '…' AS wh (TYPE fabricator, session_context '{"team": "finance"}');
 ```
 
-- **Must be inside an explicit `BEGIN`…`COMMIT`.** In autocommit the connection it tags is released with that
-  statement, so the tag would apply to nothing — the function raises instead of silently doing nothing.
-- `SELECT fabricator_exec(…, 'EXEC sp_set_session_context …')` does **not** work as a substitute: a raw exec
-  joins an existing pinned connection or takes a throwaway one, and nothing is pinned yet when a pre-hook runs.
-- Key ≤ 128 bytes, value ≤ 8000 (the `sp_set_session_context` limits). Values are passed as parameters; the tag
-  is also written into the statement text as a comment so it stays findable in the query history.
-- ⚠ **Not reliable as a dbt pre-hook at `--threads > 1`.** Measured: the tag a model's own hook set was
-  frequently *not* what its body saw — a stale value from an earlier run, which silently mis-attributes cost.
-  It is dependable single-threaded, and within one explicit transaction generally.
-- To attribute a whole **run**, set `application_name` on the secret instead. It is a connection-string property,
-  so every connection the run opens carries it and it cannot go stale — and it needs no SQL changes. Combine it
-  with `OPTION (LABEL = '…')` for per-statement grain. Details and the CU story:
+On Fabric, each tagged connection's `EXEC sp_set_session_context` carries the values in a trailing comment, so
+query insights can be searched for the tag and its `connection_id` joins the statements that connection ran:
+
+```sql
+SELECT count(*) AS statements, SUM(r.allocated_cpu_time_ms) AS cpu_ms
+FROM fabricator_query('wh',
+  'SELECT r.allocated_cpu_time_ms FROM queryinsights.exec_requests_history r
+    WHERE r.connection_id IN (SELECT connection_id FROM queryinsights.exec_requests_history
+                               WHERE command LIKE ''%fabricator_session_context%dbt_run_id=7f3c%'')');
+```
+
+- A JSON object; values may be strings, numbers, booleans or `null`. Key ≤ 128 characters, value ≤ 4000 (the
+  `sp_set_session_context` limits). Keys and values are sent as parameters.
+- No transaction needed. A `SET` inside a transaction reaches its pinned connection at the next write; a key the
+  new object no longer names is cleared there.
+- `'{}'` sends nothing for this session (also overriding an ATTACH tag); `''` falls back to the ATTACH option.
+- Unset costs nothing. Set, it costs one round trip per opened connection.
+- To attribute a whole **run** without SQL changes, `application_name` on the secret also works: every
+  connection carries it in `program_name`. Details and the CU story:
   [`docs/consumption-monitoring.md`](docs/consumption-monitoring.md).
 
 ### `fabricator_version() -> VARCHAR`
@@ -4078,6 +4102,7 @@ use: a transaction's pinned connection keeps the MARS mode it was opened with fo
 | `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved **per connection, when it is opened**, so it applies to connections this catalog opens after the `SET` — no need to set it before `ATTACH`, and two DuckDB connections sharing one attached catalog can use different modes. A transaction's pinned connection keeps the mode it was opened with. Confirm with `SELECT value FROM fabricator_server_info('<cat>') WHERE property = 'mars_enabled'`. Because a `SET` covers the whole DuckDB connection, use the per-catalog **`mars` ATTACH option** when two catalogs must differ (a `SET` outranks it). ⚠ Forcing `false` on **box SQL Server**: a scan of a table the open transaction has already written cannot run (it would deadlock against its own transaction) and is **refused with a message naming the remedies** — enable `READ_COMMITTED_SNAPSHOT` on the database, turn MARS back on, or COMMIT first. Reads of other tables are unaffected, as are Fabric/Synapse. See [known-limitations.md](docs/known-limitations.md) 1.15 |
 | `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts. **Defaults to `true`, on every engine.** Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595` — and it is what gives that scan **read-your-writes**, now including on engines with no MARS at all (Fabric, Synapse). Set `false` to keep the scan **streaming** instead: it then reads from a pooled connection at SNAPSHOT (needs `ALLOW_SNAPSHOT_ISOLATION` on the database) and therefore does **not** see rows the same transaction wrote — worth it for bulk movement, where a drained scan buffers the whole source in memory with no spill (a 1M-row same-catalog CTAS measured ~27% more CPU and 484 MB more allocation drained than streamed). Overrides the per-catalog `materialize` ATTACH option |
 | `mssql_keep_nulls` | **Active** | Write a **NULL as NULL**; **defaults to `true`**. Every `INSERT`/CTAS/`COPY` on this provider streams through `SqlBulkCopy`, which *without* this flag **replaces a source NULL with the target column's `DEFAULT` constraint** — so `INSERT INTO t (k, v) VALUES (1, NULL)` and a CSV with **blank fields** would silently store the default instead of NULL, where plain T-SQL stores NULL. ⚠ **This default changed** (it was previously the replacing behaviour); set `false` for the old semantics. `false` is also the only way to make `VALUES (…, DEFAULT)` apply a **non-literal** server default, because an expression default is not reported to DuckDB (see the column-default read-back) and that spelling therefore reaches us as an ordinary NULL — the one case `true` costs. An **omitted** column is unaffected either way: it is never sent, so the server applies its own default. Overrides the per-catalog `keep_nulls` ATTACH option |
+| `mssql_session_context` | **Active** | A JSON object of keys and values, e.g. `'{"dbt_run_id": "…"}'`, set with `sp_set_session_context` on **every** connection the provider opens — pooled, pinned or bulk — so the server reads them with `SESSION_CONTEXT(N'key')` and Fabric query insights can attribute the work. Values: string, number, boolean or null; key ≤ 128 characters, value ≤ 4000. A `SET` inside a transaction reaches its pinned connection at the next write. Unset = nothing sent; `'{}'` sends nothing even over an ATTACH tag. Overrides the per-catalog `session_context` ATTACH option. See [Session context](#session-context-set-mssql_session_context-sql-server--fabric) |
 | `mssql_command_timeout` | **Active** | `SqlCommand.CommandTimeout` (seconds) for scans / DML / bulk; **default `0` = infinite**. Server-enforced per round-trip; overrides the per-catalog `command_timeout` ATTACH option |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
 | `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |

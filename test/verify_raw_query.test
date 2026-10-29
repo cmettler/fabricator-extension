@@ -451,10 +451,10 @@ DETACH rqd;
 # behaviour above: a registration regression would leave every row in §9–§15 passing on whichever overload
 # survived, or fail them all for a reason that names nothing.
 #
-# ⚠ Safe to assert IN ORDER, unlike a signature with two NAMED parameters: fabricator_query has exactly ONE
-# (a single entry cannot be out of order) and fabricator_exec is a SCALAR, whose parameters come from the
-# ordered `arguments` vector. See the named-parameter ordering trap — `duckdb_functions().parameters` lists
-# NAMED ones in an unordered_map's iteration order, which differs by platform.
+# ⚠ Safe to assert IN ORDER on 2.0: every parameter, named ones included, lives in ONE ordered vector on the
+# function's signature. (1.5 listed NAMED parameters in an unordered_map's iteration order, which differed by
+# platform; fabricator_query carried a single one there for that reason. Since 2026-10-29 it has two —
+# params and refresh_cache — and fabricator_exec gained refresh_cache as a keyword parameter, bound last.)
 
 query TTTT
 SELECT function_name, function_type, parameters, parameter_types
@@ -462,9 +462,30 @@ FROM duckdb_functions()
 WHERE function_name IN ('fabricator_query', 'fabricator_exec')
 ORDER BY function_name, len(parameters);
 ----
-fabricator_exec	scalar	[col0, col1]	[VARCHAR, VARCHAR]
-fabricator_exec	scalar	[col0, col1, col2]	[VARCHAR, VARCHAR, ANY]
-fabricator_query	table	[col0, col1, params]	[VARCHAR, VARCHAR, ANY]
+fabricator_exec	scalar	[col0, col1, refresh_cache]	[VARCHAR, VARCHAR, BOOLEAN]
+fabricator_exec	scalar	[col0, col1, col2, refresh_cache]	[VARCHAR, VARCHAR, ANY, BOOLEAN]
+fabricator_query	table	[col0, col1, params, refresh_cache]	[VARCHAR, VARCHAR, ANY, BOOLEAN]
+
+# ═══ §6b Duplicate column names ═══════════════════════════════════════════════════════════════════════
+# DuckDB refuses a table function whose columns repeat a name, and a raw query can return one (`SELECT t.id,
+# s.id …`). Repeats become `a_1`, `a_2`, … like duckdb-postgres, case-insensitively because DuckDB's names
+# are. Before: "table fabricator_query has duplicate column name a".
+
+query II
+SELECT a, a_1 FROM fabricator_query('q', 'SELECT 41 AS a, 42 AS a');
+----
+41	42
+
+# A suffix that is already taken is skipped, and a different spelling of the same name counts as a repeat.
+query IIII
+SELECT a, a_1, a_2, "A_3" FROM fabricator_query('q', 'SELECT 1 AS a, 2 AS a_1, 3 AS a, 4 AS A');
+----
+1	2	3	4
+
+query T
+SELECT string_agg(column_name, ',') FROM (DESCRIBE SELECT * FROM fabricator_query('q', 'SELECT 1 AS a, 2 AS a_1, 3 AS a, 4 AS A'));
+----
+a,a_1,a_2,A_3
 
 # ═══ §7  Teardown ════════════════════════════════════════════════════════════════════════════════════
 
