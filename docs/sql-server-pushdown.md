@@ -19,6 +19,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | `DELETE` | the `WHERE` translates exactly — strings, subqueries over the catalog, `USING` included (D1–D3) | `FABRICATOR_REMOTE_DML` | `Mssql Net Delete`: scan the keys, delete by key (D4) |
 | `UPDATE` | as `DELETE`, every `SET` value translates (U1); not `UPDATE … FROM` | `FABRICATOR_REMOTE_DML` | `Mssql Net Update`: scan, update by key (U2) |
 | `… RETURNING` | not as one pushed statement: `DELETE` / `UPDATE` take the key path, the rows come from T-SQL `OUTPUT` | `Mssql Net Delete` / `Update` / `Insert` | see [RETURNING](#returning) |
+| `WITH moved AS (DELETE … RETURNING …) INSERT INTO … SELECT … FROM moved` | source and target are tables of the same catalog, the columns keep their types (R4) | `FABRICATOR_REMOTE_DML` | the `DELETE … RETURNING` (R2), then the regular insert (R5) |
 | `MERGE` | — | — | merge by key, see [MERGE](#merge) |
 
 ## Seeing what happens
@@ -210,19 +211,36 @@ variable that the same batch reads back — the trigger fires as for any other s
 (PolyBase) table: its writes go to storage, which returns no rows.
 
 **R4 — moving rows with a data-modifying CTE (DuckDB 2.0).** A CTE body can be a `DELETE … RETURNING`, and the
-statement that follows consumes what it returned:
+statement that follows consumes what it returned. When both tables belong to the same SQL Server catalog this is ONE
+server statement — `DELETE … OUTPUT DELETED.<columns> INTO pg_archive (<columns>) FROM … WHERE …` — so the rows never
+leave the server and the move is atomic in itself:
 
 ```sql
 WITH moved AS MATERIALIZED (
     DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-02-01' RETURNING *
 )
-INSERT INTO mssql.dbo.pg_archive SELECT * FROM moved;     -- 1 (row 1 moved)
+INSERT INTO mssql.dbo.pg_archive SELECT * FROM moved;     -- 1 (row 1 moved); EXPLAIN: FABRICATOR_REMOTE_DML
 ```
 
-Today it runs as the `DELETE … OUTPUT DELETED.*` (R2), whose rows DuckDB then inserts with the regular insert — both
-in one transaction, so a `ROLLBACK` undoes both halves. Planned: the whole statement as ONE server statement
-(`DELETE … OUTPUT DELETED.* INTO pg_archive`), so the rows never leave the server. ⚠ DuckDB does not take a `MERGE`
-as a CTE body.
+The `WHERE` follows the rules of a pushed `DELETE` (strings, subqueries and `USING` included). `RETURNING` may name
+columns (`RETURNING *`, `RETURNING id, note`); the `SELECT` picks them by position, and an `INSERT INTO t (c, …)`
+column list is honoured.
+
+**R5 — when the move runs in DuckDB instead.** Then it is the `DELETE … RETURNING` (R2) whose rows DuckDB inserts with
+the regular insert — both in one transaction, so a `ROLLBACK` undoes both halves. That happens when:
+
+| Case | Why |
+|---|---|
+| a moved column lands in a column of another type (e.g. `DECIMAL` into `INT`) | `OUTPUT INTO` converts the T-SQL way (truncates), DuckDB rounds |
+| the target has an enabled trigger, a `FOREIGN KEY` (either side) or a `CHECK` constraint | T-SQL refuses `OUTPUT INTO` such a table |
+| the target is the source itself, or either is an external (PolyBase) table | not translated |
+| `RETURNING` computes a value (`RETURNING n + 1`), or the `SELECT` filters, groups or computes | only plain columns are moved |
+| the `WHERE` does not translate exactly, or `SET fabricator_dml_pushdown = false` | as for any `DELETE` |
+
+Other destinations: `COPY (WITH moved AS (DELETE … RETURNING *) SELECT * FROM moved) TO 'file.csv'` works (R2 plus
+DuckDB's writer). Moving into a table of ANOTHER attached database — a Delta catalog, DuckDB's own tables — is refused
+by DuckDB itself: one transaction writes to one attached database (*"a single transaction can only write to a single
+attached database"*), and nothing is deleted. ⚠ DuckDB does not take a `MERGE` as a CTE body.
 
 ## MERGE
 

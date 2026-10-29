@@ -3196,7 +3196,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         string sql;
         int columnCount;
         List<bool> orderDescending;
-        (int Op, IReadOnlyList<string> Table, IReadOnlyList<string> Columns)? write;
+        (int Op, IReadOnlyList<string> Table, IReadOnlyList<string> Columns, IReadOnlyList<string>? Source)? write;
         try
         {
             var special = UncollatableColumns();
@@ -3212,7 +3212,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             // A write runs on the transaction's own connection (the host's fabricator_remote_dml), so the no-MARS
             // concern below does not apply; what must hold instead is that it does what the host's insert would.
-            return WriteDeclineReason(target.Op, target.Table, target.Columns) is { } reason
+            return WriteDeclineReason(target.Op, target.Table, target.Columns, target.Source) is { } reason
                 ? RemoteQuery.Declined(reason)
                 : new RemoteQuery(sql, columnCount, orderDescending) { ChangesRows = true };
         }
@@ -3242,11 +3242,36 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// to storage, not to SQL Server), and <c>mssql_keep_nulls = false</c> (the bulk copy then writes a
     /// column's default for a NULL).
     /// </summary>
-    private string? WriteDeclineReason(int op, IReadOnlyList<string> table, IReadOnlyList<string> columns)
+    private string? WriteDeclineReason(int op, IReadOnlyList<string> table, IReadOnlyList<string> columns,
+                                       IReadOnlyList<string>? source = null)
     {
-        if (table.Count != 2)
+        if (table.Count != 2 || source is { Count: not 2 })
         {
             return "the write target is not a schema-qualified table";
+        }
+        if (source is not null)
+        {
+            // DELETE … OUTPUT … INTO: the deleting half is a DELETE like any other (only an external table differs),
+            // and T-SQL refuses an OUTPUT INTO table with enabled triggers, a FOREIGN KEY on either side or a CHECK
+            // constraint — decline those up front rather than fail the statement. The insert half then gets the
+            // INSERT rules below (triggers, a named IDENTITY, keep_nulls).
+            if (string.Equals(source[0], table[0], StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(source[1], table[1], StringComparison.OrdinalIgnoreCase))
+            {
+                return "the rows move into the table they are deleted from";
+            }
+            if (DetectExternalTable(source[0], source[1]) is not null)
+            {
+                return $"{source[0]}.{source[1]} is an external table";
+            }
+            const string outputInto =
+                "SELECT N'foreign key', name FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID(@obj) OR referenced_object_id = OBJECT_ID(@obj) " +
+                "UNION ALL SELECT N'check constraint', name FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID(@obj)";
+            var target = new[] { new SqlParameter("@obj", Quote(table[0]) + "." + Quote(table[1])) };
+            foreach (var row in ReadMetadataRows(outputInto, 2, target))
+            {
+                return $"{table[0]}.{table[1]} has the {row[0]} {row[1]}, which OUTPUT … INTO does not allow";
+            }
         }
         if (op != Clast.Drivers.SqlServer.Substrait.SubstraitFields.WriteOp_Insert)
         {

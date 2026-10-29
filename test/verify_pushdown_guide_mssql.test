@@ -200,9 +200,15 @@ UPDATE mssql.dbo.pg_sales SET amount = 1 WHERE id = 2 RETURNING id, amount;
 ----
 2	1.00
 
-# R4: the data-modifying CTE that moves rows (DuckDB 2.0) — today a DELETE … OUTPUT, then the regular insert
+# R4: the data-modifying CTE that moves rows (DuckDB 2.0) — ONE server statement, DELETE … OUTPUT DELETED.* INTO
 statement ok
 SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_archive; CREATE TABLE dbo.pg_archive (id INT PRIMARY KEY, region VARCHAR(2), amount DECIMAL(10,2), sold DATE, note NVARCHAR(50));', refresh_cache := true);
+
+query II
+EXPLAIN WITH moved AS MATERIALIZED (DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-02-01' RETURNING *)
+INSERT INTO mssql.dbo.pg_archive SELECT * FROM moved;
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
 
 query I
 WITH moved AS MATERIALIZED (DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-02-01' RETURNING *)

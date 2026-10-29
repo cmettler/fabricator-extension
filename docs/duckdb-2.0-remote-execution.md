@@ -1098,7 +1098,50 @@ WHERE, any read accepted as the target, no cast in SET, DELETE never pushed. `ve
 
 **Next, user-agreed:** the data-modifying "moved" CTE as ONE statement (`DELETE … OUTPUT DELETED.* INTO target`,
 declined on a target with triggers, FKs or CHECK), then server-side MERGE after measuring T-SQL MERGE against
-DuckDB's semantics.
+DuckDB's semantics. → §4.7.
+
+### 4.7 The "moved" CTE as ONE server statement — BUILT (2026-10-29)
+
+`WITH moved AS (DELETE FROM src … RETURNING *) INSERT INTO dst SELECT * FROM moved`, with `src` and `dst` in the
+same SQL Server catalog, runs as `DELETE [t0] OUTPUT DELETED.[c…] INTO dst ([d…]) FROM … WHERE …`
+(`SubstraitMoved`, `TSqlEmitter.EmitMovedDelete`). No ABI change. Gate NEW `verify_moved_rows_mssql` (126, service).
+
+- **MEASURED FIRST, user-raised ("das Ergebnis kann auch in einen anderen Katalog oder eine Datei gehen"):** into
+  another attached database — a Delta catalog, or DuckDB's own tables — DuckDB refuses the statement itself (*"a
+  single transaction can only write to a single attached database"*), and nothing is deleted. Into a file
+  (`COPY (WITH moved … SELECT * FROM moved) TO …`) and to the client it works, through the rowid `DELETE … RETURNING`.
+  So the one-statement form has exactly one destination worth building: the same catalog.
+- **How the optimizer gets there.** A CTE's result is merged into the statement's, so the `DELETE … RETURNING` body
+  must report this catalog: `SupportsPushdown(DELETE)` now says yes for a RETURNING of plain columns too. Standing
+  alone such a DELETE reaches `RemoteExecute`, where `SubstraitDml` declines it (it would lose its rows — guarded
+  inside `SubstraitDml` as well) and the rowid path returns the rows as before. Any OTHER data-modifying CTE makes
+  `SupportsPushdown` say no, so DuckDB evaluates it.
+- **The plan.** The DELETE is rewritten as SubstraitDml does; its WriteRel gets `OUTPUT_MODE_MODIFIED_RECORDS` with
+  the deleted columns in `table_schema`, in the order of the INSERT's columns, and is the input of the INSERT's
+  WriteRel. The C# side reads the nested WriteRel and writes `OUTPUT DELETED.<src> INTO dst (<dst>)`.
+- **Declines** (each one then runs locally, two steps in one transaction): a moved column whose DuckDB type differs
+  from its landing column (`OUTPUT INTO` converts the T-SQL way — measured DECIMAL 2.50 -> INT is 2 on the server, 3
+  in DuckDB); a target with an enabled trigger, a FOREIGN KEY on either side or a CHECK constraint (T-SQL refuses
+  `OUTPUT INTO` there); source = target; an external table on either side; a RETURNING expression; an outer SELECT
+  that filters, groups or computes; `INSERT BY NAME`; the INSERT rules of §4.4 (named IDENTITY, keep_nulls).
+- ⚠⚠ **THE DECLINE PATH WAS BROKEN UNTIL THE GATE'S TRIGGER ROW HIT IT.** A declined statement is handed back as a
+  SUBQUERY (`SELECT * FROM (<statement>)`), and the binder refuses a data-modifying CTE below the top level (*"WITH
+  clause containing a data-modifying statement must be at the top level"*). The rule guards a CTE that a nested query
+  would run more than once or not at all; our subquery IS the statement and runs once, so the declined node's CTEs
+  are marked `is_trigger_generated` — the binder's own flag for the CTEs trigger expansion generates, whose only
+  effect is to skip that check.
+- ⚠ **A LATENT HAZARD CLOSED ON THE WAY:** the INSERT decline path pushed the INSERT's `SELECT` alone. With a CTE on
+  the INSERT, that SELECT names the CTE as a table, and `RestoreCatalog` on the SELECT alone would qualify it as
+  `<catalog>.<schema>.<cte>` — a real table of that name would have been read instead. It now skips the SELECT
+  pushdown when the INSERT defines CTEs.
+- Gate: routing (pushed; type change, trigger, FK, CHECK, self-move, RETURNING expression, filtering SELECT, switch
+  all local; a standalone DELETE … RETURNING returns its rows; COPY to a file; another database refused with nothing
+  deleted), then the three-way differential (`on` / `off` / DuckDB tables) over eight moves: a range, an exact
+  string against `'b '`, NULLs, `IN (subquery)`, `NOT IN` over a NULL, reordered named columns, a declined `||`
+  predicate, and a target with other column names. Transactions: ROLLBACK undoes both halves, COMMIT keeps them.
+  Five mutants killed at their own rows: DELETED named by the insert's columns (M8), no OUTPUT INTO decline (FK
+  row), no type check (the type-change row), the shape never recognised (routing), the CTE not marked (the first
+  decline). `verify_pushdown_guide_mssql` R4 asserts the route, R5 lists the declines (74 -> 76).
 
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 

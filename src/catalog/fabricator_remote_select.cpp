@@ -39,6 +39,7 @@
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
@@ -195,6 +196,46 @@ bool ReadsTable(QueryNode &node) {
 	return found;
 }
 
+//! Whether a RETURNING list names only columns — a plain `*` or column references — which T-SQL's OUTPUT DELETED.<c>
+//! can write.
+bool ReturnsColumns(const vector<unique_ptr<ParsedExpression>> &returning) {
+	for (auto &expr : returning) {
+		if (expr->GetExpressionClass() == ExpressionClass::STAR) {
+			auto &star = expr->Cast<StarExpression>();
+			if (!star.RelationName().empty() || !star.ExcludeList().empty() || !star.ReplaceList().empty() ||
+			    !star.RenameList().empty() || star.Expression() || star.IsColumns()) {
+				return false;
+			}
+		} else if (expr->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			return false;
+		}
+	}
+	return !returning.empty();
+}
+
+//! The data-modifying CTE of `node` (DuckDB 2.0: a CTE whose body is a DELETE / UPDATE / INSERT / MERGE), if any.
+const CommonTableExpressionInfo *DmlCte(const QueryNode &node) {
+	for (auto &kv : node.cte_map.map) {
+		auto &body = kv.second->query_node;
+		if (body && (body->type == QueryNodeType::DELETE_QUERY_NODE || body->type == QueryNodeType::UPDATE_QUERY_NODE ||
+		             body->type == QueryNodeType::INSERT_QUERY_NODE || body->type == QueryNodeType::MERGE_QUERY_NODE)) {
+			return kv.second.get();
+		}
+	}
+	return nullptr;
+}
+
+//! The moved-rows shape SubstraitMoved writes as one statement: an INSERT whose only CTE is a DELETE … RETURNING of
+//! columns. Checked before binding; SubstraitMoved checks the rest and declines.
+bool IsMovedRowsInsert(const QueryNode &node) {
+	if (node.type != QueryNodeType::INSERT_QUERY_NODE || node.cte_map.map.size() != 1) {
+		return false;
+	}
+	auto cte = DmlCte(node);
+	return cte && cte->query_node->type == QueryNodeType::DELETE_QUERY_NODE &&
+	       ReturnsColumns(cte->query_node->Cast<DeleteQueryNode>().returning_list);
+}
+
 //! A write the provider translated: fabricator_remote_dml runs it on this transaction's own connection when the
 //! statement EXECUTES and yields its changed-row count as DuckDB's own DML does (one BIGINT column, CHANGED_ROWS).
 unique_ptr<TableRef> RemoteDmlRef(FabricatorCatalog &catalog, const string &sql) {
@@ -207,9 +248,10 @@ unique_ptr<TableRef> RemoteDmlRef(FabricatorCatalog &catalog, const string &sql)
 }
 
 //! A pushed query's plan wrapped in a WriteRel on schema.table: `columns` are the table columns the input writes
-//! (INSERT: the named columns; UPDATE: the assigned ones; DELETE: none). Empty, with `reason`, on failure.
+//! (INSERT: the named columns; UPDATE: the assigned ones; DELETE: none, or — `modified_records` — the deleted columns
+//! it outputs). Empty, with `reason`, on failure.
 string WrapInWrite(const string &plan_bytes, substrait::WriteRel::WriteOp op, const string &schema,
-                   const string &table, const vector<string> &columns, string &reason) {
+                   const string &table, const vector<string> &columns, string &reason, bool modified_records = false) {
 	substrait::Plan plan;
 	if (!plan.ParseFromString(plan_bytes)) {
 		reason = "the pushed plan does not parse";
@@ -228,7 +270,9 @@ string WrapInWrite(const string &plan_bytes, substrait::WriteRel::WriteOp op, co
 	auto write_rel = make_uniq<substrait::Rel>();
 	auto write = write_rel->mutable_write();
 	write->set_op(op);
-	write->set_output(substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_NO_OUTPUT);
+	write->set_output(modified_records
+	                      ? substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_MODIFIED_RECORDS
+	                      : substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_NO_OUTPUT);
 	write->mutable_named_table()->add_names(schema);
 	write->mutable_named_table()->add_names(table);
 	auto table_schema = write->mutable_table_schema();
@@ -459,6 +503,12 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 //! condition and the new values. Null, with `reason`, when anything declines; the statement then runs locally.
 unique_ptr<TableRef> SubstraitDml(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
                                   const Identifier &default_schema, string &reason) {
+	if ((node.type == QueryNodeType::DELETE_QUERY_NODE && !node.Cast<DeleteQueryNode>().returning_list.empty()) ||
+	    (node.type == QueryNodeType::UPDATE_QUERY_NODE && !node.Cast<UpdateQueryNode>().returning_list.empty())) {
+		// the statement would lose its rows: RETURNING keeps the rowid path, which returns them from its own OUTPUT
+		reason = "RETURNING keeps the rowid path";
+		return nullptr;
+	}
 	auto copy = node.Copy();
 	RestoreCatalog(*copy, catalog.GetName(), default_schema);
 	auto select = make_uniq<SelectNode>();
@@ -526,6 +576,200 @@ unique_ptr<TableRef> SubstraitDml(ClientContext &context, FabricatorCatalog &cat
 	}
 	auto bytes = WrapInWrite(plan_bytes, op, target_name.Schema().GetIdentifierName(),
 	                         target_name.Name().GetIdentifierName(), columns, reason);
+	if (bytes.empty()) {
+		return nullptr;
+	}
+	auto sql = TranslateWrite(context, catalog, bytes, reason);
+	if (sql.empty()) {
+		return nullptr;
+	}
+	RemoteTrace("remote: " + sql);
+	return RemoteDmlRef(catalog, sql);
+}
+
+//! DuckDB 2.0's data-modifying CTE that MOVES rows within this catalog —
+//!   WITH moved AS (DELETE FROM src … RETURNING *) INSERT INTO dst SELECT * FROM moved
+//! — as ONE provider statement, `DELETE … OUTPUT DELETED.<c…> INTO dst (<d…>) …` on SQL Server: no row leaves the
+//! server and the move is atomic in itself. The DELETE is rewritten as SubstraitDml does; its WriteRel outputs the
+//! deleted columns the INSERT writes (MODIFIED_RECORDS), wrapped in the INSERT's WriteRel. Only the plain shape: the
+//! outer SELECT picks columns of the CTE by position (no filter, grouping or modifier), and every moved column has
+//! exactly the type of the column it lands in — OUTPUT INTO converts the T-SQL way, the local path the DuckDB way.
+//! Null, with `reason`, when anything declines; the statement then runs locally.
+unique_ptr<TableRef> SubstraitMoved(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
+                                    const Identifier &default_schema, string &reason) {
+	if (!IsMovedRowsInsert(node)) {
+		reason = "not the moved-rows shape";
+		return nullptr;
+	}
+	auto copy = node.Copy();
+	RestoreCatalog(*copy, catalog.GetName(), default_schema);
+	auto &insert = copy->Cast<InsertQueryNode>();
+	auto &cte_entry = *insert.cte_map.map.begin();
+	auto &cte_name = cte_entry.first.GetIdentifierName();
+	if (!cte_entry.second->key_targets.empty()) {
+		reason = "a recursive moved CTE";
+		return nullptr;
+	}
+	auto &del = cte_entry.second->query_node->Cast<DeleteQueryNode>();
+	if (insert.column_order != InsertColumnOrder::INSERT_BY_POSITION || !insert.select_statement ||
+	    insert.on_conflict_info || insert.default_values || !insert.returning_list.empty() || !del.cte_map.map.empty()) {
+		reason = "the INSERT is not a plain INSERT … SELECT";
+		return nullptr;
+	}
+	auto &outer_node = *insert.select_statement->node;
+	if (outer_node.type != QueryNodeType::SELECT_NODE || !outer_node.modifiers.empty() ||
+	    !outer_node.cte_map.map.empty()) {
+		reason = "the INSERT's SELECT is not a plain SELECT";
+		return nullptr;
+	}
+	auto &outer = outer_node.Cast<SelectNode>();
+	if (outer.where_clause || !outer.groups.group_expressions.empty() || !outer.groups.grouping_sets.empty() ||
+	    outer.having || outer.qualify || outer.sample || !outer.from_table ||
+	    outer.from_table->type != TableReferenceType::BASE_TABLE) {
+		reason = "the INSERT's SELECT does more than pick columns";
+		return nullptr;
+	}
+	auto &from_name = outer.from_table->Cast<BaseTableRef>().GetQualifiedName();
+	if (!from_name.Catalog().empty() || !from_name.Schema().empty() ||
+	    !StringUtil::CIEquals(from_name.Name().GetIdentifierName(), cte_name)) {
+		reason = "the INSERT's SELECT does not read the moved rows alone";
+		return nullptr;
+	}
+	if (!del.table || del.table->type != TableReferenceType::BASE_TABLE) {
+		reason = "the DELETE target is not a table";
+		return nullptr;
+	}
+	auto &src_name = del.table->Cast<BaseTableRef>().GetQualifiedName();
+	auto &dst_name = insert.qualified_name;
+	auto src_entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, src_name.Schema(), src_name.Name(),
+	                                  OnEntryNotFound::RETURN_NULL);
+	auto dst_entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, dst_name.Schema(), dst_name.Name(),
+	                                  OnEntryNotFound::RETURN_NULL);
+	if (!src_entry || !dst_entry) {
+		reason = "a table of the move is not found"; // the binder reports it
+		return nullptr;
+	}
+	auto &src = src_entry->Cast<TableCatalogEntry>();
+	auto &dst = dst_entry->Cast<TableCatalogEntry>();
+	// the CTE's columns: the name it exposes, the source column behind it
+	vector<pair<string, const ColumnDefinition *>> moved;
+	for (auto &expr : del.returning_list) {
+		if (expr->GetExpressionClass() == ExpressionClass::STAR) {
+			for (auto &column : src.GetColumns().Logical()) {
+				if (column.Generated()) {
+					reason = "the moved table has a generated column";
+					return nullptr;
+				}
+				moved.emplace_back(column.Name().GetIdentifierName(), &column);
+			}
+			continue;
+		}
+		auto &ref = expr->Cast<ColumnRefExpression>();
+		auto &name = ref.GetColumnName();
+		if (!src.ColumnExists(name)) {
+			reason = "RETURNING names a column the table does not have"; // the binder reports it
+			return nullptr;
+		}
+		auto &column = src.GetColumn(name);
+		auto alias = expr->GetAlias().GetIdentifierName();
+		moved.emplace_back(alias.empty() ? column.Name().GetIdentifierName() : alias, &column);
+	}
+	// the outer SELECT picks them by position
+	vector<const ColumnDefinition *> picked;
+	for (auto &expr : outer.select_list) {
+		if (expr->GetExpressionClass() == ExpressionClass::STAR) {
+			auto &star = expr->Cast<StarExpression>();
+			if (!star.ExcludeList().empty() || !star.ReplaceList().empty() || !star.RenameList().empty() ||
+			    star.Expression() || star.IsColumns()) {
+				reason = "the INSERT's SELECT transforms the moved columns";
+				return nullptr;
+			}
+			for (auto &m : moved) {
+				picked.push_back(m.second);
+			}
+			continue;
+		}
+		if (expr->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			reason = "the INSERT's SELECT computes a value";
+			return nullptr;
+		}
+		auto &name = expr->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName();
+		const ColumnDefinition *found = nullptr;
+		for (auto &m : moved) {
+			if (StringUtil::CIEquals(m.first, name)) {
+				if (found) {
+					reason = "the moved rows have two columns named " + name; // the binder reports it
+					return nullptr;
+				}
+				found = m.second;
+			}
+		}
+		if (!found) {
+			reason = "the INSERT's SELECT names a column the moved rows do not have";
+			return nullptr;
+		}
+		picked.push_back(found);
+	}
+	// the columns they land in
+	vector<const ColumnDefinition *> landing;
+	if (insert.columns.empty()) {
+		for (auto &column : dst.GetColumns().Logical()) {
+			if (column.Generated()) {
+				reason = "the target table has a generated column";
+				return nullptr;
+			}
+			landing.push_back(&column);
+		}
+	} else {
+		for (auto &name : insert.columns) {
+			if (!dst.ColumnExists(name)) {
+				reason = "the INSERT names a column the table does not have";
+				return nullptr;
+			}
+			landing.push_back(&dst.GetColumn(name));
+		}
+	}
+	if (picked.size() != landing.size() || picked.empty()) {
+		reason = "the INSERT writes a different number of columns than it selects";
+		return nullptr;
+	}
+	vector<string> src_columns, dst_columns;
+	for (idx_t i = 0; i < picked.size(); i++) {
+		if (picked[i]->Type() != landing[i]->Type()) {
+			reason = "a moved column changes its type (" + picked[i]->Type().ToString() + " -> " +
+			         landing[i]->Type().ToString() + ")";
+			return nullptr;
+		}
+		src_columns.push_back(picked[i]->Name().GetIdentifierName());
+		dst_columns.push_back(landing[i]->Name().GetIdentifierName());
+	}
+	// the DELETE's own query, as SubstraitDml builds it
+	auto select = make_uniq<SelectNode>();
+	select->select_list.push_back(ConstantExpression::Integer(1));
+	unique_ptr<TableRef> from = del.table->Copy();
+	for (auto &using_clause : del.using_clauses) {
+		auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+		join->left = std::move(from);
+		join->right = std::move(using_clause);
+		from = std::move(join);
+	}
+	select->from_table = std::move(from);
+	select->where_clause = std::move(del.condition);
+	string plan_bytes;
+	vector<LogicalType> types;
+	vector<Identifier> names;
+	if (!BindToSubstrait(context, catalog, *select, default_schema, /*require_worth=*/false, plan_bytes, types, names,
+	                     reason)) {
+		return nullptr;
+	}
+	auto bytes = WrapInWrite(plan_bytes, substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_DELETE,
+	                         src_name.Schema().GetIdentifierName(), src_name.Name().GetIdentifierName(), src_columns,
+	                         reason, /*modified_records=*/true);
+	if (bytes.empty()) {
+		return nullptr;
+	}
+	bytes = WrapInWrite(bytes, substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_INSERT,
+	                    dst_name.Schema().GetIdentifierName(), dst_name.Name().GetIdentifierName(), dst_columns, reason);
 	if (bytes.empty()) {
 		return nullptr;
 	}
@@ -718,14 +962,22 @@ bool FabricatorCatalog::SupportsPushdown(const SQLStatement &statement) {
 bool FabricatorCatalog::SupportsPushdown(const QueryNode &node) {
 	// SELECT and set operations; RemoteExecute binds them and declines what does not translate. MERGE keeps the
 	// rowid path (Substrait has no MERGE).
+	// A data-modifying CTE (DuckDB 2.0): only the rows MOVED within this catalog are one statement (SubstraitMoved);
+	// every other shape runs locally, where DuckDB evaluates the CTE and the rowid path writes.
+	if (DmlCte(node)) {
+		return IsMovedRowsInsert(node);
+	}
 	if (node.type == QueryNodeType::SELECT_NODE || node.type == QueryNodeType::SET_OPERATION_NODE) {
 		return true;
 	}
 	// DELETE / UPDATE as one statement (SubstraitDml). RETURNING keeps the rowid path, which returns the rows from
 	// the statement's own OUTPUT; UPDATE … FROM keeps it too — a target row the join matches twice would be updated
 	// with whichever match SQL Server takes. A declined one still gets the plan-less shortcut (ABI v93/v94).
+	// A DELETE … RETURNING of columns says yes all the same: as the body of a moved-rows CTE it must report this
+	// catalog for the INSERT around it to be pushed. Standing alone it reaches RemoteExecute, which declines it.
 	if (node.type == QueryNodeType::DELETE_QUERY_NODE) {
-		return node.Cast<DeleteQueryNode>().returning_list.empty();
+		auto &del = node.Cast<DeleteQueryNode>();
+		return del.returning_list.empty() || ReturnsColumns(del.returning_list);
 	}
 	if (node.type == QueryNodeType::UPDATE_QUERY_NODE) {
 		auto &update = node.Cast<UpdateQueryNode>();
@@ -753,6 +1005,10 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 		// the switch exists for the case where streaming the rows through DuckDB is FASTER (a parallel plan the
 		// server would not choose for an INSERT … SELECT) — and it is the reference oracle of the differential gate
 		reason = "fabricator_dml_pushdown = false";
+	} else if (is_insert && DmlCte(*node)) {
+		if (auto pushed = SubstraitMoved(context, *this, *node, default_schema, reason)) {
+			return pushed;
+		}
 	} else if (is_dml) {
 		if (auto pushed = SubstraitDml(context, *this, *node, default_schema, reason)) {
 			return pushed;
@@ -764,8 +1020,9 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 	// so it binds and runs locally
 	RemoteTrace("local: " + reason);
 	RestoreCatalog(*node, GetName(), default_schema);
-	if (is_insert) {
-		// the rows go through the host's own insert, but the query that produces them can still run on the server
+	if (is_insert && node->cte_map.map.empty()) {
+		// the rows go through the host's own insert, but the query that produces them can still run on the server.
+		// Not when the INSERT defines CTEs: its SELECT alone would bind a CTE name as a table of this catalog.
 		auto &insert = node->Cast<InsertQueryNode>();
 		string select_reason;
 		if (auto pushed = SubstraitPushdown(context, *this, *insert.select_statement->node, default_schema,
@@ -777,6 +1034,12 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 		} else {
 			RemoteTrace("local select: " + select_reason);
 		}
+	}
+	// A data-modifying CTE binds only at the top level, and the declined statement now sits in a subquery. That rule
+	// guards a CTE that a nested query would run more than once or not at all; this subquery IS the statement, run
+	// exactly once — so the CTE is marked as the binder marks the ones it generates itself (trigger expansion).
+	for (auto &cte : node->cte_map.map) {
+		cte.second->is_trigger_generated = true;
 	}
 	auto declined = make_uniq<SelectStatement>();
 	declined->node = std::move(node);

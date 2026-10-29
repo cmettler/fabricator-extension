@@ -706,7 +706,11 @@ violation fails just like a classic INSERT (CTAS/COPY skip constraint checking f
 `IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
 otherwise. `UPDATE`, `DELETE` and `MERGE` support `RETURNING` on SQL Server: the rows come from the statement's own
 `OUTPUT` clause (through a table variable when the table has an enabled trigger), and a `DELETE` returns its key as
-`rowid`. Examples, and the DuckDB 2.0 data-modifying CTE that moves rows between tables:
+`rowid`. The DuckDB 2.0 data-modifying CTE that moves rows between two tables of the same catalog —
+`WITH moved AS (DELETE … RETURNING *) INSERT INTO dst SELECT * FROM moved` — runs as ONE server statement,
+`DELETE … OUTPUT DELETED.* INTO dst`, so the rows never leave the server (`FABRICATOR_REMOTE_DML`); a target with a
+trigger, a foreign key or a CHECK constraint, or a column whose type changes, keeps the two-step path. Moving into
+another attached database is refused by DuckDB itself (one transaction writes one database). Examples:
 [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md#returning).
 
 A DELETE or UPDATE runs as ONE statement on SQL Server — no scan, no row ids, so it also works on a table without a

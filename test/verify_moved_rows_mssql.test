@@ -1,0 +1,422 @@
+# name: test/verify_moved_rows_mssql.test
+# description: DuckDB 2.0's data-modifying CTE that MOVES rows within one SQL Server catalog —
+#              `WITH moved AS (DELETE FROM src … RETURNING *) INSERT INTO dst SELECT * FROM moved` — as ONE server
+#              statement, `DELETE … OUTPUT DELETED.<c…> INTO dst (<d…>) FROM … WHERE …`. No row leaves the server.
+#              Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THREE-WAY DIFFERENTIAL, like verify_remote_dml_mssql: every move runs on `on` (pushed), `off`
+#              (`fabricator_dml_pushdown = false`: DuckDB evaluates the CTE, the rowid DELETE returns the rows, the
+#              host inserts them) and `loc` (DuckDB tables — the semantics both must reproduce). Every expected count
+#              is DuckDB's own, computed by running the same sequence on DuckDB tables.
+#              ⚠ What declines must still run, locally: a declined move reaches the binder as a SUBQUERY, where a
+#              data-modifying CTE is refused unless marked (§1's trigger row is the one that found it).
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'true');
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.mvr_src_on; DROP TABLE IF EXISTS dbo.mvr_dst_on; DROP TABLE IF EXISTS dbo.mvr_src_off; DROP TABLE IF EXISTS dbo.mvr_dst_off; DROP TABLE IF EXISTS dbo.mvr_keys; DROP TABLE IF EXISTS dbo.mvr_keysn; DROP TABLE IF EXISTS dbo.mvr_arch_on; DROP TABLE IF EXISTS dbo.mvr_arch_off; DROP TABLE IF EXISTS dbo.mvr_r; DROP TABLE IF EXISTS dbo.mvr_t_int; DROP TABLE IF EXISTS dbo.mvr_t_trg; DROP TABLE IF EXISTS dbo.mvr_t_fk; DROP TABLE IF EXISTS dbo.mvr_parent; DROP TABLE IF EXISTS dbo.mvr_t_chk; DROP TABLE IF EXISTS dbo.mvr_t_ok; DROP TABLE IF EXISTS dbo.mvr_tx_src; DROP TABLE IF EXISTS dbo.mvr_tx_dst;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.mvr_src_on (id INT PRIMARY KEY, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_src_off (id INT PRIMARY KEY, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_dst_on (id INT, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_dst_off (id INT, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_arch_on (k INT, label VARCHAR(10));
+CREATE TABLE dbo.mvr_arch_off (k INT, label VARCHAR(10));
+CREATE TABLE dbo.mvr_keys (k INT); INSERT INTO dbo.mvr_keys VALUES (8),(10),(99);
+CREATE TABLE dbo.mvr_keysn (k INT NULL); INSERT INTO dbo.mvr_keysn VALUES (11),(NULL);
+CREATE TABLE dbo.mvr_r (id INT PRIMARY KEY, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+INSERT INTO dbo.mvr_r VALUES (1,''a'',1,2.50),(2,''b'',2,3.50),(3,''c'',3,4.50),(4,''d'',4,5.50),(5,''e'',5,6.50),(6,''f'',6,7.50),(7,''g'',7,8.50);
+CREATE TABLE dbo.mvr_t_int (id INT, s VARCHAR(10), n INT NULL, amount INT);
+CREATE TABLE dbo.mvr_t_trg (id INT, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_parent (id INT PRIMARY KEY); INSERT INTO dbo.mvr_parent SELECT value FROM GENERATE_SERIES(1, 10);
+CREATE TABLE dbo.mvr_t_fk (id INT REFERENCES dbo.mvr_parent(id), s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_t_chk (id INT CHECK (id > 0), s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_t_ok (id INT, s VARCHAR(10), n INT NULL, amount DECIMAL(10,2));
+CREATE TABLE dbo.mvr_tx_src (id INT PRIMARY KEY, s VARCHAR(10)); INSERT INTO dbo.mvr_tx_src VALUES (1,''x''),(2,''y''),(3,''z'');
+CREATE TABLE dbo.mvr_tx_dst (id INT, s VARCHAR(10));');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TRIGGER dbo.mvr_t_trg_ins ON dbo.mvr_t_trg AFTER INSERT AS SET NOCOUNT ON;');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+CREATE TABLE loc_src (id INT PRIMARY KEY, s VARCHAR(10), n INT, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO loc_src VALUES (1,'a',1,1.00),(2,'A',NULL,2.50),(3,'b',3,3.25),(4,'b ',4,4.75),(5,'c',NULL,5.50),(6,NULL,6,6.00),(7,'b',7,7.10),(8,'d',8,8.80),(9,'e',NULL,9.90),(10,'f',10,10.00),(11,'g',11,0.10),(12,'h',12,12.12);
+
+statement ok
+CREATE TABLE loc_dst (id INT, s VARCHAR(10), n INT, amount DECIMAL(10,2));
+
+statement ok
+CREATE TABLE loc_arch (k INT, label VARCHAR(10));
+
+statement ok
+CREATE TABLE loc_keys (k INT);
+
+statement ok
+INSERT INTO loc_keys VALUES (8),(10),(99);
+
+statement ok
+CREATE TABLE loc_keysn (k INT);
+
+statement ok
+INSERT INTO loc_keysn VALUES (11),(NULL);
+
+statement ok
+INSERT INTO db.dbo.mvr_src_on SELECT * FROM loc_src;
+
+statement ok
+INSERT INTO db.dbo.mvr_src_off SELECT * FROM loc_src;
+
+# ═══ §1  Routing ═══════════════════════════════════════════════════════════════════════════════════════
+
+# the plain move: one statement
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 1 RETURNING *) INSERT INTO db.dbo.mvr_t_ok SELECT * FROM moved;
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 1 RETURNING *) INSERT INTO db.dbo.mvr_t_ok SELECT * FROM moved;
+----
+1
+
+query ITIR
+SELECT * FROM db.dbo.mvr_t_ok;
+----
+1	a	1	2.50
+
+# a column whose type changes declines — OUTPUT INTO would convert the T-SQL way (2.50 -> INT truncates to 2),
+# DuckDB rounds (3)
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 2 RETURNING *) INSERT INTO db.dbo.mvr_t_int SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 2 RETURNING *) INSERT INTO db.dbo.mvr_t_int SELECT * FROM moved;
+----
+1
+
+query ITII
+SELECT * FROM db.dbo.mvr_t_int;
+----
+2	b	2	4
+
+# T-SQL refuses OUTPUT INTO a table with an enabled trigger, a FOREIGN KEY or a CHECK constraint: each declines, and
+# the declined statement still runs — locally, inside a subquery (the binder needs the CTE marked for that)
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 3 RETURNING *) INSERT INTO db.dbo.mvr_t_trg SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 3 RETURNING *) INSERT INTO db.dbo.mvr_t_trg SELECT * FROM moved;
+----
+1
+
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 4 RETURNING *) INSERT INTO db.dbo.mvr_t_fk SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 4 RETURNING *) INSERT INTO db.dbo.mvr_t_fk SELECT * FROM moved;
+----
+1
+
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 5 RETURNING *) INSERT INTO db.dbo.mvr_t_chk SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 5 RETURNING *) INSERT INTO db.dbo.mvr_t_chk SELECT * FROM moved;
+----
+1
+
+query III
+SELECT (SELECT count(*) FROM db.dbo.mvr_t_trg), (SELECT count(*) FROM db.dbo.mvr_t_fk), (SELECT count(*) FROM db.dbo.mvr_t_chk);
+----
+1	1	1
+
+# rows moved into the table they come from: local
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 6 RETURNING *) INSERT INTO db.dbo.mvr_r SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# a RETURNING expression, a filtering outer SELECT, and the switch: local
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 6 RETURNING id, s, n + 1 AS n, amount) INSERT INTO db.dbo.mvr_t_ok SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id >= 6 RETURNING *) INSERT INTO db.dbo.mvr_t_ok SELECT * FROM moved WHERE id = 6;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 6 RETURNING *) INSERT INTO db.dbo.mvr_t_ok SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# a DELETE … RETURNING standing alone keeps the rowid path, and still returns its rows
+query II
+EXPLAIN DELETE FROM db.dbo.mvr_r WHERE id = 6 RETURNING *;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query ITIR
+DELETE FROM db.dbo.mvr_r WHERE id = 6 RETURNING *;
+----
+6	f	6	7.50
+
+# rows moved to a file: DuckDB evaluates the CTE, the rows travel (the rowid DELETE returns them)
+statement ok
+COPY (WITH moved AS (DELETE FROM db.dbo.mvr_r WHERE id = 7 RETURNING *) SELECT * FROM moved) TO '__TEST_DIR__/mvr_moved.csv';
+
+query ITIR
+SELECT * FROM read_csv('__TEST_DIR__/mvr_moved.csv');
+----
+7	g	7	8.50
+
+# into ANOTHER attached database (here DuckDB's own): DuckDB refuses — one transaction writes one database — and
+# nothing is deleted
+statement ok
+CREATE TABLE loc_other (id INT, s VARCHAR, n INT, amount DECIMAL(10,2));
+
+statement error
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE id = 1 RETURNING *) INSERT INTO loc_other SELECT * FROM moved;
+----
+<REGEX>:.*a single transaction can only write to a single attached database.*
+
+query I
+SELECT count(*) FROM db.dbo.mvr_src_on;
+----
+12
+
+query I
+SELECT count(*) FROM db.dbo.mvr_r;
+----
+0
+
+# ═══ §2  The differential — on (pushed) / off (local) / loc (DuckDB) ═══════════════════════════════════
+# M1 a range
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE id <= 2 RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+2
+
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE s = 'b' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# M2 an exact string: 'b ' (trailing space) is NOT 'b' in DuckDB, though it is under SQL Server's ANSI padding
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE s = 'b' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+2
+
+# M3 NULLs
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE n IS NULL RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+2
+
+# M4 a subquery
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE id IN (SELECT k FROM db.dbo.mvr_keys) RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+2
+
+# M5 NOT IN over a NULL: nothing
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE id NOT IN (SELECT k FROM db.dbo.mvr_keysn) RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+0
+
+# M6 named, reordered columns: OUTPUT DELETED.<c> must follow the INSERT's order
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE amount > 5.5 RETURNING id, s, n, amount) INSERT INTO db.dbo.mvr_dst_on (amount, n, s, id) SELECT amount, n, s, id FROM moved;
+----
+2
+
+# M7 || is not in the Substrait producer: declines, runs locally
+query II
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE s || '' = 'b ' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE s || '' = 'b ' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+----
+1
+
+# M8 into a table whose columns have OTHER names
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE id = 11 RETURNING id, s) INSERT INTO db.dbo.mvr_arch_on SELECT * FROM moved;
+----
+1
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE id <= 2 RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
+----
+2
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE s = 'b' RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
+----
+2
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE n IS NULL RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
+----
+2
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE id IN (SELECT k FROM db.dbo.mvr_keys) RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
+----
+2
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE id NOT IN (SELECT k FROM db.dbo.mvr_keysn) RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
+----
+0
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE amount > 5.5 RETURNING id, s, n, amount) INSERT INTO db.dbo.mvr_dst_off (amount, n, s, id) SELECT amount, n, s, id FROM moved;
+----
+2
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE s || '' = 'b ' RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
+----
+1
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE id = 11 RETURNING id, s) INSERT INTO db.dbo.mvr_arch_off SELECT * FROM moved;
+----
+1
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE id <= 2 RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE s = 'b' RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE n IS NULL RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE id IN (SELECT k FROM loc_keys) RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE id NOT IN (SELECT k FROM loc_keysn) RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE amount > 5.5 RETURNING id, s, n, amount) INSERT INTO loc_dst (amount, n, s, id) SELECT amount, n, s, id FROM moved;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE s || '' = 'b ' RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
+
+statement ok
+WITH moved AS (DELETE FROM loc_src WHERE id = 11 RETURNING id, s) INSERT INTO loc_arch SELECT * FROM moved;
+
+# the three agree, row for row, both ways
+query IIII
+SELECT (SELECT count(*) FROM loc_src), (SELECT count(*) FROM loc_dst), (SELECT count(*) FROM loc_arch), (SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM loc_dst);
+----
+0	11	1	1,2,3,4,5,6,7,8,9,10,12
+
+query IIIIII
+SELECT (SELECT count(*) FROM ((SELECT * FROM db.dbo.mvr_dst_on) EXCEPT ALL (SELECT * FROM loc_dst))),
+       (SELECT count(*) FROM ((SELECT * FROM loc_dst) EXCEPT ALL (SELECT * FROM db.dbo.mvr_dst_on))),
+       (SELECT count(*) FROM ((SELECT * FROM db.dbo.mvr_dst_off) EXCEPT ALL (SELECT * FROM loc_dst))),
+       (SELECT count(*) FROM ((SELECT * FROM loc_dst) EXCEPT ALL (SELECT * FROM db.dbo.mvr_dst_off))),
+       (SELECT count(*) FROM ((SELECT * FROM db.dbo.mvr_src_on) EXCEPT ALL (SELECT * FROM loc_src))),
+       (SELECT count(*) FROM ((SELECT * FROM db.dbo.mvr_src_off) EXCEPT ALL (SELECT * FROM loc_src)));
+----
+0	0	0	0	0	0
+
+query IIII
+SELECT (SELECT count(*) FROM ((SELECT * FROM db.dbo.mvr_arch_on) EXCEPT ALL (SELECT * FROM loc_arch))),
+       (SELECT count(*) FROM ((SELECT * FROM loc_arch) EXCEPT ALL (SELECT * FROM db.dbo.mvr_arch_on))),
+       (SELECT count(*) FROM db.dbo.mvr_src_on), (SELECT count(*) FROM db.dbo.mvr_src_off);
+----
+0	0	0	0
+
+query IT
+SELECT * FROM db.dbo.mvr_arch_on;
+----
+11	g
+
+# ═══ §3  Transactions: on the transaction's connection ═════════════════════════════════════════════════
+
+statement ok
+BEGIN;
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_tx_src WHERE id <= 2 RETURNING *) INSERT INTO db.dbo.mvr_tx_dst SELECT * FROM moved;
+----
+2
+
+query II
+SELECT (SELECT count(*) FROM db.dbo.mvr_tx_src), (SELECT count(*) FROM db.dbo.mvr_tx_dst);
+----
+1	2
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM db.dbo.mvr_tx_src), (SELECT count(*) FROM db.dbo.mvr_tx_dst);
+----
+3	0
+
+statement ok
+BEGIN;
+
+query I
+WITH moved AS (DELETE FROM db.dbo.mvr_tx_src WHERE id = 3 RETURNING *) INSERT INTO db.dbo.mvr_tx_dst SELECT * FROM moved;
+----
+1
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT (SELECT count(*) FROM db.dbo.mvr_tx_src), (SELECT count(*) FROM db.dbo.mvr_tx_dst), (SELECT max(s) FROM db.dbo.mvr_tx_dst);
+----
+2	1	z
+
+# ═══ §4  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.mvr_src_on; DROP TABLE IF EXISTS dbo.mvr_dst_on; DROP TABLE IF EXISTS dbo.mvr_src_off; DROP TABLE IF EXISTS dbo.mvr_dst_off; DROP TABLE IF EXISTS dbo.mvr_keys; DROP TABLE IF EXISTS dbo.mvr_keysn; DROP TABLE IF EXISTS dbo.mvr_arch_on; DROP TABLE IF EXISTS dbo.mvr_arch_off; DROP TABLE IF EXISTS dbo.mvr_r; DROP TABLE IF EXISTS dbo.mvr_t_int; DROP TABLE IF EXISTS dbo.mvr_t_trg; DROP TABLE IF EXISTS dbo.mvr_t_fk; DROP TABLE IF EXISTS dbo.mvr_parent; DROP TABLE IF EXISTS dbo.mvr_t_chk; DROP TABLE IF EXISTS dbo.mvr_t_ok; DROP TABLE IF EXISTS dbo.mvr_tx_src; DROP TABLE IF EXISTS dbo.mvr_tx_dst;');

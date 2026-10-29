@@ -154,6 +154,30 @@ internal sealed class TSqlEmitter
         {
             throw SubstraitTranslationException.Unsupported("WriteRel output of the modified records (RETURNING).");
         }
+        var block = DmlTarget(write, out string alias, out string targetRead, out string where);
+        if (!update)
+        {
+            return "DELETE " + alias + "\nFROM " + block.From + where;
+        }
+        if (block.From != targetRead)
+        {
+            throw SubstraitTranslationException.Unsupported("an UPDATE joined with another table.");
+        }
+        if (block.Columns.Count != write.ColumnNames.Count || write.ColumnNames.Count == 0)
+        {
+            throw SubstraitTranslationException.MalformedPlan($"WriteRel assigns {write.ColumnNames.Count} columns but its input has {block.Columns.Count}.");
+        }
+        var assignments = write.ColumnNames.Select((c, i) => TSql.Identifier(c) + " = " + block.Columns[i].Expr.Value);
+        return "UPDATE " + alias + " SET " + string.Join(", ", assignments) + "\nFROM " + block.From + where;
+    }
+
+    /// <summary>
+    /// The input of a WriteRel DELETE / UPDATE and the target's row in it: its alias, its FROM item and the WHERE
+    /// clause (with its leading line break, or empty). Refused unless the target is read exactly once at the top of
+    /// the input's FROM and the input is a plain query.
+    /// </summary>
+    private SelectBlock DmlTarget(WriteRel write, out string alias, out string targetRead, out string where)
+    {
         var block = EmitRel(write.Input);
         if (!block.IsPlain)
         {
@@ -168,22 +192,35 @@ internal sealed class TSqlEmitter
         {
             throw SubstraitTranslationException.Unsupported("the target table is not read exactly once at the top of the query.");
         }
-        string alias = atTop[0].Substring(target.Length + " AS ".Length);
-        string where = block.Where.Count > 0 ? "\nWHERE " + string.Join("\n  AND ", block.Where) : "";
-        if (!update)
+        targetRead = atTop[0];
+        alias = targetRead.Substring(target.Length + " AS ".Length);
+        where = block.Where.Count > 0 ? "\nWHERE " + string.Join("\n  AND ", block.Where) : "";
+        return block;
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB's data-modifying CTE that MOVES rows —
+    /// <c>WITH moved AS (DELETE FROM src … RETURNING *) INSERT INTO dst SELECT * FROM moved</c> — as ONE statement:
+    /// a WriteRel INSERT on dst whose input is a WriteRel DELETE on src with MODIFIED_RECORDS output, the deleted
+    /// columns named by its table_schema in the order of the INSERT's columns:
+    /// <c>DELETE [t0] OUTPUT DELETED.[s…] INTO dst ([d…]) FROM … WHERE …</c>. No row leaves the server.
+    /// </summary>
+    private string EmitMovedDelete(WriteRel insert, WriteRel delete)
+    {
+        if (delete.Emit != null)
         {
-            return "DELETE " + alias + "\nFROM " + block.From + where;
+            throw SubstraitTranslationException.Unsupported("WriteRel with an output mapping.");
         }
-        if (block.From != atTop[0])
+        if (delete.ColumnNames.Count != insert.ColumnNames.Count)
         {
-            throw SubstraitTranslationException.Unsupported("an UPDATE joined with another table.");
+            throw SubstraitTranslationException.MalformedPlan($"the DELETE outputs {delete.ColumnNames.Count} columns but the INSERT writes {insert.ColumnNames.Count}.");
         }
-        if (block.Columns.Count != write.ColumnNames.Count || write.ColumnNames.Count == 0)
-        {
-            throw SubstraitTranslationException.MalformedPlan($"WriteRel assigns {write.ColumnNames.Count} columns but its input has {block.Columns.Count}.");
-        }
-        var assignments = write.ColumnNames.Select((c, i) => TSql.Identifier(c) + " = " + block.Columns[i].Expr.Value);
-        return "UPDATE " + alias + " SET " + string.Join(", ", assignments) + "\nFROM " + block.From + where;
+        string target = _tableName?.Invoke(insert.TableNames) ?? string.Join(".", insert.TableNames.Select(TSql.Identifier));
+        var block = DmlTarget(delete, out string alias, out _, out string where);
+        return "DELETE " + alias +
+               "\nOUTPUT " + string.Join(", ", delete.ColumnNames.Select(c => "DELETED." + TSql.Identifier(c))) +
+               "\nINTO " + target + " (" + string.Join(", ", insert.ColumnNames.Select(TSql.Identifier)) + ")" +
+               "\nFROM " + block.From + where;
     }
 
     /// <summary>How often <paramref name="part"/> occurs in <paramref name="from"/> outside parentheses, quoted
@@ -261,6 +298,10 @@ internal sealed class TSqlEmitter
             {
                 throw SubstraitTranslationException.MalformedPlan($"WriteRel table_schema has duplicate column name '{name}'.");
             }
+        }
+        if (write.Input is WriteRel { Op: F.WriteOp_Delete, Output: F.WriteOutput_ModifiedRecords } moved)
+        {
+            return EmitMovedDelete(write, moved);
         }
         var block = EmitRel(write.Input);
         if (block.Columns.Count != write.ColumnNames.Count)
