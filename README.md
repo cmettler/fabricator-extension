@@ -59,9 +59,9 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Projection + filter pushdown (best-effort, parameterized WHERE) | ✅ |
 | | `LIMIT` → `TOP n`; `ORDER BY`+`LIMIT` → TopN (safe keys only) | ✅ |
 | | Statistics → optimizer: cardinality + per-column NDV | ✅ (NDV only; min/max intentionally not reported) |
-| **Write** | INSERT, INSERT…SELECT, INSERT…RETURNING (`OUTPUT INSERTED.*`) | ✅ |
+| **Write** | INSERT, INSERT…SELECT, `RETURNING` on INSERT / UPDATE / DELETE / MERGE (T-SQL `OUTPUT`) | ✅ (SQL Server; not on external tables) |
 | | UPDATE / DELETE (rowid-based, parameterized) | ✅ |
-| | `MERGE INTO` — all actions incl. `NOT MATCHED BY SOURCE`, `DO NOTHING`, `ERROR` | ✅ (needs a rowid; 2+ `UPDATE`/`DELETE` actions are fused into one commit on Delta; no `RETURNING`) |
+| | `MERGE INTO` — all actions incl. `NOT MATCHED BY SOURCE`, `DO NOTHING`, `ERROR` | ✅ (needs a rowid; 2+ `UPDATE`/`DELETE` actions are fused into one commit on Delta; `RETURNING` on SQL Server) |
 | | `UPDATE … SET col = DEFAULT` | ❌ (write the value explicitly) |
 | | `INSERT … ON CONFLICT` | ❌ (no unique constraint is advertised — use `MERGE INTO`) |
 | | CREATE TABLE AS / COPY TO (streaming bulk via `SqlBulkCopy`) | ✅ |
@@ -287,6 +287,8 @@ ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, mars 'false');
 -- On by default: whole queries (joins, aggregates, windows) run on the server. Opt out per catalog:
 ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, remote_pushdown 'false');
 ```
+
+**What runs on the server and what does not, with an example for each case: [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md).**
 
 **`remote_pushdown` (on by default since 2026-10-27; `'false'` opts out, any other value is refused).** The
 environment variable `FABRICATOR_REMOTE_PUSHDOWN=false` changes the default for every ATTACH that does not name the
@@ -702,7 +704,10 @@ UPDATE mssql.dbo.people SET salary = salary * 1.1 WHERE id = 1;
 INSERT streams through `SqlBulkCopy` with `CheckConstraints` enabled, so a CHECK / FOREIGN KEY
 violation fails just like a classic INSERT (CTAS/COPY skip constraint checking for bulk-load speed).
 `IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
-otherwise. Neither UPDATE nor DELETE supports RETURNING.
+otherwise. `UPDATE`, `DELETE` and `MERGE` support `RETURNING` on SQL Server: the rows come from the statement's own
+`OUTPUT` clause (through a table variable when the table has an enabled trigger), and a `DELETE` returns its key as
+`rowid`. Examples, and the DuckDB 2.0 data-modifying CTE that moves rows between tables:
+[docs/sql-server-pushdown.md](docs/sql-server-pushdown.md#returning).
 
 A DELETE or UPDATE runs as ONE `DELETE FROM … WHERE …` / `UPDATE … SET … WHERE …` on SQL Server — no scan,
 no row ids, so it also works on a table without a key — when **every** part of it translates exactly:
@@ -796,8 +801,8 @@ COMMIT;
 
 Each action is executed by the same rowid machinery as the standalone statement, so the same
 requirements apply: **the target needs a primary key or unique index** (row identity is how DuckDB tells
-a matched row from an unmatched one, so this holds even for a merge whose only action is an INSERT), and
-`MERGE … RETURNING` is not supported.
+a matched row from an unmatched one, so this holds even for a merge whose only action is an INSERT).
+`MERGE … RETURNING` works on SQL Server (each action's rows, with `merge_action`).
 
 **On Delta, a merge carrying two or more `UPDATE`/`DELETE` actions is FUSED into one commit — in autocommit
 as well as inside a transaction — and that is a correctness mechanism, not a convenience.** Those actions all

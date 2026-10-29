@@ -298,7 +298,9 @@ public interface IProviderCatalog : IDisposable
     /// and this default ("{}") is the correct answer for a provider with nothing to claim. Keys the host
     /// reads today: <c>exact_filter_pushdown</c> (pushed table filters are applied EXACTLY, never a
     /// superset => the scan may advertise filter_pushdown=true) and <c>is_binary_collation</c> (the
-    /// database collation sorts strings by byte value == DuckDB => string-keyed TopN pushdown). One key is a
+    /// database collation sorts strings by byte value == DuckDB => string-keyed TopN pushdown), and
+    /// <c>dml_returning</c> (<see cref="ExecuteDeleteReturning"/> / <see cref="ExecuteUpdateReturning"/> are
+    /// implemented => DELETE / UPDATE / MERGE … RETURNING is planned; refused at planning otherwise). One key is a
     /// STRING, not a flag: <c>default_schema</c> names the schema an unqualified name resolves to
     /// (<c>db.t</c>, <c>USE db</c>, DuckLake's metadata schema); absent => DuckDB's <c>main</c>. Each
     /// override must derive its answer from the SAME source as its diagnostic ServerInfo rows so the two
@@ -590,6 +592,28 @@ public interface IProviderCatalog : IDisposable
     long ExecuteUpdate(IReadOnlyList<string> schemaPath, string tableName, int setColumnCount,
                        IArrowArrayStream data) =>
         ExecuteUpdate(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, setColumnCount, data);
+
+    /// <summary>
+    /// <c>DELETE … RETURNING</c> (ABI v98): as <see cref="ExecuteDelete(IReadOnlyList{string}, string, IArrowArrayStream)"/>,
+    /// returning the deleted rows — every table column, in table order, as the host's table entry declares them.
+    /// The default refuses: a provider that cannot return the rows it deleted says so rather than deleting them.
+    /// </summary>
+    IArrowArrayStream ExecuteDeleteReturning(IReadOnlyList<string> schemaPath, string tableName, IArrowArrayStream keys)
+    {
+        keys.Dispose();
+        throw new NotSupportedException("DELETE ... RETURNING is not supported by this provider");
+    }
+
+    /// <summary>
+    /// <c>UPDATE … RETURNING</c> (ABI v98): as <see cref="ExecuteUpdate(IReadOnlyList{string}, string, int, IArrowArrayStream)"/>,
+    /// returning each updated row's NEW values — every table column, in table order.
+    /// </summary>
+    IArrowArrayStream ExecuteUpdateReturning(IReadOnlyList<string> schemaPath, string tableName, int setColumnCount,
+                                             IArrowArrayStream data)
+    {
+        data.Dispose();
+        throw new NotSupportedException("UPDATE ... RETURNING is not supported by this provider");
+    }
 
 
     /// <summary>

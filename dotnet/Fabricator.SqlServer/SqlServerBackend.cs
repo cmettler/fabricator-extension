@@ -2478,6 +2478,143 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     }
 
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
+        => ExecuteDeleteCore(schemaName, tableName, keys, returned: null);
+
+    public IArrowArrayStream ExecuteDeleteReturning(IReadOnlyList<string> schemaPath, string tableName,
+                                                    IArrowArrayStream keys)
+    {
+        string schemaName = schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1];
+        RefuseReturningOnExternal(schemaName, tableName, keys, "DELETE");
+        var returned = new ReturnedRows();
+        ExecuteDeleteCore(schemaName, tableName, keys, returned);
+        return returned.ToStream(this, schemaName, tableName);
+    }
+
+    public IArrowArrayStream ExecuteUpdateReturning(IReadOnlyList<string> schemaPath, string tableName,
+                                                    int setColumnCount, IArrowArrayStream data)
+    {
+        string schemaName = schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1];
+        RefuseReturningOnExternal(schemaName, tableName, data, "UPDATE");
+        var returned = new ReturnedRows();
+        ExecuteUpdateCore(schemaName, tableName, setColumnCount, data, returned);
+        return returned.ToStream(this, schemaName, tableName);
+    }
+
+    private void RefuseReturningOnExternal(string schemaName, string tableName, IArrowArrayStream input, string verb)
+    {
+        if (DetectExternalTable(schemaName, tableName) is not null)
+        {
+            input.Dispose(); // never leak the imported stream to the finalizer
+            throw new NotSupportedException(
+                $"{verb} ... RETURNING is not supported on external table {schemaName}.{tableName} (the write "
+                + "routes to storage, which returns no OUTPUT rows).");
+        }
+    }
+
+    /// <summary>
+    /// The rows a DML statement's OUTPUT clause returned (RETURNING), collected across the statement's batches —
+    /// several result sets when an UPDATE sends one statement per row. The hidden rowid column is dropped, as for
+    /// INSERT … RETURNING.
+    /// </summary>
+    private sealed class ReturnedRows
+    {
+        private Schema? _schema;
+        private readonly List<RecordBatch> _batches = new();
+
+        /// <summary>Reads every result set left on <paramref name="reader"/>; the caller disposes it.</summary>
+        public void ReadAll(SqlConnection connection, SqlCommand? command, SqlDataReader reader)
+        {
+            do
+            {
+                if (reader.FieldCount == 0)
+                {
+                    continue;
+                }
+                var stream = new DbDataReaderArrowStream(connection, command!, reader, ownsConnection: false,
+                                                         ownsReader: false);
+                _schema ??= WithoutHiddenRowId(stream.Schema);
+                RecordBatch? rb;
+                while ((rb = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
+                {
+                    _batches.Add(WithoutHiddenRowId(rb));
+                }
+            } while (reader.NextResult());
+        }
+
+        public IArrowArrayStream ToStream(SqlServerCatalog catalog, string schemaName, string tableName)
+        {
+            // nothing affected: an empty stream with the table's own schema
+            var schema = _schema ?? catalog.ReturningSchema(schemaName, tableName);
+            return new InMemoryArrayStream(schema, _batches);
+        }
+    }
+
+    /// <summary>
+    /// How a statement returns its affected rows (RETURNING). Plain <c>OUTPUT …</c> unless the table has an enabled
+    /// trigger: SQL Server then refuses an OUTPUT without INTO (Msg 334), so the rows go INTO a table variable that
+    /// the same batch selects afterwards. Its columns are the table's, as <c>sp_describe_first_result_set</c>
+    /// reports them (a rowversion becomes <c>binary(8)</c>, which a table variable can take a value into).
+    /// </summary>
+    private (string Prefix, string Into, string Suffix) ReturningShape(SqlConnection connection,
+                                                                     SqlTransaction? transaction, string schemaName,
+                                                                     string tableName)
+    {
+        string qualified = Quote(schemaName) + "." + Quote(tableName);
+        using (var probe = connection.CreateCommand())
+        {
+            probe.Transaction = transaction;
+            probe.CommandText = "SELECT COUNT(*) FROM sys.triggers WHERE parent_id = OBJECT_ID(@obj) AND is_disabled = 0";
+            probe.Parameters.AddWithValue("@obj", qualified);
+            if (Convert.ToInt32(probe.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture) == 0)
+            {
+                return ("", "", "");
+            }
+        }
+        var columns = new List<string>();
+        using (var describe = connection.CreateCommand())
+        {
+            describe.Transaction = transaction;
+            describe.CommandText = "EXEC sys.sp_describe_first_result_set @tsql";
+            describe.Parameters.AddWithValue("@tsql", "SELECT * FROM " + qualified);
+            using var reader = describe.ExecuteReader();
+            while (reader.Read())
+            {
+                if (reader["is_hidden"] is bool hidden && hidden)
+                {
+                    continue;
+                }
+                string type = (string)reader["system_type_name"];
+                if (type.Equals("timestamp", StringComparison.OrdinalIgnoreCase) ||
+                    type.Equals("rowversion", StringComparison.OrdinalIgnoreCase))
+                {
+                    type = "binary(8)";
+                }
+                string collation = reader["collation_name"] is string c && c.Length > 0 ? " COLLATE " + c : "";
+                columns.Add(Quote((string)reader["name"]) + " " + type + collation + " NULL");
+            }
+        }
+        return ("DECLARE @__fab_returned TABLE (" + string.Join(", ", columns) + "); ",
+                " INTO @__fab_returned",
+                "; SELECT * FROM @__fab_returned;");
+    }
+
+    private Schema ReturningSchema(string schemaName, string tableName)
+    {
+        var (connection, transaction, owns) = BeginWrite();
+        try
+        {
+            return ReadTableSchema(connection, transaction, Quote(schemaName) + "." + Quote(tableName));
+        }
+        finally
+        {
+            if (owns)
+            {
+                connection.Dispose();
+            }
+        }
+    }
+
+    private long ExecuteDeleteCore(string schemaName, string tableName, IArrowArrayStream keys, ReturnedRows? returned)
     {
         RecordTouch(schemaName, tableName, schemaChanged: false);
         // slice D: a detected external DELTA table's rowid is its Delta IDENTITY column — the DELETE routes
@@ -2501,6 +2638,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         var keyColumns = keys.Schema.FieldsList.Select(f => f.Name).ToList();
         var keyBindings = DateTimeBindings(connection, transaction, schemaName, tableName, keys.Schema.FieldsList);
+        var shape = returned is null ? ("", "", "") : ReturningShape(connection, transaction, schemaName, tableName);
 
         using var reader = new ArrowDataReader(keys);
         long total = 0;
@@ -2515,7 +2653,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandTimeout = ResolveCommandTimeout();
-            var sb = new StringBuilder("DELETE FROM ").Append(qualified).Append(" WHERE ");
+            // RETURNING: the deleted rows, from the statement itself (no second read)
+            var sb = new StringBuilder(shape.Item1).Append("DELETE FROM ").Append(qualified)
+                .Append(returned is null ? "" : " OUTPUT DELETED.*" + shape.Item2).Append(" WHERE ");
             int p = 0;
             for (int r = 0; r < batch.Count; r++)
             {
@@ -2536,10 +2676,21 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 }
                 sb.Append(')');
             }
+            sb.Append(shape.Item3);
             cmd.CommandText = sb.ToString();
             if (Log.IsEnabled(LogLevel.Debug))
                 Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
-            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            if (returned is null)
+            {
+                total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            }
+            else
+            {
+                using (var rdr = cmd.ExecuteReaderAsync(token).GetAwaiter().GetResult())
+                {
+                    returned.ReadAll(connection, cmd, rdr);
+                }
+            }
             batch.Clear();
         }
 
@@ -2684,6 +2835,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     private const int UpdateBatchRows = 500;
 
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
+        => ExecuteUpdateCore(schemaName, tableName, setColumnCount, data, returned: null);
+
+    private long ExecuteUpdateCore(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data,
+                                   ReturnedRows? returned)
     {
         RecordTouch(schemaName, tableName, schemaChanged: false);
         // slice D: identity-keyed UPDATE routes to storage (see ExecuteDelete). SET of the identity column
@@ -2722,7 +2877,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // One statement per row, the same text for every row, sent UpdateBatchRows at a time as one SqlBatch: one
         // round trip per block instead of per row, while each row keeps its own statement — so a row id that
         // appears twice still means "the last one wins", exactly as row by row.
-        var sb = new StringBuilder("UPDATE ").Append(qualified).Append(" SET ");
+        var shape = returned is null ? ("", "", "") : ReturningShape(connection, transaction, schemaName, tableName);
+        var sb = new StringBuilder(shape.Item1).Append("UPDATE ").Append(qualified).Append(" SET ");
         for (int c = 0; c < setColumnCount; c++)
         {
             if (c > 0)
@@ -2731,7 +2887,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             }
             sb.Append(Quote(columns[c])).Append(" = @s").Append(c);
         }
-        sb.Append(" WHERE ");
+        // RETURNING: each row's new values, from the statement itself
+        sb.Append(returned is null ? "" : " OUTPUT INSERTED.*" + shape.Item2).Append(" WHERE ");
         for (int c = keyStart; c < columns.Count; c++)
         {
             if (c > keyStart)
@@ -2740,6 +2897,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             }
             sb.Append(Quote(columns[c])).Append(" = @k").Append(c);
         }
+        sb.Append(shape.Item3);
         string sql = sb.ToString();
         if (Log.IsEnabled(LogLevel.Debug))
             Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(sql));
@@ -2755,7 +2913,16 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 {
                     return;
                 }
-                total += batch.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+                if (returned is null)
+                {
+                    total += batch.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+                }
+                else
+                {
+                    // one OUTPUT result set per statement of the batch
+                    using var rdr = batch.ExecuteReaderAsync(token).GetAwaiter().GetResult();
+                    returned.ReadAll(connection, null, rdr);
+                }
                 batch.BatchCommands.Clear();
             }
 
@@ -2809,6 +2976,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             var columns = rows.Schema.FieldsList.Select(f => f.Name).ToList();
             string columnList = string.Join(", ", columns.Select(Quote));
             var bindings = DateTimeBindings(connection, transaction, schemaName, tableName, rows.Schema.FieldsList);
+            var shape = ReturningShape(connection, transaction, schemaName, tableName);
 
             using var reader = new ArrowDataReader(rows);
             var batch = new List<object?[]>();
@@ -2823,8 +2991,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 }
                 using var cmd = connection.CreateCommand();
                 cmd.Transaction = transaction;
-                var sb = new StringBuilder("INSERT INTO ").Append(qualified).Append(" (").Append(columnList)
-                    .Append(") OUTPUT INSERTED.* VALUES ");
+                var sb = new StringBuilder(shape.Item1).Append("INSERT INTO ").Append(qualified).Append(" (")
+                    .Append(columnList).Append(") OUTPUT INSERTED.*").Append(shape.Item2).Append(" VALUES ");
                 int p = 0;
                 for (int r = 0; r < batch.Count; r++)
                 {
@@ -2845,6 +3013,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                     }
                     sb.Append(')');
                 }
+                sb.Append(shape.Item3);
                 cmd.CommandText = sb.ToString();
                 var rdr = cmd.ExecuteReader();
                 // The OUTPUT result set is the inserted rows; materialize them as Arrow
@@ -3005,6 +3174,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // spliced: a schema name is user-controlled text.
     public string CapabilitiesJson
         => "{\"bind_schema_cacheable\":true," +
+           "\"dml_returning\":true," +
            $"\"default_schema\":{JsonSerializer.Serialize(Profile.DefaultSchema)}," +
            $"\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
            $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";

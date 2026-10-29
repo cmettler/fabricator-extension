@@ -22,6 +22,8 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include <cstring>
+
 namespace duckdb {
 
 // Shared sink state: an Arrow producer over the columns we send to the bridge —
@@ -61,6 +63,10 @@ public:
 	ClientProperties properties;
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;
 	unique_ptr<fabricator::ArrowProducer> producer;
+	//! RETURNING: the affected rows the provider returned, read by GetData.
+	unique_ptr<fabricator::ArrowStreamReader> returning_reader;
+	//! DELETE … RETURNING with virtual columns: the provider's rows, before the virtual columns are appended.
+	DataChunk returning_table_chunk;
 	idx_t total = 0;
 	bool returned = false;
 	mutable mutex lock;
@@ -131,9 +137,61 @@ static void AppendModifyBatch(FabricatorModifyGlobalState &gstate, DataChunk &ch
 	gstate.producer->AddBatch(array);
 }
 
-static SourceResultType EmitCount(GlobalSinkState &sink_state, DataChunk &chunk) {
+static SourceResultType EmitCount(ClientContext &context, const FabricatorModifyTarget &target,
+                                  GlobalSinkState &sink_state, DataChunk &chunk) {
 	auto &gstate = sink_state.Cast<FabricatorModifyGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
+	if (gstate.returning_reader) {
+		// RETURNING: stream the affected rows back as this operator's output
+		if (target.returning_virtual_ids.empty()) {
+			gstate.returning_reader->Read(chunk);
+			return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+		}
+		auto &rows = gstate.returning_table_chunk;
+		if (rows.ColumnCount() == 0) {
+			rows.Initialize(Allocator::Get(context), target.returning_table_types);
+		}
+		rows.Reset();
+		gstate.returning_reader->Read(rows);
+		if (rows.size() == 0) {
+			chunk.SetCardinality(0);
+			return SourceResultType::FINISHED;
+		}
+		auto table_columns = target.returning_table_types.size();
+		for (idx_t i = 0; i < table_columns; i++) {
+			chunk.data[i].Reference(rows.data[i]);
+		}
+		for (idx_t v = 0; v < target.returning_virtual_ids.size(); v++) {
+			auto &out = chunk.data[table_columns + v];
+			bool filled = false;
+			if (target.returning_virtual_ids[v] == COLUMN_IDENTIFIER_ROW_ID) {
+				// the rowid is the key: one column as itself, several as a STRUCT of them
+				auto &keys = target.returning_key_positions;
+				bool all_returned = !keys.empty();
+				for (auto k : keys) {
+					all_returned = all_returned && k != DConstants::INVALID_INDEX;
+				}
+				if (all_returned && keys.size() == 1 && out.GetType() == rows.data[keys[0]].GetType()) {
+					out.Reference(rows.data[keys[0]]);
+					filled = true;
+				} else if (all_returned && keys.size() > 1 && out.GetType().id() == LogicalTypeId::STRUCT) {
+					auto &entries = StructVector::GetEntries(out);
+					if (entries.size() == keys.size()) {
+						for (idx_t k = 0; k < keys.size(); k++) {
+							entries[k].Reference(rows.data[keys[k]]);
+						}
+						filled = true;
+					}
+				}
+			}
+			if (!filled) {
+				out.SetVectorType(VectorType::CONSTANT_VECTOR);
+				ConstantVector::SetNull(out, true);
+			}
+		}
+		chunk.SetCardinality(rows.size());
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
 	if (gstate.returned) {
 		return SourceResultType::FINISHED;
 	}
@@ -235,13 +293,21 @@ SinkFinalizeType FabricatorPhysicalDelete::Finalize(Pipeline &pipeline, Event &e
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
 	FabricatorSetActiveTxn(handle_, context);
+	if (target_.returning) {
+		ArrowArrayStream out;
+		std::memset(&out, 0, sizeof(out));
+		fabricator::ExecuteModifyReturning(handle_, target_.schema_path, target_.table_name, /*set_count=*/-1,
+		                                   *gstate.producer->Stream(), out);
+		gstate.returning_reader = make_uniq<fabricator::ArrowStreamReader>(context, out);
+		return SinkFinalizeType::READY;
+	}
 	gstate.total = (idx_t)fabricator::ExecuteDelete(handle_, target_.schema_path, target_.table_name,
 	                                              *gstate.producer->Stream());
 	return SinkFinalizeType::READY;
 }
 SourceResultType FabricatorPhysicalDelete::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                          OperatorSourceInput &input) const {
-	return EmitCount(*sink_state, chunk);
+	return EmitCount(context.client, target_, *sink_state, chunk);
 }
 
 //===----------------------------------------------------------------------===//
@@ -280,13 +346,21 @@ SinkFinalizeType FabricatorPhysicalUpdate::Finalize(Pipeline &pipeline, Event &e
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
 	FabricatorSetActiveTxn(handle_, context);
+	if (target_.returning) {
+		ArrowArrayStream out;
+		std::memset(&out, 0, sizeof(out));
+		fabricator::ExecuteModifyReturning(handle_, target_.schema_path, target_.table_name,
+		                                   (int32_t)gstate.set_count, *gstate.producer->Stream(), out);
+		gstate.returning_reader = make_uniq<fabricator::ArrowStreamReader>(context, out);
+		return SinkFinalizeType::READY;
+	}
 	gstate.total = (idx_t)fabricator::ExecuteUpdate(handle_, target_.schema_path, target_.table_name,
 	                                              (int32_t)gstate.set_count, *gstate.producer->Stream());
 	return SinkFinalizeType::READY;
 }
 SourceResultType FabricatorPhysicalUpdate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                          OperatorSourceInput &input) const {
-	return EmitCount(*sink_state, chunk);
+	return EmitCount(context.client, target_, *sink_state, chunk);
 }
 
 } // namespace duckdb

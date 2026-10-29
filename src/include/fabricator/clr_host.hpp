@@ -326,6 +326,11 @@ void RollbackTransaction(FabricatorHandle handle);
 void InsertReturning(FabricatorHandle handle, const std::vector<std::string> &schema_path,
                      const std::string &table, ArrowArrayStream &in, ArrowArrayStream &out);
 
+// DELETE / UPDATE ... RETURNING (ABI v98): as ExecuteDelete (set_count < 0) / ExecuteUpdate, filling `out` with the
+// affected rows (all table columns). Consumes/releases `in`.
+void ExecuteModifyReturning(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                            const std::string &table, int32_t set_count, ArrowArrayStream &in, ArrowArrayStream &out);
+
 // -----------------------------------------------------------------------------
 // Streaming bulk-load (begin/push/complete). Unlike the removed bulk_insert (which handed over a
 // whole stream), this streams batches so the host never buffers the full dataset;

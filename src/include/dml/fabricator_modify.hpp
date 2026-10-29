@@ -75,6 +75,15 @@ struct FabricatorModifyTarget {
 	//! directly and deliberately leaves it FALSE, because PhysicalMergeInto drives our operators manually over
 	//! one shared global sink state and never consults their ParallelSink() at all.
 	bool parallel = false;
+	//! DELETE / UPDATE … RETURNING: the operator emits the affected rows (every table column) instead of a count.
+	bool returning = false;
+	//! DELETE … RETURNING only: 2.0's LogicalDelete returns the table's columns AND its virtual columns (rowid,
+	//! provider virtual columns), in the order GetVirtualColumns() iterates. The provider returns the table
+	//! columns; the operator appends these: the rowid from the key columns, anything else NULL.
+	vector<LogicalType> returning_table_types;
+	vector<column_t> returning_virtual_ids;
+	//! The key columns' positions among the table columns (INVALID_INDEX: not returned, e.g. a hidden rowid).
+	vector<idx_t> returning_key_positions;
 };
 
 //! DELETE FROM [schema].[table] WHERE <rowid predicates>, batched.

@@ -12,6 +12,27 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v98 (2026-10-29) — `execute_modify_returning`: DELETE / UPDATE … RETURNING
+
+ONE entry appended after `remote_translate`: the rowid DML of `execute_delete` / `execute_update` (a negative
+`set_count` means DELETE), exporting the affected rows into `out` — every table column, in table order; a DELETE's old
+values, an UPDATE's new ones. `IProviderCatalog.ExecuteDeleteReturning` / `ExecuteUpdateReturning` are DIMs that
+REFUSE, so a provider that cannot return the rows it changed says so instead of changing them. SQL Server reads them
+from the statement's own `OUTPUT DELETED.*` / `OUTPUT INSERTED.*`; on a table with an enabled trigger (Msg 334 for an
+OUTPUT without INTO) through `OUTPUT … INTO` a table variable typed by `sp_describe_first_result_set`, which also
+fixed the pre-existing `INSERT … RETURNING` there. MERGE … RETURNING needed no entry: each action operator runs in
+RETURNING mode and DuckDB's `PhysicalMergeInto` appends `merge_action`.
+
+⚠ 2.0's `LogicalDelete::ResolveTypes` returns the table columns AND its virtual columns (rowid, provider virtual
+columns), an UPDATE and a MERGE action only the table columns. The provider returns the table columns; the DELETE
+operator appends the rest — the rowid from the returned key columns, anything else NULL. Without that, the first
+DELETE … RETURNING that matched a row failed with `arrow_scan: array length mismatch`.
+
+Gate `verify_returning_mssql` (104, service): every statement on SQL Server AND on an identical DuckDB table, the
+returned rows captured with a data-modifying CTE and compared both ways, plus the final contents; MERGE (which DuckDB
+does not take as a CTE body) against DuckDB's own output; the DuckDB 2.0 "moved" CTE with ROLLBACK; a trigger table.
+Mutants killed: an UPDATE returning the old values, no table variable for a trigger table, no virtual columns.
+
 ## v97 (2026-10-26) — every catalog object takes a SCHEMA PATH: functions, macros, views (nested schemas, slice 2d)
 
 v90–v92 nested TABLES; this version nests everything else a provider declares. BREAKING for providers and

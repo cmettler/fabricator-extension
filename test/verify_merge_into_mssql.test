@@ -241,14 +241,14 @@ statement ok
 SELECT fabricator_exec('db', 'DROP TABLE fmerge.fabricator_mschema; DROP SCHEMA fmerge');
 
 # ==============================================================================================
-# 6. MERGE ... RETURNING is refused rather than silently dropping the returning list.
+# 6. MERGE ... RETURNING returns the action's rows (ABI v98; every action in verify_returning_mssql).
 # ==============================================================================================
 
-statement error
+query IIT
 MERGE INTO db.dbo.fabricator_mtgt AS t USING (VALUES (1, 1)) AS s(id, v) ON t.id = s.id
   WHEN MATCHED THEN UPDATE SET v = s.v RETURNING *;
 ----
-MERGE INTO ... RETURNING is not supported
+1	1	nosrc
 
 statement ok
 DROP TABLE IF EXISTS db.dbo.fabricator_mtgt;

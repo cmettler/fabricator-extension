@@ -201,6 +201,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
+		dml_returning_ = caps.dml_returning;
 		default_schema_ = caps.default_schema;
 	} catch (std::exception &ex) {
 		string_order_pushable_ = false;
@@ -209,6 +210,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = false;
 		remote_select_ = false;
 		bind_schema_cacheable_ = false;
+		dml_returning_ = false;
 		default_schema_.clear();
 		// ⚠ IT WARNS NOW, and the silence was the defect. This catch guards TWO unrelated things: a provider
 		// that cannot answer (fine — defaults are the safe direction, superset-and-re-apply) and a TRANSIENT
@@ -992,7 +994,8 @@ PhysicalOperator &FabricatorCatalog::PlanUpdate(ClientContext &context, Physical
 
 PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalDelete &op, PhysicalOperator &plan) {
-	if (op.return_chunk) {
+	// RETURNING: the provider returns the deleted rows from the DELETE itself (ABI v98) — where it declares it can
+	if (op.return_chunk && !dml_returning_) {
 		throw NotImplementedException("fabricator: DELETE ... RETURNING is not supported yet");
 	}
 	auto target = FabricatorBuildModifyTarget(op.table);
@@ -1006,8 +1009,26 @@ PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, Physical
 	// precedent here rather than something to argue with; we keep the same plan-time gate as the write sinks so
 	// the four cannot drift. What parallelizes is the scan, the filter and the rowid append — the provider work
 	// happens once at Finalize either way.
-	target.parallel = FabricatorParallelWrite(context, &plan);
-	vector<LogicalType> result_types {LogicalType::BIGINT};
+	target.parallel = !op.return_chunk && FabricatorParallelWrite(context, &plan);
+	target.returning = op.return_chunk;
+	if (op.return_chunk) {
+		// the order LogicalDelete::ResolveTypes uses: the table's columns, then GetVirtualColumns()
+		target.returning_table_types = op.table.GetTypes();
+		for (auto &entry : op.table.GetVirtualColumns()) {
+			target.returning_virtual_ids.push_back(entry.first);
+		}
+		auto names = op.table.GetColumns().GetColumnNames();
+		for (auto &key : target.rowid_columns) {
+			idx_t position = DConstants::INVALID_INDEX;
+			for (idx_t i = 0; i < names.size(); i++) {
+				if (StringUtil::CIEquals(names[i], key)) {
+					position = i;
+				}
+			}
+			target.returning_key_positions.push_back(position);
+		}
+	}
+	vector<LogicalType> result_types = op.return_chunk ? op.types : vector<LogicalType> {LogicalType::BIGINT};
 	auto &del = planner.Make<FabricatorPhysicalDelete>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);
 	del.children.push_back(plan);
@@ -1056,7 +1077,8 @@ void FabricatorFillUpdateSetColumns(TableCatalogEntry &table, const vector<Physi
 
 PhysicalOperator &FabricatorCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
-	if (op.return_chunk) {
+	// RETURNING: the provider returns the new values from the UPDATE itself (ABI v98) — where it declares it can
+	if (op.return_chunk && !dml_returning_) {
 		throw NotImplementedException("fabricator: UPDATE ... RETURNING is not supported yet");
 	}
 	auto target = FabricatorBuildModifyTarget(op.table);
@@ -1067,8 +1089,9 @@ PhysicalOperator &FabricatorCatalog::PlanUpdate(ClientContext &context, Physical
 	// arbitrary one. That order was never a promise — it is a hash join's probe order — and DuckDB accepts the
 	// same nondeterminism in its own parallel PhysicalUpdate. (Its ON CONFLICT DO UPDATE path is the one that
 	// serializes, and for a different reason: it must DETECT the double update in order to error.)
-	target.parallel = FabricatorParallelWrite(context, &plan);
-	vector<LogicalType> result_types {LogicalType::BIGINT};
+	target.parallel = !op.return_chunk && FabricatorParallelWrite(context, &plan);
+	target.returning = op.return_chunk;
+	vector<LogicalType> result_types = op.return_chunk ? op.types : vector<LogicalType> {LogicalType::BIGINT};
 	auto &upd = planner.Make<FabricatorPhysicalUpdate>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);
 	upd.children.push_back(plan);

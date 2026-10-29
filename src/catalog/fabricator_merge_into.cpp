@@ -68,7 +68,9 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 		FabricatorFillUpdateSetColumns(op.table, action.columns, action.expressions, target);
 		target.rowid_child_index = op.row_id_start;
 		target.force_buffered = force_buffered;
-		vector<LogicalType> result_types {LogicalType::BIGINT};
+		// RETURNING: each action emits its rows (the table's columns); PhysicalMergeInto appends merge_action
+		target.returning = op.return_chunk;
+		vector<LogicalType> result_types = op.return_chunk ? op.table.GetTypes() : vector<LogicalType> {LogicalType::BIGINT};
 		auto &upd = planner.Make<FabricatorPhysicalUpdate>(std::move(result_types), op.EstimateCardinality(context),
 		                                                   std::move(target), catalog.GetHandle());
 		result->op = upd;
@@ -78,7 +80,8 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 		auto target = FabricatorBuildModifyTarget(op.table);
 		target.rowid_child_index = op.row_id_start;
 		target.force_buffered = force_buffered;
-		vector<LogicalType> result_types {LogicalType::BIGINT};
+		target.returning = op.return_chunk; // the table's columns only: a merge returns no virtual columns
+		vector<LogicalType> result_types = op.return_chunk ? op.table.GetTypes() : vector<LogicalType> {LogicalType::BIGINT};
 		auto &del = planner.Make<FabricatorPhysicalDelete>(std::move(result_types), op.EstimateCardinality(context),
 		                                                   std::move(target), catalog.GetHandle());
 		result->op = del;
@@ -105,7 +108,7 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 		result->expressions = std::move(action.expressions);
 
 		FabricatorInsertTarget target;
-		target.returning = false; // MERGE ... RETURNING is refused below.
+		target.returning = op.return_chunk;
 		// ⚠⚠ THE PATH, NOT ONLY THE LEAF (ABI v92). The UPDATE/DELETE legs above get this from
 		// FabricatorBuildModifyTarget; this leg hand-builds its target and was missed when paths landed, so
 		// `schema_path` stayed EMPTY -- and an empty path is not a loud failure: the managed contract's
@@ -119,7 +122,7 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 			target.column_types.push_back(col.Type());
 		}
 		target.force_buffered = force_buffered;
-		vector<LogicalType> result_types {LogicalType::BIGINT};
+		vector<LogicalType> result_types = op.return_chunk ? op.table.GetTypes() : vector<LogicalType> {LogicalType::BIGINT};
 		auto &ins = planner.Make<FabricatorPhysicalInsert>(std::move(result_types), op.EstimateCardinality(context),
 		                                                   std::move(target), catalog.GetHandle());
 		result->op = ins;
@@ -140,7 +143,9 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 
 PhysicalOperator &FabricatorCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                                    LogicalMergeInto &op, PhysicalOperator &plan) {
-	if (op.return_chunk) {
+	// RETURNING (ABI v98): each action operator returns its rows from the provider's OUTPUT clause — where the
+	// provider declares it can (capability `dml_returning`); refused here otherwise, before any action writes
+	if (op.return_chunk && !SupportsDmlReturning()) {
 		throw NotImplementedException("fabricator: MERGE INTO ... RETURNING is not supported yet");
 	}
 	// Row identity is required by EVERY merge, including one whose only action is an INSERT: DuckDB decides

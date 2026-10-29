@@ -1,0 +1,214 @@
+# name: test/verify_pushdown_guide_mssql.test
+# description: Every example of docs/sql-server-pushdown.md, by its id (S1, D2, …): where it runs — the EXPLAIN marker
+#              the guide names — and what it answers. A change of routing fails here first, and then the guide is
+#              wrong too: update both together. Needs MSSQL_TESTDB_DSN.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE fabricator);
+
+# ═══ Setup (the guide's "Example tables") ══════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals;');
+
+statement ok
+SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.pg_regions (region VARCHAR(2) PRIMARY KEY, name NVARCHAR(30));
+CREATE TABLE dbo.pg_sales (id INT PRIMARY KEY, region VARCHAR(2), amount DECIMAL(10,2), sold DATE, note NVARCHAR(50));
+CREATE TABLE dbo.pg_sales_eu (id INT, amount DECIMAL(10,2), loaded DATETIME2 DEFAULT SYSDATETIME());
+INSERT INTO dbo.pg_regions VALUES (''EU'', N''Europe''), (''US'', N''Americas'');
+INSERT INTO dbo.pg_sales VALUES (1,''EU'',10,''2026-01-05'',N''first''),(2,''US'',20,''2026-02-01'',NULL),(3,''EU'',30,''2026-02-07'',N''Größe''),(4,''US'',5,''2025-12-30'',N''late'');', refresh_cache := true);
+
+# ═══ S — SELECT ════════════════════════════════════════════════════════════════════════════════════════
+
+# S1: a join with an aggregate runs as one T-SQL statement
+query II
+EXPLAIN SELECT r.name, count(*) AS n, sum(s.amount) AS total FROM mssql.dbo.pg_sales s JOIN mssql.dbo.pg_regions r USING (region) GROUP BY r.name ORDER BY total DESC;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TII
+SELECT r.name, count(*) AS n, sum(s.amount) AS total FROM mssql.dbo.pg_sales s JOIN mssql.dbo.pg_regions r USING (region) GROUP BY r.name ORDER BY total DESC;
+----
+Europe	2	40.00
+Americas	2	25.00
+
+# S2: a plain scan keeps the table scan; its filter still goes to the server
+query II
+EXPLAIN SELECT id, amount FROM mssql.dbo.pg_sales WHERE amount > 15;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT id, amount FROM mssql.dbo.pg_sales WHERE amount > 15;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
+
+# S3: a function with no exact T-SQL (regular expressions) keeps the whole query local
+query II
+EXPLAIN SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^f') GROUP BY id;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^f') GROUP BY id;
+----
+1
+
+# S4: a join with a local table: the remote table is scanned, the join runs in DuckDB
+statement ok
+CREATE TEMP TABLE targets AS SELECT 'EU' AS region, 25 AS target;
+
+query II
+EXPLAIN SELECT t.region, sum(s.amount) - t.target AS gap FROM mssql.dbo.pg_sales s JOIN targets t USING (region) GROUP BY t.region, t.target;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT t.region, sum(s.amount) - t.target AS gap FROM mssql.dbo.pg_sales s JOIN targets t USING (region) GROUP BY t.region, t.target;
+----
+EU	15.00
+
+# ═══ I / C — INSERT … SELECT and CREATE TABLE … AS ═════════════════════════════════════════════════════
+
+# I1: INSERT … SELECT within the catalog: one INSERT … SELECT on the server
+query II
+EXPLAIN INSERT INTO mssql.dbo.pg_sales_eu (id, amount) SELECT id, amount FROM mssql.dbo.pg_sales WHERE region = 'EU';
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+INSERT INTO mssql.dbo.pg_sales_eu (id, amount) SELECT id, amount FROM mssql.dbo.pg_sales WHERE region = 'EU';
+----
+2
+
+# the server applied the default of the column the statement did not name
+query I
+SELECT count(*) FROM mssql.dbo.pg_sales_eu WHERE loaded IS NOT NULL;
+----
+2
+
+# I2: INSERT … VALUES: the regular insert (bulk copy)
+query II
+EXPLAIN INSERT INTO mssql.dbo.pg_sales_eu (id, amount) VALUES (99, 1);
+----
+physical_plan	<REGEX>:.*Mssql Net Insert.*
+
+# C1: CREATE TABLE … AS over an aggregate: table created as usual, filled on the server
+query II
+EXPLAIN CREATE TABLE mssql.dbo.pg_totals AS SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region;
+----
+physical_plan	<REGEX>:.*Fabricator Remote Ctas.*
+
+query I
+CREATE TABLE mssql.dbo.pg_totals AS SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region;
+----
+2
+
+# C2: CREATE TABLE … AS over a plain scan: the rows stream through DuckDB into a bulk copy
+query II
+EXPLAIN CREATE TABLE mssql.dbo.pg_totals2 AS SELECT * FROM mssql.dbo.pg_sales;
+----
+physical_plan	<REGEX>:.*Mssql Net Create Table As.*
+
+# ═══ D / U — DELETE and UPDATE ═════════════════════════════════════════════════════════════════════════
+
+# D1: a predicate on exact types: one DELETE … WHERE on the server
+query II
+EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-01-01';
+----
+physical_plan	<REGEX>:.*Fabricator Delete Where.*
+
+# D2: a string comparison (its meaning depends on the collation): scan, then delete by key
+query II
+EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE region = 'US';
+----
+physical_plan	<REGEX>:.*Mssql Net Delete.*
+
+# U1: DECIMAL arithmetic in SET is not rendered: scan, then update by key
+query II
+EXPLAIN UPDATE mssql.dbo.pg_sales SET amount = amount * 2 WHERE id = 1;
+----
+physical_plan	<REGEX>:.*Mssql Net Update.*
+
+# U2: a constant SET value and an exact predicate: one UPDATE … WHERE on the server
+query II
+EXPLAIN UPDATE mssql.dbo.pg_sales SET amount = 12.50 WHERE id = 1;
+----
+physical_plan	<REGEX>:.*Fabricator Update Where.*
+
+# R1: INSERT … RETURNING
+query I
+INSERT INTO mssql.dbo.pg_sales_eu (id, amount) VALUES (7, 7) RETURNING id;
+----
+7
+
+# R2: DELETE … RETURNING — the deleted rows come from the DELETE itself (T-SQL OUTPUT DELETED.*)
+query II
+EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE id = 4 RETURNING id;
+----
+physical_plan	<REGEX>:.*Mssql Net Delete.*
+
+query IT
+DELETE FROM mssql.dbo.pg_sales WHERE id = 4 RETURNING id, note;
+----
+4	late
+
+# R3: UPDATE … RETURNING returns the NEW values
+query IT
+UPDATE mssql.dbo.pg_sales SET amount = 1 WHERE id = 2 RETURNING id, amount;
+----
+2	1.00
+
+# R4: the data-modifying CTE that moves rows (DuckDB 2.0) — today a DELETE … OUTPUT, then the regular insert
+statement ok
+SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_archive; CREATE TABLE dbo.pg_archive (id INT PRIMARY KEY, region VARCHAR(2), amount DECIMAL(10,2), sold DATE, note NVARCHAR(50));', refresh_cache := true);
+
+query I
+WITH moved AS MATERIALIZED (DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-02-01' RETURNING *)
+INSERT INTO mssql.dbo.pg_archive SELECT * FROM moved;
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM mssql.dbo.pg_sales), (SELECT string_agg(id::VARCHAR, ',') FROM mssql.dbo.pg_archive);
+----
+2	1
+
+# ═══ Switches ══════════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN INSERT INTO mssql.dbo.pg_sales_eu (id, amount) SELECT id, amount FROM mssql.dbo.pg_sales WHERE region = 'EU';
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE sold < DATE '2026-01-01';
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql_off (TYPE fabricator, remote_pushdown 'false');
+
+query II
+EXPLAIN SELECT r.name, count(*) AS n FROM mssql_off.dbo.pg_sales s JOIN mssql_off.dbo.pg_regions r USING (region) GROUP BY r.name;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+statement ok
+DETACH mssql_off;
+
+# ═══ Cleanup ═══════════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_archive;');

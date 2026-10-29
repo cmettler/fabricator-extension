@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 97;
+        vtable->AbiVersion = 98;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -177,6 +177,7 @@ public static unsafe class Bootstrap
         vtable->TableDmlWhere = &TableDmlWhere;
         vtable->TablePartitionStats = &TablePartitionStats;
         vtable->RemoteTranslate = &RemoteTranslate;
+        vtable->ExecuteModifyReturning = &ExecuteModifyReturning;
         return FabricatorStatus.Ok;
     }
 
@@ -927,6 +928,37 @@ public static unsafe class Bootstrap
 
             var rows = CArrowArrayStreamImporter.ImportArrayStream(input);
             IArrowArrayStream returned = catalog.InsertReturning(path, tableName, rows);
+            CArrowArrayStreamExporter.ExportArrayStream(returned, outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // DELETE / UPDATE … RETURNING (ABI v98): the rowid DML of execute_delete / execute_update, exporting the
+    // affected rows (OUTPUT DELETED.* / INSERTED.*) into *out. set_count < 0 means DELETE.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteModifyReturning(nint handle, byte** schemaPath, int schemaPathLen, byte* table,
+                                              int setCount, CArrowArrayStream* input, CArrowArrayStream* outStream,
+                                              byte** err)
+    {
+        try
+        {
+            if (input is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var path = ReadSchemaPath(schemaPath, schemaPathLen);
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var rows = CArrowArrayStreamImporter.ImportArrayStream(input);
+            IArrowArrayStream returned = setCount < 0
+                ? catalog.ExecuteDeleteReturning(path, tableName, rows)
+                : catalog.ExecuteUpdateReturning(path, tableName, setCount, rows);
             CArrowArrayStreamExporter.ExportArrayStream(returned, outStream);
             return FabricatorStatus.Ok;
         }

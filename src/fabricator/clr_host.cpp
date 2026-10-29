@@ -1712,6 +1712,21 @@ void InsertReturning(FabricatorHandle handle, const std::vector<std::string> &sc
 	}
 }
 
+void ExecuteModifyReturning(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                            const std::string &table, int32_t set_count, ArrowArrayStream &in, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.execute_modify_returning) {
+		throw duckdb::IOException("Fabricator: bridge does not provide execute_modify_returning");
+	}
+	char *err = nullptr;
+	PathArgs path(schema_path);
+	int32_t rc = vt.execute_modify_returning(handle, path.Data(), path.Len(), table.c_str(), set_count, &in, &out,
+	                                         &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: execute_modify_returning failed");
+	}
+}
+
 FabricatorHandle BeginBulk(FabricatorHandle handle, const std::vector<std::string> &schema_path,
                          const std::string &table, bool create_table,
                          bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,

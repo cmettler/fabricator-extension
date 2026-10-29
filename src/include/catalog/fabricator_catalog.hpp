@@ -78,6 +78,9 @@ public:
 		return null_order_expressible_;
 	}
 
+	bool SupportsDmlReturning() const {
+		return dml_returning_;
+	}
 	//! Whether a table entry may reuse its first bind-time describe (capability `bind_schema_cacheable`).
 	bool BindSchemaCacheable() const {
 		return bind_schema_cacheable_;
@@ -234,6 +237,9 @@ private:
 	bool string_order_pushable_ = false;
 	bool null_order_expressible_ = false;
 	bool bind_schema_cacheable_ = false;
+	//! Capability `dml_returning`: DELETE / UPDATE / MERGE … RETURNING. Refused at PLANNING otherwise, before any
+	//! action has written anything.
+	bool dml_returning_ = false;
 	bool supports_nested_schemas_ = false;
 	//! The provider's default schema (capability `default_schema`); empty => DuckDB's `main`.
 	string default_schema_;

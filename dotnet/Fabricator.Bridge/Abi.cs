@@ -344,6 +344,13 @@ public unsafe struct FabricatorVTable
     // int32 remote_translate(void* catalog, const uint8_t* plan, int64 plan_len, char** out_json, char** err)
     // — a Substrait plan to the provider's query; owned UTF-8, host frees via free_error.
     public delegate* unmanaged[Cdecl]<nint, byte*, long, byte**, byte**, int> RemoteTranslate;
+
+    // --- DELETE / UPDATE … RETURNING, ABI v98 ---
+
+    // int32 execute_modify_returning(void* handle, const char* const* schema_path, int32 schema_path_len,
+    //   const char* table, int32 set_count, ArrowArrayStream* in, ArrowArrayStream* out, char** err)
+    // set_count < 0: a DELETE, `in` = the keys; otherwise an UPDATE, `in` = [set values…, keys…].
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, int, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteModifyReturning;
 }
 
 /// <summary>

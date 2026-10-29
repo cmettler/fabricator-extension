@@ -275,11 +275,23 @@ DELETE FROM db.dbo.dp_heap WHERE CAST(n AS VARCHAR) = '2';
 ----
 primary key
 
-# RETURNING keeps the rowid path and its existing answer.
-statement error
+# RETURNING keeps the rowid path — the shortcut returns only a count — and returns the deleted rows from the DELETE's
+# own OUTPUT (ABI v98; verify_returning_mssql). Rolled back, so the tables stay as the later sections expect them.
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE id = 20 RETURNING id;
+----
+physical_plan	<REGEX>:.*Mssql Net Delete.*
+
+statement ok
+BEGIN;
+
+query I
 DELETE FROM db.dbo.dp_on WHERE id = 20 RETURNING id;
 ----
-RETURNING
+20
+
+statement ok
+ROLLBACK;
 
 # ═══ §5  UPDATE setup (ABI v94) ═════════════════════════════════════════════════════════════════════════
 # The same discipline for UPDATE: the SET values must render exactly too. Two identical tables again, with one
@@ -564,10 +576,22 @@ SELECT n FROM db.dbo.dp_heap WHERE id = 2;
 ----
 9
 
-statement error
-UPDATE db.dbo.du_on SET n = 1 WHERE id = 1 RETURNING id;
+# RETURNING keeps the rowid path and returns the new values from the UPDATE's own OUTPUT (ABI v98); rolled back
+query II
+EXPLAIN UPDATE db.dbo.du_on SET n = 1 WHERE id = 1 RETURNING id;
 ----
-RETURNING
+physical_plan	<REGEX>:.*Mssql Net Update.*
+
+statement ok
+BEGIN;
+
+query II
+UPDATE db.dbo.du_on SET n = 1 WHERE id = 1 RETURNING id, n;
+----
+1	1
+
+statement ok
+ROLLBACK;
 
 # ═══ §11  Timestamps on the ROWID path — bound as the column's own type ═════════════════════════════════════
 # SqlClient infers legacy `datetime` (≈3.33 ms) for a .NET DateTime. Against a datetime2 column that ROUNDED a

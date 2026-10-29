@@ -31,6 +31,7 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
     private readonly IArrowType[] _columnTypes;
     private readonly int _batchSize;
     private readonly bool _ownsConnection;
+    private readonly bool _ownsReader;
     private readonly InterruptScope? _interrupt;
     private readonly CancellationToken _token;
     private bool _done;
@@ -40,13 +41,14 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
 
     public DbDataReaderArrowStream(DbConnection connection, DbCommand command, DbDataReader reader,
                                    int batchSize = 2048, bool ownsConnection = true,
-                                   InterruptScope? interrupt = null)
+                                   InterruptScope? interrupt = null, bool ownsReader = true)
     {
         _connection = connection;
         _command = command;
         _reader = reader;
         _batchSize = batchSize;
         _ownsConnection = ownsConnection;
+        _ownsReader = ownsReader;
         _interrupt = interrupt;
         _token = interrupt?.Token ?? default;
 
@@ -167,8 +169,13 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
         {
             Log.LogDebug("reader released ({Why})", why);
         }
-        _reader.Dispose();
-        _command.Dispose();
+        // A reader the caller keeps (ownsReader: false) goes on to its NEXT result set — e.g. one OUTPUT result set
+        // per statement of a SqlBatch — so only the caller may close it.
+        if (_ownsReader)
+        {
+            _reader.Dispose();
+            _command.Dispose();
+        }
         // A borrowed (pinned-transaction) connection is owned by the catalog.
         if (_ownsConnection)
         {

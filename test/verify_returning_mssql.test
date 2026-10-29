@@ -1,0 +1,220 @@
+# name: test/verify_returning_mssql.test
+# description: DELETE / UPDATE / MERGE … RETURNING on SQL Server (ABI v98: the rows come back from the statement's own
+#              OUTPUT clause), and DuckDB 2.0's data-modifying CTE that moves rows between two tables.
+#              Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THE ORACLE IS A DuckDB TABLE. Every statement runs on the SQL Server table AND on an identical
+#              in-memory DuckDB table; what each RETURNING returned is captured with a data-modifying CTE
+#              (`WITH x AS (… RETURNING …) INSERT INTO <capture> SELECT * FROM x`), and the captures and the
+#              final contents must agree both ways. So the gate holds the rows to DuckDB's own semantics, not to
+#              what SQL Server happens to return.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# ═══ §0  Setup: the same rows on both sides ═══════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.ret_t; DROP TABLE IF EXISTS dbo.ret_stage; DROP TABLE IF EXISTS dbo.ret_arch;
+DROP TABLE IF EXISTS dbo.ret_trg; DROP TABLE IF EXISTS dbo.ret_log;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.ret_t (id INT PRIMARY KEY, v NVARCHAR(20), n DECIMAL(10,2), d DATE, ts DATETIME2(6));
+INSERT INTO dbo.ret_t SELECT value, CASE value % 4 WHEN 0 THEN NULL WHEN 1 THEN N''Äpfel'' ELSE N''v'' + CAST(value AS NVARCHAR) END,
+  value * 1.25, DATEADD(day, value, ''2026-01-01''), DATEADD(microsecond, value * 1234, CAST(''2026-03-04T05:06:07'' AS DATETIME2(6)))
+FROM GENERATE_SERIES(1, 30);
+CREATE TABLE dbo.ret_stage (id INT PRIMARY KEY, v NVARCHAR(20)); CREATE TABLE dbo.ret_arch (id INT PRIMARY KEY, v NVARCHAR(20));
+INSERT INTO dbo.ret_stage SELECT value, N''s'' + CAST(value AS NVARCHAR) FROM GENERATE_SERIES(1, 10);
+CREATE TABLE dbo.ret_trg (id INT PRIMARY KEY, v NVARCHAR(20)); CREATE TABLE dbo.ret_log (id INT, what NVARCHAR(10));
+INSERT INTO dbo.ret_trg VALUES (1, N''a''), (2, N''b''), (3, N''c'');');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TRIGGER dbo.ret_trg_t ON dbo.ret_trg AFTER INSERT, UPDATE, DELETE AS
+INSERT INTO dbo.ret_log SELECT id, N''old'' FROM deleted UNION ALL SELECT id, N''new'' FROM inserted;', refresh_cache := true);
+
+statement ok
+CREATE TABLE loc_t AS SELECT * FROM db.dbo.ret_t;
+
+statement ok
+CREATE TEMP TABLE got_db (step INTEGER, a VARCHAR, id INTEGER, v VARCHAR, n DECIMAL(18,2), d DATE, ts TIMESTAMP);
+
+statement ok
+CREATE TABLE got_loc (step INTEGER, a VARCHAR, id INTEGER, v VARCHAR, n DECIMAL(18,2), d DATE, ts TIMESTAMP);
+
+# ═══ §1  DELETE … RETURNING ═══════════════════════════════════════════════════════════════════════════
+
+query II
+EXPLAIN DELETE FROM db.dbo.ret_t WHERE n > 30 RETURNING *;
+----
+physical_plan	<REGEX>:.*Mssql Net Delete.*
+
+statement ok
+WITH x AS (DELETE FROM db.dbo.ret_t WHERE n > 30 RETURNING *) INSERT INTO got_db SELECT 1, NULL, id, v, n, d, ts FROM x;
+
+statement ok
+WITH x AS (DELETE FROM loc_t WHERE n > 30 RETURNING *) INSERT INTO got_loc SELECT 1, NULL, id, v, n, d, ts FROM x;
+
+# expressions over the returned row, and the rowid (the key)
+statement ok
+WITH x AS (DELETE FROM db.dbo.ret_t WHERE v = 'v6' OR v IS NULL AND id < 9 RETURNING id, upper(v) AS v, rowid AS n) INSERT INTO got_db (step, id, v, n) SELECT 2, id, v, n FROM x;
+
+statement ok
+WITH x AS (DELETE FROM loc_t WHERE v = 'v6' OR v IS NULL AND id < 9 RETURNING id, upper(v) AS v, id AS n) INSERT INTO got_loc (step, id, v, n) SELECT 2, id, v, n FROM x;
+
+# ═══ §2  UPDATE … RETURNING (the new values) ══════════════════════════════════════════════════════════
+
+statement ok
+WITH x AS (UPDATE db.dbo.ret_t SET v = v || '!', n = n * 2 WHERE id % 3 = 0 RETURNING *) INSERT INTO got_db SELECT 3, NULL, id, v, n, d, ts FROM x;
+
+statement ok
+WITH x AS (UPDATE loc_t SET v = v || '!', n = n * 2 WHERE id % 3 = 0 RETURNING *) INSERT INTO got_loc SELECT 3, NULL, id, v, n, d, ts FROM x;
+
+# ═══ §3  MERGE … RETURNING, every action ══════════════════════════════════════════════════════════════
+
+statement ok
+CREATE TABLE msrc AS SELECT * FROM (VALUES (1, 'm1'), (2, NULL), (4, 'm4'), (100, 'new')) s(id, v);
+
+# DuckDB does not take a MERGE as a CTE body, so both sides are compared with one expected answer — DuckDB's own,
+# produced by running the same sequence on a DuckDB table
+query TITTTT rowsort
+MERGE INTO db.dbo.ret_t t USING msrc s ON t.id = s.id
+  WHEN MATCHED AND s.v IS NULL THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)
+  RETURNING merge_action, *;
+----
+DELETE	2	v2	2.50	2026-01-03	2026-03-04 05:06:07.002468
+INSERT	100	new	NULL	NULL	NULL
+INSERT	4	m4	NULL	NULL	NULL
+UPDATE	1	m1	1.25	2026-01-02	2026-03-04 05:06:07.001234
+
+query TITTTT rowsort
+MERGE INTO loc_t t USING msrc s ON t.id = s.id
+  WHEN MATCHED AND s.v IS NULL THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)
+  RETURNING merge_action, *;
+----
+DELETE	2	v2	2.50	2026-01-03	2026-03-04 05:06:07.002468
+INSERT	100	new	NULL	NULL	NULL
+INSERT	4	m4	NULL	NULL	NULL
+UPDATE	1	m1	1.25	2026-01-02	2026-03-04 05:06:07.001234
+
+# ═══ §4  The returned rows and the final contents agree with DuckDB's ═════════════════════════════════
+
+query I
+SELECT count(*) FROM (SELECT * FROM got_db EXCEPT ALL SELECT * FROM got_loc);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM got_loc EXCEPT ALL SELECT * FROM got_db);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.ret_t EXCEPT ALL SELECT * FROM loc_t) UNION ALL
+SELECT count(*) FROM (SELECT * FROM loc_t EXCEPT ALL SELECT * FROM db.dbo.ret_t);
+----
+0
+0
+
+# ... not vacuously: every step returned rows
+query II rowsort
+SELECT step, count(*) FROM got_db GROUP BY step;
+----
+1	6
+2	3
+3	7
+
+# the rowid returned by a DELETE is the key
+query I
+SELECT count(*) FROM got_db WHERE step = 2 AND n <> id;
+----
+0
+
+# Plain RETURNING, not captured
+query IT
+DELETE FROM db.dbo.ret_t WHERE id = 1 RETURNING id, v;
+----
+1	m1
+
+query IT
+UPDATE db.dbo.ret_t SET v = 'u' WHERE id = 3 RETURNING id, v;
+----
+3	u
+
+# nothing affected: no rows, no error
+query I
+DELETE FROM db.dbo.ret_t WHERE id = 12345 RETURNING id;
+----
+
+# ═══ §5  The data-modifying CTE that MOVES rows (DuckDB 2.0) ══════════════════════════════════════════
+
+query I
+WITH moved AS MATERIALIZED (DELETE FROM db.dbo.ret_stage WHERE id <= 4 RETURNING *)
+INSERT INTO db.dbo.ret_arch SELECT * FROM moved;
+----
+4
+
+query II
+SELECT (SELECT count(*) FROM db.dbo.ret_stage), (SELECT string_agg(v, ',' ORDER BY id) FROM db.dbo.ret_arch);
+----
+6	s1,s2,s3,s4
+
+# inside a transaction: ROLLBACK undoes both halves
+statement ok
+BEGIN;
+
+statement ok
+WITH moved AS MATERIALIZED (DELETE FROM db.dbo.ret_stage RETURNING *) INSERT INTO db.dbo.ret_arch SELECT * FROM moved;
+
+query II
+SELECT (SELECT count(*) FROM db.dbo.ret_stage), (SELECT count(*) FROM db.dbo.ret_arch);
+----
+0	10
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM db.dbo.ret_stage), (SELECT count(*) FROM db.dbo.ret_arch);
+----
+6	4
+
+# ═══ §6  A table with an enabled trigger (SQL Server refuses OUTPUT without INTO there) ════════════════
+
+query IT
+DELETE FROM db.dbo.ret_trg WHERE id = 1 RETURNING id, v;
+----
+1	a
+
+query IT
+UPDATE db.dbo.ret_trg SET v = 'B' WHERE id = 2 RETURNING id, v;
+----
+2	B
+
+query IT
+INSERT INTO db.dbo.ret_trg VALUES (9, 'z') RETURNING id, v;
+----
+9	z
+
+# ... and the trigger fired for each of them
+query IT rowsort
+SELECT id, what FROM db.dbo.ret_log;
+----
+1	old
+2	new
+2	old
+9	new
+
+# ═══ §7  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.ret_t; DROP TABLE IF EXISTS dbo.ret_stage; DROP TABLE IF EXISTS dbo.ret_arch;
+DROP TABLE IF EXISTS dbo.ret_trg; DROP TABLE IF EXISTS dbo.ret_log;');

@@ -1212,6 +1212,16 @@ typedef struct FabricatorVTable {
 	// whatever it cannot reproduce exactly.
 	int32_t (*remote_translate)(FabricatorHandle catalog, const uint8_t *plan, int64_t plan_len, char **out_json,
 	                            char **err);
+
+	// -------------------------------------------------------------------------
+	// DELETE / UPDATE … RETURNING — ABI v98. The rowid DML of execute_delete / execute_update, exporting the
+	// affected rows into *out: every table column, in table order (a DELETE the old values, an UPDATE the new).
+	// set_count < 0: a DELETE and `in` carries the keys; otherwise an UPDATE and `in` carries
+	// [set values…, keys…]. Consumes/releases `in`. A provider that cannot return the rows refuses.
+	// -------------------------------------------------------------------------
+	int32_t (*execute_modify_returning)(FabricatorHandle handle, const char *const *schema_path,
+	                                    int32_t schema_path_len, const char *table, int32_t set_count,
+	                                    struct ArrowArrayStream *in, struct ArrowArrayStream *out, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1448,7 +1458,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 97
+#define FABRICATOR_ABI_VERSION 98
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen
