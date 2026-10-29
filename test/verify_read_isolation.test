@@ -180,6 +180,12 @@ SET mssql_materialize=false;
 statement ok
 SET mssql_read_isolation='snapshot';
 
+# ⚠ the refusal belongs to the SCAN routing, so the remote INSERT pushdown is held off: pushed, the same statement
+# has no scan at all — it reads inside one server statement on the transaction's connection
+# (verify_remote_insert_mssql), which is what read_isolation asks for.
+statement ok
+SET fabricator_dml_pushdown = false;
+
 statement ok
 BEGIN;
 
@@ -190,6 +196,9 @@ contradict each other
 
 statement ok
 ROLLBACK;
+
+statement ok
+RESET fabricator_dml_pushdown;
 
 statement ok
 SET mssql_materialize=true;

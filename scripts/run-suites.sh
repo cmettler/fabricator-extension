@@ -1036,7 +1036,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=76}"   # 2026-10-29: +verify_session_context_mssql; 2026-10-29: +verify_default_schema_mssql; 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
+        : "${MIN_SUITES:=77}"   # 2026-10-29: +verify_remote_insert_mssql; 2026-10-29: +verify_session_context_mssql; 2026-10-29: +verify_default_schema_mssql; 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1517,7 +1517,11 @@ case "$TIER" in
         # 2026-10-29: 5283 -> 5361, from a green 76-run tier: +verify_session_context_mssql (51, new; the session
         # tag function and its held-out suite are gone), verify_exec_invalidate_cache 33 -> 53 (refresh_cache :=),
         # verify_raw_query 85 -> 92 (duplicate column names, the two signatures). Nothing else moved.
-        : "${MIN_ASSERTIONS:=5361}"
+        # 2026-10-29: 5361 -> 5466, from a green 77-run tier: +verify_remote_insert_mssql (97, new), and
+        # verify_read_isolation / verify_mars_off_same_catalog +2 each in BOTH legs (the scan-routing refusal rows
+        # now hold the remote INSERT pushdown off). Nothing else moved.
+        # 2026-10-29: 5466 -> 5505: verify_remote_insert_mssql 97 -> 136 (CTAS over a pushed query). Nothing else moved.
+        : "${MIN_ASSERTIONS:=5505}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

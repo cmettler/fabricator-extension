@@ -39,6 +39,10 @@ struct FabricatorCtasInfo {
 	//! Whether the sink may run on SEVERAL tasks at once — see FabricatorInsertTarget::parallel for why this
 	//! governs the whole pipeline rather than only the sink. Decided in FabricatorCatalog::PlanCreateTableAs.
 	bool parallel = false;
+	//! Set when the source is a query this catalog pushed (FabricatorCatalog::RemoteInsertForCtas): the provider's
+	//! INSERT … SELECT that fills the table on the server. The table is still created by the bulk path, so its
+	//! types are the regular CTAS's; only the rows no longer travel.
+	string remote_insert_sql;
 };
 
 //! CREATE TABLE [schema].[table] AS SELECT ... — streams the SELECT result as
@@ -70,6 +74,29 @@ public:
 	                          OperatorSinkFinalizeInput &input) const override;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override;
+
+private:
+	FabricatorCtasInfo info_;
+};
+
+//! CREATE TABLE … AS whose query runs on the server (info.remote_insert_sql): creates the table through the bulk
+//! path with no rows, then fills it with one INSERT … SELECT on the transaction's connection. A source, no child.
+class FabricatorPhysicalRemoteCreateTableAs : public PhysicalOperator {
+public:
+	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
+
+	FabricatorPhysicalRemoteCreateTableAs(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                                      FabricatorCtasInfo info);
+
+	string GetName() const override {
+		return "FABRICATOR_REMOTE_CTAS";
+	}
+	bool IsSource() const override {
+		return true;
+	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
 

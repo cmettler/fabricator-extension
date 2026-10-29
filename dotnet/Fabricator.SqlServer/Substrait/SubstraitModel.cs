@@ -303,6 +303,19 @@ sealed class ReadRel : Rel
     public List<int>? Projection;
 }
 
+/// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] A write to a named table (only INSERT is translated).</summary>
+sealed class WriteRel : Rel
+{
+    public List<string> TableNames = new();
+    /// <summary>The columns written, in the input's column order; the table's other columns take their defaults.</summary>
+    public List<string> ColumnNames = new();
+    public List<SType> ColumnTypes = new();
+    public int Op;
+    public int Output;
+    public int CreateMode;
+    public Rel Input = null!;
+}
+
 sealed class FilterRel : Rel
 {
     public Rel Input = null!;

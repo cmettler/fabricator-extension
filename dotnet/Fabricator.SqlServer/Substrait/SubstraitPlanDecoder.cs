@@ -260,6 +260,7 @@ sealed class SubstraitPlanDecoder
                 case F.Rel_Cross: rel = ReadCrossRel(r.ReadMessage(wire)); break;
                 case F.Rel_TopN: rel = ReadTopNRel(r.ReadMessage(wire)); break;
                 case F.Rel_Window: rel = ReadWindowRel(r.ReadMessage(wire)); break; // [FABRICATOR-PATCH: OURS-BY-DESIGN] window functions
+                case F.Rel_Write: rel = ReadWriteRel(r.ReadMessage(wire)); break; // [FABRICATOR-PATCH: OURS-BY-DESIGN] INSERT … SELECT
                 default: throw SubstraitTranslationException.UnsupportedRelation(field);
             }
         }
@@ -300,6 +301,53 @@ sealed class SubstraitPlanDecoder
             }
         }
         return emit;
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A WriteRel: the target named table, the columns written
+    /// (<c>table_schema</c>, matched by the input's columns in order), the operation and the output mode.
+    /// </summary>
+    WriteRel ReadWriteRel(ProtoReader r)
+    {
+        var rel = new WriteRel();
+        var schema = new ReadRel();
+        bool hasSchema = false;
+        Rel? input = null;
+        while (r.Next(out int field, out int wire))
+        {
+            switch (field)
+            {
+                case F.WriteRel_NamedTable:
+                {
+                    var nr = r.ReadMessage(wire);
+                    while (nr.Next(out int nf, out int nw))
+                    {
+                        if (nf == F.NamedTable_Names) rel.TableNames.Add(nr.ReadString(nw));
+                        else if (nf == F.NamedTable_AdvancedExtension) CheckAdvancedExtension(nr.ReadMessage(nw), "NamedObjectWrite");
+                        else throw SubstraitTranslationException.UnexpectedField("NamedObjectWrite", nf);
+                    }
+                    break;
+                }
+                case F.WriteRel_ExtensionTable:
+                    throw SubstraitTranslationException.Unsupported("WriteRel extension_table is not supported; only named tables can be written.");
+                case F.WriteRel_TableSchema: ReadNamedStruct(r.ReadMessage(wire), schema); hasSchema = true; break;
+                case F.WriteRel_Op: rel.Op = r.ReadInt32(wire); break;
+                case F.WriteRel_Input: input = ReadRel(r.ReadMessage(wire)); break;
+                case F.WriteRel_Output: rel.Output = r.ReadInt32(wire); break;
+                case F.WriteRel_Common: rel.Emit = ReadRelCommon(r.ReadMessage(wire), "WriteRel"); break;
+                case F.WriteRel_CreateMode: rel.CreateMode = r.ReadInt32(wire); break;
+                case F.WriteRel_AdvancedExtension: CheckAdvancedExtension(r.ReadMessage(wire), "WriteRel"); break;
+                default: throw SubstraitTranslationException.UnexpectedField("WriteRel", field);
+            }
+        }
+        if (rel.TableNames.Count == 0)
+            throw SubstraitTranslationException.MalformedPlan("WriteRel has no named_table.");
+        if (!hasSchema)
+            throw SubstraitTranslationException.MalformedPlan("WriteRel has no table_schema.");
+        rel.ColumnNames = schema.ColumnNames;
+        rel.ColumnTypes = schema.ColumnTypes;
+        rel.Input = input ?? throw SubstraitTranslationException.MalformedPlan("WriteRel missing input.");
+        return rel;
     }
 
     ReadRel ReadReadRel(ProtoReader r)

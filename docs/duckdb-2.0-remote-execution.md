@@ -966,6 +966,100 @@ removed.
 **Not done:** string ORDER BY / min / max (would need the `_UTF8` collations of SQL Server 2019+ and a
 varbinary key), booleans, division, decimal arithmetic, expressions in GROUP BY, and a warehouse profile.
 
+### 4.4 `INSERT … SELECT` within the catalog — BUILT (2026-10-29, user-agreed order: DML through Substrait)
+
+An `INSERT … SELECT` whose source reads the same SQL Server catalog runs as ONE `INSERT INTO … (…) SELECT …` on the
+server. No ABI change: one additive key (`changes_rows`) in the `remote_translate` JSON and one additive init
+property on `RemoteQuery`.
+
+- **DuckDB side** (`remote_pushdown_optimizer.cpp:440`): for an INSERT whose target and SELECT are in one remote
+  catalog it asks `SupportsPushdown(InsertQueryNode)`; a yes hands the whole node to `RemoteExecute`, and the
+  result is re-wrapped `SELECT * FROM <our ref>`. We answer yes only for an INSERT with a SELECT that reads a
+  table, without RETURNING / ON CONFLICT / DEFAULT VALUES — so `INSERT … VALUES` never enters this path.
+- **Producer** (`to_substrait.cpp` `TransformInsertTable`, was a throwing stub): a `WriteRel` (`WRITE_OP_INSERT`,
+  `OUTPUT_MODE_NO_OUTPUT`). ⚠ DEVIATION FROM THE SPEC, on purpose: Substrait wants every table column in
+  `table_schema` with defaults stated in the input; we list only the columns the statement NAMES, found with the
+  same discriminator `FabricatorCatalog::PlanInsert` uses (2.0's `ResolveInputProjection` MOVES the bound default
+  out for an omitted column), so the server applies its own default (IDENTITY, `getdate()`) exactly as the bulk
+  insert does. The input is the child plus a `ProjectRel` whose emit keeps the named columns.
+- **Provider** (`SubstraitPlanDecoder.ReadWriteRel`, `TSqlEmitter.EmitInsert`): the input query is the ordinary
+  SELECT translation (every exactness refusal of §3.12 applies to the inserted values), rendered without ORDER BY
+  unless a TOP needs it. `SqlServerBackend.WriteDeclineReason` then declines where a server INSERT would behave
+  differently from the bulk insert, which is the reference: a named IDENTITY column (KeepIdentity there),
+  enabled triggers (a bulk copy fires none), an external table (rows go to storage), `mssql_keep_nulls = false`
+  (the bulk copy writes a column's default for a NULL). One metadata round trip, at bind.
+- **Execution** (`fabricator_remote_dml`, `fabricator_extension.cpp`): bind declares one BIGINT `Count`, sets
+  `call_return_type = CHANGED_ROWS` and calls `RegisterDBModify` — so a READ_ONLY attach refuses it and the
+  one-writer rule sees it, at the same point as for DuckDB's own INSERT. It runs once, when the statement
+  EXECUTES (EXPLAIN runs nothing), after `GetCatalogTransaction` and with the ambient transaction set NON-join-only:
+  `BeginWrite` pins the transaction's connection, so ROLLBACK undoes it even as the transaction's first write.
+- **Declined** (and with `SET fabricator_dml_pushdown = false`, the user's per-case switch for when streaming through
+  DuckDB with a parallel plan is faster): the INSERT runs on the regular path, wrapped `SELECT * FROM (INSERT …)`
+  (a DML node in a subquery; the statement still reports CHANGED_ROWS because the inner bind sets it last), and its
+  SELECT alone is offered to the Substrait pushdown, so an aggregate source is still computed on the server.
+
+Gate `verify_remote_insert_mssql` (97, service): routing (§1), a differential against the switch over filtered
+copies of every type, an aggregate into a wider decimal, a join with integer arithmetic in another column order,
+DISTINCT, ORDER BY … LIMIT, BY NAME, an empty result and a list-less insert (§2), server defaults on both paths
+(§3), the four declines (§4), transactions incl. the pushed insert as a first write, the one-writer rule and EXPLAIN
+(§5), READ_ONLY (§6). Five mutants, each killed at its own row: SupportsPushdown says no (59), join-only execution
+(329, the first-write rollback), no RegisterDBModify (383, one writer), no identity decline (270), no trigger
+decline (284). ⚠ My first expected total (41) was wrong by hand-summing; recomputed from the data, 38.
+
+⚠ THE TIER FOUND A BEHAVIOUR CHANGE THE GATE DID NOT: `verify_read_isolation` §6 and `verify_mars_off_same_catalog`
+§5 pin that `mssql_materialize=false` beside `read_isolation` is REFUSED for a same-catalog `INSERT … SELECT`
+("contradict each other"). That refusal lives in the SCAN routing; pushed, the statement has no scan and reads inside
+one server statement on the transaction's connection — which is what read_isolation asks for — so it now succeeds.
+Both rows now set `fabricator_dml_pushdown = false`, so they keep testing the refusal on the path it belongs to.
+⚠ And the first tier run failed the new suite on a TABLE NAME: `ri_src` is also `verify_mars_off_same_catalog`'s,
+and SQL Server compiles a whole batch against the existing table before its DROP runs (`213: Column name or number
+of supplied values does not match`). The suite's tables are `rins_*` now.
+
+### 4.5 `CREATE TABLE … AS` over a pushed query — BUILT (2026-10-29)
+
+A CTAS whose query the remote pushdown already sent to this catalog creates the table exactly as the regular CTAS
+does (the bulk path with `create_table` and no rows — same type mapping, `WITH` options, add-identity, hidden
+rowid) and then fills it with ONE `INSERT INTO … (…) SELECT …` on the transaction's connection
+(`FabricatorPhysicalRemoteCreateTableAs`, `EXPLAIN`: `Fabricator Remote Ctas`). No ABI change.
+
+- **Why not the optimizer's own CTAS pushdown:** a whole CREATE statement reaches a catalog only through
+  `EXECUTE_STATEMENT` + `RemoteExecute(SQLStatement)`, and that path has NO way back — a statement the provider
+  cannot translate cannot run locally instead (duckdb-postgres throws there). The CTAS's QUERY is already pushed
+  (`RewriteCreateInfo` → `FinishPushdown(query)`), so `FabricatorCatalog::PlanCreateTableAs` recognises it instead.
+- **Recognition** (`RemoteInsertForCtas`): every output column, followed through the wrapper's projections and
+  ORDER BY, is the pushed query's `c<i>` in order; the planned leaf is a `fabricator_query` table scan on this
+  catalog's handle with no `params` / `refresh_cache`; and its SQL is one this catalog pushed — the catalog keeps the
+  Substrait plan of every pushed query (`RememberRemotePlan`, keyed by the SQL, bounded at 256). That plan is wrapped
+  in the same WriteRel INSERT §4.4 uses and translated again, so every exactness rule and every decline applies.
+  Anything else — a plain scan (never pushed), a user's own `fabricator_query`, a source outside the catalog,
+  `WITH (location=…)`, `fabricator_dml_pushdown = false` — keeps the regular CTAS.
+- ⚠ **Three 2.0 facts it had to work around, each found by a failing smoke run:** (1) at physical planning the
+  column references are already POSITIONS (`BoundReferenceExpression`), not bindings; (2) `LogicalGet::parameters`
+  is EMPTY on 2.0 (the inputs are not kept), so the SQL comes from the bind data; (3) the child is planned BEFORE
+  `PlanCreateTableAs` and its bind data has MOVED into the `PhysicalTableScan` — reading it from the LogicalGet
+  dereferenced a null `unique_ptr` (an INTERNAL error). And `ArrowStreamBindData::Copy()` keeps only the base type,
+  so the query and handle live there (`query_sql` / `query_handle`), not on `fabricator_query`'s derived bind data.
+- ⚠ The wrapper's `CAST(c<i> AS <bound type>)` is skipped: the server converts the value into the column created
+  from that bound type. The differential compares the created column types and the rows, incl. `datetime2(7)`
+  values at a rounding tie and 50 ns short of the next second — identical.
+
+**A PRE-EXISTING DEFECT THE CTAS GATE FOUND, fixed:** inside a transaction that created or altered a table, a pushed
+query over that table blocked until the command timeout — `fabricator_query`'s bind-time DESCRIBE
+(`DescribeQuery`, `SET FMTONLY ON`) always opened a POOLED connection, which waits for the transaction's Sch-M lock.
+MEASURED with the regular CTAS (pushdown off): `BEGIN; CREATE TABLE t AS …; SELECT g, sum(x) FROM t GROUP BY g`
+answered correctly only after `mssql_command_timeout` (15 s set; the suite hung past 300 s on the default). The
+describe now runs on the transaction's own connection when it has one, and `QueryBind` sets the ambient transaction
+before describing. ⚠ It is a LATENCY defect — the answer was always right, from the execution's fallback — so no
+assertion can fail on it; the suite would hang instead.
+
+Gate `verify_remote_insert_mssql` 97 -> 136 (§7): routing incl. a plain scan, a local source and the switch; three
+CTAS pairs (aggregate with a string max; a join over every type under ORDER BY … LIMIT; DISTINCT + a window over
+datetime2(7)) with equal counts, rows both ways and column types; a CTAS inside BEGIN that the transaction reads and
+ROLLBACK removes; CREATE OR REPLACE; IF NOT EXISTS over an existing table. Mutant (never remote) killed at 432.
+
+**Next, user-agreed:** DELETE / UPDATE beyond the v93/v94 shortcut (subqueries, `RETURNING` via `OUTPUT`). MERGE
+stays on the rowid path (Substrait has no MERGE).
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

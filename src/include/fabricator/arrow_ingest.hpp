@@ -221,6 +221,12 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! For catalog tables: the backing table entry, so LogicalGet::GetTable()
 	//! resolves (required for UPDATE/DELETE). Null for raw table functions.
 	duckdb::optional_ptr<duckdb::TableCatalogEntry> table;
+	//! fabricator_query on an ATTACHED catalog with no options: the query and the catalog's handle. A CREATE TABLE AS
+	//! over a query the remote pushdown produced reads them back (FabricatorCatalog::RemoteInsertForCtas) — they
+	//! live here, not on the derived bind data, because DuckDB copies bind data through Copy(), which keeps only
+	//! this type. Empty / null otherwise.
+	duckdb::string query_sql;
+	void *query_handle = nullptr; // a FabricatorHandle
 
 	//! Required by DuckDB's late-materialization rewrite (LateMaterializationHelper::CreateLHSGet clones
 	//! the scan's bind data for the fetch-side get). Copies every post-bind member; `schema_root` /

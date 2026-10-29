@@ -74,6 +74,14 @@ public static class SqlServerSubstrait
     /// </summary>
     internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending,
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null)
+        => TranslatePushdown(plan, ignoreNulls, out columnCount, out orderDescending, out _, columnSqlTypes);
+
+    /// <param name="write">For a plan that writes (an INSERT … SELECT), the target table and the columns it
+    /// names; the query is then a statement with no result, and <paramref name="columnCount"/> is 1 — the
+    /// affected-row count the host reports. Null for a query.</param>
+    internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending,
+                                             out (IReadOnlyList<string> Table, IReadOnlyList<string> Columns)? write,
+                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null)
     {
         if (plan == null || plan.Length == 0)
         {
@@ -83,6 +91,15 @@ public static class SqlServerSubstrait
         RootRel root = decoder.DecodePlan();
         // IGNORE NULLS and DATETRUNC arrived together, with SQL Server 2022
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes) { SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls };
+        if (root.Input is WriteRel writeRel)
+        {
+            string sql = emitter.EmitInsert(writeRel);
+            write = (writeRel.TableNames, writeRel.ColumnNames);
+            columnCount = 1;
+            orderDescending = new List<bool>();
+            return sql;
+        }
+        write = null;
         return emitter.EmitPushdown(root, out columnCount, out orderDescending);
     }
 

@@ -19,6 +19,7 @@
 #include "catalog/fabricator_lateral.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_schema_entry.hpp"
+#include "catalog/fabricator_txn_util.hpp"
 #include "copy/fabricator_copy.hpp"
 #include "fabricator_optimizer.hpp"
 #include "fabricator_fs_spike.hpp"
@@ -31,6 +32,7 @@
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/main/config.hpp"
@@ -439,6 +441,10 @@ static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionB
 		}
 		refresh_catalog = &db->GetCatalog().Cast<FabricatorCatalog>();
 	}
+	if (!bind_data->owns_handle && params.IsNull() && !refresh_catalog) {
+		bind_data->query_sql = sql;
+		bind_data->query_handle = handle;
+	}
 	// The factory runs ONCE at bind (to read the schema) and again when the scan executes; only the second
 	// marks the catalog, so an EXPLAIN — which binds and never executes — leaves the cache alone.
 	auto executing = make_shared_ptr<bool>(false);
@@ -451,9 +457,72 @@ static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionB
 		}
 	};
 
+	// the describe runs on the transaction's own connection when it has one (a pooled one would wait for the
+	// transaction's schema locks), so the transaction must be the ambient one here, at bind
+	FabricatorSetActiveTxn(handle, context);
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
 	*executing = true;
 	return std::move(bind_data);
+}
+
+// --- fabricator_remote_dml(catalog VARCHAR, sql VARCHAR) -> Count BIGINT --------------------------------------------
+// The write half of the remote pushdown (src/catalog/fabricator_remote_select.cpp): a whole INSERT … SELECT the
+// provider translated into ONE statement of its own. It stands where DuckDB's own DML would, so it behaves like it:
+//  - it runs when the statement EXECUTES (an EXPLAIN binds and runs nothing), once;
+//  - on the transaction's OWN provider connection (BeginWrite, not fabricator_exec's join-only), with the catalog
+//    transaction started, so ROLLBACK undoes it and COMMIT commits it — autocommit and inside BEGIN alike;
+//  - it registers the write at bind (StatementProperties::RegisterDBModify), so a READ_ONLY attach refuses it and
+//    the one-writer-per-transaction rule sees it, exactly as for a native INSERT;
+//  - it reports CHANGED_ROWS with the provider's affected-row count.
+// Internal: the first argument must name an attached fabricator catalog.
+struct RemoteDmlBindData : public TableFunctionData {
+	string catalog_name;
+	string sql;
+};
+
+struct RemoteDmlGlobalState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+static FabricatorCatalog &RemoteDmlCatalog(ClientContext &context, const string &name) {
+	auto db = DatabaseManager::Get(context).GetDatabase(context, Identifier(name));
+	if (!db || !FabricatorCatalog::Is(db->GetCatalog())) {
+		throw BinderException("fabricator_remote_dml: '%s' is not an attached fabricator catalog", name);
+	}
+	return db->GetCatalog().Cast<FabricatorCatalog>();
+}
+
+static unique_ptr<FunctionData> RemoteDmlBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto data = make_uniq<RemoteDmlBindData>();
+	data->catalog_name = input.inputs[0].GetValue<string>();
+	data->sql = input.inputs[1].GetValue<string>();
+	auto &catalog = RemoteDmlCatalog(context, data->catalog_name);
+	if (input.binder) {
+		input.binder->GetStatementProperties().RegisterDBModify(catalog, context, DatabaseModificationType::INSERT_DATA);
+	}
+	return_types.push_back(LogicalType::BIGINT);
+	names.emplace_back("Count");
+	return std::move(data);
+}
+
+static unique_ptr<GlobalTableFunctionState> RemoteDmlInitGlobal(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<RemoteDmlGlobalState>();
+}
+
+static void RemoteDmlFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<RemoteDmlGlobalState>();
+	if (state.done) {
+		return;
+	}
+	state.done = true;
+	auto &bind = input.bind_data->Cast<RemoteDmlBindData>();
+	auto &catalog = RemoteDmlCatalog(context, bind.catalog_name);
+	catalog.GetCatalogTransaction(context); // so COMMIT / ROLLBACK reach the provider
+	FabricatorSetActiveTxn(catalog.GetHandle(), context);
+	auto rows = fabricator::ExecuteDml(catalog.GetHandle(), bind.sql);
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::BIGINT(rows));
 }
 
 // --- fabricator_functions(connection VARCHAR) ---------------------------------
@@ -716,6 +785,12 @@ query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY, Value());
 	// Rebuild the attached catalog's metadata cache after the query (see QueryBind). NULL default = off.
 	query_fn.GetSignature().AddKeywordOnly("refresh_cache", LogicalType::BOOLEAN, Value());
 	loader.RegisterFunction(query_fn);
+
+	// The write half of the remote pushdown (see RemoteDmlBind): reports as DML, not as a query.
+	TableFunction remote_dml_fn("fabricator_remote_dml", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                            RemoteDmlFunction, RemoteDmlBind, RemoteDmlInitGlobal);
+	remote_dml_fn.call_return_type = StatementReturnType::CHANGED_ROWS;
+	loader.RegisterFunction(remote_dml_fn);
 
 	// fabricator_functions(catalog|connstr) — lists discovered routines (diagnostic).
 	TableFunction functions_fn("fabricator_functions", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan,

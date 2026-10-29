@@ -209,6 +209,17 @@ public:
 	bool SupportsPushdown(const SQLStatement &statement) override;
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
 
+	//! The Substrait plan behind a query this catalog pushed (keyed by the query's SQL), so a CREATE TABLE AS over
+	//! it can become one INSERT … SELECT on the server (PlanCreateTableAs). Bounded; a miss only means the CTAS
+	//! streams its rows as before.
+	void RememberRemotePlan(const string &sql, const string &plan);
+	bool FindRemotePlan(const string &sql, string &plan);
+	//! CREATE TABLE … AS over a query this catalog pushed: the provider's INSERT … SELECT that fills the new table
+	//! (`columns`, in order) with no row leaving the server — empty, with `reason`, when it does not apply.
+	string RemoteInsertForCtas(ClientContext &context, LogicalOperator &source, PhysicalOperator &planned,
+	                           const string &schema, const string &table, const vector<string> &columns,
+	                           string &reason);
+
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
 	bool InMemory() override;
 	string GetDBPath() override;
@@ -228,6 +239,8 @@ private:
 	string default_schema_;
 	//! The provider runs a pushed SELECT (capability `remote_select`); see Supports().
 	bool remote_select_ = false;
+	mutex remote_plans_lock_;
+	unordered_map<string, string> remote_plans_;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
 	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().
 	bool exact_filter_pushdown_ = false;

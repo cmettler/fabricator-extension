@@ -131,6 +131,49 @@ internal sealed class TSqlEmitter
         return Render(block, items, keepOrder: true);
     }
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Writes a WriteRel INSERT with no output as
+    /// <c>INSERT INTO &lt;table&gt; (&lt;columns&gt;) &lt;query&gt;</c>. Only the columns the plan lists are
+    /// named, so the table's other columns take their own defaults (an IDENTITY, a <c>getdate()</c>) — the
+    /// host's producer lists exactly the columns the statement named. Order is not kept: an INSERT has none.
+    /// </summary>
+    public string EmitInsert(WriteRel write)
+    {
+        if (write.Op != F.WriteOp_Insert)
+        {
+            throw SubstraitTranslationException.Unsupported($"WriteRel operation {write.Op}; only INSERT is translated.");
+        }
+        if (write.Output == F.WriteOutput_ModifiedRecords)
+        {
+            throw SubstraitTranslationException.Unsupported("WriteRel output of the modified records (RETURNING).");
+        }
+        if (write.Emit != null)
+        {
+            throw SubstraitTranslationException.Unsupported("WriteRel with an output mapping.");
+        }
+        if (write.ColumnNames.Count == 0)
+        {
+            throw SubstraitTranslationException.MalformedPlan("WriteRel table_schema has no columns.");
+        }
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string name in write.ColumnNames)
+        {
+            if (!seen.Add(name))
+            {
+                throw SubstraitTranslationException.MalformedPlan($"WriteRel table_schema has duplicate column name '{name}'.");
+            }
+        }
+        var block = EmitRel(write.Input);
+        if (block.Columns.Count != write.ColumnNames.Count)
+        {
+            throw SubstraitTranslationException.MalformedPlan($"WriteRel writes {write.ColumnNames.Count} columns but its input has {block.Columns.Count}.");
+        }
+        string target = _tableName?.Invoke(write.TableNames) ?? string.Join(".", write.TableNames.Select(TSql.Identifier));
+        var names = Enumerable.Range(0, block.Columns.Count).Select(i => "c" + i.ToString(CultureInfo.InvariantCulture)).ToList();
+        return "INSERT INTO " + target + " (" + string.Join(", ", write.ColumnNames.Select(TSql.Identifier)) + ")\n" +
+               Render(block, SelectList(block, names), keepOrder: false);
+    }
+
     #region Relations
 
     private SelectBlock EmitRel(Rel rel)

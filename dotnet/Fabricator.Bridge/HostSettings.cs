@@ -79,9 +79,10 @@ internal static class HostSettings
             DmlPushdownName,
             ProviderSettingType.Bool,
             Default: true,
-            Description: "Run a DELETE whose whole WHERE translates exactly as one statement on the provider " +
-                         "(no scan, no row ids). On by default; turn it off to use the row-id path, which is " +
-                         "also the reference oracle for it."),
+            Description: "Run a DELETE or UPDATE whose whole WHERE translates exactly, and an INSERT … SELECT " +
+                         "reading the same catalog (remote_pushdown), as one statement on the provider. On by " +
+                         "default; turn it off to use the row-id path and the host's own insert, which are also " +
+                         "the reference oracle for it."),
         new ProviderSetting(
             PartitionStatsName,
             ProviderSettingType.Bool,

@@ -11,6 +11,7 @@
 #include "fabricator/arrow_produce.hpp"
 #include "fabricator/clr_host.hpp"
 #include "catalog/fabricator_schema_entry.hpp"
+#include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -129,6 +130,57 @@ SourceResultType FabricatorPhysicalCreateTableAs::GetDataInternal(ExecutionConte
 	gstate.returned = true;
 	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT((int64_t)gstate.total));
+	return SourceResultType::FINISHED;
+}
+
+// --- FabricatorPhysicalRemoteCreateTableAs -------------------------------------------------------------------------
+
+class FabricatorRemoteCtasState : public GlobalSourceState {
+public:
+	bool done = false;
+};
+
+FabricatorPhysicalRemoteCreateTableAs::FabricatorPhysicalRemoteCreateTableAs(PhysicalPlan &plan,
+                                                                             vector<LogicalType> types,
+                                                                             idx_t estimated_cardinality,
+                                                                             FabricatorCtasInfo info)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+      info_(std::move(info)) {
+}
+
+unique_ptr<GlobalSourceState> FabricatorPhysicalRemoteCreateTableAs::GetGlobalSourceState(ClientContext &) const {
+	return make_uniq<FabricatorRemoteCtasState>();
+}
+
+SourceResultType FabricatorPhysicalRemoteCreateTableAs::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                                      OperatorSourceInput &input) const {
+	auto &state = input.global_state.Cast<FabricatorRemoteCtasState>();
+	if (state.done) {
+		return SourceResultType::FINISHED;
+	}
+	state.done = true;
+	auto &client = context.client;
+	// 1. the table, exactly as the regular CTAS creates it: the bulk path with create_table and no rows
+	fabricator::ArrowProducer producer(info_.column_types, info_.column_names,
+	                                   fabricator::BoundaryClientProperties(client));
+	ArrowSchema schema;
+	std::memset(&schema, 0, sizeof(schema));
+	auto *stream = producer.Stream();
+	stream->get_schema(stream, &schema);
+	auto txn_id = (int64_t)client.ActiveTransaction().global_transaction_id;
+	auto session = fabricator::BeginBulk(info_.handle, info_.schema_path, info_.table_name, /*create_table=*/true,
+	                                     info_.replace, /*check_constraints=*/false, txn_id, schema,
+	                                     info_.partition_columns, info_.sort_columns, /*schema_mode=*/"",
+	                                     /*partition_overwrite=*/false, info_.options_json);
+	fabricator::CompleteBulk(session, /*abort=*/false);
+	// 2. its rows, by one INSERT … SELECT on the same (pinned) connection
+	FabricatorSetActiveTxn(info_.handle, client);
+	auto rows = fabricator::ExecuteDml(info_.handle, info_.remote_insert_sql);
+	if (info_.schema_entry) {
+		const_cast<FabricatorSchemaEntry &>(*info_.schema_entry).AddTable(info_.table_name, "BASE TABLE");
+	}
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, Value::BIGINT(rows));
 	return SourceResultType::FINISHED;
 }
 

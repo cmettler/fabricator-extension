@@ -85,6 +85,24 @@ internal static class SubstraitFields
     public const int Rel_AdvancedExtension = 10;
 
     // ── ReadRel ────────────────────────────────────────────────────
+    // ── WriteRel ([FABRICATOR-PATCH: OURS-BY-DESIGN]) ─────────────────
+    public const int WriteRel_NamedTable = 1;
+    public const int WriteRel_ExtensionTable = 2;
+    public const int WriteRel_TableSchema = 3;
+    public const int WriteRel_Op = 4;
+    public const int WriteRel_Input = 5;
+    public const int WriteRel_Output = 6;
+    public const int WriteRel_Common = 7;
+    public const int WriteRel_CreateMode = 8;
+    public const int WriteRel_AdvancedExtension = 9;
+    public const int WriteOp_Insert = 1;
+    public const int WriteOp_Delete = 2;
+    public const int WriteOp_Update = 3;
+    public const int WriteOp_Ctas = 4;
+    public const int WriteOutput_Unspecified = 0;
+    public const int WriteOutput_NoOutput = 1;
+    public const int WriteOutput_ModifiedRecords = 2;
+
     public const int ReadRel_Common = 1;
     public const int ReadRel_BaseSchema = 2;
     public const int ReadRel_Filter = 3;

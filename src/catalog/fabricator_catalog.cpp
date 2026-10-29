@@ -526,6 +526,9 @@ static bool FabricatorParallelWrite(ClientContext &context, optional_ptr<Physica
 	return PhysicalPlanGenerator::OrderPreservationRecursive(*plan) != OrderPreservationType::FIXED_ORDER;
 }
 
+static bool DmlPushdownEnabled(ClientContext &context);
+static void DmlTrace(const string &message);
+
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
@@ -546,6 +549,21 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	info.handle = handle_;
 	info.schema_entry = &op.schema.Cast<FabricatorSchemaEntry>();
 	info.parallel = FabricatorParallelWrite(context, &plan);
+
+	// The query was pushed to this catalog: fill the new table with one INSERT … SELECT on the server instead of
+	// streaming the rows out and back (docs/duckdb-2.0-remote-execution.md §4.5). Not for an external table
+	// (WITH location: its rows go to storage), and fabricator_dml_pushdown = false keeps the stream.
+	if (remote_select_ && !create_info.options.count("location") && DmlPushdownEnabled(context)) {
+		string reason;
+		info.remote_insert_sql = RemoteInsertForCtas(context, *op.children[0], plan, info.schema_name,
+		                                             info.table_name, info.column_names, reason);
+		if (!info.remote_insert_sql.empty()) {
+			vector<LogicalType> remote_types {LogicalType::BIGINT};
+			return planner.Make<FabricatorPhysicalRemoteCreateTableAs>(std::move(remote_types),
+			                                                         op.estimated_cardinality, std::move(info));
+		}
+		DmlTrace("ctas streams its rows: " + reason);
+	}
 
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	auto &ctas = planner.Make<FabricatorPhysicalCreateTableAs>(std::move(result_types), op.estimated_cardinality,

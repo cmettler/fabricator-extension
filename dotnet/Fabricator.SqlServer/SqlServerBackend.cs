@@ -1615,28 +1615,23 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     {
         try
         {
+            // ⚠ On the transaction's OWN connection when it has one. A pooled connection waits for every schema
+            // lock the transaction holds — a table it created or altered (Sch-M until COMMIT) — so describing a
+            // query over that table blocked until the command timeout, then fell back to executing. MEASURED:
+            // BEGIN; CREATE TABLE t AS …; SELECT g, sum(x) FROM t GROUP BY g (pushed) took the full timeout.
+            if (AmbientTransaction.Current != 0 && _txns.TryGet(AmbientTransaction.Current) is { } state)
+            {
+                lock (state)
+                {
+                    if (state.Connection is not null)
+                    {
+                        return DescribeOn(state.Connection, state.Transaction, sql, parameters);
+                    }
+                }
+            }
             using var connection = OpenConnection();
             connection.Open();
-            using var command = connection.CreateCommand();
-            command.CommandText = sql;
-            command.CommandType = CommandType.Text;
-            command.CommandTimeout = ResolveCommandTimeout();
-            AddParameters(command, parameters);
-            using var reader = command.ExecuteReader(CommandBehavior.SchemaOnly);
-            var columns = reader.GetColumnSchema();
-            if (columns.Count == 0)
-            {
-                // No result set to describe (a bare INSERT, a DDL batch). Returning null rather than an empty
-                // schema matters: an empty schema is a CLAIM about the result, and a zero-column Arrow stream
-                // cannot cross the boundary anyway.
-                return null;
-            }
-            var fields = new Field[columns.Count];
-            for (int i = 0; i < columns.Count; i++)
-            {
-                fields[i] = Fabricator.Bridge.Conversion.SqlArrowMapping.ToArrowField(columns[i]);
-            }
-            return new Schema(fields, metadata: null);
+            return DescribeOn(connection, null, sql, parameters);
         }
         catch (Exception ex)
         {
@@ -1646,6 +1641,32 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             Log.LogDebug(ex, "describe_query: could not describe without executing; falling back to execution");
             return null;
         }
+    }
+
+    private Schema? DescribeOn(SqlConnection connection, SqlTransaction? transaction, string sql,
+                               IReadOnlyList<SqlParameter>? parameters)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        command.CommandType = CommandType.Text;
+        command.CommandTimeout = ResolveCommandTimeout();
+        AddParameters(command, parameters);
+        using var reader = command.ExecuteReader(CommandBehavior.SchemaOnly);
+        var columns = reader.GetColumnSchema();
+        if (columns.Count == 0)
+        {
+            // No result set to describe (a bare INSERT, a DDL batch). Returning null rather than an empty
+            // schema matters: an empty schema is a CLAIM about the result, and a zero-column Arrow stream
+            // cannot cross the boundary anyway.
+            return null;
+        }
+        var fields = new Field[columns.Count];
+        for (int i = 0; i < columns.Count; i++)
+        {
+            fields[i] = Fabricator.Bridge.Conversion.SqlArrowMapping.ToArrowField(columns[i]);
+        }
+        return new Schema(fields, metadata: null);
     }
 
     public IArrowArrayStream ExecuteQuery(string sql) => ExecuteQuery(sql, (IReadOnlyList<SqlParameter>?)null);
@@ -3002,6 +3023,29 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             return null;
         }
+        string sql;
+        int columnCount;
+        List<bool> orderDescending;
+        (IReadOnlyList<string> Table, IReadOnlyList<string> Columns)? write;
+        try
+        {
+            var special = UncollatableColumns();
+            sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
+                substraitPlan, HasIgnoreNulls, out columnCount, out orderDescending, out write,
+                names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null);
+        }
+        catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
+        {
+            return RemoteQuery.Declined(ex.Message); // what the emitter refuses is an answer, not a failure
+        }
+        if (write is { } target)
+        {
+            // A write runs on the transaction's own connection (the host's fabricator_remote_dml), so the no-MARS
+            // concern below does not apply; what must hold instead is that it does what the host's insert would.
+            return WriteDeclineReason(target.Table, target.Columns) is { } reason
+                ? RemoteQuery.Declined(reason)
+                : new RemoteQuery(sql, columnCount, orderDescending) { ChangesRows = true };
+        }
         // The pushed query runs through fabricator_query, i.e. as a plain pooled read. Inside a transaction
         // that holds a connection without MARS (and without the read_isolation pin), that read would sit
         // beside the transaction's own uncommitted writes and wait forever for its locks. The local scan
@@ -3017,18 +3061,46 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 }
             }
         }
-        try
+        return new RemoteQuery(sql, columnCount, orderDescending);
+    }
+
+    /// <summary>
+    /// Why a pushed <c>INSERT … SELECT</c> into <paramref name="table"/> would NOT do what the host's own insert
+    /// (the bulk copy) does — null when it would. The bulk copy is the reference, so each difference declines
+    /// rather than changing behaviour: an IDENTITY column the statement names (KeepIdentity there; an INSERT
+    /// would need IDENTITY_INSERT), enabled triggers (a bulk copy fires none), an external table (its rows go
+    /// to storage, not to SQL Server), and <c>mssql_keep_nulls = false</c> (the bulk copy then writes a
+    /// column's default for a NULL).
+    /// </summary>
+    private string? WriteDeclineReason(IReadOnlyList<string> table, IReadOnlyList<string> columns)
+    {
+        if (table.Count != 2)
         {
-            var special = UncollatableColumns();
-            string sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
-                substraitPlan, HasIgnoreNulls, out int columnCount, out var orderDescending,
-                names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null);
-            return new RemoteQuery(sql, columnCount, orderDescending);
+            return "the insert target is not a schema-qualified table";
         }
-        catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
+        if (!ResolveKeepNulls())
         {
-            return RemoteQuery.Declined(ex.Message); // what the emitter refuses is an answer, not a failure
+            return "mssql_keep_nulls = false replaces a NULL by the column default, an INSERT … SELECT does not";
         }
+        const string probe =
+            "SELECT N'external', name FROM sys.external_tables WHERE object_id = OBJECT_ID(@obj) " +
+            "UNION ALL SELECT N'trigger', name FROM sys.triggers WHERE parent_id = OBJECT_ID(@obj) AND is_disabled = 0 " +
+            "UNION ALL SELECT N'identity', name FROM sys.columns WHERE object_id = OBJECT_ID(@obj) AND is_identity = 1";
+        var named = new HashSet<string>(columns, StringComparer.OrdinalIgnoreCase);
+        var parameters = new[] { new SqlParameter("@obj", Quote(table[0]) + "." + Quote(table[1])) };
+        foreach (var row in ReadMetadataRows(probe, 2, parameters))
+        {
+            switch (row[0])
+            {
+                case "external":
+                    return $"{table[0]}.{table[1]} is an external table";
+                case "trigger":
+                    return $"{table[0]}.{table[1]} has the enabled trigger {row[1]}, which a bulk insert does not fire";
+                case "identity" when row[1] is { } identity && named.Contains(identity):
+                    return $"the insert names the IDENTITY column {identity}";
+            }
+        }
+        return null;
     }
 
     // Builds a two-column (property, value) stream from the detected ServerProfile. Accessing Profile

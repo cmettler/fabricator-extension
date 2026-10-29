@@ -360,10 +360,19 @@ COMMIT;
 statement ok
 SET mssql_materialize='false';
 
+# ⚠ the refusal belongs to the SCAN routing, so the remote INSERT pushdown is held off: pushed, the same statement
+# has no scan at all — it reads inside one server statement on the transaction's connection
+# (verify_remote_insert_mssql), which is what read_isolation asks for.
+statement ok
+SET fabricator_dml_pushdown = false;
+
 statement error
 INSERT INTO r_iso.dbo.ri_dst SELECT a FROM r_iso.dbo.ri_src;
 ----
 contradict each other
+
+statement ok
+RESET fabricator_dml_pushdown;
 
 statement ok
 RESET mssql_materialize;

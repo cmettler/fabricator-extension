@@ -663,7 +663,8 @@ public static unsafe class Bootstrap
         }
     }
 
-    // remote_translate (ABI v96): {"sql":"…","columns":N,"order":[desc,…]}, {"reason":"…"} when the provider
+    // remote_translate (ABI v96): {"sql":"…","columns":N,"order":[desc,…]} (+ "changes_rows":true for a write),
+    // {"reason":"…"} when the provider
     // declines with a reason, or {} when it declines without one.
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int RemoteTranslate(nint handle, byte* plan, long planLength, byte** outJson, byte** err)
@@ -688,6 +689,10 @@ public static unsafe class Bootstrap
                 {
                     json.WriteString("sql", query.Sql);
                     json.WriteNumber("columns", query.ColumnCount);
+                    if (query.ChangesRows)
+                    {
+                        json.WriteBoolean("changes_rows", true);
+                    }
                     json.WriteStartArray("order");
                     foreach (bool descending in query.OrderDescending)
                     {

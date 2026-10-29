@@ -24,15 +24,18 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
@@ -42,11 +45,17 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/subquery/flatten_dependent_join.hpp"
 #include "duckdb/planner/subquery/recursive_dependent_join_planner.hpp"
+#include "fabricator/arrow_ingest.hpp"
 #include "fabricator/clr_host.hpp"
 #include "to_substrait.hpp"
+#include "substrait/plan.pb.h"
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -153,11 +162,33 @@ void RestoreCatalogInExpression(ParsedExpression &expr, const Identifier &catalo
 	    expr, [&](ParsedExpression &child) { RestoreCatalogInExpression(child, catalog, default_schema, ctes); });
 }
 
-//! The optimizer stripped this catalog's name from every table it pushed; put it back.
+//! The optimizer stripped this catalog's name from every table it pushed; put it back — the INSERT target too,
+//! which is a name on the node rather than a table reference.
 void RestoreCatalog(QueryNode &node, const Identifier &catalog, const Identifier &default_schema) {
 	case_insensitive_set_t ctes;
 	CollectCteNames(node, ctes);
 	RestoreCatalog(node, catalog, default_schema, ctes);
+	if (node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		auto &insert = node.Cast<InsertQueryNode>();
+		auto &name = insert.qualified_name;
+		if (name.Catalog().empty()) {
+			insert.SetQualifiedName(catalog, name.Schema().empty() ? default_schema : name.Schema(), name.Name());
+		}
+	}
+}
+
+//! Whether a query reads a table at all (a CTE name counts too — over-approximated, harmless: a false yes only
+//! means the plan is bound and then declined).
+bool ReadsTable(QueryNode &node) {
+	bool found = false;
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [&](unique_ptr<ParsedExpression> &) {},
+	    [&](TableRef &ref) {
+		    if (ref.type == TableReferenceType::BASE_TABLE) {
+			    found = true;
+		    }
+	    });
+	return found;
 }
 
 //! The pushed query as the provider's own, through Substrait (ABI v96; docs/duckdb-2.0-remote-execution.md §3.12):
@@ -262,9 +293,11 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 	auto columns_value = yyjson_obj_get(root, "columns");
 	auto order_value = yyjson_obj_get(root, "order");
 	auto reason_value = yyjson_obj_get(root, "reason");
+	auto writes_value = yyjson_obj_get(root, "changes_rows");
 	string sql = yyjson_is_str(sql_value) ? yyjson_get_str(sql_value) : "";
 	string declined = yyjson_is_str(reason_value) ? yyjson_get_str(reason_value) : "the provider declined the plan";
 	int64_t columns = yyjson_is_int(columns_value) ? yyjson_get_sint(columns_value) : -1;
+	bool changes_rows = yyjson_is_bool(writes_value) && yyjson_get_bool(writes_value);
 	vector<bool> descending;
 	if (yyjson_is_arr(order_value)) {
 		size_t index, count;
@@ -284,6 +317,20 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 		return nullptr;
 	}
 	RemoteTrace("remote: " + sql);
+	if (!changes_rows) {
+		catalog.RememberRemotePlan(sql, plan_bytes);
+	}
+
+	if (changes_rows) {
+		// A write: fabricator_remote_dml runs it on this transaction's own connection when the statement EXECUTES
+		// and yields its changed-row count as DuckDB's own DML does (one BIGINT column, CHANGED_ROWS).
+		vector<unique_ptr<ParsedExpression>> dml_args;
+		dml_args.push_back(ConstantExpression::String(catalog.GetName().GetIdentifierName()));
+		dml_args.push_back(ConstantExpression::String(sql));
+		auto dml = make_uniq<TableFunctionRef>();
+		dml->function = make_uniq<FunctionExpression>(Identifier("fabricator_remote_dml"), std::move(dml_args));
+		return std::move(dml);
+	}
 
 	// ⚠ Every reference to the server's columns is QUALIFIED with the function's alias, so a user alias can never
 	// shadow one (a select list sees earlier items' aliases, ORDER BY binds a select alias first).
@@ -319,7 +366,203 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
+//! Follows each output column of `op` down to the column of the pushed query it is, `c<j>` -> j, through the
+//! projections and the ORDER BY the pushdown wraps a query in. False for anything else in between — a filter,
+//! a computed expression — and for a scan that is not fabricator_query. ⚠ Called from physical planning, where
+//! the column references are already POSITIONS into the child (BoundReferenceExpression), not bindings.
+bool MapToRemoteColumns(LogicalOperator &op, vector<int64_t> &out, optional_ptr<LogicalGet> &get_out) {
+	auto from_child = [&](const vector<idx_t> &positions) {
+		vector<int64_t> child_map;
+		if (op.children.size() != 1 || !MapToRemoteColumns(*op.children[0], child_map, get_out)) {
+			return false;
+		}
+		for (auto position : positions) {
+			if (position >= child_map.size()) {
+				return false;
+			}
+			out.push_back(child_map[position]);
+		}
+		return true;
+	};
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = op.Cast<LogicalGet>();
+		if (get.function.GetName() != "fabricator_query") {
+			return false;
+		}
+		auto &ids = get.GetColumnIds();
+		auto projected = get.projection_ids.size();
+		auto count = projected ? projected : ids.size();
+		for (idx_t p = 0; p < count; p++) {
+			auto &id = ids[projected ? get.projection_ids[p].GetIndex() : p];
+			if (id.IsVirtualColumn()) {
+				return false;
+			}
+			auto name = get.names[id.GetPrimaryIndex()].GetIdentifierName();
+			int64_t j = -1;
+			if (name.size() > 1 && name[0] == 'c' && name.find_first_not_of("0123456789", 1) == string::npos) {
+				j = std::stoll(name.substr(1));
+			}
+			out.push_back(j);
+		}
+		get_out = &get;
+		return true;
+	}
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		vector<idx_t> positions;
+		for (auto &expr : op.expressions) {
+			const Expression *e = expr.get();
+			while (BoundCastExpression::IsCast(*e)) {
+				e = &BoundCastExpression::Child(e->Cast<BoundFunctionExpression>());
+			}
+			if (e->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+				return false;
+			}
+			positions.push_back(e->Cast<BoundReferenceExpression>().Index());
+		}
+		return from_child(positions);
+	}
+	case LogicalOperatorType::LOGICAL_ORDER_BY: {
+		auto &order = op.Cast<LogicalOrder>();
+		vector<idx_t> positions;
+		if (order.projection_map.empty()) {
+			for (idx_t i = 0; i < op.children[0]->types.size(); i++) {
+				positions.push_back(i);
+			}
+		} else {
+			for (auto &index : order.projection_map) {
+				positions.push_back(index);
+			}
+		}
+		return from_child(positions);
+	}
+	default:
+		return false;
+	}
+}
+
 } // namespace
+
+void FabricatorCatalog::RememberRemotePlan(const string &sql, const string &plan) {
+	lock_guard<mutex> guard(remote_plans_lock_);
+	if (remote_plans_.size() >= 256) {
+		remote_plans_.clear();
+	}
+	remote_plans_[sql] = plan;
+}
+
+bool FabricatorCatalog::FindRemotePlan(const string &sql, string &plan) {
+	lock_guard<mutex> guard(remote_plans_lock_);
+	auto it = remote_plans_.find(sql);
+	if (it == remote_plans_.end()) {
+		return false;
+	}
+	plan = it->second;
+	return true;
+}
+
+string FabricatorCatalog::RemoteInsertForCtas(ClientContext &context, LogicalOperator &source,
+                                              PhysicalOperator &planned, const string &schema, const string &table,
+                                              const vector<string> &columns, string &reason) {
+	// the source must be exactly a query this catalog pushed, its columns in order
+	vector<int64_t> map;
+	optional_ptr<LogicalGet> get;
+	if (!MapToRemoteColumns(source, map, get) || !get) {
+		reason = "the source is not a pushed query";
+		return "";
+	}
+	if (map.size() != columns.size()) {
+		reason = "the source has another column count";
+		return "";
+	}
+	for (idx_t i = 0; i < map.size(); i++) {
+		if (map[i] != static_cast<int64_t>(i)) {
+			reason = "the source reorders the pushed query's columns";
+			return "";
+		}
+	}
+	// fabricator_query on THIS catalog with no options, as the pushdown writes it. 2.0's LogicalGet keeps no
+	// inputs, and by now its bind data has MOVED into the physical scan (the child is planned before the CTAS),
+	// so the query is read from there — the one table scan at the bottom of the planned chain.
+	optional_ptr<PhysicalOperator> leaf = &planned;
+	while (leaf->children.size() == 1) {
+		leaf = &leaf->children[0].get();
+	}
+	if (!leaf->children.empty() || leaf->type != PhysicalOperatorType::TABLE_SCAN) {
+		reason = "the planned source is not one scan";
+		return "";
+	}
+	auto &scan = leaf->Cast<PhysicalTableScan>();
+	if (scan.function.GetName() != "fabricator_query" || !scan.bind_data) {
+		reason = "the planned source is not fabricator_query";
+		return "";
+	}
+	auto &query = scan.bind_data->Cast<::fabricator::ArrowStreamBindData>();
+	if (query.query_handle != GetHandle() || query.query_sql.empty()) {
+		reason = "the source query is not this catalog's";
+		return "";
+	}
+	string plan_bytes;
+	if (!FindRemotePlan(query.query_sql, plan_bytes)) {
+		reason = "the source query was not pushed by this catalog";
+		return "";
+	}
+	// its plan, wrapped in a WriteRel INSERT into the new table — the same translation an INSERT … SELECT gets
+	substrait::Plan plan;
+	if (!plan.ParseFromString(plan_bytes)) {
+		reason = "the pushed plan does not parse";
+		return "";
+	}
+	substrait::RelRoot *root = nullptr;
+	for (auto &rel : *plan.mutable_relations()) {
+		if (rel.has_root()) {
+			root = rel.mutable_root();
+		}
+	}
+	if (!root) {
+		reason = "the pushed plan has no root";
+		return "";
+	}
+	auto write_rel = make_uniq<substrait::Rel>();
+	auto write = write_rel->mutable_write();
+	write->set_op(substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_INSERT);
+	write->set_output(substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_NO_OUTPUT);
+	write->mutable_named_table()->add_names(schema);
+	write->mutable_named_table()->add_names(table);
+	for (auto &column : columns) {
+		write->mutable_table_schema()->add_names(column);
+	}
+	write->set_allocated_input(root->release_input());
+	root->set_allocated_input(write_rel.release());
+	root->clear_names();
+
+	string json;
+	try {
+		FabricatorSetActiveTxn(GetHandle(), context);
+		json = fabricator::RemoteTranslate(GetHandle(), plan.SerializeAsString());
+	} catch (std::exception &ex) {
+		reason = ErrorData(ex).RawMessage();
+		return "";
+	}
+	auto doc = yyjson_read(json.data(), json.size(), 0);
+	if (!doc) {
+		reason = "remote_translate returned malformed JSON";
+		return "";
+	}
+	auto obj = yyjson_doc_get_root(doc);
+	auto sql_value = yyjson_obj_get(obj, "sql");
+	auto writes_value = yyjson_obj_get(obj, "changes_rows");
+	auto reason_value = yyjson_obj_get(obj, "reason");
+	string sql = yyjson_is_str(sql_value) ? yyjson_get_str(sql_value) : "";
+	bool writes = yyjson_is_bool(writes_value) && yyjson_get_bool(writes_value);
+	reason = yyjson_is_str(reason_value) ? yyjson_get_str(reason_value) : "the provider declined the insert";
+	yyjson_doc_free(doc);
+	if (sql.empty() || !writes) {
+		return "";
+	}
+	RemoteTrace("remote ctas: " + sql);
+	return sql;
+}
 
 bool FabricatorCatalog::Supports(RemoteCapability capability) const {
 	switch (capability) {
@@ -346,21 +589,53 @@ bool FabricatorCatalog::SupportsPushdown(const SQLStatement &statement) {
 
 bool FabricatorCatalog::SupportsPushdown(const QueryNode &node) {
 	// SELECT and set operations; RemoteExecute binds them and declines what does not translate. DELETE and UPDATE
-	// keep the plan-less shortcut (ABI v93/v94), which keeps DuckDB's binding and its affected-row count; INSERT
-	// and MERGE keep the rowid path.
-	return node.type == QueryNodeType::SELECT_NODE || node.type == QueryNodeType::SET_OPERATION_NODE;
+	// keep the plan-less shortcut (ABI v93/v94), which keeps DuckDB's binding and its affected-row count; MERGE
+	// keeps the rowid path.
+	if (node.type == QueryNodeType::SELECT_NODE || node.type == QueryNodeType::SET_OPERATION_NODE) {
+		return true;
+	}
+	// INSERT … SELECT reading a table of this catalog: one INSERT … SELECT on the server, no rows travel. Only that
+	// shape — an INSERT … VALUES gains nothing and keeps the host's own insert untouched, and RETURNING / ON
+	// CONFLICT / DEFAULT VALUES are not translated.
+	if (node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		auto &insert = node.Cast<InsertQueryNode>();
+		return insert.select_statement && insert.returning_list.empty() && !insert.on_conflict_info &&
+		       !insert.default_values && ReadsTable(*insert.select_statement->node);
+	}
+	return false;
 }
 
 unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
 	Identifier default_schema(GetDefaultSchema().value_or(Identifier("dbo")));
 	string reason;
-	if (auto pushed = SubstraitPushdown(context, *this, *node, default_schema, reason)) {
+	const bool is_insert = node->type == QueryNodeType::INSERT_QUERY_NODE;
+	Value dml_enabled;
+	if (is_insert && context.TryGetCurrentSetting("fabricator_dml_pushdown", dml_enabled) && !dml_enabled.IsNull() &&
+	    !dml_enabled.GetValue<bool>()) {
+		// the switch exists for the case where streaming the rows through DuckDB is FASTER (a parallel plan the
+		// server would not choose for an INSERT … SELECT) — and it is the reference oracle of the differential gate
+		reason = "fabricator_dml_pushdown = false";
+	} else if (auto pushed = SubstraitPushdown(context, *this, *node, default_schema, reason)) {
 		return pushed;
 	}
 	// DECLINE: the statement as written, this catalog's name restored on every table (the optimizer stripped it),
 	// so it binds and runs locally
 	RemoteTrace("local: " + reason);
 	RestoreCatalog(*node, GetName(), default_schema);
+	if (is_insert) {
+		// the rows go through the host's own insert, but the query that produces them can still run on the server
+		auto &insert = node->Cast<InsertQueryNode>();
+		string select_reason;
+		if (auto pushed = SubstraitPushdown(context, *this, *insert.select_statement->node, default_schema,
+		                                    select_reason)) {
+			auto select = make_uniq<SelectNode>();
+			select->select_list.push_back(make_uniq<StarExpression>());
+			select->from_table = std::move(pushed);
+			insert.select_statement->node = std::move(select);
+		} else {
+			RemoteTrace("local select: " + select_reason);
+		}
+	}
 	auto declined = make_uniq<SelectStatement>();
 	declined->node = std::move(node);
 	return make_uniq<SubqueryRef>(std::move(declined));

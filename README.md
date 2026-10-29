@@ -328,6 +328,27 @@ DuckDB and stays `ß` on the server, likewise `µ`, `ſ`, Greek symbol forms and
 umlauts and accents agree. This also applies to a DuckDB `nocase` collation, which DuckDB binds as `lower()`.
 Overflows are an error on both sides.
 
+**`INSERT … SELECT` within the catalog.** When the `SELECT` reads tables of the same catalog and translates
+exactly, the whole statement runs as ONE `INSERT INTO … (…) SELECT …` on the server — no row travels through
+DuckDB. `EXPLAIN` shows `FABRICATOR_REMOTE_DML`; the statement reports its changed rows like any `INSERT`, runs on
+the transaction's own connection (`ROLLBACK` undoes it, also as a transaction's first write), and a `READ_ONLY`
+attach refuses it. Only the columns the statement names are written, so the server applies its own defaults to the
+others — exactly what the regular insert does. It stays on the regular insert (DuckDB streams the rows into a bulk
+copy, and the `SELECT` alone is still pushed when worth it) for `INSERT … VALUES`, `RETURNING`, `ON CONFLICT`, a
+source outside the catalog, a named `IDENTITY` column, a table with enabled triggers (a bulk copy fires none), an
+external table, and `mssql_keep_nulls = false`. `SET fabricator_dml_pushdown = false` keeps every insert on the
+regular path — use it per statement when streaming through DuckDB is faster than the server's own plan.
+
+```sql
+INSERT INTO mssql.dbo.sales_2026 (id, region, amount)
+SELECT id, region, amount FROM mssql.dbo.sales WHERE year(sold) = 2026;   -- one statement on the server
+```
+
+`CREATE TABLE … AS` over such a query works the same way: the table is created exactly as before (same column
+types and `WITH` options), then filled by one `INSERT … SELECT` on the server; `EXPLAIN` shows
+`Fabricator Remote Ctas`. A CTAS over a plain table scan, over local data or with `WITH (location=…)` streams its
+rows as before, and so does every CTAS under `SET fabricator_dml_pushdown = false`.
+
 Needs SQL Server 2019+ or Azure SQL (exact string semantics rest on UTF-8 collations); ignored on a Fabric /
 Synapse warehouse; read once at ATTACH. `FABRICATOR_DUMP_REMOTE=1` prints each decision and the T-SQL sent.
 
@@ -4126,7 +4147,7 @@ Settings the extension itself owns rather than a provider, so they exist even wh
 |---------|--------|-------------|
 | `fabricator_allow_plugin_install` | **Active** | Whether `fabricator_install_plugin()` (see [Function Reference](#function-reference)) may write plugin assemblies into a plugin root. **Default `false`**: an installed plugin is loaded into this process and runs with the extension's privileges, so it is opt-in rather than something a SQL statement can arrange on its own. Session-scoped like every other setting, so `RESET` closes it again |
 | `fabricator_partition_stats` | **Active** | Answer an ungrouped `COUNT(*)` / `MIN` / `MAX` from table metadata instead of scanning — on Delta, the log's per-file counts and statistics (see [Delta Lake provider](#delta-lake-provider)). **Default `true`**; `false` always scans, which is also the reference the metadata answer is tested against |
-| `fabricator_dml_pushdown` | **Active** | Run a DELETE or UPDATE whose whole WHERE (and SET) translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)). **Default `true`**; `false` sends every DELETE and UPDATE down the row-id path, which is also the reference the shortcut is tested against |
+| `fabricator_dml_pushdown` | **Active** | Run a DELETE or UPDATE whose whole WHERE (and SET) translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)) — and, under `remote_pushdown`, an `INSERT … SELECT` reading the same catalog. **Default `true`**; `false` sends every DELETE and UPDATE down the row-id path and every INSERT through the regular bulk insert, which are also the reference the shortcut is tested against |
 
 ### Delta read tuning
 

@@ -274,6 +274,11 @@ public sealed class RemoteQuery
     public int ColumnCount { get; }
     public IReadOnlyList<bool> OrderDescending { get; }
 
+    /// <summary>The plan was a write (an <c>INSERT … SELECT</c>): <see cref="Sql"/> is a statement with no
+    /// result, the host runs it on the transaction's own connection and reports its affected-row count, and
+    /// <see cref="ColumnCount"/> is 1.</summary>
+    public bool ChangesRows { get; init; }
+
     /// <summary>Why the provider declined the plan, when <see cref="Declined"/> made it; the statement runs locally.</summary>
     public string? Reason { get; private init; }
 

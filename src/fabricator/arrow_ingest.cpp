@@ -281,6 +281,8 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 	copy->provider_virtual_columns = provider_virtual_columns;
 	copy->row_count = row_count;
 	copy->table = table;
+	copy->query_sql = query_sql;
+	copy->query_handle = query_handle;
 	return std::move(copy);
 }
 

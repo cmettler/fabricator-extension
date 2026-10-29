@@ -2752,8 +2752,61 @@ void DuckDBToSubstrait::SetNamedTable(const TableCatalogEntry &table, substrait:
 }
 
 substrait::Rel *DuckDBToSubstrait::TransformInsertTable(LogicalOperator &dop) {
-	// [FABRICATOR-PATCH: OURS-BY-DESIGN] only SELECT is pushed; DDL and DML keep their own paths (CreateTableInfo and the write operators changed shape in 2.0)
-	throw NotImplementedException("to_substrait: TransformInsertTable is not supported by this build");
+	// [FABRICATOR-PATCH: OURS-BY-DESIGN] INSERT … SELECT as a WriteRel (WRITE_OP_INSERT, no output). Upstream's
+	// version targets 1.x's LogicalInsert; this one follows 2.0's binder, which hands the insert a FULL-WIDTH child
+	// (Binder::ResolveInputProjection) where an omitted column carries the default DuckDB knows.
+	//
+	// ⚠ DEVIATION FROM THE SPEC, on purpose: Substrait wants every table column in table_schema with defaults stated
+	// in the input. We list only the columns the statement NAMES, so the target applies its OWN default to the rest
+	// (a server getdate(), an IDENTITY) — exactly what the host's own insert path does (FabricatorCatalog::PlanInsert).
+	// The discriminator is the same: ResolveInputProjection MOVES the bound default out for an omitted column.
+	auto &insert = dop.Cast<LogicalInsert>();
+	if (insert.return_chunk) {
+		throw NotImplementedException("to_substrait: INSERT … RETURNING");
+	}
+	if (insert.on_conflict_info.action_type != OnConflictAction::THROW) {
+		throw NotImplementedException("to_substrait: INSERT … ON CONFLICT");
+	}
+	auto &columns = insert.table.GetColumns();
+	const bool defaults_usable = insert.bound_defaults.size() == columns.PhysicalColumnCount();
+	vector<idx_t> named;
+	for (auto &col : columns.Physical()) {
+		if (defaults_usable && !insert.bound_defaults[col.StorageOid()]) {
+			continue;
+		}
+		named.push_back(col.Physical().index);
+	}
+	if (named.empty()) {
+		throw NotImplementedException("to_substrait: INSERT … DEFAULT VALUES");
+	}
+	auto rel = make_uniq<substrait::Rel>();
+	auto write = rel->mutable_write();
+	write->set_op(substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_INSERT);
+	write->set_output(substrait::WriteRel::OutputMode::WriteRel_OutputMode_OUTPUT_MODE_NO_OUTPUT);
+	SetNamedTable(insert.table, write);
+	auto schema = write->mutable_table_schema();
+	auto type_info = make_uniq<substrait::Type_Struct>();
+	type_info->set_nullability(substrait::Type_Nullability_NULLABILITY_REQUIRED);
+	for (auto index : named) {
+		auto &col = columns.GetColumn(PhysicalIndex(index));
+		schema->add_names(col.Name().GetIdentifierName());
+		*type_info->add_types() = DuckToSubstraitType(col.Type(), nullptr, false);
+	}
+	schema->set_allocated_struct_(type_info.release());
+	// the child's columns are the table's physical columns, in order; keep the named ones
+	auto input = TransformOp(*dop.children[0]);
+	if (named.size() != columns.PhysicalColumnCount()) {
+		auto project_rel = make_uniq<substrait::Rel>();
+		auto project = project_rel->mutable_project();
+		project->set_allocated_input(input);
+		auto emit = project->mutable_common()->mutable_emit();
+		for (auto index : named) {
+			emit->add_output_mapping(static_cast<int32_t>(index));
+		}
+		input = project_rel.release();
+	}
+	write->set_allocated_input(input);
+	return rel.release();
 }
 
 substrait::Rel *DuckDBToSubstrait::TransformDeleteTable(LogicalOperator &dop) {

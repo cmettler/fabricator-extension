@@ -1,0 +1,578 @@
+# name: test/verify_remote_insert_mssql.test
+# description: An INSERT … SELECT whose source reads the same SQL Server catalog runs as ONE server statement
+#              (remote pushdown: the vendored to_substrait writes a WriteRel, the provider an INSERT … SELECT,
+#              fabricator_remote_dml runs it on the transaction's own connection). No row travels through DuckDB.
+#              Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THE LOAD-BEARING SECTION IS §2, AND IT IS A DIFFERENTIAL. The same INSERT sequence runs into two
+#              identical tables, one pushed and one with `fabricator_dml_pushdown = false` (the host's own bulk
+#              insert, i.e. the reference oracle), and every returned count and the final contents must agree.
+#              ⚠ §1's routing rows keep §2 from passing VACUOUSLY: a build in which the pushdown never fires
+#              would agree with the oracle perfectly.
+#
+#              ⚠ The bulk insert is the reference, so every case where a server INSERT would behave differently
+#              stays on it (§4): a named IDENTITY column (KeepIdentity), enabled triggers (a bulk copy fires
+#              none), mssql_keep_nulls = false. Both paths name only the columns the statement names, so the
+#              server applies its own defaults to the rest (§3).
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'true');
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+# A source with SQL Server's own types, and identical targets carrying an IDENTITY plus two server defaults.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rins_src; DROP TABLE IF EXISTS dbo.rins_on; DROP TABLE IF EXISTS dbo.rins_off;
+DROP TABLE IF EXISTS dbo.rins_all_on; DROP TABLE IF EXISTS dbo.rins_all_off; DROP TABLE IF EXISTS dbo.rins_trg; DROP TABLE IF EXISTS dbo.rins_log;
+CREATE TABLE dbo.rins_src (id INT PRIMARY KEY, n INT NULL, amount DECIMAL(10,2), d DATE, ts DATETIME2(6), s NVARCHAR(30), b BIT);
+INSERT INTO dbo.rins_src SELECT value, CASE WHEN value % 7 = 0 THEN NULL ELSE value % 5 END, value * 1.25,
+  DATEADD(day, value, ''2026-01-01''), DATEADD(microsecond, value * 1234, CAST(''2026-03-04T05:06:07'' AS DATETIME2(6))),
+  CASE value % 4 WHEN 0 THEN NULL WHEN 1 THEN N''Äpfel'' WHEN 2 THEN N''日本'' ELSE N''s '' + CAST(value AS NVARCHAR) END,
+  value % 2 FROM GENERATE_SERIES(1, 40);
+CREATE TABLE dbo.rins_on (k INT IDENTITY(1,1), id INT, n INT, amount DECIMAL(12,2), d DATE, ts DATETIME2(6), s NVARCHAR(30), b BIT,
+  created DATETIME2 DEFAULT SYSDATETIME(), tag VARCHAR(10) DEFAULT ''dflt'');
+SELECT * INTO dbo.rins_off FROM dbo.rins_on;
+ALTER TABLE dbo.rins_off ADD CONSTRAINT df_rins_off_created DEFAULT SYSDATETIME() FOR created;
+ALTER TABLE dbo.rins_off ADD CONSTRAINT df_rins_off_tag DEFAULT ''dflt'' FOR tag;
+CREATE TABLE dbo.rins_all_on (id INT, s NVARCHAR(30)); CREATE TABLE dbo.rins_all_off (id INT, s NVARCHAR(30));
+CREATE TABLE dbo.rins_trg (id INT); CREATE TABLE dbo.rins_log (id INT);');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TRIGGER dbo.rins_trg_ins ON dbo.rins_trg AFTER INSERT AS INSERT INTO dbo.rins_log SELECT id FROM inserted;');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# SELECT … INTO copies the IDENTITY property, so both targets are alike
+query I
+SELECT * FROM fabricator_query('db', 'SELECT COLUMNPROPERTY(OBJECT_ID(''dbo.rins_off''), ''k'', ''IsIdentity'') AS i');
+----
+1
+
+# ═══ §1  Routing — the pushdown fires exactly where it should ═════════════════════════════════════════
+
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (id, s) SELECT id, s FROM db.dbo.rins_src WHERE id > 35;
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# a plain VALUES insert keeps the host's insert
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (id) VALUES (1);
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# a source outside the catalog keeps it too
+statement ok
+CREATE TABLE local_src AS SELECT range::INTEGER AS id FROM range(3);
+
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (id) SELECT id FROM local_src;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# RETURNING is not translated
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (id) SELECT id FROM db.dbo.rins_src RETURNING id;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+# the switch: the host's insert — and the SELECT that feeds it is still pushed when it is worth it
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (id, n) SELECT n, count(*) FROM db.dbo.rins_src GROUP BY n;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (id, n) SELECT n, count(*) FROM db.dbo.rins_src GROUP BY n;
+----
+physical_plan	<REGEX>:.*FABRICATOR_QUERY.*
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# ═══ §2  The differential — pushed vs the host's insert ═══════════════════════════════════════════════
+# Each statement runs into rins_on with the pushdown and into rins_off without; the counts must agree.
+
+# (a) a filtered copy of every type
+query I
+INSERT INTO db.dbo.rins_on (id, n, amount, d, ts, s, b) SELECT id, n, amount, d, ts, s, b FROM db.dbo.rins_src WHERE id <= 12;
+----
+12
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+INSERT INTO db.dbo.rins_off (id, n, amount, d, ts, s, b) SELECT id, n, amount, d, ts, s, b FROM db.dbo.rins_src WHERE id <= 12;
+----
+12
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# (b) an aggregate, NULL group included, into a wider decimal
+query I
+INSERT INTO db.dbo.rins_on (id, n, amount) SELECT n, count(*), sum(amount) FROM db.dbo.rins_src GROUP BY n;
+----
+6
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+INSERT INTO db.dbo.rins_off (id, n, amount) SELECT n, count(*), sum(amount) FROM db.dbo.rins_src GROUP BY n;
+----
+6
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# (c) a join, integer arithmetic, and a column list in another order than the table's
+query I
+INSERT INTO db.dbo.rins_on (s, id, n) SELECT b.s, a.id * 2 + 1, a.n - b.n FROM db.dbo.rins_src a JOIN db.dbo.rins_src b ON a.id = b.id + 1 WHERE a.id BETWEEN 20 AND 30;
+----
+11
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+INSERT INTO db.dbo.rins_off (s, id, n) SELECT b.s, a.id * 2 + 1, a.n - b.n FROM db.dbo.rins_src a JOIN db.dbo.rins_src b ON a.id = b.id + 1 WHERE a.id BETWEEN 20 AND 30;
+----
+11
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# (d) DISTINCT, and ORDER BY … LIMIT (a TOP on the server)
+query I
+INSERT INTO db.dbo.rins_on (b, d) SELECT DISTINCT b, d FROM db.dbo.rins_src WHERE id % 10 = 3;
+----
+4
+
+query I
+INSERT INTO db.dbo.rins_on (id, s) SELECT id, s FROM db.dbo.rins_src ORDER BY id DESC LIMIT 3;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+INSERT INTO db.dbo.rins_off (b, d) SELECT DISTINCT b, d FROM db.dbo.rins_src WHERE id % 10 = 3;
+----
+4
+
+query I
+INSERT INTO db.dbo.rins_off (id, s) SELECT id, s FROM db.dbo.rins_src ORDER BY id DESC LIMIT 3;
+----
+3
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# (e) BY NAME, and nothing selected
+query I
+INSERT INTO db.dbo.rins_on BY NAME SELECT s, id + 100 AS id FROM db.dbo.rins_src WHERE id IN (5, 6);
+----
+2
+
+query I
+INSERT INTO db.dbo.rins_on (id) SELECT id FROM db.dbo.rins_src WHERE id > 1000;
+----
+0
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+INSERT INTO db.dbo.rins_off BY NAME SELECT s, id + 100 AS id FROM db.dbo.rins_src WHERE id IN (5, 6);
+----
+2
+
+query I
+INSERT INTO db.dbo.rins_off (id) SELECT id FROM db.dbo.rins_src WHERE id > 1000;
+----
+0
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# (f) no column list at all, into a table without an IDENTITY
+query I
+INSERT INTO db.dbo.rins_all_on SELECT id, s FROM db.dbo.rins_src WHERE id < 6;
+----
+5
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+INSERT INTO db.dbo.rins_all_off SELECT id, s FROM db.dbo.rins_src WHERE id < 6;
+----
+5
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# The contents agree, both ways (k and created are the server's own and differ by design)
+query I
+SELECT count(*) FROM (SELECT id, n, amount, d, ts, s, b, tag FROM db.dbo.rins_on EXCEPT ALL SELECT id, n, amount, d, ts, s, b, tag FROM db.dbo.rins_off);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, n, amount, d, ts, s, b, tag FROM db.dbo.rins_off EXCEPT ALL SELECT id, n, amount, d, ts, s, b, tag FROM db.dbo.rins_on);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.rins_all_on EXCEPT ALL SELECT * FROM db.dbo.rins_all_off);
+----
+0
+
+# ... and they are not vacuously equal
+query II
+SELECT count(*), count(DISTINCT s) FROM db.dbo.rins_on;
+----
+38	9
+
+# exact values of the typed copy, against the source
+query I
+SELECT count(*) FROM (SELECT id, n, amount, d, ts, s, b FROM db.dbo.rins_src WHERE id <= 12 EXCEPT ALL SELECT id, n, amount, d, ts, s, b FROM db.dbo.rins_on);
+----
+0
+
+# ═══ §3  Server defaults apply to the omitted columns, on both paths ═══════════════════════════════════
+
+query II
+SELECT count(*) FILTER (WHERE created IS NULL OR tag <> 'dflt'), count(DISTINCT k) = count(*) FROM db.dbo.rins_on;
+----
+0	true
+
+query II
+SELECT count(*) FILTER (WHERE created IS NULL OR tag <> 'dflt'), count(DISTINCT k) = count(*) FROM db.dbo.rins_off;
+----
+0	true
+
+# ═══ §4  What stays on the host's insert ═══════════════════════════════════════════════════════════════
+
+# A named IDENTITY column: the bulk copy keeps the value (KeepIdentity); an INSERT would need IDENTITY_INSERT
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (k, id) SELECT id + 1000, id FROM db.dbo.rins_src WHERE id = 1;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+INSERT INTO db.dbo.rins_on (k, id) SELECT id + 1000, id FROM db.dbo.rins_src WHERE id = 1;
+
+query I
+SELECT id FROM db.dbo.rins_on WHERE k = 1001;
+----
+1
+
+# Enabled triggers: a bulk copy fires none, and the pushed path must not start firing them
+query II
+EXPLAIN INSERT INTO db.dbo.rins_trg SELECT id FROM db.dbo.rins_src;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+INSERT INTO db.dbo.rins_trg SELECT id FROM db.dbo.rins_src WHERE id < 4;
+
+query II
+SELECT (SELECT count(*) FROM db.dbo.rins_trg), (SELECT count(*) FROM db.dbo.rins_log);
+----
+3	0
+
+# mssql_keep_nulls = false: the bulk copy writes a column's default for a NULL, an INSERT does not
+statement ok
+SET mssql_keep_nulls = false;
+
+query II
+EXPLAIN INSERT INTO db.dbo.rins_on (id, tag) SELECT id, NULL FROM db.dbo.rins_src WHERE id = 2;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+RESET mssql_keep_nulls;
+
+# ═══ §5  Transactions — it runs on the transaction's own connection ═══════════════════════════════════
+
+query I
+SELECT count(*) FROM db.dbo.rins_all_on;
+----
+5
+
+# the pushed insert as the transaction's FIRST write: it must pin the connection itself (fabricator_exec's
+# join-only rule would run it on a connection of its own, in autocommit, and the ROLLBACK would undo nothing)
+statement ok
+BEGIN;
+
+query I
+INSERT INTO db.dbo.rins_all_on (id, s) SELECT id, s FROM db.dbo.rins_src WHERE id <= 10;
+----
+10
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM db.dbo.rins_all_on;
+----
+5
+
+statement ok
+BEGIN;
+
+# a write of the host's own first, then the pushed one: both on the one pinned connection
+statement ok
+INSERT INTO db.dbo.rins_all_on VALUES (900, 'local');
+
+query I
+INSERT INTO db.dbo.rins_all_on (id, s) SELECT id, s FROM db.dbo.rins_src WHERE id <= 10;
+----
+10
+
+# read-your-writes
+query I
+SELECT count(*) FROM db.dbo.rins_all_on;
+----
+16
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM db.dbo.rins_all_on;
+----
+5
+
+statement ok
+BEGIN;
+
+query I
+INSERT INTO db.dbo.rins_all_on (id, s) SELECT id, s FROM db.dbo.rins_src WHERE id > 38;
+----
+2
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM db.dbo.rins_all_on;
+----
+7
+
+# One writer per transaction, as for DuckDB's own DML
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO local_src VALUES (9);
+
+statement error
+INSERT INTO db.dbo.rins_all_on (id) SELECT id FROM db.dbo.rins_src;
+----
+a single transaction can only write to a single attached database
+
+statement ok
+ROLLBACK;
+
+# EXPLAIN runs nothing
+statement ok
+EXPLAIN INSERT INTO db.dbo.rins_all_on (id) SELECT id FROM db.dbo.rins_src;
+
+query I
+SELECT count(*) FROM db.dbo.rins_all_on;
+----
+7
+
+# ═══ §6  A READ_ONLY attach refuses it, as it refuses DuckDB's own INSERT ═════════════════════════════
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dbro (TYPE fabricator, READ_ONLY, remote_pushdown 'true');
+
+statement error
+INSERT INTO dbro.dbo.rins_all_on (id) SELECT id FROM dbro.dbo.rins_src;
+----
+read-only
+
+statement ok
+DETACH dbro;
+
+query I
+SELECT count(*) FROM db.dbo.rins_all_on;
+----
+7
+
+# ═══ §7  CREATE TABLE … AS over a pushed query ════════════════════════════════════════════════════════
+# The CTAS operator recognises a source that is exactly a query this catalog pushed: the table is created as the
+# regular CTAS creates it, then filled by one INSERT … SELECT on the server. Everything is compared with the regular
+# CTAS (switch off): rows, counts and the created column types.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rins_c1_on; DROP TABLE IF EXISTS dbo.rins_c1_off; DROP TABLE IF EXISTS dbo.rins_c2_on;
+DROP TABLE IF EXISTS dbo.rins_c2_off; DROP TABLE IF EXISTS dbo.rins_c3_on; DROP TABLE IF EXISTS dbo.rins_c3_off; DROP TABLE IF EXISTS dbo.rins_c4;
+DROP TABLE IF EXISTS dbo.rins_c5; DROP TABLE IF EXISTS dbo.rins_t7;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rins_t7 (id INT, t7 DATETIME2(7));
+INSERT INTO dbo.rins_t7 VALUES (1, ''2026-03-04T05:06:07.1234565''), (2, ''2026-03-04T05:06:07.9999995''), (3, NULL);', refresh_cache := true);
+
+query II
+EXPLAIN CREATE TABLE db.dbo.rins_c1_on AS SELECT n, count(*) AS cnt, sum(amount) AS total, max(s) AS ms FROM db.dbo.rins_src GROUP BY n;
+----
+physical_plan	<REGEX>:.*Fabricator Remote Ctas.*
+
+# a plain scan is not pushed at all, so the CTAS streams as before
+query II
+EXPLAIN CREATE TABLE db.dbo.rins_c4 AS SELECT * FROM db.dbo.rins_src;
+----
+physical_plan	<!REGEX>:.*Fabricator Remote Ctas.*
+
+# a source outside the catalog
+query II
+EXPLAIN CREATE TABLE db.dbo.rins_c4 AS SELECT n, count(*) AS c FROM db.dbo.rins_src JOIN local_src USING (id) GROUP BY n;
+----
+physical_plan	<!REGEX>:.*Fabricator Remote Ctas.*
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN CREATE TABLE db.dbo.rins_c1_off AS SELECT n, count(*) AS cnt, sum(amount) AS total, max(s) AS ms FROM db.dbo.rins_src GROUP BY n;
+----
+physical_plan	<!REGEX>:.*Fabricator Remote Ctas.*
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+# (1) an aggregate with a string max; (2) a join over every type, under ORDER BY … LIMIT; (3) DISTINCT, a window,
+# and datetime2(7) values that round (a tie, and one 50 ns short of the next second)
+query I
+CREATE TABLE db.dbo.rins_c1_on AS SELECT n, count(*) AS cnt, sum(amount) AS total, max(s) AS ms FROM db.dbo.rins_src GROUP BY n;
+----
+6
+
+query I
+CREATE TABLE db.dbo.rins_c2_on AS SELECT a.id, a.n, a.amount, a.d, a.ts, b.s, a.b FROM db.dbo.rins_src a JOIN db.dbo.rins_src b ON a.id = b.id + 1 ORDER BY a.id DESC LIMIT 15;
+----
+15
+
+query I
+CREATE TABLE db.dbo.rins_c3_on AS SELECT DISTINCT t.id, t.t7, row_number() OVER (ORDER BY t.id) AS rn FROM db.dbo.rins_t7 t JOIN db.dbo.rins_src s ON s.id = t.id;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+CREATE TABLE db.dbo.rins_c1_off AS SELECT n, count(*) AS cnt, sum(amount) AS total, max(s) AS ms FROM db.dbo.rins_src GROUP BY n;
+----
+6
+
+query I
+CREATE TABLE db.dbo.rins_c2_off AS SELECT a.id, a.n, a.amount, a.d, a.ts, b.s, a.b FROM db.dbo.rins_src a JOIN db.dbo.rins_src b ON a.id = b.id + 1 ORDER BY a.id DESC LIMIT 15;
+----
+15
+
+query I
+CREATE TABLE db.dbo.rins_c3_off AS SELECT DISTINCT t.id, t.t7, row_number() OVER (ORDER BY t.id) AS rn FROM db.dbo.rins_t7 t JOIN db.dbo.rins_src s ON s.id = t.id;
+----
+3
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.rins_c1_on EXCEPT ALL SELECT * FROM db.dbo.rins_c1_off) UNION ALL
+SELECT count(*) FROM (SELECT * FROM db.dbo.rins_c1_off EXCEPT ALL SELECT * FROM db.dbo.rins_c1_on) UNION ALL
+SELECT count(*) FROM (SELECT * FROM db.dbo.rins_c2_on EXCEPT ALL SELECT * FROM db.dbo.rins_c2_off) UNION ALL
+SELECT count(*) FROM (SELECT * FROM db.dbo.rins_c2_off EXCEPT ALL SELECT * FROM db.dbo.rins_c2_on) UNION ALL
+SELECT count(*) FROM (SELECT * FROM db.dbo.rins_c3_on EXCEPT ALL SELECT * FROM db.dbo.rins_c3_off) UNION ALL
+SELECT count(*) FROM (SELECT * FROM db.dbo.rins_c3_off EXCEPT ALL SELECT * FROM db.dbo.rins_c3_on);
+----
+0
+0
+0
+0
+0
+0
+
+# the created column types agree, column by column
+query I
+SELECT * FROM fabricator_query('db', 'SELECT COUNT(*) AS diff FROM (
+  SELECT REPLACE(TABLE_NAME, ''_on'', '''') AS t, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, IS_NULLABLE
+  FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME IN (''rins_c1_on'', ''rins_c2_on'', ''rins_c3_on'')
+  EXCEPT
+  SELECT REPLACE(TABLE_NAME, ''_off'', ''''), COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION, IS_NULLABLE
+  FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME IN (''rins_c1_off'', ''rins_c2_off'', ''rins_c3_off'')) x');
+----
+0
+
+# ... and they are not vacuously equal
+query II
+SELECT (SELECT count(*) FROM db.dbo.rins_c2_on), (SELECT count(DISTINCT t7) FROM db.dbo.rins_c3_on);
+----
+15	2
+
+# Inside a transaction: the transaction sees the new table, and ROLLBACK removes it
+statement ok
+BEGIN;
+
+query I
+CREATE TABLE db.dbo.rins_c5 AS SELECT n, count(*) AS c FROM db.dbo.rins_src GROUP BY n;
+----
+6
+
+query I
+SELECT sum(c) FROM db.dbo.rins_c5;
+----
+40
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM fabricator_query('db', 'SELECT name FROM sys.tables WHERE name = ''rins_c5''');
+----
+0
+
+# CREATE OR REPLACE over an existing table, and IF NOT EXISTS over one that exists
+query I
+CREATE OR REPLACE TABLE db.dbo.rins_c1_on AS SELECT n, count(*) AS cnt FROM db.dbo.rins_src WHERE id > 20 GROUP BY n;
+----
+6
+
+query II
+SELECT count(*), sum(cnt) FROM db.dbo.rins_c1_on;
+----
+6	20
+
+statement ok
+CREATE TABLE IF NOT EXISTS db.dbo.rins_c1_on AS SELECT n, count(*) AS cnt FROM db.dbo.rins_src GROUP BY n;
+
+query I
+SELECT sum(cnt) FROM db.dbo.rins_c1_on;
+----
+20
+
+# ═══ §8  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rins_src; DROP TABLE IF EXISTS dbo.rins_on; DROP TABLE IF EXISTS dbo.rins_off;
+DROP TABLE IF EXISTS dbo.rins_all_on; DROP TABLE IF EXISTS dbo.rins_all_off; DROP TABLE IF EXISTS dbo.rins_trg; DROP TABLE IF EXISTS dbo.rins_log;
+DROP TABLE IF EXISTS dbo.rins_c1_on; DROP TABLE IF EXISTS dbo.rins_c1_off; DROP TABLE IF EXISTS dbo.rins_c2_on; DROP TABLE IF EXISTS dbo.rins_c2_off;
+DROP TABLE IF EXISTS dbo.rins_c3_on; DROP TABLE IF EXISTS dbo.rins_c3_off; DROP TABLE IF EXISTS dbo.rins_c4; DROP TABLE IF EXISTS dbo.rins_c5;
+DROP TABLE IF EXISTS dbo.rins_t7;');
