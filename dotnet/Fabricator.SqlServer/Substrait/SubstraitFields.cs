@@ -104,8 +104,11 @@ internal static class SubstraitFields
     public const int WriteOp_FabricatorMerge = -1;
     public const string Enhancement_FabricatorMerge = "fabricator.merge";
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] On a ReadRel: the named table is a TABLE FUNCTION of the catalog,
-    /// and the one row of the virtual table holds its arguments.</summary>
+    /// and the enhancement's value is an Expression.Nested.Struct of its arguments.</summary>
     public const string Enhancement_FabricatorTableFunction = "fabricator.table_function";
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] On a CrossRel: its right side is a table function called once per
+    /// row of the left side; the function's arguments are field references into the LEFT input.</summary>
+    public const string Enhancement_FabricatorApply = "fabricator.apply";
     public const int Any_TypeUrl = 1;
     public const int Any_Value = 2;
     public const int WriteOutput_Unspecified = 0;

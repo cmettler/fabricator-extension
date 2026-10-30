@@ -235,6 +235,34 @@ sealed class SubstraitPlanDecoder
         }
     }
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A CrossRel's advanced extension: <c>fabricator.apply</c> makes it an APPLY
+    /// (true); any other enhancement changes its meaning in a way this consumer does not know.
+    /// </summary>
+    static bool ReadCrossEnhancement(ProtoReader r)
+    {
+        bool apply = false;
+        while (r.Next(out int field, out int wire))
+        {
+            if (field != F.AdvancedExtension_Enhancement)
+            {
+                r.Skip(wire);
+                continue;
+            }
+            var any = r.ReadMessage(wire);
+            string? typeUrl = null;
+            while (any.Next(out int af, out int aw))
+            {
+                if (af == F.Any_TypeUrl) typeUrl = any.ReadString(aw);
+                else any.Skip(aw);
+            }
+            if (typeUrl != F.Enhancement_FabricatorApply)
+                throw SubstraitTranslationException.Unsupported($"CrossRel carries the enhancement '{typeUrl}', which changes its semantics.");
+            apply = true;
+        }
+        return apply;
+    }
+
     static void CheckAdvancedExtension(ProtoReader r, string owner)
     {
         while (r.Next(out int field, out int wire))
@@ -968,7 +996,7 @@ sealed class SubstraitPlanDecoder
                 case F.CrossRel_Common: rel.Emit = ReadRelCommon(r.ReadMessage(wire), "CrossRel"); break;
                 case F.CrossRel_Left: left = ReadRel(r.ReadMessage(wire)); break;
                 case F.CrossRel_Right: right = ReadRel(r.ReadMessage(wire)); break;
-                case F.Rel_AdvancedExtension: CheckAdvancedExtension(r.ReadMessage(wire), "CrossRel"); break;
+                case F.Rel_AdvancedExtension: rel.Apply = ReadCrossEnhancement(r.ReadMessage(wire)); break;
                 default: throw SubstraitTranslationException.UnexpectedField("CrossRel", field);
             }
         }

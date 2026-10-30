@@ -275,8 +275,17 @@ argument; each chunk of them goes to the server as ONE `(VALUES …) CROSS APPLY
 SELECT t.region, s.id FROM targets t, mssql.dbo.pg_region_sales(t.region) s;   -- EU 1 / EU 3
 ```
 
-With a column argument from a table OF THE CATALOG the same plan runs (the outer table is read, the function applied
-per chunk) — not yet as one statement.
+**S12 — pushed: the same function per row of a table OF THE CATALOG.** Then the whole query is one statement, the
+call a `CROSS APPLY` (a `LEFT JOIN LATERAL … ON true` keeps the rows without a match, as in DuckDB):
+
+```sql
+SELECT r.name, s.id FROM mssql.dbo.pg_regions r, mssql.dbo.pg_region_sales(r.region) s;
+-- Europe 1 / Americas 2 / Europe 3 / Americas 4
+-- sent: … FROM [dbo].[pg_regions] … CROSS APPLY [dbo].[pg_region_sales]([t2].[region] …) AS [t3] …
+```
+
+DuckDB plans such a call over the DISTINCT arguments and joins the result back, so the server reads the outer table
+twice — like S9, only where it reads one statement consistently; elsewhere S11's per-chunk calls run.
 
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
 connection), a part calling a function the provider implements itself (scalar or table) or a function of another

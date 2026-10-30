@@ -1547,7 +1547,9 @@ case "$TIER" in
         # 167 -> 184 (P16, N4), verify_pushdown_guide_mssql 125 -> 140 (S10, S11).
         # 2026-10-30: 6309 -> 6318: repeated reads only where one statement reads consistently — verify_subtree_pushdown_mssql
         # 184 -> 193 (P14 at SNAPSHOT, the in-transaction decline, P13 -> N5).
-        : "${MIN_ASSERTIONS:=6318}"
+        # 2026-10-30: 6318 -> 6345: a TVF called per row of a server table as CROSS APPLY — verify_subtree_pushdown_mssql
+        #             193 -> 210 (P17, P18, N6), verify_pushdown_guide_mssql 140 -> 150 (S12)
+        : "${MIN_ASSERTIONS:=6345}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

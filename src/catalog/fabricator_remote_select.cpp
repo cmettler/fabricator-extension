@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "catalog/fabricator_catalog.hpp"
+#include "catalog/fabricator_lateral.hpp"
 #include "catalog/fabricator_txn_util.hpp"
 #include "fabricator_optimizer.hpp"
 #include "fabricator_trace.hpp"
@@ -1319,6 +1320,18 @@ bool MapToRemoteColumns(LogicalOperator &op, vector<int64_t> &out, optional_ptr<
 
 //! The catalog a table scan reads, when the scan may be part of a pushed subtree: a plain fabricator_scan of a catalog
 //! with remote_select — no time travel, no table filters, no row id or other virtual column.
+//! The fabricator catalog `owner` is, when it takes pushed queries.
+optional_ptr<FabricatorCatalog> RemoteCatalog(optional_ptr<Catalog> owner) {
+	if (!owner || !FabricatorCatalog::Is(*owner)) {
+		return nullptr;
+	}
+	auto &catalog = owner->Cast<FabricatorCatalog>();
+	if (!catalog.Supports(RemoteCapability::EXECUTE_QUERY_NODE)) {
+		return nullptr;
+	}
+	return &catalog;
+}
+
 optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 	// ⚠ filter_pushdown: a scan that takes table filters may be the target of a join's dynamic filter, which the join
 	// keeps a pointer to — replacing the scan would leave it dangling. A SQL Server scan never declares it.
@@ -1338,11 +1351,8 @@ optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 			owner = data->table_function_catalog;
 		}
 	}
-	if (!owner || !FabricatorCatalog::Is(*owner)) {
-		return nullptr;
-	}
-	auto &catalog = owner->Cast<FabricatorCatalog>();
-	if (!catalog.Supports(RemoteCapability::EXECUTE_QUERY_NODE)) {
+	auto catalog = RemoteCatalog(owner);
+	if (!catalog) {
 		return nullptr;
 	}
 	if (!get.bind_data->Cast<::fabricator::ArrowStreamBindData>().at_unit.empty() || get.table_filters.HasFilters()) {
@@ -1353,7 +1363,7 @@ optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 			return nullptr;
 		}
 	}
-	return &catalog;
+	return catalog;
 }
 
 //! Whether an expression may run on the server: no parameter (a prepared statement binds its values per EXECUTE, after
@@ -1712,6 +1722,20 @@ void SinkCtes(unique_ptr<LogicalOperator> &op) {
 }
 
 //! Sends `op` to `catalog`'s server and puts the result in its place; leaves it alone when anything declines.
+//! DuckDB's ColumnBindingResolver does not descend below a get, so the input relation of a table function called per
+//! row (an APPLY) keeps its column references; it is self-contained, so it is resolved on its own.
+void ResolveGetInputs(LogicalOperator &op) {
+	for (auto &child : op.children) {
+		ResolveGetInputs(*child);
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		for (auto &child : op.children) {
+			ColumnBindingResolver resolver;
+			resolver.VisitOperator(*child);
+		}
+	}
+}
+
 void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog) {
 	op->ResolveOperatorTypes();
 	auto old_bindings = op->GetColumnBindings();
@@ -1745,6 +1769,7 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		copy->ResolveOperatorTypes();
 		ColumnBindingResolver resolver;
 		resolver.VisitOperator(*copy);
+		ResolveGetInputs(*copy);
 		copy->ResolveOperatorTypes();
 		vector<string> root_names;
 		for (idx_t i = 0; i < types.size(); i++) {
@@ -1808,6 +1833,26 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		}
 	}
 	SubtreeReads result;
+	if (op->type == LogicalOperatorType::LOGICAL_GET && !op->children.empty()) {
+		// a server TVF called per row of a relation of its own catalog: one CROSS APPLY on the server
+		vector<string> path;
+		optional_ptr<Catalog> owner;
+		idx_t arg_count = 0;
+		auto catalog = FabricatorLateralApply(op->Cast<LogicalGet>(), path, owner, arg_count) ? RemoteCatalog(owner)
+		                                                                                       : nullptr;
+		auto &input = children[0];
+		if (catalog && input.pure && (!input.catalog || input.catalog.get() == catalog.get())) {
+			result.catalog = catalog;
+			result.pure = true;
+			result.worth = true; // one statement instead of one call per chunk of arguments
+			result.cte_refs = input.cte_refs;
+			return result;
+		}
+		if (state.Replaceable(input)) {
+			ReplaceSubtree(state, op->children[0], *input.catalog);
+		}
+		return SubtreeReads();
+	}
 	if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		result.catalog = PushableScanCatalog(op->Cast<LogicalGet>());
 		result.pure = result.catalog != nullptr;
@@ -2215,6 +2260,10 @@ static bool ResolveTableFunction(LogicalGet &get, vector<string> &path, vector<V
 
 void RegisterFabricatorSubtreePushdown(DBConfig &config) {
 	DuckDBToSubstrait::table_function_resolver = ResolveTableFunction;
+	DuckDBToSubstrait::apply_resolver = [](LogicalGet &get, vector<string> &path, idx_t &arg_count) {
+		optional_ptr<Catalog> catalog;
+		return FabricatorLateralApply(get, path, catalog, arg_count);
+	};
 	OptimizerExtension extension;
 	extension.pre_optimize_function = SubtreePushdownPreOptimize;
 	extension.optimize_function = SubtreePushdownOptimize;

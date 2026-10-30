@@ -161,6 +161,20 @@ SELECT t.region, s.id FROM targets t, mssql.dbo.pg_region_sales(t.region) s ORDE
 EU	1
 EU	3
 
+# S12: the same function called per row of a table OF THE CATALOG: one statement, FROM … CROSS APPLY [dbo].[f](…)
+query II
+EXPLAIN SELECT r.name, s.id FROM mssql.dbo.pg_regions r, mssql.dbo.pg_region_sales(r.region) s;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT r.name, s.id FROM mssql.dbo.pg_regions r, mssql.dbo.pg_region_sales(r.region) s ORDER BY 2;
+----
+Europe	1
+Americas	2
+Europe	3
+Americas	4
+
 # the switch for parts of statements: S5 runs locally again, same answer
 statement ok
 SET fabricator_subtree_pushdown = false;

@@ -338,7 +338,8 @@ called once per batch. A function the provider implements itself (C#, a plugin) 
 with the CTE inlined for the server — only where the database reads one statement consistently
 (`READ_COMMITTED_SNAPSHOT`, snapshot isolation allowed, or a SERIALIZABLE / SNAPSHOT transaction), since the server
 reads that CTE once per reference. A correlated scalar subquery stays local (its single join has no T-SQL form). A **table-valued function** with constant arguments (`mssql.dbo.tvf('EU')`) is
-called by name inside such a query, joined with the catalog's tables. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
+called by name inside such a query, joined with the catalog's tables; called per row of a table of the catalog
+(`FROM mssql.dbo.t, mssql.dbo.tvf(t.a)`) it becomes a `CROSS APPLY` in the same statement. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
 condition down). `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.
 
 ⚠ **The one accepted difference: `lower` / `upper`.** SQL Server's case tables are Unicode 5.0, DuckDB's are

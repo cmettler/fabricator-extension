@@ -3955,7 +3955,8 @@ static unique_ptr<FunctionData> FabricatorTvfBind(ClientContext &context, TableF
                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
 	if (info.lateral && FabricatorIsCorrelatedCall(input)) {
-		return FabricatorLateralBind(context, input, *info.lateral, return_types, names);
+		return FabricatorLateralBind(context, input, *info.lateral, return_types, names,
+		                             info.is_proc ? nullptr : info.catalog);
 	}
 	return FabricatorTableFunctionBind(context, input, return_types, names);
 }

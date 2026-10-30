@@ -1434,6 +1434,34 @@ introduced by §4.14, measured, and fixed:
   evaluated inline, i.e. a different number of times and in a different place than per batch; (5) the plan-restore
   path is still ungated.
 
+### 4.17 A TVF called per row of a server table: CROSS APPLY in the pushed query — BUILT (2026-10-30, step 3b-2)
+
+- **The plan.** DuckDB decorrelates `FROM db.t, db.tvf(t.a)` before the optimizers into a `__duckdb_delim` CTE over
+  the outer scan, a DISTINCT over the arguments, the in-out `LogicalGet` of the TVF with that as its ONE child, and an
+  `IS NOT DISTINCT FROM` join back. The get's columns are the callee's (its column ids) followed by the child columns it
+  passes through (`projected_input`); the child's leading `arg_width` columns are the arguments.
+- **Recognizing it.** The lateral bind data of a discovered TVF now records its catalog (`FabricatorTvfBind` passes
+  `info.catalog`, not for a proc); `FabricatorLateralApply` accepts the get when every argument slot reaches the
+  wire (no bind-time constant), the child is exactly `[args | passed through]` and no virtual column is read.
+  `AnalyzeSubtree` makes such a get pure when its child is a pure part of the same catalog, and worth it.
+- **Encoding.** to_substrait's `apply_resolver`: a CrossRel marked `fabricator.apply`, left = the child, right = the
+  ReadRel of the function (`fabricator.table_function`) whose arguments are FIELD REFERENCES into the left input, and
+  an emit putting the callee columns first. The C# decoder accepts that one CrossRel enhancement (any other still
+  refuses the plan); `TSqlEmitter.EmitApply` renders `FROM <left> CROSS APPLY [s].[f](<left columns>) AS tN`. An
+  inner apply is right for LEFT JOIN LATERAL too: the outer join DuckDB put above it keeps the unmatched rows.
+- **⚠ Two things only building it found.** (1) DuckDB's `ColumnBindingResolver` does NOT descend below a
+  `LogicalGet`, so the translated copy kept `BOUND_COLUMN_REF`s in the get's input — `ResolveGetInputs` resolves each
+  such input on its own. (2) An UPSTREAM to_substrait bug: `IsPassthroughProjection` set no output mapping for a
+  projection that starts as `#0, #1` and then repeats a column (`#0, #1, #0, #1` — exactly the get's input), so the
+  ProjectRel emitted two columns instead of four. Fixed `[FABRICATOR-PATCH: OFFER-READY]`.
+- **Cost.** The CTE is read twice (outer + DISTINCT), so the plan carries `fabricator.repeated_reads` and needs a
+  consistent read (§4.16); elsewhere the per-chunk lateral session runs. Rewriting the join-back into a direct
+  `t CROSS APPLY f(t.a)` would read once — not built.
+- Gates: `verify_subtree_pushdown_mssql` P17 (aggregated + joined with local data, log asserts `CROSS APPLY
+  [dbo].[st_tvf]`), P18 (LEFT JOIN LATERAL, computed argument, NULL argument), N6 (local outer stays `Fabricator
+  Lateral Batched`) — 193 -> 210; guide S12. Mutants killed at P17: the apply never recognized; the passthrough fix
+  reverted.
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

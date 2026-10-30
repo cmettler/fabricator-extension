@@ -40,6 +40,10 @@ public:
 	//! arguments: its name path and arguments. It is read as a ReadRel naming the function, its arguments the one
 	//! row of a virtual table, marked by the enhancement `fabricator.table_function`. Set once at load.
 	static std::function<bool(LogicalGet &get, vector<string> &path, vector<Value> &args)> table_function_resolver;
+	//! [FABRICATOR-PATCH: OURS-BY-DESIGN] A table function called per row of an input relation (an in-out get): the
+	//! function's name and how many leading input columns are its arguments. Emitted as a CrossRel marked
+	//! `fabricator.apply` whose right side reads the function with field references into the left side.
+	static std::function<bool(LogicalGet &get, vector<string> &path, idx_t &arg_count)> apply_resolver;
 	//! [FABRICATOR-PATCH: OURS-BY-DESIGN] Adds a plan-level optimization hint (an Any with this type URL and no value):
 	//! information a consumer may use or ignore without changing what the plan means.
 	void AddPlanOptimization(const string &type_url);
@@ -84,6 +88,8 @@ private:
 	substrait::Rel *TransformWindow(LogicalOperator &dop);
 	substrait::Rel *TransformExpressionGet(LogicalOperator &dop);
 	substrait::Rel *TransformGet(LogicalOperator &dop);
+	substrait::Rel *TransformApply(LogicalGet &dget, const vector<string> &path, idx_t arg_count);
+	static void TableFunctionSchema(LogicalGet &dget, substrait::ReadRel &sget);
 	substrait::Rel *TransformCrossProduct(LogicalOperator &dop);
 	substrait::Rel *TransformUnion(LogicalOperator &dop);
 	substrait::Rel *TransformDistinct(LogicalOperator &dop);

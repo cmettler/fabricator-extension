@@ -1382,7 +1382,10 @@ bool DuckDBToSubstrait::IsPassthroughProjection(LogicalProjection &dproj, idx_t 
 		}
 		exp_col_idx++;
 	}
-	needs_output_mapping = child_column_count != exp_col_idx;
+	// [FABRICATOR-PATCH: OFFER-READY] upstream compared the count of leading in-order references only, so a projection
+	// that starts as one and then repeats or reorders a column (`#0, #1, #0, #1` over two columns) got no output
+	// mapping and emitted just its input's two columns
+	needs_output_mapping = !isPassThrough || child_column_count != exp_col_idx;
 	return child_column_count == exp_col_idx && isPassThrough;
 }
 
@@ -2445,6 +2448,68 @@ substrait::Rel *DuckDBToSubstrait::TransformEmptyResult(LogicalOperator &dop) {
 std::function<bool(LogicalGet &get, vector<string> &path, vector<Value> &args)>
     DuckDBToSubstrait::table_function_resolver;
 
+std::function<bool(LogicalGet &get, vector<string> &path, idx_t &arg_count)> DuckDBToSubstrait::apply_resolver;
+
+//! Adds a table function's columns to a ReadRel's base schema.
+void DuckDBToSubstrait::TableFunctionSchema(LogicalGet &dget, substrait::ReadRel &sget) {
+	auto base_schema = make_uniq<substrait::NamedStruct>();
+	auto type_info = make_uniq<substrait::Type_Struct>();
+	type_info->set_nullability(substrait::Type_Nullability_NULLABILITY_REQUIRED);
+	for (idx_t i = 0; i < dget.names.size(); i++) {
+		base_schema->add_names(dget.names[i].GetIdentifierName());
+		for (auto &name : DepthFirstNames(dget.returned_types[i])) {
+			base_schema->add_names(name);
+		}
+		*type_info->add_types() = DuckToSubstraitType(dget.returned_types[i]);
+	}
+	base_schema->set_allocated_struct_(type_info.release());
+	sget.set_allocated_base_schema(base_schema.release());
+}
+
+substrait::Rel *DuckDBToSubstrait::TransformApply(LogicalGet &dget, const vector<string> &path, idx_t arg_count) {
+	auto child_width = dget.children[0]->types.size();
+	auto rel = make_uniq<substrait::Rel>();
+	auto cross = rel->mutable_cross();
+	cross->set_allocated_left(TransformOp(*dget.children[0]));
+
+	auto right = make_uniq<substrait::Rel>();
+	auto sget = right->mutable_read();
+	for (auto &name : path) {
+		sget->mutable_named_table()->add_names(name);
+	}
+	TableFunctionSchema(dget, *sget);
+	auto &column_ids = dget.GetColumnIds();
+	auto projection = make_uniq<substrait::Expression_MaskExpression>();
+	projection->set_maintain_singular_struct(true);
+	for (auto &column : column_ids) {
+		projection->mutable_select()->add_struct_items()->set_field(static_cast<int32_t>(column.GetPrimaryIndex()));
+	}
+	sget->set_allocated_projection(projection.release());
+	// the arguments are the left side's leading columns: field references into the LEFT input of the apply
+	substrait::Expression_Nested_Struct arguments;
+	for (idx_t i = 0; i < arg_count; i++) {
+		auto selection = arguments.add_fields()->mutable_selection();
+		selection->mutable_root_reference();
+		selection->mutable_direct_reference()->mutable_struct_field()->set_field(static_cast<int32_t>(i));
+	}
+	auto any = sget->mutable_advanced_extension()->mutable_enhancement();
+	any->set_type_url("fabricator.table_function");
+	any->set_value(arguments.SerializeAsString());
+	cross->set_allocated_right(right.release());
+	cross->mutable_advanced_extension()->mutable_enhancement()->set_type_url("fabricator.apply");
+
+	// the get's columns: the function's, then the input columns it passes through
+	vector<int32_t> output_mapping;
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		output_mapping.push_back(static_cast<int32_t>(child_width + i));
+	}
+	for (auto entry : dget.projected_input) {
+		output_mapping.push_back(static_cast<int32_t>(entry));
+	}
+	cross->set_allocated_common(CreateOutputMapping(output_mapping));
+	return rel.release();
+}
+
 void DuckDBToSubstrait::AddPlanOptimization(const string &type_url) {
 	plan.mutable_advanced_extensions()->add_optimization()->set_type_url(type_url);
 }
@@ -2452,6 +2517,16 @@ void DuckDBToSubstrait::AddPlanOptimization(const string &type_url) {
 substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 	auto get_rel = make_uniq<substrait::Rel>();
 	auto &dget = dop.Cast<LogicalGet>();
+
+	// [FABRICATOR-PATCH: OURS-BY-DESIGN] a table function called per row of its input (see apply_resolver)
+	if (!dget.children.empty()) {
+		vector<string> apply_path;
+		idx_t arg_count = 0;
+		if (!apply_resolver || !apply_resolver(dget, apply_path, arg_count)) {
+			throw NotImplementedException("to_substrait: a table function with an input relation is not supported");
+		}
+		return TransformApply(dget, apply_path, arg_count);
+	}
 
 	// [FABRICATOR-PATCH: OURS-BY-DESIGN] a catalog table function called with constants (see table_function_resolver)
 	vector<string> function_path;
@@ -2572,18 +2647,7 @@ substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 		for (auto &name : function_path) {
 			sget->mutable_named_table()->add_names(name);
 		}
-		auto base_schema = make_uniq<substrait::NamedStruct>();
-		auto type_info = make_uniq<substrait::Type_Struct>();
-		type_info->set_nullability(substrait::Type_Nullability_NULLABILITY_REQUIRED);
-		for (idx_t i = 0; i < dget.names.size(); i++) {
-			base_schema->add_names(dget.names[i].GetIdentifierName());
-			for (auto &name : DepthFirstNames(dget.returned_types[i])) {
-				base_schema->add_names(name);
-			}
-			*type_info->add_types() = DuckToSubstraitType(dget.returned_types[i]);
-		}
-		base_schema->set_allocated_struct_(type_info.release());
-		sget->set_allocated_base_schema(base_schema.release());
+		TableFunctionSchema(dget, *sget);
 		// the arguments ride the enhancement's value as a struct of literals: a ReadRel names ONE source (named_table is
 		// a oneof with virtual_table), so they cannot be a virtual table beside the name
 		substrait::Expression_Nested_Struct arguments;

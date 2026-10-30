@@ -415,6 +415,7 @@ internal sealed class TSqlEmitter
             SortRel r => EmitSort(r),
             AggregateRel r => EmitAggregate(r),
             JoinRel r => EmitJoin(r),
+            CrossRel { Apply: true } r => EmitApply(r), // [FABRICATOR-PATCH: OURS-BY-DESIGN]
             CrossRel r => EmitJoin(new JoinRel { Left = r.Left, Right = r.Right, Type = F.JoinType_Inner }),
             SetRel r => EmitSet(r),
             TopNRel r => EmitTopN(r),
@@ -443,7 +444,30 @@ internal sealed class TSqlEmitter
         return block;
     }
 
-    private SelectBlock EmitRead(ReadRel rel)
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A table function called once per row of the left side:
+    /// <c>FROM left CROSS APPLY [s].[f](left columns) AS tN</c>. No rows from the function, no row out — as the
+    /// lateral call it replaces.
+    /// </summary>
+    private SelectBlock EmitApply(CrossRel rel)
+    {
+        if (rel.Right is not ReadRel { TableFunctionArgs: not null } call || call.Filter != null ||
+            call.BestEffortFilter != null || call.Emit != null)
+        {
+            throw SubstraitTranslationException.Unsupported("An apply calls exactly one table function.");
+        }
+        var left = JoinInput(EmitRel(rel.Left), nullSupplying: false, keepWhere: true);
+        var right = EmitRead(call, left.Columns);
+        return new SelectBlock
+        {
+            From = $"{left.From}\nCROSS APPLY {right.From}",
+            FromIsJoin = true,
+            Columns = left.Columns.Concat(right.Columns).ToList(),
+            Where = left.Where.Concat(right.Where).ToList(),
+        };
+    }
+
+    private SelectBlock EmitRead(ReadRel rel, IReadOnlyList<SqlColumn>? argumentScope = null)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (string name in rel.ColumnNames)
@@ -463,7 +487,8 @@ internal sealed class TSqlEmitter
             string display = string.Join(".", rel.TableNames);
             string name = CatalogTableFunctions?.Invoke(rel.TableNames)
                           ?? throw SubstraitTranslationException.Unsupported($"{display}() is not a table function of the server");
-            var args = rel.TableFunctionArgs.Select(arg => Render(arg, Array.Empty<SqlColumn>()).Value);
+            // constants, or (in an apply) references to the columns of the left side
+            var args = rel.TableFunctionArgs.Select(arg => Render(arg, argumentScope ?? Array.Empty<SqlColumn>()).Value);
             block.From = $"{name}({string.Join(", ", args)}) AS {alias}";
         }
         else if (rel.VirtualRows != null)

@@ -107,6 +107,8 @@ struct LateralBindData : public TableFunctionData {
 	//! That needs a call-once-then-EOS latch where the operator shape needs one call per input chunk.
 	bool source_shape = false;
 	shared_ptr<LateralBindingHolder> holder;
+	//! The catalog whose server runs the function, for the pushdown (FabricatorLateralApply); null otherwise.
+	optional_ptr<Catalog> apply_catalog;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1065,11 +1067,51 @@ bool FabricatorIsCorrelatedCall(const TableFunctionBindInput &input) {
 
 unique_ptr<FunctionData> FabricatorLateralBind(ClientContext &context, TableFunctionBindInput &input,
                                                TableFunctionInfo &lateral_info, vector<LogicalType> &return_types,
-                                               vector<Identifier> &names) {
+                                               vector<Identifier> &names, optional_ptr<Catalog> catalog) {
 	TableFunctionBindInput lateral_input(input.inputs, input.named_parameters, input.input_table_types,
 	                                     input.input_table_names, &lateral_info, input.binder, input.table_function,
 	                                     input.ref, input.input_plan);
-	return LateralBind(context, lateral_input, return_types, names);
+	auto result = LateralBind(context, lateral_input, return_types, names);
+	result->Cast<LateralBindData>().apply_catalog = catalog;
+	return result;
+}
+
+bool FabricatorLateralApply(LogicalGet &get, vector<string> &path, optional_ptr<Catalog> &catalog, idx_t &arg_count) {
+	if (get.function.in_out_function != FabricatorLateralInOut || get.function.in_out_function_final ||
+	    !get.bind_data) {
+		return false;
+	}
+	auto bind = dynamic_cast<LateralBindData *>(get.bind_data.get());
+	if (!bind || !bind->apply_catalog || bind->source_shape) {
+		return false;
+	}
+	if (get.children.size() != 1 || get.projected_input.empty() || !get.projection_ids.empty()) {
+		return false;
+	}
+	// every argument slot reaches the server: no bind-time constant the wire would skip
+	if (bind->input_types.size() != bind->arg_width) {
+		return false;
+	}
+	get.children[0]->ResolveOperatorTypes();
+	auto child_width = get.children[0]->types.size();
+	if (child_width != bind->arg_width + get.projected_input.size()) {
+		return false;
+	}
+	for (auto entry : get.projected_input) {
+		if (entry < bind->arg_width || entry >= child_width) {
+			return false;
+		}
+	}
+	for (auto &id : get.GetColumnIds()) {
+		if (id.IsRowIdColumn() || id.IsVirtualColumn()) {
+			return false;
+		}
+	}
+	path = bind->schema_path;
+	path.push_back(bind->func);
+	catalog = bind->apply_catalog;
+	arg_count = bind->arg_width;
+	return true;
 }
 
 bool FabricatorIsLateralBindData(optional_ptr<const FunctionData> bind_data) {

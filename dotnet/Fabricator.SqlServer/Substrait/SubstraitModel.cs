@@ -374,6 +374,8 @@ sealed class CrossRel : Rel
 {
     public Rel Left = null!;
     public Rel Right = null!;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] <c>fabricator.apply</c>: the right side is called per left row.</summary>
+    public bool Apply;
 }
 
 sealed class SetRel : Rel

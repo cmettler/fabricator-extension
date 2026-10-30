@@ -33,6 +33,7 @@
 #include "catalog/fabricator_metadata.hpp"
 #include "fabricator/clr_host.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
 
@@ -63,9 +64,15 @@ shared_ptr<TableFunctionInfo> FabricatorMakeLateralInfo(FabricatorHandle handle,
 //! Whether a call binds correlated: DuckDB synthesized an input relation from the argument expressions (named
 //! columns). A literal call reports its parameter types with EMPTY names.
 bool FabricatorIsCorrelatedCall(const TableFunctionBindInput &input);
+//! `catalog`: the attached catalog whose server runs the function (a discovered TVF), so a pushed query can call it
+//! per row of a relation the server reads too (FabricatorLateralApply); null for a function that runs here.
 unique_ptr<FunctionData> FabricatorLateralBind(ClientContext &context, TableFunctionBindInput &input,
                                                TableFunctionInfo &lateral_info, vector<LogicalType> &return_types,
-                                               vector<Identifier> &names);
+                                               vector<Identifier> &names, optional_ptr<Catalog> catalog = nullptr);
+//! A correlated call of a server function the pushdown can send as an APPLY: its catalog, its name (schema path +
+//! name) and how many leading columns of its input relation are its arguments. The input relation's remaining
+//! columns are the ones the call passes through (`projected_input`).
+bool FabricatorLateralApply(LogicalGet &get, vector<string> &path, optional_ptr<Catalog> &catalog, idx_t &arg_count);
 bool FabricatorIsLateralBindData(optional_ptr<const FunctionData> bind_data);
 unique_ptr<LocalTableFunctionState> FabricatorLateralInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                               GlobalTableFunctionState *global);
