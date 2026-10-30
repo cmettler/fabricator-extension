@@ -13,7 +13,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | Statement | Pushed when … | `EXPLAIN` shows | Otherwise |
 |---|---|---|---|
 | `SELECT` | it joins, aggregates, sorts with a limit, uses windows, … over tables of the catalog (S1) | `Fabricator Query` | `Fabricator Scan` (+ DuckDB operators); the scan still sends its filter and columns to the server (S2) |
-| part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5, S6) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
+| part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5–S7) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
 | `INSERT … SELECT` | the `SELECT` reads tables of the same catalog and translates exactly (I1) | `FABRICATOR_REMOTE_DML` | `Mssql Net Insert`: DuckDB streams the rows into a bulk copy — and still pushes the `SELECT` when worth it |
 | `INSERT … VALUES` | never — a bulk copy is already the fast path (I2) | — | `Mssql Net Insert` |
 | `CREATE TABLE … AS` | its query is pushed (C1) | `Fabricator Remote Ctas` | `Mssql Net Create Table As`: rows stream into a bulk copy (C2) |
@@ -62,6 +62,8 @@ The reasons you will meet most:
 | `no Substrait translation: Could not find function "<f>" …` | the function has no exact T-SQL; rewrite with one that has, or accept the local run |
 | `a plain scan keeps the table scan` | nothing to gain: the scan already sends its filter and columns |
 | `… stays local because it calls <f>() of catalog <c>` | a SQL Server or C# function of the attached catalog (not pushed: its bare name could mean a built-in) |
+| `… stays local because it calls <f>(), whose value is not fixed by its arguments` / `local: it calls …` | `now()`, `current_date`, `random()`, … — the server would answer with its own clock, time zone or generator |
+| `a filter above it reads its columns; left for the pass after the optimizers` | not a refusal: the part is pushed once DuckDB has moved the filter into it, so the server query carries the `WHERE` (S7) |
 | `… stays local because it uses a prepared-statement parameter` | only for a part of a statement; a whole prepared statement is planned per `EXECUTE` with its values |
 | `the predicate does not render exactly: <condition>` | the named condition has no exact T-SQL |
 | `fabricator_dml_pushdown = false` | switched off in this session |
@@ -205,10 +207,24 @@ SELECT region, target - (SELECT max(amount) FROM mssql.dbo.pg_sales) AS below_ma
 -- EXPLAIN: Fabricator Query (the max) crossed with the local scan.   EU -5.00
 ```
 
+**S7 — pushed, with the condition inside.** A `WHERE` on a column of the part belongs in the server query:
+
+```sql
+SELECT t.region, s.total
+FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region)
+WHERE s.region = 'EU';
+-- sent: SELECT … FROM [dbo].[pg_sales] … WHERE … = N'EU' … GROUP BY …   EU 40.00
+```
+
+Such a part is pushed only after DuckDB has moved the condition into it. Pushed earlier, the server would aggregate
+the whole table and the condition would be applied afterwards in DuckDB — on 200 000 rows with an index on the column
+that was 0.73 s instead of 0.08 s.
+
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
 connection), a part calling a function of the catalog (a SQL Server UDF — in the plan it carries only its bare name,
-which could translate as a built-in of that name), time travel (`AT (…)`), and anything that does not translate
-exactly.
+which could translate as a built-in of that name), a part calling a function whose value is not fixed by its arguments
+(`now()`, `current_date`, `random()` — the server would use its own clock, time zone or generator; this holds for whole
+statements too), time travel (`AT (…)`), and anything that does not translate exactly.
 
 The full list of what translates — functions, window frames, date parts, string functions — and of what does not is
 in the README, section *remote_pushdown*.

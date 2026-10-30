@@ -120,6 +120,12 @@ EXPLAIN WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FROM rp.dbo.st_bi
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
+# P11: a WHERE on the subquery's group key: the condition goes INTO the server query (the pass after the optimizers)
+query II
+EXPLAIN SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region) WHERE r.region = 'A';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
 # N1: a scan with a filter only: the table scan pushes that already
 query II
 EXPLAIN SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region);
@@ -129,6 +135,12 @@ physical_plan	<!REGEX>:.*Fabricator Query.*
 # N2: a SQL Server UDF in the subtree: its bare name could translate as a built-in
 query II
 EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.st_fn(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# N3: a function whose value is not fixed by its arguments (random(); now() and current_date alike): the server would answer with its own generator, clock or time zone
+query II
+EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -245,6 +257,17 @@ SELECT count(*) FROM (WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FRO
 ----
 5
 
+# P11
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region) WHERE r.region = 'A') EXCEPT ALL (SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM lb GROUP BY region) r USING (region) WHERE r.region = 'A'))) + (SELECT count(*) FROM ((SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM lb GROUP BY region) r USING (region) WHERE r.region = 'A') EXCEPT ALL (SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region) WHERE r.region = 'A')));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM lb GROUP BY region) r USING (region) WHERE r.region = 'A');
+----
+1
+
 # N1
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region))));
@@ -264,6 +287,17 @@ SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT regi
 
 query I
 SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(st_fn_local(v)) AS s FROM lb GROUP BY region) r USING (region));
+----
+5
+
+# N3
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM lb GROUP BY region) r USING (region));
 ----
 5
 
@@ -304,6 +338,61 @@ SELECT (SELECT count(*) FROM (FROM rp.dbo.st_out EXCEPT ALL SELECT l.region, r.s
  + (SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM lb GROUP BY region) r USING (region) EXCEPT ALL FROM rp.dbo.st_out));
 ----
 0
+
+# ═══ §3b  The decisions in duckdb_logs: where each condition ended up, and why something stayed local ═══════
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory');
+
+# P11 — the WHERE on the group key must reach the server query. Replaced before DuckDB's optimizers, the condition stayed
+# outside it: the whole table aggregated on the server, measured 0.73 s against 0.08 s for the scan with the condition.
+statement ok
+SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region) WHERE r.region = 'A';
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'remote subtree (after the optimizers): %WHERE%';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'remote subtree (before the optimizers): %';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message = 'local subtree (before the optimizers): a filter above it reads its columns; left for the pass after the optimizers';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# N3 — a function the server would answer with its own clock, time zone or generator keeps the part local
+statement ok
+SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE 'local subtree (%): AGGREGATE stays local because it calls %(), whose value is not fixed by its arguments';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# … and the same for a whole statement (the remote optimizer's route)
+query II
+EXPLAIN SELECT region, max(v) FROM rp.dbo.st_big WHERE random() < 2 GROUP BY region;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE 'local: it calls %(), whose value is not fixed by its arguments';
+----
+true
+
+statement ok
+CALL disable_logging();
 
 # ═══ §4  Statements the subtree pushdown reaches beyond the remote optimizer ═════════════════════════════
 

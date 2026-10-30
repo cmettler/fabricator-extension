@@ -321,7 +321,9 @@ regular expressions, `LIKE` patterns with `_`, `substring` with a negative or no
 grouping binary values (SQL Server ignores trailing zero bytes), a float divided by a value that may be zero,
 decimal arithmetic past precision 38 (SQL Server would round), float → string casts, `any_value`, `GROUPS` /
 `RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions with no T-SQL rendering (`date_sub`,
-`strftime`, list and JSON functions, …), and a part of a statement that only scans, filters and projects.
+`strftime`, list and JSON functions, …), functions whose value is not fixed by their arguments (`now()`,
+`current_date`, `random()`, … — the server would use its own clock, time zone or generator), and a part of a
+statement that only scans, filters and projects.
 (A statement naming a result column twice, or reading a CTE, is pushed as a whole by the part-of-a-statement pushdown below; a
 prepared statement is planned per `EXECUTE` with its values, and pushed like a literal one.)
 
@@ -330,7 +332,8 @@ rest of the statement reads local data — `local JOIN (SELECT region, sum(v) FR
 a scalar `(SELECT max(v) FROM mssql.dbo.big)`, an `IN (SELECT … GROUP BY … HAVING …)`: `EXPLAIN` shows
 `Fabricator Query` under DuckDB's own join. The same exactness rule applies; such a part is kept local when it calls
 a function of the catalog (a SQL Server UDF), and nothing is pushed in a statement that writes a table of the
-catalog. `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.
+catalog. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
+condition down). `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.
 
 ⚠ **The one accepted difference: `lower` / `upper`.** SQL Server's case tables are Unicode 5.0, DuckDB's are
 current: 298 (`lower`) and 308 (`upper`) rarely used BMP characters map differently — `upper('ß')` is `ẞ` in

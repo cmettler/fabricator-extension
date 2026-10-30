@@ -37,6 +37,8 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -87,6 +89,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <set>
 #include <yyjson.h>
 
 namespace duckdb {
@@ -353,6 +356,71 @@ string TranslateWrite(ClientContext &context, FabricatorCatalog &catalog, const 
 	return sql;
 }
 
+//! Whether `expr` itself (not its children) gives the same value for the same arguments. now(), current_date or
+//! random() would run with the server's clock, time zone and generator — a different answer, and nothing would fail.
+//! The T-SQL emitter knows none of them today; this keeps it so when it learns one. `why` receives the reason.
+bool ConsistentNode(const Expression &expr, string *why) {
+	auto check = [&](FunctionStability stability, const Identifier &name) {
+		if (stability == FunctionStability::CONSISTENT) {
+			return true;
+		}
+		if (why) {
+			*why = "it calls " + name.GetIdentifierName() + "(), whose value is not fixed by its arguments";
+		}
+		return false;
+	};
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>().Function();
+		return check(function.GetStability(), function.GetName());
+	}
+	case ExpressionClass::BOUND_AGGREGATE: {
+		auto &function = expr.Cast<BoundAggregateExpression>().Function();
+		return check(function.GetStability(), function.GetName());
+	}
+	case ExpressionClass::BOUND_WINDOW: {
+		auto &window = expr.Cast<BoundWindowExpression>();
+		if (window.AggregateFunction() &&
+		    !check(window.AggregateFunction()->GetStability(), window.AggregateFunction()->GetName())) {
+			return false;
+		}
+		if (window.WindowFunction() &&
+		    !check(window.WindowFunction()->GetStability(), window.WindowFunction()->GetName())) {
+			return false;
+		}
+		return true;
+	}
+	default:
+		return true;
+	}
+}
+
+//! ConsistentNode over every expression of a plan.
+bool ConsistentPlan(LogicalOperator &op, string &why) {
+	bool consistent = true;
+	std::function<void(const Expression &)> visit = [&](const Expression &expr) {
+		if (!consistent) {
+			return;
+		}
+		if (!ConsistentNode(expr, &why)) {
+			consistent = false;
+			return;
+		}
+		ExpressionIterator::EnumerateChildren(expr, visit);
+	};
+	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
+		if (*expr) {
+			visit(**expr);
+		}
+	});
+	for (auto &child : op.children) {
+		if (consistent && !ConsistentPlan(*child, why)) {
+			consistent = false;
+		}
+	}
+	return consistent;
+}
+
 //! Binds a copy of `node` (this catalog's name restored on its tables) and serializes the plan as Substrait, the
 //! root's columns named c0…; false, with `reason`, when anything on the way declines. `require_worth`: decline a plan
 //! of scans, filters, projections and sorts only — the table scan already does that much.
@@ -399,6 +467,10 @@ bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const Q
 		if (require_worth && !worth_pushing(*plan)) {
 			depth--;
 			reason = "a plain scan keeps the table scan";
+			return false;
+		}
+		if (!ConsistentPlan(*plan, reason)) {
+			depth--;
 			return false;
 		}
 		plan->ResolveOperatorTypes();
@@ -1315,6 +1387,10 @@ bool PushableExpression(const Expression &expr, string *why = nullptr) {
 	default:
 		break;
 	}
+	// after the catalog check: a function of the catalog is refused for that, whatever its declared stability
+	if (!ConsistentNode(expr, why)) {
+		return false;
+	}
 	bool pushable = true;
 	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
 		if (pushable && !PushableExpression(child, why)) {
@@ -1403,6 +1479,10 @@ struct SubtreePushdown {
 	//! every replaced subtree's output bindings, and its replacement's, by position
 	vector<ColumnBinding> old_bindings;
 	vector<ColumnBinding> new_bindings;
+	//! each replaced subtree, with the slot it was taken from: put back if the plan cannot take the replacements
+	vector<pair<unique_ptr<LogicalOperator> *, unique_ptr<LogicalOperator>>> originals;
+	//! (before the optimizers) the tables each conjunct of a WHERE reads — see MayReceiveFilter
+	vector<std::set<TableIndex>> filter_conjuncts;
 
 	//! A decision of this pass. Both passes see most plans, so each message says which one decided.
 	void Trace(const string &decision, const string &detail) {
@@ -1418,12 +1498,67 @@ struct SubtreeReads {
 };
 
 //! Sends `op` to `catalog`'s server and puts the result in its place; leaves it alone when anything declines.
+//! The tables each conjunct of every filter in the plan reads.
+void CollectFilterConjuncts(LogicalOperator &op, vector<std::set<TableIndex>> &conjuncts) {
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		std::function<void(const Expression &)> split = [&](const Expression &expr) {
+			if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+				for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+					split(*child);
+				}
+				return;
+			}
+			std::set<TableIndex> tables;
+			ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+			    expr, [&](const BoundColumnRefExpression &ref) { tables.insert(ref.Binding().table_index); });
+			if (!tables.empty()) {
+				conjuncts.push_back(std::move(tables));
+			}
+		};
+		for (auto &expr : op.expressions) {
+			split(*expr);
+		}
+	}
+	for (auto &child : op.children) {
+		CollectFilterConjuncts(*child, conjuncts);
+	}
+}
+
+//! Before the optimizers, whether a filter above the subtree reads its output alone: DuckDB's filter pushdown would
+//! move that condition INTO the subtree (a WHERE on a group key down to the aggregate's scan). Replaced now, the
+//! condition stays outside the pushed query — measured: the whole table aggregated on the server, 0.73 s, where the
+//! scan with the condition took 0.08 s. Such a subtree is left to the pass after the optimizers, which sees it with
+//! the condition inside.
+bool MayReceiveFilter(const SubtreePushdown &state, const vector<ColumnBinding> &outputs) {
+	std::set<TableIndex> produced;
+	for (auto &binding : outputs) {
+		produced.insert(binding.table_index);
+	}
+	for (auto &conjunct : state.filter_conjuncts) {
+		bool inside = true;
+		for (auto &table : conjunct) {
+			if (produced.find(table) == produced.end()) {
+				inside = false;
+				break;
+			}
+		}
+		if (inside) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog) {
 	op->ResolveOperatorTypes();
 	auto old_bindings = op->GetColumnBindings();
 	auto types = op->types;
 	if (old_bindings.size() != types.size()) {
 		state.Trace("local subtree", "its bindings and types disagree");
+		return;
+	}
+	if (state.pre && MayReceiveFilter(state, old_bindings)) {
+		state.Trace("local subtree", "a filter above it reads its columns; left for the pass after the optimizers");
 		return;
 	}
 	string plan_bytes;
@@ -1482,6 +1617,7 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 	state.Trace("remote subtree", query.sql);
 	state.old_bindings.insert(state.old_bindings.end(), old_bindings.begin(), old_bindings.end());
 	state.new_bindings.insert(state.new_bindings.end(), new_bindings.begin(), new_bindings.end());
+	state.originals.emplace_back(&op, std::move(op));
 	op = std::move(replacement);
 }
 
@@ -1528,7 +1664,23 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 	return SubtreeReads();
 }
 
+//! Whether the plan scans a fabricator table at all — every other plan leaves this pass untouched.
+bool ReadsFabricatorTable(LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET && op.Cast<LogicalGet>().function.GetName() == "fabricator_scan") {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (ReadsFabricatorTable(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, bool pre) {
+	if (!ReadsFabricatorTable(*plan)) {
+		return;
+	}
 	Value enabled;
 	if (input.context.TryGetCurrentSetting("fabricator_subtree_pushdown", enabled) && !enabled.IsNull() &&
 	    !enabled.GetValue<bool>()) {
@@ -1541,7 +1693,10 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		}
 		return;
 	}
-	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}};
+	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}, {}, {}};
+	if (pre) {
+		CollectFilterConjuncts(*plan, state.filter_conjuncts);
+	}
 	auto root = AnalyzeSubtree(state, plan);
 	if (root.pure && root.worth) {
 		// a whole statement the remote optimizer did not push (a CTE, a name it cannot repeat, …)
@@ -1550,10 +1705,24 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	if (state.old_bindings.empty()) {
 		return;
 	}
-	ColumnBindingReplacer replacer;
-	replacer.AddReplacements(state.old_bindings, state.new_bindings);
-	replacer.VisitOperator(*plan);
-	plan->ResolveOperatorTypes();
+	try {
+		ColumnBindingReplacer replacer;
+		replacer.AddReplacements(state.old_bindings, state.new_bindings);
+		replacer.VisitOperator(*plan);
+		plan->ResolveOperatorTypes();
+	} catch (std::exception &ex) {
+		// the plan did not take the replacements: put every subtree back and point the references at it again, so the
+		// statement runs as DuckDB planned it rather than failing
+		for (auto it = state.originals.rbegin(); it != state.originals.rend(); ++it) {
+			*it->first = std::move(it->second);
+		}
+		ColumnBindingReplacer restore;
+		restore.AddReplacements(state.new_bindings, state.old_bindings);
+		restore.VisitOperator(*plan);
+		plan->ResolveOperatorTypes();
+		state.Trace("local subtree", "the plan did not take the replacement (" + ErrorData(ex).RawMessage() +
+		                                 "); every subtree runs locally");
+	}
 }
 
 //! BEFORE DuckDB's optimizers, which may rewrite a subtree into a form that has no translation (an aggregate pushed

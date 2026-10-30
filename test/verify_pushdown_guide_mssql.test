@@ -96,6 +96,17 @@ SELECT region, target - (SELECT max(amount) FROM mssql.dbo.pg_sales) AS below_ma
 ----
 EU	-5.00
 
+# S7: a WHERE on a column of the part goes into the server query (taken after DuckDB moved the condition down)
+query II
+EXPLAIN SELECT t.region, s.total FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region) WHERE s.region = 'EU';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT t.region, s.total FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region) WHERE s.region = 'EU';
+----
+EU	40.00
+
 # the switch for parts of statements: S5 runs locally again, same answer
 statement ok
 SET fabricator_subtree_pushdown = false;

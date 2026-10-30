@@ -1317,6 +1317,32 @@ stderr; EXPLAIN shows where a statement ran, never why. Now `FabricatorRoutingTr
 - Seen on the way, not changed: a bare `SELECT count(*) FROM db.t` stays local (`row id and virtual columns are not
   supported` — the empty projection carries DuckDB's empty-column id). It always did; nothing asserted it.
 
+### 4.12 Inverse-thinking pass over the pushdowns — three fixes (2026-10-30, user-asked)
+
+Asked "how would this go wrong?" rather than "does it work?". The differentials cannot see a pushdown that answers
+RIGHT but slowly, nor one that is right only because the emitter happens to lack a mapping. Three changes:
+
+1. **A WHERE above a part was left outside the pushed query — MEASURED, a regression of route b.** The pre pass
+   replaced `(SELECT region, sum(v) … GROUP BY region) r … WHERE r.region = 'A'` before DuckDB's filter pushdown ran,
+   so the server aggregated the whole table (0.73 s) where the scan with the condition did an index seek (0.08 s; 200k
+   rows, index on `region`). Now the pre pass leaves a subtree alone when a conjunct of some filter reads only its
+   output tables (`MayReceiveFilter`); the pass after the optimizers takes it with the condition inside. Cross-side
+   conditions (`r.s > l.w`) do not hold it back. Gate: `verify_subtree_pushdown_mssql` P11 + §3b (the sent T-SQL
+   contains WHERE, nothing replaced before the optimizers).
+2. **Functions whose value is not fixed by their arguments are vetoed explicitly** (`ConsistentNode` /
+   `ConsistentPlan`, `FunctionStability != CONSISTENT`), on both routes. Until now `now()`, `current_date`, `random()`
+   stayed local only because the T-SQL emitter has no mapping for them — the day one is added, the server's clock and
+   time zone would answer silently. Gate: N3 + the whole-statement row in §3b.
+3. **The plan is restored when it does not take the replacements.** `ColumnBindingReplacer` / `ResolveOperatorTypes`
+   ran outside every catch — a failure there failed the statement (an INTERNAL one would invalidate the database).
+   The replaced subtrees are kept with their slots and put back, references re-pointed. And the pass returns at once
+   for a plan with no `fabricator_scan`: it runs for every query of every database the extension is loaded in.
+
+Recorded, not changed: per-subtree planning round trips (translate + describe, per pass, per EXECUTE of a prepared
+statement); literals instead of parameters fill SQL Server's plan cache with single-use plans; the dependency on
+DuckDB internals (pre-optimize hook, child binder, `ColumnBindingReplacer`, `LogicalOperator::Copy` via serialization,
+the remote optimizer itself — the 2.1 canary already shows two red suites).
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets
