@@ -1333,6 +1333,7 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	// are read by the same TopN pushdown, so they are set together.
 	auto &parent_catalog = ParentCatalog().Cast<FabricatorCatalog>();
 	data->string_order_pushable = parent_catalog.StringOrderPushable();
+	data->reapply_filters = parent_catalog.SupersetFilterPushdown();
 	data->null_order_expressible = parent_catalog.NullOrderExpressible();
 
 	// Build the Arrow column converters + verify the result schema.
@@ -1427,6 +1428,14 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 			function.late_materialization = true;
 			function.get_row_id_columns = FabricatorScanRowIdColumns;
 		}
+	} else if (ParentCatalog().Cast<FabricatorCatalog>().SupersetFilterPushdown()) {
+		// The provider (SQL Server) renders the pushed filters as a SUPERSET — its collation, its padding — so the
+		// scan RE-APPLIES every table filter to the rows it returns (ArrowStreamScan), exactly as DuckDB would above
+		// it. That is what makes filter_pushdown=true safe here, and filter_pushdown is what brings a hash join's
+		// runtime filter (the build side's keys, its min/max) into this scan's WHERE: a small local table joined
+		// with a large remote one reads the matching rows instead of all of them
+		// (docs/duckdb-2.0-remote-execution.md §5).
+		function.filter_pushdown = true;
 	}
 	function.cardinality = FabricatorScanCardinality;
 	function.statistics = FabricatorScanStatistics;

@@ -181,6 +181,9 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! the generated SQL is executed BY DuckDB, so the comparator that picks the top-n IS the comparator of
 	//! the TopN kept above the scan. Same flag, same meaning ("this source orders strings as DuckDB does").
 	bool string_order_pushable = false;
+	//! The scan re-applies its live table filters (static ones DuckDB erased from the plan, the runtime join
+	//! filters) to every chunk it returns: the provider's rendering of them is only a superset.
+	bool reapply_filters = false;
 	//! A catalog-bound TABLE FUNCTION called with constant arguments (not a table scan): its schema path + name, its
 	//! positional arguments as bound, and its catalog — what a pushed query needs to call it on the server
 	//! (fabricator_remote_select.cpp). Empty for a table scan and for a function the pushdown cannot call.

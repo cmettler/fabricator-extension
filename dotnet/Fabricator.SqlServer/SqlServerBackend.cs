@@ -654,6 +654,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // FABRICATOR_REMOTE_PUSHDOWN sets the default for an ATTACH that does not name the option, which is how
     // scripts/run-suites.sh runs the routing suites a second time with pushdown off.
     private readonly bool _remotePushdown = DefaultRemotePushdown();
+    // ATTACH option `dynamic_filters` (default TRUE): declare `superset_filter_pushdown`, so the host lets DuckDB push
+    // table filters — a hash join's runtime filter on the build side's keys among them — into this catalog's scans,
+    // renders them into the WHERE as a superset and re-applies them to the rows (docs/duckdb-2.0-remote-execution.md
+    // §5). `false` keeps the scans as before: filters stay above them.
+    private readonly bool _dynamicFilters = true;
 
     private static bool DefaultRemotePushdown()
     {
@@ -804,6 +809,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                     // DuckDB latches it at ATTACH — it counts remote catalogs when the database is attached.
                     case "remote_pushdown":
                         _remotePushdown = ParseRemotePushdown(val, "remote_pushdown");
+                        break;
+                    case "dynamic_filters":
+                        _dynamicFilters = ParseRemotePushdown(val, "dynamic_filters");
                         break;
                     // ⚠ ADDED WITH CHANGE B, and it RESTORES a capability that change would otherwise have
                     // removed. MARS used to be frozen per catalog at its first connect, so attaching twice
@@ -3185,6 +3193,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // spliced: a schema name is user-controlled text.
     public string CapabilitiesJson
         => "{\"bind_schema_cacheable\":true," +
+           $"\"superset_filter_pushdown\":{(_dynamicFilters ? "true" : "false")}," +
            // RETURNING comes from T-SQL OUTPUT, which a warehouse engine does not have (measured on Fabric Warehouse:
            // "OUTPUT is not supported." on DELETE, UPDATE, INSERT and MERGE alike) — the host then refuses at plan time
            $"\"dml_returning\":{(Profile.IsWarehouse ? "false" : "true")}," +

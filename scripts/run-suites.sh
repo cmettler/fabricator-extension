@@ -1036,7 +1036,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=83}"   # 2026-10-30: +verify_subtree_pushdown_mssql; 2026-10-29: +verify_merge_pushdown_mssql; 2026-10-29: +verify_moved_rows_mssql; 2026-10-29: +verify_remote_dml_mssql; 2026-10-29: +verify_returning_mssql, +verify_pushdown_guide_mssql; 2026-10-29: +verify_remote_insert_mssql; 2026-10-29: +verify_session_context_mssql; 2026-10-29: +verify_default_schema_mssql; 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
+        : "${MIN_SUITES:=84}"   # 2026-10-30: +verify_dynamic_filters_mssql; 2026-10-30: +verify_subtree_pushdown_mssql; 2026-10-29: +verify_merge_pushdown_mssql; 2026-10-29: +verify_moved_rows_mssql; 2026-10-29: +verify_remote_dml_mssql; 2026-10-29: +verify_returning_mssql, +verify_pushdown_guide_mssql; 2026-10-29: +verify_remote_insert_mssql; 2026-10-29: +verify_session_context_mssql; 2026-10-29: +verify_default_schema_mssql; 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1554,7 +1554,9 @@ case "$TIER" in
         # 2026-10-30: 6379 -> 6397: a lateral TVF call inside a writing transaction runs on its connection —
         #             verify_table_inout 97 -> 115
         # 2026-10-30: 6397 -> 6410: table statistics from sys.partitions, a view unknown — verify_cardinality 4 -> 17
-        : "${MIN_ASSERTIONS:=6410}"
+        # 2026-10-30: 6410 -> 6446 (84 runs): dynamic join filters for SQL Server scans — NEW verify_dynamic_filters_mssql
+        #             (30), verify_pushdown_guide_mssql 150 -> 156 (J1)
+        : "${MIN_ASSERTIONS:=6446}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

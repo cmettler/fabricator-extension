@@ -88,6 +88,7 @@ private:
 	substrait::Rel *TransformWindow(LogicalOperator &dop);
 	substrait::Rel *TransformExpressionGet(LogicalOperator &dop);
 	substrait::Rel *TransformGet(LogicalOperator &dop);
+	substrait::Rel *TransformGetRead(LogicalOperator &dop);
 	substrait::Rel *TransformApply(LogicalGet &dget, const vector<string> &path, idx_t arg_count);
 	static void TableFunctionSchema(LogicalGet &dget, substrait::ReadRel &sget);
 	substrait::Rel *TransformCrossProduct(LogicalOperator &dop);

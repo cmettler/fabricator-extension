@@ -131,8 +131,9 @@ SELECT hits FROM fabricator_query('db',
   'SELECT COUNT(*) AS hits FROM (
      SELECT DISTINCT st.text FROM sys.dm_exec_query_stats qs
      CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
-     WHERE (CHARINDEX(''FROM [dbo].[sg_sales_2024] WHERE [yr] ='', st.text) > 0
-         OR CHARINDEX(''FROM [dbo].[sg_sales_2023] WHERE [yr] ='', st.text) > 0)
+     WHERE (CHARINDEX(''FROM [dbo].[sg_sales_2024] WHERE '', st.text) > 0
+         OR CHARINDEX(''FROM [dbo].[sg_sales_2023] WHERE '', st.text) > 0)
+       AND CHARINDEX(''[yr] = @p'', st.text) > 0
        AND CHARINDEX(''[id], [nm], [yr]'', st.text) > 0
        AND CHARINDEX(''dm_exec'', st.text) = 0) x');
 ----

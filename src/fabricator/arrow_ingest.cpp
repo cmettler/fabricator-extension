@@ -25,6 +25,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/common/vector/struct_vector.hpp" // 2.0 split vector.hpp
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 // 2.0 split these out of table_filter.hpp; without them DynamicFilterData / TableFilterSet are
 // incomplete types here (the old header only forward-declares them now).
 #include "duckdb/planner/table_filter_set.hpp"
@@ -56,6 +57,9 @@ using namespace duckdb;
 namespace {
 
 struct ArrowStreamGlobalState : public GlobalTableFunctionState {
+	//! The scan's live table filters as ONE predicate over its output columns, re-applied to every chunk when the
+	//! provider's rendering of them is a superset (ArrowStreamBindData::reapply_filters); null otherwise.
+	unique_ptr<Expression> reapply_filter;
 	//! The live data stream for this scan (owned; released in the destructor).
 	ArrowArrayStream stream {};
 	bool stream_initialized = false;
@@ -143,6 +147,10 @@ struct ArrowStreamLocalState : public ArrowScanLocalState {
 	    : ArrowScanLocalState(std::move(current_chunk), context) {
 	}
 
+	//! Evaluates the global state's reapply_filter (a copy per thread: an executor is not shared).
+	unique_ptr<Expression> filter_expression;
+	unique_ptr<ExpressionExecutor> filter_executor;
+	SelectionVector filter_sel {STANDARD_VECTOR_SIZE};
 	//! How long this thread waits before asking again, when it finds another thread mid-pull. Resets on
 	//! every batch it gets, so a fast pull is never waited on and a slow one costs a bounded number of
 	//! wake-ups. See src/include/fabricator/scan_wait.hpp.
@@ -272,6 +280,7 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 	copy->top_n = top_n;
 	copy->order_by_json = order_by_json;
 	copy->string_order_pushable = string_order_pushable;
+	copy->reapply_filters = reapply_filters;
 	copy->null_order_expressible = null_order_expressible;
 	copy->at_unit = at_unit;
 	copy->at_value = at_value;
@@ -436,6 +445,30 @@ static void SqlIdentIngest(const string &s, string &out) {
 // which binds nowhere.
 // All five are "not required for query correctness" (DuckDB re-applies every predicate above the scan),
 // so DROPPING them is superset-safe — the same rule the legacy branches already apply by returning false.
+// Whether a pushed filter only narrows what DuckDB discards anyway: one of the internal wrappers above (a TopN's
+// moving bound, a join's min/max, a bloom or prefix-range filter), or an AND of only such. Such a filter does not
+// make a server-side TOP unsafe: re-applied after it, it drops rows that could not be in the answer.
+static bool IsOptionalFilterExpression(const Expression &e) {
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	    TableFilterFunctions::IsTableFilterFunction(e.Cast<BoundFunctionExpression>().Function())) {
+		return true;
+	}
+	if (e.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : e.Cast<BoundConjunctionExpression>().GetChildren()) {
+			if (!IsOptionalFilterExpression(*child)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+static bool IsMandatoryFilter(const TableFilter &filter) {
+	return filter.filter_type != TableFilterType::EXPRESSION_FILTER ||
+	       !IsOptionalFilterExpression(*filter.Cast<ExpressionFilter>().expr);
+}
+
 static bool ContainsTableFilterFunction(const Expression &e) {
 	if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
 	    TableFilterFunctions::IsTableFilterFunction(e.Cast<BoundFunctionExpression>().Function())) {
@@ -1285,7 +1318,7 @@ string BuildSchemaOnlySpec(const string &at_unit, const string &at_value) {
 }
 
 static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<column_t> &output_column_ids,
-                            const string &live_filter_sql, const string &live_filter_json) {
+                            const string &live_filter_sql, const string &live_filter_json, bool has_live_filters) {
 	vector<string> cols;
 	auto add = [&](idx_t table_idx) {
 		if (table_idx >= bind_data.names.size()) {
@@ -1368,11 +1401,13 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		JsonEscape(native_filter, json);
 	}
 	// TOP (n) is only safe with no pushed filter: a best-effort filter returns a
-	// superset, so limiting before exact (DuckDB) filtering could drop valid rows.
-	if (bind_data.top_n >= 0 && bind_data.filter_json.empty() && live_filter_json.empty()) {
+	// superset, so limiting before exact (DuckDB) filtering could drop valid rows. ⚠ That includes a live filter
+	// that did not serialize: the scan re-applies it (reapply_filters) after the server's TOP.
+	if (bind_data.top_n >= 0 && bind_data.filter_json.empty() && live_filter_json.empty() && !has_live_filters) {
 		json += ",\"top\":" + to_string(bind_data.top_n);
 	}
-	if (!bind_data.order_by_json.empty() && bind_data.filter_json.empty() && live_filter_json.empty()) {
+	if (!bind_data.order_by_json.empty() && bind_data.filter_json.empty() && live_filter_json.empty() &&
+	    !has_live_filters) {
 		json += ",\"order_by\":" + bind_data.order_by_json; // already a JSON array
 	}
 	// Time travel (AT clause): orthogonal to projection/filter/order — always emitted when set so the
@@ -1503,6 +1538,41 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 			gstate->output_column_ids.push_back(input.column_ids[proj]);
 		}
 	}
+	if (bind_data.reapply_filters && input.filters) {
+		vector<unique_ptr<Expression>> conjuncts;
+		for (auto entry : *input.filters) {
+			idx_t key = entry.GetIndex(); // an index into column_ids
+			idx_t out = key;
+			if (!input.projection_ids.empty()) {
+				out = DConstants::INVALID_INDEX;
+				for (idx_t k = 0; k < input.projection_ids.size(); k++) {
+					if (input.projection_ids[k] == key) {
+						out = k;
+					}
+				}
+			}
+			if (out == DConstants::INVALID_INDEX || out >= gstate->output_column_ids.size()) {
+				// filter_prune is not set, so a filtered column is always an output column; were it not, the filter
+				// could not be re-applied and the server's superset would stand — refuse instead
+				throw InternalException("fabricator: a pushed filter on a column the scan does not return");
+			}
+			auto col_id = input.column_ids[key];
+			if (col_id >= bind_data.return_types.size()) {
+				throw InternalException("fabricator: a pushed filter on a virtual column");
+			}
+			BoundReferenceExpression column(bind_data.return_types[col_id], out);
+			conjuncts.push_back(entry.Filter().ToExpression(column));
+		}
+		if (conjuncts.size() == 1) {
+			gstate->reapply_filter = std::move(conjuncts[0]);
+		} else if (!conjuncts.empty()) {
+			auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+			for (auto &conjunct : conjuncts) {
+				conjunction->GetChildrenMutable().push_back(std::move(conjunct));
+			}
+			gstate->reapply_filter = std::move(conjunction);
+		}
+	}
 
 	// Catalog scans push the projected column list (and superset-safe filters) to the
 	// provider; raw queries fetch the full result (the SQL is user-supplied).
@@ -1517,7 +1587,15 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		string live_filter_sql = RenderLiveFilters(bind_data, input);
 		vector<Value> filter_constants = bind_data.filter_constants;
 		string live_filter_json = SerializeLiveFilters(bind_data, input, filter_constants);
-		request.spec_json = BuildScanSpec(bind_data, input.column_ids, live_filter_sql, live_filter_json);
+		// a filter the scan re-applies after the server's TOP must not be able to remove one of its rows
+		bool has_live_filters = false;
+		if (input.filters) {
+			for (auto entry : *input.filters) {
+				has_live_filters = has_live_filters || IsMandatoryFilter(entry.Filter());
+			}
+		}
+		request.spec_json = BuildScanSpec(bind_data, input.column_ids, live_filter_sql, live_filter_json,
+		                                  has_live_filters);
 		if (!filter_constants.empty()) {
 			// Owned by the scan's global state, NOT this frame — the consumer may release it lazily.
 			gstate->filter_value_producer = BuildFilterValues(context, filter_constants);
@@ -1605,7 +1683,35 @@ static void BuildRowId(const vector<idx_t> &sources, DataChunk &all_columns, Vec
 	                  column, table, actual.ToString(), expected.ToString(), catalog);
 }
 
+static void ArrowStreamScanChunk(ClientContext &context, TableFunctionInput &data, DataChunk &output);
+
 void ArrowStreamScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &gstate = data.global_state->Cast<ArrowStreamGlobalState>();
+	auto &lstate = data.local_state->Cast<ArrowStreamLocalState>();
+	while (true) {
+		ArrowStreamScanChunk(context, data, output);
+		// end of the scan, a pull handed back (BLOCKED, no rows), or nothing to re-apply
+		if (!gstate.reapply_filter || output.size() == 0) {
+			return;
+		}
+		// the provider's WHERE was a superset: keep exactly the rows DuckDB's own filters keep
+		if (!lstate.filter_executor) {
+			lstate.filter_expression = gstate.reapply_filter->Copy();
+			lstate.filter_executor = make_uniq<ExpressionExecutor>(context, *lstate.filter_expression);
+		}
+		idx_t kept = lstate.filter_executor->SelectExpression(output, lstate.filter_sel);
+		if (kept == output.size()) {
+			return;
+		}
+		if (kept > 0) {
+			output.Slice(lstate.filter_sel, kept);
+			return;
+		}
+		output.Reset(); // no row of this chunk passed; 0 rows would read as the end of the scan
+	}
+}
+
+static void ArrowStreamScanChunk(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &gstate = data.global_state->Cast<ArrowStreamGlobalState>();
 	auto &lstate = data.local_state->Cast<ArrowStreamLocalState>();
 

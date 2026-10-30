@@ -14,6 +14,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 |---|---|---|---|
 | `SELECT` | it joins, aggregates, sorts with a limit, uses windows, … over tables of the catalog (S1) | `Fabricator Query` | `Fabricator Scan` (+ DuckDB operators); the scan still sends its filter and columns to the server (S2) |
 | part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5–S9) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
+| a table joined with LOCAL data | the server table is large enough for DuckDB to plan a join filter: the keys reach the scan's `WHERE` once DuckDB has read the local side (J1) | `Fabricator Scan` (the `WHERE … IN` shows in `Fabricator.Sql`) | `dynamic_filters 'false'`: the whole table is read |
 | `INSERT … SELECT` | the `SELECT` reads tables of the same catalog and translates exactly (I1) | `FABRICATOR_REMOTE_DML` | `Mssql Net Insert`: DuckDB streams the rows into a bulk copy — and still pushes the `SELECT` when worth it |
 | `INSERT … VALUES` | never — a bulk copy is already the fast path (I2) | — | `Mssql Net Insert` |
 | `CREATE TABLE … AS` | its query is pushed (C1) | `Fabricator Remote Ctas` | `Mssql Net Create Table As`: rows stream into a bulk copy (C2) |
@@ -90,7 +91,8 @@ JOIN (SELECT region, sum(mssql.dbo.cf_add(id, 1)) AS n FROM mssql.dbo.pg_sales G
 
 ```sql
 DELETE FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^l');
--- Fabricator.Dml | rowid path: the predicate does not render exactly: prefix(note, 'l') (BOUND_FUNCTION)
+-- Fabricator.Dml | rowid path: the predicate does not render exactly: ((note >= 'l') AND (note < 'm')) (BOUND_CONJUNCTION)
+-- (DuckDB turns the prefix test into a string range, and a string comparison has no exact T-SQL here)
 ```
 
 **L4** — what was pushed, and what SQL Server received:
@@ -112,6 +114,7 @@ the whole statement. `Fabricator.Sql` also shows the catalog's own metadata quer
 | every new ATTACH | environment `FABRICATOR_REMOTE_PUSHDOWN=false` | the default for ATTACHes that do not name the option |
 | the session, per statement | `SET fabricator_dml_pushdown = false;` … `RESET fabricator_dml_pushdown;` | `DELETE`, `UPDATE`, `INSERT … SELECT` and `CREATE TABLE … AS` use the regular paths; `SELECT` pushdown is unaffected |
 | the session, parts of statements | `SET fabricator_subtree_pushdown = false;` … `SET fabricator_subtree_pushdown = true;` | a subquery or CTE beside local data runs in DuckDB again (S5, S6); whole statements are unaffected |
+| one catalog, join keys | `ATTACH … (TYPE fabricator, dynamic_filters 'false')` | a scan no longer takes a join's keys (J1) or DuckDB's other table filters; filters stay above it |
 
 Use the per-statement switch when streaming through DuckDB is faster — DuckDB reads and writes in parallel, while a
 single server `INSERT … SELECT` uses whatever plan SQL Server picks.
@@ -286,6 +289,23 @@ SELECT r.name, s.id FROM mssql.dbo.pg_regions r, mssql.dbo.pg_region_sales(r.reg
 
 DuckDB plans such a call over the DISTINCT arguments and joins the result back, so the server reads the outer table
 twice — like S9, only where it reads one statement consistently; elsewhere S11's per-chunk calls run.
+
+**J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
+first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
+an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or
+padding collation on the server cannot add rows:
+
+```sql
+-- pg_clicks: 3000 rows, region cycling EU / US / AP (created with the example tables in the pinning suite)
+SELECT t.region, count(*) FROM targets t JOIN mssql.dbo.pg_clicks c ON c.region = t.region GROUP BY t.region;  -- EU 1000
+-- Fabricator.Sql: SELECT [region] FROM [dbo].[pg_clicks] WHERE [region] = @p0
+-- (one key here; several give WHERE [region] IN (@p0, @p1, …), many a range)
+-- (EXPLAIN shows the Fabricator Scan only: the filter is made while the query runs)
+```
+
+DuckDB plans such a filter only where the server table is worth filtering — not for the four rows of `pg_sales`.
+
+Measured over 1M server rows and a 2-row local table: 1.36 s → 0.19 s (20 000 rows cross instead of 1 000 000).
 
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
 connection), a part calling a function the provider implements itself (scalar or table) or a function of another

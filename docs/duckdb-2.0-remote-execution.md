@@ -1642,7 +1642,42 @@ Gate: `verify_cardinality` rewritten from "the query text reached the plan cache
 behaviour — a table's `~500 rows`, a view never `~0 rows`, and the estimate for a login denied the permission — 4 ->
 17. Mutants killed at their own rows: the view's 0 back (the view row), the DMV back (the low-privileged row).
 
-## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
+## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
+
+**As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.
+It does not: the scan RE-APPLIES the filters itself.
+- **Capability `superset_filter_pushdown`** (SQL Server, ATTACH `dynamic_filters`, default true): the host sets
+  `filter_pushdown = true` on the catalog's scans (`BuildScanFunction`) and the bind data's `reapply_filters`.
+- **Re-application:** `ArrowStreamInitGlobal` turns the live TableFilterSet (the static filters DuckDB erased from the
+  plan + the runtime join filters) into one predicate over the output columns (`TableFilter::ToExpression`);
+  `ArrowStreamScan` evaluates it per chunk with an `ExpressionExecutor` (a copy per thread) and slices — a chunk with no
+  row left is skipped, since 0 rows would end the scan. The server's WHERE (the existing FilterNode render, now with
+  the runtime `IN` / range) only has to be a superset; measured `WHERE [region] IN (@p0, @p1)`, parameterized and
+  sargable.
+- **⚠ TOP**: a server TOP before a filter the scan re-applies could drop rows. The spec already withheld TOP when the
+  bind-time filter or the live render was non-empty; a MANDATORY live filter that did not render (a string `>` under a
+  case-insensitive collation) now withholds it too — but a TopN's own runtime bound (an internal optional wrapper)
+  does not, or TOP + ORDER BY would never be pushed again (`verify_orderby_pushdown`, `verify_collation_pushdown`
+  caught exactly that).
+- **The subtree pushdown** declined every scan with `filter_pushdown` (a "dangling pointer" the join was thought to
+  keep). It holds only `shared_ptr<DynamicTableFilterSet>` (join_filter_pushdown.hpp) — the veto is gone. A scan's
+  STATIC table filters become a `FilterRel` again in to_substrait (`TransformGet`: `ToExpression` per filter, declined
+  for a column the read does not return); a runtime filter there has no translation and declines the part, which
+  keeps the scan with its filter. Whole-statement pushdown goes through the same translation.
+- Side effect: a DELETE's predicate now reaches `FindExactScan` as table filters (the prefix test as a string range);
+  the DML trace names the column now instead of `#[0.0]` (guide L3).
+- **Measured:** a 2-row local table JOIN the 1M-row `rv_big`: 1.36 s → 0.19 s.
+- **Gate:** NEW `verify_dynamic_filters_mssql` (30): the `IN` reaches the server (and not with `dynamic_filters
+  'false'`), the answers against the switched-off catalog under a case-insensitive, padding collation, static filters
+  on the scan path, TOP with a re-applied filter, TOP + ORDER BY still pushed. Guide J1. Mutants killed at their own
+  rows: no re-application (a static filter's count), TOP despite a mandatory filter (the string `>` case), the
+  capability not declared (the routing row).
+- ⚠ EXPLAIN does not show a join's runtime filter (it is made at execution — a TopN's bound does show); the gates read
+  the statement in `Fabricator.Sql`. DuckDB plans one only for a probe side worth filtering (none for the guide's
+  4-row `pg_sales`, hence its 3000-row `pg_clicks`).
+
+### The record before it was built (2026-10-27)
+
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets
 `filter_pushdown = true` (`join_filter_pushdown_optimizer.cpp`: `if (!get.function.filter_pushdown) return;`).

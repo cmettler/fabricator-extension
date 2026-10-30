@@ -290,6 +290,13 @@ ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, remote_pushdown 'fal
 
 **What runs on the server and what does not, with an example for each case: [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md).**
 
+**Joins with local data (`dynamic_filters`, on by default).** A SQL Server table joined with a local (or any other)
+table reads only the rows whose keys the other side has: once DuckDB has read the build side of the hash join, its
+keys go into the scan's `WHERE` (`[region] IN (…)`, or a range). The scan applies every filter DuckDB hands it again
+to the rows it receives, so the server's collation (case-insensitive, padded) cannot add rows. The filter is made
+while the query runs, so `EXPLAIN` does not show it; the statement logged under `Fabricator.Sql` does. `ATTACH … (TYPE fabricator, dynamic_filters 'false')` turns it off for a
+catalog.
+
 **`remote_pushdown` (on by default since 2026-10-27; `'false'` opts out, any other value is refused).** The
 environment variable `FABRICATOR_REMOTE_PUSHDOWN=false` changes the default for every ATTACH that does not name the
 option; an explicit option always wins. It applies

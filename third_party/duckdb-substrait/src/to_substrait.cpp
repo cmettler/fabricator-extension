@@ -2514,7 +2514,52 @@ void DuckDBToSubstrait::AddPlanOptimization(const string &type_url) {
 	plan.mutable_advanced_extensions()->add_optimization()->set_type_url(type_url);
 }
 
+//! [FABRICATOR-PATCH: OURS-BY-DESIGN] A scan that takes table filters (filter_pushdown) carries its WHERE as TABLE
+//! FILTERS once DuckDB's filter pushdown ran — the plan holds no LogicalFilter for them any more. They become a
+//! FilterRel over the read again, each through TableFilter::ToExpression. A runtime filter of a join (an internal
+//! table-filter function) has no translation and declines the plan, as does a filter on a column the read does not
+//! return.
 substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
+	auto &dget = dop.Cast<LogicalGet>();
+	if (!dget.children.empty() || !dget.table_filters.HasFilters()) {
+		return TransformGetRead(dop);
+	}
+	auto &column_ids = dget.GetColumnIds();
+	vector<unique_ptr<Expression>> conditions;
+	for (auto entry : dget.table_filters) {
+		idx_t key = entry.GetIndex();
+		idx_t position = key;
+		if (!dget.projection_ids.empty()) {
+			position = DConstants::INVALID_INDEX;
+			for (idx_t k = 0; k < dget.projection_ids.size(); k++) {
+				if (dget.projection_ids[k].GetIndex() == key) {
+					position = k;
+				}
+			}
+		}
+		if (key >= column_ids.size() || position == DConstants::INVALID_INDEX) {
+			throw NotImplementedException("to_substrait: a table filter on a column the scan does not return");
+		}
+		auto &column = column_ids[key];
+		if (column.IsRowIdColumn() || column.IsVirtualColumn() || column.IsPushdownExtract() ||
+		    column.GetPrimaryIndex() >= dget.returned_types.size()) {
+			throw NotImplementedException("to_substrait: a table filter on a virtual or extracted column");
+		}
+		BoundReferenceExpression reference(dget.returned_types[column.GetPrimaryIndex()], position);
+		conditions.push_back(entry.Filter().ToExpression(reference));
+	}
+	auto filter = make_uniq<substrait::Rel>();
+	filter->mutable_filter()->set_allocated_input(TransformGetRead(dop));
+	filter->mutable_filter()->set_allocated_condition(
+	    CreateConjunction(conditions, [&](const unique_ptr<Expression> &in) {
+		    auto expr = make_uniq<substrait::Expression>();
+		    TransformExpr(*in, *expr);
+		    return expr.release();
+	    }));
+	return filter.release();
+}
+
+substrait::Rel *DuckDBToSubstrait::TransformGetRead(LogicalOperator &dop) {
 	auto get_rel = make_uniq<substrait::Rel>();
 	auto &dget = dop.Cast<LogicalGet>();
 
@@ -2540,12 +2585,6 @@ substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 	TableFunctionGetBindInfoInput bind_info_input(context, dget.bind_data.get()); // [FABRICATOR-PATCH: DUCKDB-2.0] get_bind_info takes an input struct
 	auto bind_info = table_function ? BindInfo(ScanType::EXTERNAL) : dget.function.get_bind_info(bind_info_input);
 	auto sget = get_rel->mutable_read();
-
-	// [FABRICATOR-PATCH: OURS-BY-DESIGN] table filters exist only after DuckDB's optimizer, which the remote
-	// pushdown does not run; a plan that has them declines rather than dropping a predicate.
-	if (dget.table_filters.HasFilters()) {
-		throw NotImplementedException("to_substrait: pushed table filters are not supported by this build");
-	}
 
 	// Collect the scan's output columns in output order
 	auto &column_ids = dget.GetColumnIds();

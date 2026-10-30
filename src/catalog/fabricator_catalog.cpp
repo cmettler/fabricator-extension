@@ -198,6 +198,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		auto caps = FetchCapabilities(handle_);
 		string_order_pushable_ = caps.string_order_pushable;
 		exact_filter_pushdown_ = caps.exact_filter_pushdown;
+		superset_filter_pushdown_ = caps.superset_filter_pushdown && !caps.exact_filter_pushdown;
 		null_order_expressible_ = caps.null_order_expressible;
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
@@ -207,6 +208,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	} catch (std::exception &ex) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;
+		superset_filter_pushdown_ = false;
 		null_order_expressible_ = false;
 		supports_nested_schemas_ = false;
 		remote_select_ = false;
@@ -796,7 +798,8 @@ static optional_ptr<LogicalGet> FindExactScan(ClientContext &context, LogicalOpe
 				DmlTrace(context, "rowid path: a scan filter on a virtual or nested column");
 				return nullptr;
 			}
-			BoundColumnRefExpression ref(get.returned_types[col.GetPrimaryIndex()],
+			// named, so a trace of the predicate reads `note >= 'l'` rather than `#[0.0] >= 'l'`
+			BoundColumnRefExpression ref(get.names[col.GetPrimaryIndex()], get.returned_types[col.GetPrimaryIndex()],
 			                             ColumnBinding(get.table_index, idx));
 			no_filters.push_back(entry.Filter().ToExpression(ref));
 		}

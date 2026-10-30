@@ -1333,9 +1333,11 @@ optional_ptr<FabricatorCatalog> RemoteCatalog(optional_ptr<Catalog> owner) {
 }
 
 optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
-	// ⚠ filter_pushdown: a scan that takes table filters may be the target of a join's dynamic filter, which the join
-	// keeps a pointer to — replacing the scan would leave it dangling. A SQL Server scan never declares it.
-	if (!get.children.empty() || !get.bind_data || get.function.filter_pushdown) {
+	// A scan that takes table filters (filter_pushdown, a SQL Server catalog with dynamic filters) may be a target of a
+	// join's runtime filter. Replacing it is safe: the join holds only a shared_ptr to the DynamicTableFilterSet, never
+	// to the scan (join_filter_pushdown.hpp), so it fills a set nobody reads. Its STATIC filters are translated back
+	// into a FilterRel (to_substrait TransformGet); a runtime filter in the copy declines the part.
+	if (!get.children.empty() || !get.bind_data) {
 		return nullptr;
 	}
 	optional_ptr<Catalog> owner;
@@ -1355,7 +1357,7 @@ optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 	if (!catalog) {
 		return nullptr;
 	}
-	if (!get.bind_data->Cast<::fabricator::ArrowStreamBindData>().at_unit.empty() || get.table_filters.HasFilters()) {
+	if (!get.bind_data->Cast<::fabricator::ArrowStreamBindData>().at_unit.empty()) {
 		return nullptr;
 	}
 	for (auto &id : get.GetColumnIds()) {

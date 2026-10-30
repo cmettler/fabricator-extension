@@ -14,7 +14,11 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE fabricator);
 # ═══ Setup (the guide's "Example tables") ══════════════════════════════════════════════════════════════
 
 statement ok
-SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals;');
+SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_clicks;');
+
+statement ok
+SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.pg_clicks (id INT PRIMARY KEY, region VARCHAR(2) NOT NULL);
+INSERT INTO dbo.pg_clicks SELECT value, CHOOSE(value % 3 + 1, ''EU'', ''US'', ''AP'') FROM GENERATE_SERIES(1, 3000);');
 
 statement ok
 SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.pg_regions (region VARCHAR(2) PRIMARY KEY, name NVARCHAR(30));
@@ -174,6 +178,24 @@ Europe	1
 Americas	2
 Europe	3
 Americas	4
+
+# J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
+# show it — the filter is made at execution — the statement in Fabricator.Sql does)
+statement ok
+CALL enable_logging(['Fabricator.Sql'], storage := 'memory', level := 'debug');
+
+query TI
+SELECT t.region, count(*) FROM targets t JOIN mssql.dbo.pg_clicks c ON c.region = t.region GROUP BY t.region;
+----
+EU	1000
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE '%FROM [dbo].[pg_clicks] WHERE [region] = @p0%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
 
 # the switch for parts of statements: S5 runs locally again, same answer
 statement ok
@@ -393,7 +415,7 @@ EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^l');
 
 query I
 SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Dml'
-  AND message = 'rowid path: the predicate does not render exactly: prefix(note, ''l'') (BOUND_FUNCTION)';
+  AND message = 'rowid path: the predicate does not render exactly: ((note >= ''l'') AND (note < ''m'')) (BOUND_CONJUNCTION)';
 ----
 1
 
@@ -450,4 +472,4 @@ DETACH mssql_off;
 # ═══ Cleanup ═══════════════════════════════════════════════════════════════════════════════════════════
 
 statement ok
-SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_archive; DROP FUNCTION IF EXISTS dbo.pg_net; DROP FUNCTION IF EXISTS dbo.pg_region_sales;');
+SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_archive; DROP FUNCTION IF EXISTS dbo.pg_net; DROP FUNCTION IF EXISTS dbo.pg_region_sales; DROP TABLE IF EXISTS dbo.pg_clicks;');

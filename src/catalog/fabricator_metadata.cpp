@@ -237,6 +237,7 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 	if (auto *root = guard.Root()) {
 		caps.string_order_pushable = yyjson_get_bool(yyjson_obj_get(root, "is_binary_collation"));
 		caps.exact_filter_pushdown = yyjson_get_bool(yyjson_obj_get(root, "exact_filter_pushdown"));
+		caps.superset_filter_pushdown = yyjson_get_bool(yyjson_obj_get(root, "superset_filter_pushdown"));
 		caps.null_order_expressible = yyjson_get_bool(yyjson_obj_get(root, "null_order_expressible"));
 		caps.supports_nested_schemas = yyjson_get_bool(yyjson_obj_get(root, "supports_nested_schemas"));
 		caps.remote_select = yyjson_get_bool(yyjson_obj_get(root, "remote_select"));

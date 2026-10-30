@@ -64,6 +64,11 @@ public:
 	//! delivery is gated on `filter_pushdown`. Detected once at LoadCatalog from the provider profile;
 	//! default false keeps the safe superset-and-DuckDB-re-applies model for SQL Server / DAX / non-native
 	//! Delta. See docs/multifile-delta.md §"Batch 2 slice 2".
+	//! The provider renders pushed table filters as a superset and the scan re-applies them exactly (SQL Server):
+	//! the scan may advertise filter_pushdown=true, which is what brings DuckDB's runtime join filters to it.
+	bool SupersetFilterPushdown() const {
+		return superset_filter_pushdown_;
+	}
 	bool ExactFilterPushdown() const {
 		return exact_filter_pushdown_;
 	}
@@ -251,6 +256,7 @@ private:
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
 	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().
 	bool exact_filter_pushdown_ = false;
+	bool superset_filter_pushdown_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> schemas_;
 
