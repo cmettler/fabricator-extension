@@ -1525,22 +1525,12 @@ struct SubtreePushdown {
 	//! each CTE definition seen so far, by CTE index
 	std::map<TableIndex, CteDefinition> cte_definitions;
 
-	//! Whether a subtree can be sent: it reads one catalog alone and gains something, and every CTE it reads from
-	//! outside is defined by a part that reads that same catalog alone (DuckDB puts the CTE of a decorrelated
-	//! subquery at the top of the statement, above any local data the statement joins).
+	//! Whether a subtree can be sent: it reads one catalog alone, gains something, and defines every CTE it reads.
+	//! A reference to a CTE defined ABOVE it would make the server read rows DuckDB reads too, in another statement —
+	//! two reads no isolation level reconciles. SinkCtes moves a CTE down to its references first, so the common
+	//! case (DuckDB hangs a decorrelated subquery's CTE at the top of the statement) does define it inside.
 	bool Replaceable(const SubtreeReads &reads) const {
-		if (!reads.pure || !reads.worth) {
-			return false;
-		}
-		for (auto &index : reads.cte_refs) {
-			auto definition = cte_definitions.find(index);
-			if (definition == cte_definitions.end() || !definition->second.reads.pure ||
-			    definition->second.reads.catalog.get() != reads.catalog.get() ||
-			    !definition->second.reads.cte_refs.empty()) {
-				return false;
-			}
-		}
-		return true;
+		return reads.pure && reads.worth && reads.catalog && reads.cte_refs.empty();
 	}
 
 	//! A decision of this pass. Both passes see most plans, so each message says which one decided.
@@ -1608,12 +1598,13 @@ bool MayReceiveFilter(const SubtreePushdown &state, const vector<ColumnBinding> 
 //! reads the definition once per reference. A copy keeps the definition's table indices: each one sits under a
 //! projection carrying the reference's own index, which is all the operators above it can see.
 unique_ptr<LogicalOperator> InlineCtes(ClientContext &context, unique_ptr<LogicalOperator> op,
-                                       std::map<TableIndex, LogicalOperator *> &definitions) {
+                                       std::map<TableIndex, LogicalOperator *> &definitions,
+                                       std::map<TableIndex, idx_t> &copies) {
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 		auto cte_index = op->Cast<LogicalMaterializedCTE>().table_index;
-		op->children[0] = InlineCtes(context, std::move(op->children[0]), definitions);
+		op->children[0] = InlineCtes(context, std::move(op->children[0]), definitions, copies);
 		definitions[cte_index] = op->children[0].get();
-		auto main = InlineCtes(context, std::move(op->children[1]), definitions);
+		auto main = InlineCtes(context, std::move(op->children[1]), definitions, copies);
 		definitions.erase(cte_index);
 		return main;
 	}
@@ -1623,6 +1614,7 @@ unique_ptr<LogicalOperator> InlineCtes(ClientContext &context, unique_ptr<Logica
 		if (definition == definitions.end()) {
 			throw NotImplementedException("a CTE read outside its definition");
 		}
+		copies[ref.cte_index]++;
 		auto copy = definition->second->Copy(context);
 		copy->ResolveOperatorTypes();
 		auto bindings = copy->GetColumnBindings();
@@ -1638,9 +1630,85 @@ unique_ptr<LogicalOperator> InlineCtes(ClientContext &context, unique_ptr<Logica
 		return std::move(projection);
 	}
 	for (auto &child : op->children) {
-		child = InlineCtes(context, std::move(child), definitions);
+		child = InlineCtes(context, std::move(child), definitions, copies);
 	}
 	return op;
+}
+
+//! How many references to CTE `index` the subtree holds.
+idx_t CountCteRefs(LogicalOperator &op, TableIndex index) {
+	idx_t count = op.type == LogicalOperatorType::LOGICAL_CTE_REF && op.Cast<LogicalCTERef>().cte_index == index ? 1 : 0;
+	for (auto &child : op.children) {
+		count += CountCteRefs(*child, index);
+	}
+	return count;
+}
+
+//! Whether every leaf of the subtree is a scan of `catalog` the pushdown could send.
+bool ReadsCatalogOnly(LogicalOperator &op, optional_ptr<FabricatorCatalog> &catalog) {
+	if (op.children.empty()) {
+		if (op.type != LogicalOperatorType::LOGICAL_GET) {
+			return false;
+		}
+		auto scan = PushableScanCatalog(op.Cast<LogicalGet>());
+		if (!scan || (catalog && catalog.get() != scan.get())) {
+			return false;
+		}
+		catalog = scan;
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (!ReadsCatalogOnly(*child, catalog)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Moves a CTE whose definition reads one catalog alone down to the smallest subtree holding all of its references.
+//! DuckDB hangs the CTE of a decorrelated subquery at the TOP of the statement, above any local data the statement
+//! joins; left there, the part reading it could only be sent with a second read of rows DuckDB reads itself.
+//! The CTE node's columns are its main side's, so wrapping that subtree keeps every binding above it.
+void SinkCtes(unique_ptr<LogicalOperator> &op) {
+	for (auto &child : op->children) {
+		SinkCtes(child);
+	}
+	if (op->type != LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		return;
+	}
+	auto index = op->Cast<LogicalMaterializedCTE>().table_index;
+	optional_ptr<FabricatorCatalog> catalog;
+	if (!ReadsCatalogOnly(*op->children[0], catalog) || CountCteRefs(*op->children[0], index) != 0) {
+		return;
+	}
+	idx_t total = CountCteRefs(*op->children[1], index);
+	if (total == 0) {
+		return;
+	}
+	// descend while one child holds every reference
+	auto *target = &op->children[1];
+	while (true) {
+		unique_ptr<LogicalOperator> *next = nullptr;
+		for (auto &child : (*target)->children) {
+			if (CountCteRefs(*child, index) == total) {
+				next = &child;
+				break;
+			}
+		}
+		if (!next) {
+			break;
+		}
+		target = next;
+	}
+	if (target == &op->children[1]) {
+		return; // already as low as it goes
+	}
+	auto cte = std::move(op);
+	auto sunk = std::move(*target);
+	auto main = std::move(cte->children[1]);
+	cte->children[1] = std::move(sunk);
+	*target = std::move(cte);
+	op = std::move(main);
 }
 
 //! Sends `op` to `catalog`'s server and puts the result in its place; leaves it alone when anything declines.
@@ -1657,6 +1725,7 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		return;
 	}
 	string plan_bytes;
+	bool repeated_reads = false;
 	try {
 		// translated from a copy: positional references are what to_substrait reads, and the plan must stay intact
 		// when the provider declines
@@ -1667,12 +1736,12 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 			FilterPushdown filter_pushdown(state.optimizer);
 			copy = filter_pushdown.Rewrite(std::move(copy));
 		}
-		// a CTE the subtree reads from outside is inlined from its definition above (Replaceable checked it)
 		std::map<TableIndex, LogicalOperator *> definitions;
-		for (auto &definition : state.cte_definitions) {
-			definitions[definition.first] = definition.second.plan;
+		std::map<TableIndex, idx_t> copies;
+		copy = InlineCtes(state.context, std::move(copy), definitions, copies);
+		for (auto &count : copies) {
+			repeated_reads = repeated_reads || count.second > 1; // the server reads that definition more than once
 		}
-		copy = InlineCtes(state.context, std::move(copy), definitions);
 		copy->ResolveOperatorTypes();
 		ColumnBindingResolver resolver;
 		resolver.VisitOperator(*copy);
@@ -1682,6 +1751,11 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 			root_names.push_back("c" + std::to_string(i));
 		}
 		DuckDBToSubstrait to_substrait(state.context, *copy, true, root_names);
+		if (repeated_reads) {
+			// DuckDB read the CTE once; the server reads it once per copy, so within one statement the copies may see
+			// different rows unless the server reads consistently — the provider decides (`fabricator.repeated_reads`)
+			to_substrait.AddPlanOptimization("fabricator.repeated_reads");
+		}
 		plan_bytes = to_substrait.SerializeToString();
 		DumpPlan(plan_bytes);
 	} catch (std::exception &ex) {
@@ -1739,6 +1813,10 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		result.pure = result.catalog != nullptr;
 		return result;
 	}
+	if (op->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT || op->type == LogicalOperatorType::LOGICAL_DUMMY_SCAN) {
+		result.pure = true; // reads nothing: pure, and of no catalog
+		return result;
+	}
 	if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = op->Cast<LogicalCTERef>();
 		auto definition = state.cte_definitions.find(ref.cte_index);
@@ -1753,8 +1831,9 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		auto cte_index = op->Cast<LogicalMaterializedCTE>().table_index;
 		auto &definition = children[0];
 		auto &main = children[1];
-		if (definition.pure && main.pure && definition.catalog.get() == main.catalog.get()) {
-			result.catalog = definition.catalog;
+		if (definition.pure && main.pure &&
+		    (!definition.catalog || !main.catalog || definition.catalog.get() == main.catalog.get())) {
+			result.catalog = definition.catalog ? definition.catalog : main.catalog;
 			result.pure = true;
 			result.worth = definition.worth || main.worth;
 			result.cte_refs = definition.cte_refs;
@@ -1776,11 +1855,14 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 	// whether everything below reads one catalog alone
 	bool children_remote = !children.empty();
 	for (auto &child : children) {
-		if (!child.pure || (result.catalog && result.catalog.get() != child.catalog.get())) {
+		// a child without a catalog (an empty result, a dummy scan) reads nothing and constrains nothing
+		if (!child.pure || (result.catalog && child.catalog && result.catalog.get() != child.catalog.get())) {
 			children_remote = false;
 			break;
 		}
-		result.catalog = child.catalog;
+		if (child.catalog) {
+			result.catalog = child.catalog;
+		}
 		worth = worth || child.worth;
 		result.cte_refs.insert(child.cte_refs.begin(), child.cte_refs.end());
 	}
@@ -1851,6 +1933,7 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	}
 	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}, {}, {}, {}};
 	if (pre) {
+		SinkCtes(plan);
 		CollectFilterConjuncts(*plan, state.filter_conjuncts);
 	}
 	auto root = AnalyzeSubtree(state, plan);

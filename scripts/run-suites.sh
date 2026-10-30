@@ -1545,7 +1545,9 @@ case "$TIER" in
         # 155 -> 167 (P13-P15), verify_pushdown_guide_mssql 119 -> 125 (S9).
         # 2026-10-30: 6277 -> 6309: TVFs with constant arguments in pushed parts — verify_subtree_pushdown_mssql
         # 167 -> 184 (P16, N4), verify_pushdown_guide_mssql 125 -> 140 (S10, S11).
-        : "${MIN_ASSERTIONS:=6309}"
+        # 2026-10-30: 6309 -> 6318: repeated reads only where one statement reads consistently — verify_subtree_pushdown_mssql
+        # 184 -> 193 (P14 at SNAPSHOT, the in-transaction decline, P13 -> N5).
+        : "${MIN_ASSERTIONS:=6318}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

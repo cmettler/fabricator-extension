@@ -49,7 +49,7 @@ sealed class SubstraitPlanDecoder
                 case F.Plan_ExtensionUris: ReadUrn(r.ReadMessage(wire), _uris); break;
                 case F.Plan_ExtensionDeclarations: ReadExtensionDeclaration(r.ReadMessage(wire)); break;
                 case F.Plan_Relations: relations.Add(r.ReadSlice(wire)); break;
-                case F.Plan_AdvancedExtensions: CheckAdvancedExtension(r.ReadMessage(wire), "Plan"); break;
+                case F.Plan_AdvancedExtensions: ReadPlanExtension(r.ReadMessage(wire)); break;
                 case F.Plan_ExecutionBehavior: ReadExecutionBehavior(r.ReadMessage(wire)); break;
                 default: r.Skip(wire); break;
             }
@@ -208,6 +208,33 @@ sealed class SubstraitPlanDecoder
     /// Optimizations may be ignored, but an enhancement changes the semantics of
     /// the message it is attached to, so it cannot be.
     /// </summary>
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The type URLs of the plan's optimization hints.</summary>
+    public HashSet<string> PlanOptimizations { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] The plan's advanced extension: optimization hints are recorded (a consumer may
+    /// act on one it knows); an enhancement changes the plan's meaning and is refused.
+    /// </summary>
+    void ReadPlanExtension(ProtoReader r)
+    {
+        while (r.Next(out int field, out int wire))
+        {
+            if (field == F.AdvancedExtension_Enhancement)
+                throw SubstraitTranslationException.Unsupported("Plan carries an advanced extension enhancement, which changes its semantics.");
+            if (field != F.AdvancedExtension_Optimization)
+            {
+                r.Skip(wire);
+                continue;
+            }
+            var any = r.ReadMessage(wire);
+            while (any.Next(out int af, out int aw))
+            {
+                if (af == F.Any_TypeUrl) PlanOptimizations.Add(any.ReadString(aw));
+                else any.Skip(aw);
+            }
+        }
+    }
+
     static void CheckAdvancedExtension(ProtoReader r, string owner)
     {
         while (r.Next(out int field, out int wire))

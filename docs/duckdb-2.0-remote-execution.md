@@ -1375,12 +1375,14 @@ decline was "local: CTE".
 - `InlineCtes` (on the translated COPY, after the pre pass's FilterPushdown): each CTE reference becomes a projection
   carrying the reference's own table index over a copy of the definition. Copies keep the definition's internal
   indices — each sits under its projection, which is all the operators above can see.
-- **DuckDB hangs the decorrelation CTE at the TOP of the statement**, above the join with local data. So a reference
-  may be inlined from a definition ABOVE the replaced subtree: `SubtreePushdown::Replaceable` accepts a subtree whose
-  outside CTE references all have a pure definition reading the same catalog. Without that, a correlated subquery in a
-  derived table joined with local data (P13) produced no trace at all — nothing was even attempted.
-- Measured pushed: correlated scalar with inequality, LATERAL with inequality + LIMIT, WITH … AS MATERIALIZED read
-  twice. Still local: a correlated EXISTS with an OR (to_substrait fails to bind a column — declines safely).
+- **DuckDB hangs the decorrelation CTE at the TOP of the statement**, above the join with local data. ⚠ The first
+  build inlined a reference from a definition ABOVE the replaced subtree — RETRACTED by §4.16: DuckDB still read that
+  definition itself, so the server's copy was a second read of the same rows in another statement. `SinkCtes` now moves
+  the CTE down to the smallest subtree holding all its references instead, and a subtree must define every CTE it reads.
+- Pushed: LATERAL with inequality + LIMIT, WITH … AS MATERIALIZED (its definition). Local: a correlated SCALAR
+  subquery — its decorrelation keeps a SINGLE join, which T-SQL has no exact form for (before §4.16 only the part
+  beside it was pushed, reading the outer rows twice); a correlated EXISTS with an OR (to_substrait fails to bind a
+  column — declines safely).
 - Gates: `verify_subtree_pushdown_mssql` P13–P15 (167, each with its differential), guide S9. Mutant "a CTE reference is
   never replaceable" killed at P13. Not built: a correlated subquery whose OUTER side is local (step 4, key shipping),
   TVFs inside a pushed part (step 3b, needs a table-function relation in Substrait).
@@ -1401,6 +1403,36 @@ decline was "local: CTE".
   relation (step 3b-2).
 - Gates: `verify_subtree_pushdown_mssql` P16 (TVF sent by name, differential vs a local table macro) + N4 (`cf_range`,
   C#, refused by the provider) — 184; guide S10/S11. Mutant "the resolver never recognizes a TVF" killed at P16.
+
+### 4.16 Second inverse-thinking pass — CTE inlining READ THE SAME ROWS TWICE (2026-10-30, user-asked)
+
+Asked over steps 1–3b-1 before building 3b-2 on top of the CTE inlining. The main finding was a WRONG ANSWER
+introduced by §4.14, measured, and fixed:
+
+- **DuckDB reads a CTE once; inlined, the server reads it once per reference — at READ COMMITTED (locking), two reads
+  in one statement can see different rows.** Harness (scratchpad inverse2/): `ic_b` static with every key, a writer
+  inserting `ic_t` rows with keys found nowhere else in `ic_t`, the probe
+  `SELECT (SELECT max(b.v) FROM ic_b b WHERE b.k > t.k - 1 AND b.k <= t.k) FROM ic_t t` (an equality would be
+  simplified to a plain LEFT JOIN that reads `ic_t` once). Pushed: **28 NULLs in 8 of 8 runs**; DuckDB: 0. A missing
+  key in the second copy loses the row's subquery result — an answer no database state gives.
+- **Fix:** InlineCtes counts copies; a definition copied more than once marks the plan with the Substrait optimization
+  hint `fabricator.repeated_reads` (ignorable by any other consumer). The provider accepts it only where one statement
+  reads consistently (`ConsistentStatementReads`: warehouse, READ_COMMITTED_SNAPSHOT, a SERIALIZABLE / SNAPSHOT
+  transaction) or — no pinned connection, `ALLOW_SNAPSHOT_ISOLATION` on — runs it on a pooled connection at SNAPSHOT
+  (remembered by SQL text, `_snapshotQueries`, and routed through the existing `snapshotRead` route); otherwise it
+  declines. A failed probe answers "not consistent". Re-measured: TestDB (snapshot allowed) pushed at SNAPSHOT, 0
+  NULLs; a database with RCSI pushed, 0 NULLs.
+- **The cross-boundary variant was worse and found only by the gate:** a reference inlined from a definition ABOVE the
+  pushed part made the server re-read rows DuckDB had read in ANOTHER statement — no isolation level reconciles two
+  statements. Replaced by `SinkCtes` (move the CTE down to its references; a part must define what it reads).
+- Gates: `verify_subtree_pushdown_mssql` §3b — P14 runs `at SNAPSHOT`, and inside a transaction holding a connection
+  it stays local with the reason; N5 (scalar subquery) local. 193.
+- Recorded, not changed: (2) a heavy definition is computed once per reference on the server — only the repeated_reads
+  rule bounds it, not its cost; (3) parallel lateral TVF sessions each open their own read transaction, so one
+  per-row call can see different points in time per thread (the `_each` form had one exchange per call); a
+  `read_isolation 'snapshot'` DuckDB transaction does not extend to them either; (4) a non-deterministic UDF is now
+  evaluated inline, i.e. a different number of times and in a different place than per batch; (5) the plan-restore
+  path is still ungated.
 
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 

@@ -138,12 +138,6 @@ EXPLAIN SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FR
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
-# P13: a correlated scalar subquery with an inequality: DuckDB decorrelates it into a CTE, inlined for the server
-query II
-EXPLAIN SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region);
-----
-physical_plan	<REGEX>:.*Fabricator Query.*
-
 # P14: a lateral subquery with an inequality and a LIMIT (decorrelated into a CTE as well)
 query II
 EXPLAIN SELECT l.w, r.id, r.v2 FROM loc l JOIN (SELECT t.id, t.region, x.v AS v2 FROM rp.dbo.st_big t, LATERAL (SELECT v FROM rp.dbo.st_big b WHERE b.v >= t.v ORDER BY v, id LIMIT 1) x WHERE t.id <= 30) r USING (region);
@@ -183,6 +177,12 @@ physical_plan	<!REGEX>:.*Fabricator Query.*
 # N4: a table function the provider implements in C# (cf_range): it does not exist on the server
 query II
 EXPLAIN SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM rp.dbo.cf_range(5) x JOIN rp.dbo.st_big b ON b.id = x.value GROUP BY b.region) r USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# N5: a correlated SCALAR subquery: its decorrelation keeps a single join (at most one row per outer row), which has no exact T-SQL form; pushing the part beside it would read the outer rows twice
+query II
+EXPLAIN SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region);
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -316,17 +316,6 @@ SELECT count(*) FROM (SELECT l.w, r.region, r.s FROM loc l JOIN (SELECT region, 
 ----
 1
 
-# P13
-query I
-SELECT (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region))));
-----
-0
-
-query I
-SELECT count(*) FROM (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region));
-----
-32
-
 # P14
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.w, r.id, r.v2 FROM loc l JOIN (SELECT t.id, t.region, x.v AS v2 FROM rp.dbo.st_big t, LATERAL (SELECT v FROM rp.dbo.st_big b WHERE b.v >= t.v ORDER BY v, id LIMIT 1) x WHERE t.id <= 30) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.v2 FROM loc l JOIN (SELECT t.id, t.region, x.v AS v2 FROM lb t, LATERAL (SELECT v FROM lb b WHERE b.v >= t.v ORDER BY v, id LIMIT 1) x WHERE t.id <= 30) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.id, r.v2 FROM loc l JOIN (SELECT t.id, t.region, x.v AS v2 FROM lb t, LATERAL (SELECT v FROM lb b WHERE b.v >= t.v ORDER BY v, id LIMIT 1) x WHERE t.id <= 30) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.v2 FROM loc l JOIN (SELECT t.id, t.region, x.v AS v2 FROM rp.dbo.st_big t, LATERAL (SELECT v FROM rp.dbo.st_big b WHERE b.v >= t.v ORDER BY v, id LIMIT 1) x WHERE t.id <= 30) r USING (region))));
@@ -404,6 +393,17 @@ SELECT count(*) FROM (SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.sq
 ----
 4
 
+# N5
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region));
+----
+32
+
 # N3
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(CASE WHEN random() < 2 THEN v END) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
@@ -457,7 +457,7 @@ SELECT (SELECT count(*) FROM (FROM rp.dbo.st_out EXCEPT ALL SELECT l.region, r.s
 # ═══ §3b  The decisions in duckdb_logs: where each condition ended up, and why something stayed local ═══════
 
 statement ok
-CALL enable_logging(['Fabricator.Remote'], storage := 'memory');
+CALL enable_logging(['Fabricator.Remote', 'Fabricator.Sql'], storage := 'memory');
 
 # P11 — the WHERE on the group key must reach the server query. Replaced before DuckDB's optimizers, the condition stayed
 # outside it: the whole table aggregated on the server, measured 0.73 s against 0.08 s for the scan with the condition.
@@ -479,6 +479,42 @@ SELECT count(*) FROM duckdb_logs
 WHERE message = 'local subtree (before the optimizers): a filter above it reads its columns; left for the pass after the optimizers';
 ----
 1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# P14 — DuckDB read the decorrelation CTE ONCE; inlined, the server reads it once per reference, so the copies agree
+# only if one statement reads consistently. TestDB has neither READ_COMMITTED_SNAPSHOT nor a pinned connection here,
+# but allows snapshot isolation: the query runs on a pooled connection at SNAPSHOT. (Measured 2026-10-30: at READ
+# COMMITTED, with a concurrent writer, 28 rows of 300 000 lost their subquery result across 8 runs.)
+statement ok
+SELECT l.w, r.id, r.v2 FROM loc l JOIN (SELECT t.id, t.region, x.v AS v2 FROM rp.dbo.st_big t, LATERAL (SELECT v FROM rp.dbo.st_big b WHERE b.v >= t.v ORDER BY v, id LIMIT 1) x WHERE t.id <= 30) r USING (region);
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE 'query [%at SNAPSHOT%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# …and inside a transaction that holds a connection it cannot, so the part stays local
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO rp.dbo.st_out VALUES ('zz', 1);
+
+statement ok
+SELECT l.w, r.id, r.v2 FROM loc l JOIN (SELECT t.id, t.region, x.v AS v2 FROM rp.dbo.st_big t, LATERAL (SELECT v FROM rp.dbo.st_big b WHERE b.v >= t.v ORDER BY v, id LIMIT 1) x WHERE t.id <= 30) r USING (region);
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE 'local subtree (%): %reads the same rows more than once%';
+----
+true
+
+statement ok
+ROLLBACK;
 
 statement ok
 CALL truncate_duckdb_logs();

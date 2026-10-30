@@ -236,17 +236,27 @@ the server's value. It crosses as its schema and name, never by its bare name �
 not as `ABS`. A function the provider implements itself (C#-authored, a plugin's, the Fabric API and CDC functions)
 does not exist on the server and keeps its part local (L2). Table-valued functions are not covered yet.
 
-**S9 — pushed: a correlated subquery.** DuckDB decorrelates it before planning — the outer rows become a CTE, the
-correlation a join with their distinct keys — and the server gets that CTE inlined, as one statement. This covers what
-cannot be written as a plain join: an inequality, a `LIMIT` per outer row, a `WITH … AS MATERIALIZED` read twice.
+**S9 — pushed: a LATERAL subquery with a `LIMIT` per row.** DuckDB decorrelates it before planning — the outer rows
+become a CTE, the correlation a join with their distinct keys — and the server gets that CTE inlined, as one statement:
 
 ```sql
-SELECT r.name, (SELECT count(*) FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount > r.region_rank) AS n
-FROM (SELECT region, name, CASE region WHEN 'EU' THEN 9 ELSE 4 END AS region_rank FROM mssql.dbo.pg_regions) r;
--- one statement; the outer query is read once per reference.   Americas 2 / Europe 2
+SELECT r.name, x.amount
+FROM mssql.dbo.pg_regions r,
+     LATERAL (SELECT s.amount FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount >= 10
+              ORDER BY s.amount DESC LIMIT 1) x;
+-- one statement; the outer rows are read once per reference.   Americas 20.00 / Europe 30.00
 ```
 
-A correlated subquery whose OUTER side is local data stays as before: its remote part is sent uncorrelated.
+⚠ **Reading the outer rows more than once is only allowed where one statement reads consistently.** DuckDB read that
+CTE once; the server reads each copy separately, and at READ COMMITTED a concurrent writer can make them disagree —
+measured: 28 of 300 000 rows lost their subquery result over 8 runs. So such a query runs where the database has
+`READ_COMMITTED_SNAPSHOT`, at `SNAPSHOT` on a pooled connection where it allows snapshot isolation (and no transaction
+holds a connection), inside a SERIALIZABLE / SNAPSHOT transaction — and stays in DuckDB otherwise
+(`… reads the same rows more than once …` in the log).
+
+Not pushed (yet): a correlated **scalar** subquery (`SELECT (SELECT max(…) FROM … WHERE … > t.k) FROM t`). Its
+decorrelation keeps a single join — at most one row per outer row — which has no exact T-SQL form. A correlated
+subquery whose OUTER side is local data stays as before: its remote part is sent uncorrelated.
 
 **S10 — pushed: a table-valued function with constant arguments.** It is called by its schema and name inside the
 server query, like a table:

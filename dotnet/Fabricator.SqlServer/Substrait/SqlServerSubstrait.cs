@@ -75,9 +75,10 @@ public static class SqlServerSubstrait
     internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending,
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null,
                                              Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
-                                             Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null)
+                                             Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null,
+                                             Func<bool>? consistentReads = null)
         => TranslatePushdown(plan, ignoreNulls, out columnCount, out orderDescending, out _, columnSqlTypes, catalogFunctions,
-                             catalogTableFunctions);
+                             catalogTableFunctions, consistentReads);
 
     /// <param name="write">For a plan that writes (INSERT … SELECT, DELETE, UPDATE), the operation, the target table
     /// and the columns it writes; the query is then a statement with no result, and <paramref name="columnCount"/>
@@ -87,7 +88,8 @@ public static class SqlServerSubstrait
                                              out (int Op, IReadOnlyList<string> Table, IReadOnlyList<string> Columns, IReadOnlyList<string>? Source)? write,
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null,
                                              Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
-                                             Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null)
+                                             Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null,
+                                             Func<bool>? consistentReads = null)
     {
         if (plan == null || plan.Length == 0)
         {
@@ -95,6 +97,12 @@ public static class SqlServerSubstrait
         }
         var decoder = new SubstraitPlanDecoder(plan);
         RootRel root = decoder.DecodePlan();
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] the host read part of this plan ONCE and the plan reads it once per copy:
+        // the copies agree only if the server reads one statement consistently
+        if (decoder.PlanOptimizations.Contains("fabricator.repeated_reads") && consistentReads?.Invoke() != true)
+            throw SubstraitTranslationException.Unsupported(
+                "the query reads the same rows more than once, and one statement would not read them consistently here " +
+                "(neither READ_COMMITTED_SNAPSHOT nor ALLOW_SNAPSHOT_ISOLATION, or a transaction holds a connection)");
         // IGNORE NULLS and DATETRUNC arrived together, with SQL Server 2022
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes)
         {

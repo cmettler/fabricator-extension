@@ -1672,7 +1672,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     public IArrowArrayStream ExecuteQuery(string sql) => ExecuteQuery(sql, (IReadOnlyList<SqlParameter>?)null);
 
     public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters) =>
-        ExecuteQuery(sql, parameters, readYourWrites: false);
+        _snapshotQueries.ContainsKey(sql)
+            ? ExecuteQuery(sql, parameters, readYourWrites: false, materialize: false, snapshotRead: true)
+            : ExecuteQuery(sql, parameters, readYourWrites: false);
 
     // --- ABI v88: the caller's `params` bag -------------------------------------------------------------
     // The host has already normalised whatever the caller wrote (a DuckDB STRUCT or a JSON object) into a
@@ -3238,13 +3240,30 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         int columnCount;
         List<bool> orderDescending;
         (int Op, IReadOnlyList<string> Table, IReadOnlyList<string> Columns, IReadOnlyList<string>? Source)? write;
+        // A plan that reads the same rows more than once (a CTE the host read once, inlined per reference) needs one
+        // statement to read consistently. Where the database does not (no READ_COMMITTED_SNAPSHOT) but allows snapshot
+        // isolation, and no transaction connection is pinned, the query runs on a pooled connection at SNAPSHOT.
+        bool atSnapshot = false;
+        bool ConsistentReads()
+        {
+            if (ConsistentStatementReads())
+            {
+                return true;
+            }
+            if (!HasPinnedConnection() && SnapshotIsolationAllowed())
+            {
+                atSnapshot = true;
+                return true;
+            }
+            return false;
+        }
         try
         {
             var special = UncollatableColumns();
             sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
                 substraitPlan, HasIgnoreNulls, out columnCount, out orderDescending, out write,
                 names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null,
-                ServerFunctionName, ServerTableFunctionName);
+                ServerFunctionName, ServerTableFunctionName, ConsistentReads);
         }
         catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
         {
@@ -3273,8 +3292,60 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 }
             }
         }
+        if (atSnapshot)
+        {
+            if (write is not null)
+            {
+                return RemoteQuery.Declined("a write that reads the same rows more than once needs READ_COMMITTED_SNAPSHOT");
+            }
+            if (_snapshotQueries.Count >= 256)
+            {
+                _snapshotQueries.Clear();
+            }
+            _snapshotQueries[sql] = true;
+        }
         return new RemoteQuery(sql, columnCount, orderDescending);
     }
+
+    // Pushed queries that must run at SNAPSHOT (see ConsistentReads in TranslateRemotePlan), by their text: the host
+    // runs each through fabricator_query, which hands this provider nothing but the SQL.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _snapshotQueries = new();
+
+    private bool HasPinnedConnection()
+    {
+        if (AmbientTransaction.Current != 0 && _txns.TryGet(AmbientTransaction.Current) is { } state)
+        {
+            lock (state)
+            {
+                return state.Connection is not null;
+            }
+        }
+        return false;
+    }
+
+    // ALLOW_SNAPSHOT_ISOLATION for this database, probed once. A failed probe answers FALSE: not knowing must not let a
+    // query read the same rows twice at READ COMMITTED.
+    private bool SnapshotIsolationAllowed()
+    {
+        if (_snapshotAllowed is null)
+        {
+            try
+            {
+                using var conn = OpenConnection();
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT snapshot_isolation_state FROM sys.databases WHERE database_id = DB_ID()";
+                _snapshotAllowed = cmd.ExecuteScalar() is byte state && state == 1;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        return _snapshotAllowed == true;
+    }
+
+    private bool? _snapshotAllowed;
 
     /// <summary>
     /// Why a pushed <c>INSERT … SELECT</c> into <paramref name="table"/> would NOT do what the host's own insert
@@ -3760,6 +3831,52 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     }
 
     private bool? _versionedReads;
+
+    // Whether one statement reads consistently — every read in it sees the same committed data — on the connection a
+    // pushed query runs on: a warehouse engine (snapshot by construction), a database with READ_COMMITTED_SNAPSHOT, or
+    // an explicit transaction at SERIALIZABLE / SNAPSHOT. Unlike VersionedReads, a failed probe answers FALSE: this one
+    // decides whether a query may read the same rows twice, and not knowing must not allow it.
+    private bool ConsistentStatementReads()
+    {
+        if (Profile.IsWarehouse)
+        {
+            return true;
+        }
+        if (_rcsi is null)
+        {
+            try
+            {
+                using var conn = OpenConnection();
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText =
+                    "SELECT CAST(is_read_committed_snapshot_on AS INT) FROM sys.databases WHERE database_id = DB_ID()";
+                _rcsi = System.Convert.ToInt32(cmd.ExecuteScalar() ?? 0) != 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        if (_rcsi == true)
+        {
+            return true;
+        }
+        if (AmbientTransaction.Current != 0 && _txns.TryGet(AmbientTransaction.Current) is { } state)
+        {
+            lock (state)
+            {
+                if (state.Transaction is { } txn &&
+                    (txn.IsolationLevel == IsolationLevel.Serializable || txn.IsolationLevel == IsolationLevel.Snapshot))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private bool? _rcsi;
 
     // Builds + runs a projected/filtered SELECT over an arbitrary FROM <source> — a table
     // (`[s].[t]`) or a parameterized TVF call (`[s].[f](@a0, ...)`). `sourceParams` are

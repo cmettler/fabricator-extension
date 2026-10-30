@@ -125,17 +125,17 @@ SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROU
 EU	32.00
 US	20.00
 
-# S9: a correlated subquery — DuckDB turns it into a CTE and joins, which the server gets inlined, as one statement
+# S9: a LATERAL subquery with a LIMIT per row — DuckDB turns it into a CTE and joins, which the server gets inlined
 query II
-EXPLAIN SELECT r.name, (SELECT count(*) FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount > r.region_rank) AS n FROM (SELECT region, name, CASE region WHEN 'EU' THEN 9 ELSE 4 END AS region_rank FROM mssql.dbo.pg_regions) r ORDER BY 1;
+EXPLAIN SELECT r.name, x.amount FROM mssql.dbo.pg_regions r, LATERAL (SELECT s.amount FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount >= 10 ORDER BY s.amount DESC LIMIT 1) x ORDER BY 1;
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
-query TI
-SELECT r.name, (SELECT count(*) FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount > r.region_rank) AS n FROM (SELECT region, name, CASE region WHEN 'EU' THEN 9 ELSE 4 END AS region_rank FROM mssql.dbo.pg_regions) r ORDER BY 1;
+query TT
+SELECT r.name, x.amount FROM mssql.dbo.pg_regions r, LATERAL (SELECT s.amount FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount >= 10 ORDER BY s.amount DESC LIMIT 1) x ORDER BY 1;
 ----
-Americas	2
-Europe	2
+Americas	20.00
+Europe	30.00
 
 # S10: a table-valued function with constant arguments, joined with a table of the catalog: one statement
 query II

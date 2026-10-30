@@ -334,9 +334,10 @@ a scalar `(SELECT max(v) FROM mssql.dbo.big)`, an `IN (SELECT … GROUP BY … H
 writes a table of the catalog. A **SQL Server scalar UDF** (`mssql.dbo.f(x)`) is called on the server, by its schema and
 name — in a part, or in a whole query that reads the catalog alone; before, the table came over and the function was
 called once per batch. A function the provider implements itself (C#, a plugin) keeps its part local. A
-**correlated subquery** over the catalog — an inequality, a `LATERAL (… LIMIT n)` per row, a
-`WITH … AS MATERIALIZED` read twice — goes as one statement too: DuckDB turns it into a CTE and joins, and the
-CTE is inlined for the server. A **table-valued function** with constant arguments (`mssql.dbo.tvf('EU')`) is
+`LATERAL (… LIMIT n)` per row, or another correlation DuckDB turns into a CTE and joins, goes as one statement too,
+with the CTE inlined for the server — only where the database reads one statement consistently
+(`READ_COMMITTED_SNAPSHOT`, snapshot isolation allowed, or a SERIALIZABLE / SNAPSHOT transaction), since the server
+reads that CTE once per reference. A correlated scalar subquery stays local (its single join has no T-SQL form). A **table-valued function** with constant arguments (`mssql.dbo.tvf('EU')`) is
 called by name inside such a query, joined with the catalog's tables. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
 condition down). `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.
 

@@ -2445,6 +2445,10 @@ substrait::Rel *DuckDBToSubstrait::TransformEmptyResult(LogicalOperator &dop) {
 std::function<bool(LogicalGet &get, vector<string> &path, vector<Value> &args)>
     DuckDBToSubstrait::table_function_resolver;
 
+void DuckDBToSubstrait::AddPlanOptimization(const string &type_url) {
+	plan.mutable_advanced_extensions()->add_optimization()->set_type_url(type_url);
+}
+
 substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 	auto get_rel = make_uniq<substrait::Rel>();
 	auto &dget = dop.Cast<LogicalGet>();

@@ -40,6 +40,9 @@ public:
 	//! arguments: its name path and arguments. It is read as a ReadRel naming the function, its arguments the one
 	//! row of a virtual table, marked by the enhancement `fabricator.table_function`. Set once at load.
 	static std::function<bool(LogicalGet &get, vector<string> &path, vector<Value> &args)> table_function_resolver;
+	//! [FABRICATOR-PATCH: OURS-BY-DESIGN] Adds a plan-level optimization hint (an Any with this type URL and no value):
+	//! information a consumer may use or ignore without changing what the plan means.
+	void AddPlanOptimization(const string &type_url);
 	//! Serializes the substrait plan to a string
 	string SerializeToString() const;
 	string SerializeToJson() const;
