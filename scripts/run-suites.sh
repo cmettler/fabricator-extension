@@ -1537,7 +1537,9 @@ case "$TIER" in
         # 2026-10-30: 6165 -> 6180: verify_pushdown_guide_mssql 94 -> 109 (L1-L4, the routing decisions in duckdb_logs).
         # 2026-10-30: 6180 -> 6205: verify_subtree_pushdown_mssql 123 -> 144 (P11 filter inside, N3 stability, §3b log),
         # verify_pushdown_guide_mssql 109 -> 113 (S7).
-        : "${MIN_ASSERTIONS:=6205}"
+        # 2026-10-30: 6205 -> 6227: SQL Server UDFs pushed — verify_subtree_pushdown_mssql 144 -> 155,
+        # verify_pushdown_guide_mssql 113 -> 119 (S8, L2 on cf_add), verify_remote_select_mssql 531 -> 536 (§5b).
+        : "${MIN_ASSERTIONS:=6227}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -53,6 +53,9 @@ CREATE TABLE ld AS SELECT * FROM rp.dbo.st_dim;
 statement ok
 CREATE MACRO st_fn_local(x) AS CAST(x * 2 + 1 AS INTEGER);
 
+statement ok
+CREATE MACRO cf_add_local(a, b) AS CAST(a + b AS INTEGER);
+
 query I
 SELECT count(*) FROM lb;
 ----
@@ -132,9 +135,15 @@ EXPLAIN SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big W
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
-# N2: a SQL Server UDF in the subtree: its bare name could translate as a built-in
+# P12: a SQL Server UDF in the subtree: called inline on the server, by its schema and name ([dbo].[st_fn])
 query II
 EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.st_fn(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# N2: a function the provider implements in C# (cf_add): it does not exist on the server, so the part stays here
+query II
+EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.cf_add(v, 1)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -279,7 +288,7 @@ SELECT count(*) FROM (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM l
 ----
 18
 
-# N2
+# P12
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.st_fn(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(st_fn_local(v)) AS s FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(st_fn_local(v)) AS s FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.st_fn(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
 ----
@@ -287,6 +296,17 @@ SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT regi
 
 query I
 SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(st_fn_local(v)) AS s FROM lb GROUP BY region) r USING (region));
+----
+5
+
+# N2
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.cf_add(v, 1)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(cf_add_local(v, 1)) AS s FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(cf_add_local(v, 1)) AS s FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.cf_add(v, 1)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(cf_add_local(v, 1)) AS s FROM lb GROUP BY region) r USING (region));
 ----
 5
 
@@ -303,8 +323,9 @@ SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(C
 
 # ═══ §3  What stays local, and why ════════════════════════════════════════════════════════════════════
 
-# A SQL Server UDF named like a built-in: in the plan a function carries only its bare name, so dbo.abs would
-# translate as ABS. Its calls keep the subtree local (N2 above is the same rule with a name nothing translates).
+# A SQL Server UDF named like a built-in. A catalog function crosses as its schema and name under our own Substrait
+# extension, never by its bare name, so dbo.abs is called as [dbo].[abs] — the differential below would see ABS
+# (v + 1000 against |v|), and §3b checks the T-SQL sent.
 query II
 SELECT rp.dbo.abs(-5), abs(-5);
 ----
@@ -313,7 +334,7 @@ SELECT rp.dbo.abs(-5), abs(-5);
 query II
 EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.abs(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.abs(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))
@@ -376,6 +397,30 @@ query I
 SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE 'local subtree (%): AGGREGATE stays local because it calls %(), whose value is not fixed by its arguments';
 ----
 true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# P12 — a SQL Server UDF is called by its schema and name, and dbo.abs as [dbo].[abs], not as the built-in ABS
+statement ok
+SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.abs(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'remote subtree (before the optimizers): %SUM(%[dbo].[abs]([t0].[v])%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# N2 — a function the provider implements itself (C#) does not exist on the server: the provider refuses it
+statement ok
+SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.cf_add(v, 1)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'local subtree (before the optimizers): %dbo.cf_add() is not a function of the server';
+----
+1
 
 statement ok
 CALL truncate_duckdb_logs();

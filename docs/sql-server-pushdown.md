@@ -13,7 +13,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | Statement | Pushed when … | `EXPLAIN` shows | Otherwise |
 |---|---|---|---|
 | `SELECT` | it joins, aggregates, sorts with a limit, uses windows, … over tables of the catalog (S1) | `Fabricator Query` | `Fabricator Scan` (+ DuckDB operators); the scan still sends its filter and columns to the server (S2) |
-| part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5–S7) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
+| part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5–S8) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
 | `INSERT … SELECT` | the `SELECT` reads tables of the same catalog and translates exactly (I1) | `FABRICATOR_REMOTE_DML` | `Mssql Net Insert`: DuckDB streams the rows into a bulk copy — and still pushes the `SELECT` when worth it |
 | `INSERT … VALUES` | never — a bulk copy is already the fast path (I2) | — | `Mssql Net Insert` |
 | `CREATE TABLE … AS` | its query is pushed (C1) | `Fabricator Remote Ctas` | `Mssql Net Create Table As`: rows stream into a bulk copy (C2) |
@@ -61,7 +61,8 @@ The reasons you will meet most:
 |---|---|
 | `no Substrait translation: Could not find function "<f>" …` | the function has no exact T-SQL; rewrite with one that has, or accept the local run |
 | `a plain scan keeps the table scan` | nothing to gain: the scan already sends its filter and columns |
-| `… stays local because it calls <f>() of catalog <c>` | a SQL Server or C# function of the attached catalog (not pushed: its bare name could mean a built-in) |
+| `… dbo.<f>() is not a function of the server` | a function the provider implements itself (C#, a plugin): it does not exist on SQL Server |
+| `… stays local because it calls <f>() of catalog <c>` | a function of ANOTHER attached catalog, or a catalog aggregate / window function |
 | `… stays local because it calls <f>(), whose value is not fixed by its arguments` / `local: it calls …` | `now()`, `current_date`, `random()`, … — the server would answer with its own clock, time zone or generator |
 | `a filter above it reads its columns; left for the pass after the optimizers` | not a refusal: the part is pushed once DuckDB has moved the filter into it, so the server query carries the `WHERE` (S7) |
 | `… stays local because it uses a prepared-statement parameter` | only for a part of a statement; a whole prepared statement is planned per `EXECUTE` with its values |
@@ -75,13 +76,14 @@ SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, 'i.s') GROUP BY id;
 -- Fabricator.Remote | local: no Substrait translation: Could not find function "regexp_matches" with argument types: ('string', 'string')
 ```
 
-**L2** — a part that reads only the server, and still stays local:
+**L2** — a part that reads only the server, and still stays local (`cf_add` is implemented by the provider in C#, so
+it does not exist on SQL Server):
 
 ```sql
-SELECT t.region, s.net
+SELECT t.region, s.n
 FROM (VALUES ('EU')) t(region)
-JOIN (SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
--- Fabricator.Remote | local subtree (before the optimizers): AGGREGATE stays local because it calls pg_net() of catalog mssql
+JOIN (SELECT region, sum(mssql.dbo.cf_add(id, 1)) AS n FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+-- Fabricator.Remote | local subtree (before the optimizers): Unsupported Substrait construct: dbo.cf_add() is not a function of the server
 ```
 
 **L3** — a `DELETE` that takes the key path names the condition (DuckDB rewrote `'^l'` to `prefix`):
@@ -130,7 +132,7 @@ SELECT fabricator_exec('mssql', '
   refresh_cache := true);
 ```
 
-L2 also uses a SQL Server function:
+S8 also uses a SQL Server function:
 
 ```sql
 SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END',
@@ -220,9 +222,22 @@ Such a part is pushed only after DuckDB has moved the condition into it. Pushed 
 the whole table and the condition would be applied afterwards in DuckDB — on 200 000 rows with an index on the column
 that was 0.73 s instead of 0.08 s.
 
+**S8 — pushed: a SQL Server UDF.** A scalar function of the catalog is called on the server, by its schema and name:
+
+```sql
+SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROUP BY region ORDER BY 1;
+-- sent: SELECT … SUM(… [dbo].[pg_net]([t0].[amount]) …) … GROUP BY …   EU 32.00 / US 20.00
+```
+
+Without this the table came over and the function was called once per batch, `SELECT [dbo].[pg_net](@p0) UNION ALL
+…`. The answer is the same either way: it is the server's function, it sees NULL arguments as before, and its result is
+the server's value. It crosses as its schema and name, never by its bare name — a `dbo.abs` is called as `[dbo].[abs]`,
+not as `ABS`. A function the provider implements itself (C#-authored, a plugin's, the Fabric API and CDC functions)
+does not exist on the server and keeps its part local (L2). Table-valued functions are not covered yet.
+
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
-connection), a part calling a function of the catalog (a SQL Server UDF — in the plan it carries only its bare name,
-which could translate as a built-in of that name), a part calling a function whose value is not fixed by its arguments
+connection), a part calling a function the provider implements itself or a function of another catalog, a part
+calling a function whose value is not fixed by its arguments
 (`now()`, `current_date`, `random()` — the server would use its own clock, time zone or generator; this holds for whole
 statements too), time travel (`AT (…)`), and anything that does not translate exactly.
 

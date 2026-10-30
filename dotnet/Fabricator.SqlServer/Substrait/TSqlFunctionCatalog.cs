@@ -240,6 +240,9 @@ internal static class TSqlFunctionCatalog
     public const string AggregateApproxUrn = "extension:io.substrait:functions_aggregate_approx";
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Fabricator's own extension: string min/max.</summary>
     public const string FabricatorStringUrn = "extension:fabricator:functions_string";
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] A function of the attached catalog, named by a JSON array of its schema
+    /// path and name — never resolved against the built-ins.</summary>
+    public const string FabricatorCatalogFunctionUrn = "extension:fabricator:catalog_function";
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Window functions with IGNORE NULLS, which Substrait cannot say.</summary>
     public const string FabricatorWindowUrn = "extension:fabricator:functions_window";
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB date functions with no Substrait counterpart.</summary>
@@ -260,12 +263,53 @@ internal static class TSqlFunctionCatalog
 
     public static SqlExpr WriteScalar(TSqlEmitter e, ScalarFunctionExpr sf, IReadOnlyList<SqlColumn> scope)
     {
+        if (sf.Function.Urn == FabricatorCatalogFunctionUrn)
+        {
+            return WriteCatalogFunction(e, sf, scope);
+        }
         var (rendered, argTypes) = RenderArgs(e, sf.Args, scope);
         var (fn, options, requested) = Resolve(sf.Function, TSqlFunctionKind.Scalar, sf.Args, argTypes, sf.Options);
         var resultType = sf.OutputType ?? fn.ReturnType(argTypes);
         var call = new TSqlCall(e, scope, sf.Function.DisplayName, sf.Args, rendered, argTypes, options, requested, resultType);
         string text = fn.Write(call);
         return fn.Predicate ? SqlExpr.Condition(text, call.Props) : SqlExpr.Of(text, resultType, call.Props);
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A call of the attached catalog's own function (a SQL Server UDF), by the name
+    /// the provider gives it. Its arguments arrive cast to the declared parameter types and its result is the server's
+    /// own value, so the call is exactly what the host would have run per row.
+    /// </summary>
+    private static SqlExpr WriteCatalogFunction(TSqlEmitter e, ScalarFunctionExpr sf, IReadOnlyList<SqlColumn> scope)
+    {
+        string[] path;
+        try
+        {
+            path = System.Text.Json.JsonSerializer.Deserialize<string[]>(sf.Function.RawName) ?? Array.Empty<string>();
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            throw SubstraitTranslationException.MalformedPlan($"Catalog function name is not a JSON array: {sf.Function.RawName}");
+        }
+        string display = string.Join(".", path);
+        string? name = path.Length >= 2 ? e.CatalogFunctions?.Invoke(path) : null;
+        if (name == null)
+        {
+            throw SubstraitTranslationException.Unsupported($"{display}() is not a function of the server");
+        }
+        if (sf.OutputType is not { } resultType)
+        {
+            throw SubstraitTranslationException.Unsupported($"{display}(): the plan does not name its result type");
+        }
+        var (rendered, argTypes) = RenderArgs(e, sf.Args, scope);
+        var call = new TSqlCall(e, scope, display, sf.Args, rendered, argTypes,
+                                new Dictionary<string, string>(), new HashSet<string>(), resultType);
+        var args = new List<string>();
+        for (int i = 0; i < sf.Args.Count; i++)
+        {
+            args.Add(call.V(i));
+        }
+        return SqlExpr.Of($"{name}({string.Join(", ", args)})", resultType, call.Props);
     }
 
     /// <summary>

@@ -75,6 +75,13 @@ internal sealed class TSqlEmitter
     public bool SupportsDateTrunc { get; init; } = true;
 
     /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A function of the attached catalog (its schema path and name) as the T-SQL
+    /// name to call it by, e.g. <c>[dbo].[f]</c> — or null when it does not run on the server (a function the provider
+    /// implements itself). Unset: every catalog function is refused.
+    /// </summary>
+    public Func<IReadOnlyList<string>, string?>? CatalogFunctions { get; init; }
+
+    /// <summary>
     /// Writes the query. With <paramref name="nested"/>, the query is meant
     /// to be used as a derived table, so a final ORDER BY (which T-SQL does not
     /// allow there, and which would not order the outer query anyway) is left out.

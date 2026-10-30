@@ -23,6 +23,9 @@ CREATE TABLE dbo.pg_sales_eu (id INT, amount DECIMAL(10,2), loaded DATETIME2 DEF
 INSERT INTO dbo.pg_regions VALUES (''EU'', N''Europe''), (''US'', N''Americas'');
 INSERT INTO dbo.pg_sales VALUES (1,''EU'',10,''2026-01-05'',N''first''),(2,''US'',20,''2026-02-01'',NULL),(3,''EU'',30,''2026-02-07'',N''Größe''),(4,''US'',5,''2025-12-30'',N''late'');', refresh_cache := true);
 
+statement ok
+SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END', refresh_cache := true);
+
 # ═══ S — SELECT ════════════════════════════════════════════════════════════════════════════════════════
 
 # S1: a join with an aggregate runs as one T-SQL statement
@@ -106,6 +109,18 @@ query TI
 SELECT t.region, s.total FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region) WHERE s.region = 'EU';
 ----
 EU	40.00
+
+# S8: a SQL Server UDF is called on the server, by its schema and name
+query II
+EXPLAIN SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROUP BY region ORDER BY 1;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TT
+SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROUP BY region ORDER BY 1;
+----
+EU	32.00
+US	20.00
 
 # the switch for parts of statements: S5 runs locally again, same answer
 statement ok
@@ -290,9 +305,6 @@ physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
 # ═══ L — why it ran where it ran (duckdb_logs) ══════════════════════════════════════════════════════════
 
 statement ok
-SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END', refresh_cache := true);
-
-statement ok
 CALL enable_logging(['Fabricator.Remote', 'Fabricator.Dml', 'Fabricator.Sql'], storage := 'memory');
 
 # L1: a statement that stays local says why
@@ -308,13 +320,14 @@ SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote'
 statement ok
 CALL truncate_duckdb_logs();
 
-# L2: a part of a statement that reads only the server and still stays local
+# L2: a part of a statement that reads only the server and still stays local: cf_add is a function the provider
+# implements in C#, not one of the server
 statement ok
-SELECT t.region, s.net FROM (VALUES ('EU')) t(region) JOIN (SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+SELECT t.region, s.n FROM (VALUES ('EU')) t(region) JOIN (SELECT region, sum(mssql.dbo.cf_add(id, 1)) AS n FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
 
 query I
 SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote'
-  AND message = 'local subtree (before the optimizers): AGGREGATE stays local because it calls pg_net() of catalog mssql';
+  AND message LIKE 'local subtree (before the optimizers): %dbo.cf_add() is not a function of the server';
 ----
 1
 

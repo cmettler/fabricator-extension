@@ -1389,10 +1389,12 @@ SELECT count(*) FROM (((SELECT count(*) AS n FROM rp.dbo.rs_t WHERE date_trunc('
 ----
 0
 
-# ═══ §5b A call of the catalog's own function keeps the statement local ═════════════════════════════════
-# It does not translate, and the optimizer strips the catalog from the call before RemoteExecute sees it
-# (`rp.dbo.f(x)` arrives as `dbo.f(x)`), so a decline could not restore it: this failed with "Scalar Function with
-# name rs_fn does not exist" under remote_pushdown, over a table and over a derived table alike.
+# ═══ §5b A call of the catalog's own function ════════════════════════════════════════════════════════════
+# The remote optimizer never takes it: the optimizer strips the catalog from the call before RemoteExecute sees it
+# (`rp.dbo.f(x)` arrives as `dbo.f(x)`), so a decline could not restore it — this failed with "Scalar Function with
+# name rs_fn does not exist" under remote_pushdown, over a table and over a derived table alike. The statement goes
+# to the server through the subtree pushdown instead, which works on the bound plan (verify_subtree_pushdown_mssql);
+# with that switched off it runs locally, and either way it answers.
 
 statement ok
 SELECT fabricator_exec('rp', 'CREATE OR ALTER FUNCTION dbo.rs_fn(@a INT) RETURNS INT AS BEGIN RETURN @a + 100 END', refresh_cache := true);
@@ -1400,7 +1402,23 @@ SELECT fabricator_exec('rp', 'CREATE OR ALTER FUNCTION dbo.rs_fn(@a INT) RETURNS
 query II
 EXPLAIN SELECT rp.dbo.rs_fn(id) FROM rp.dbo.rs_t;
 ----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+SET fabricator_subtree_pushdown = false;
+
+query II
+EXPLAIN SELECT rp.dbo.rs_fn(id) FROM rp.dbo.rs_t;
+----
 physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT min(rp.dbo.rs_fn(id)) - min(id) FROM rp.dbo.rs_t WHERE id < 1000;
+----
+100
+
+statement ok
+SET fabricator_subtree_pushdown = true;
 
 query I
 SELECT min(rp.dbo.rs_fn(id)) - min(id) FROM rp.dbo.rs_t WHERE id < 1000;

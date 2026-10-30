@@ -435,6 +435,42 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 	auto &dfun = dexpr.Cast<BoundFunctionExpression>();
 
 	auto function_name = dfun.Function().GetName().GetIdentifierName();
+	// [FABRICATOR-PATCH: OURS-BY-DESIGN] A function of an attached catalog (a SQL Server UDF, a provider's own function):
+	// declared under our own extension, named by its schema path and name as a JSON array — so it can never resolve as
+	// a built-in of the same name (a dbo.abs is not ABS). Whether it runs there is the consumer's decision.
+	auto catalog_name = dfun.Function().GetCatalogName().GetIdentifierName();
+	if (!catalog_name.empty() && !StringUtil::CIEquals(catalog_name, "system")) {
+		auto qualified = dfun.Function().GetQualifiedName();
+		auto &path = qualified.Path(); // [catalog, schema…, name]
+		string declared = "[";
+		for (idx_t i = 1; i < path.size(); i++) {
+			if (i > 1) {
+				declared += ",";
+			}
+			declared += "\"";
+			for (auto ch : path[i].GetIdentifierName()) {
+				if (ch == '"' || ch == '\\') {
+					declared += '\\';
+					declared += ch;
+				} else if (static_cast<unsigned char>(ch) < 0x20) {
+					char buffer[8];
+					snprintf(buffer, sizeof(buffer), "\\u%04x", static_cast<unsigned char>(ch));
+					declared += buffer;
+				} else {
+					declared += ch;
+				}
+			}
+			declared += "\"";
+		}
+		declared += "]";
+		auto sfun = sexpr.mutable_scalar_function();
+		for (auto &child : dfun.GetChildren()) {
+			TransformExpr(*child, *sfun->add_arguments()->mutable_value(), col_offset);
+		}
+		sfun->set_function_reference(RegisterDeclaredFunction(declared, "extension:fabricator:catalog_function"));
+		*sfun->mutable_output_type() = DuckToSubstraitType(dfun.GetReturnType());
+		return;
+	}
 	// [FABRICATOR-PATCH: OFFER-READY] a unary minus is Substrait's negate, not a one-argument subtract
 	if (function_name == "-" && dfun.GetChildren().size() == 1) {
 		function_name = "negate";

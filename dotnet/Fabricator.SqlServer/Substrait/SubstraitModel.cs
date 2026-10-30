@@ -140,6 +140,9 @@ sealed class FunctionDecl
     public string Name = "";
     /// <summary>The signature part of a compound name ("i64_i64"), or null for a bare name.</summary>
     public string? Signature;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The name as declared, unsplit (a catalog function's name is a JSON
+    /// array of its schema path and name, which may contain a colon).</summary>
+    public string RawName = "";
 
     public string DisplayName => Signature == null ? Name : Name + ":" + Signature;
 }

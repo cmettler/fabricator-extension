@@ -372,6 +372,10 @@ bool ConsistentNode(const Expression &expr, string *why) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &function = expr.Cast<BoundFunctionExpression>().Function();
+		auto catalog = function.GetCatalogName().GetIdentifierName();
+		if (!catalog.empty() && !StringUtil::CIEquals(catalog, "system")) {
+			return true; // the provider's own function: run by the provider either way, so pushed or not, same answer
+		}
 		return check(function.GetStability(), function.GetName());
 	}
 	case ExpressionClass::BOUND_AGGREGATE: {
@@ -1338,10 +1342,12 @@ optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 }
 
 //! Whether an expression may run on the server: no parameter (a prepared statement binds its values per EXECUTE, after
-//! the plan was translated), no subquery, and no function of an attached catalog — a SQL Server UDF or a C#-authored
-//! catalog function carries only its bare name in the plan, which could translate as a built-in of that name.
-//! `why`, when given, receives the reason of a refusal.
-bool PushableExpression(const Expression &expr, string *why = nullptr) {
+//! the plan was translated), no subquery, and no aggregate or window function of an attached catalog. A SCALAR function
+//! of an attached catalog (a SQL Server UDF) is allowed and recorded in `catalog_functions` as (catalog, name): the
+//! subtree must read that same catalog, and the provider decides at translation whether it runs there (a C#-authored
+//! function does not). `why`, when given, receives the reason of a refusal.
+bool PushableExpression(const Expression &expr, string *why = nullptr,
+                        vector<pair<string, string>> *catalog_functions = nullptr) {
 	auto builtin = [&](const Identifier &function, const Identifier &catalog) {
 		auto name = catalog.GetIdentifierName();
 		if (name.empty() || StringUtil::CIEquals(name, "system")) {
@@ -1365,8 +1371,12 @@ bool PushableExpression(const Expression &expr, string *why = nullptr) {
 		return false;
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &function = expr.Cast<BoundFunctionExpression>().Function();
-		if (!builtin(function.GetName(), function.GetCatalogName())) {
-			return false;
+		auto catalog = function.GetCatalogName().GetIdentifierName();
+		if (!catalog.empty() && !StringUtil::CIEquals(catalog, "system")) {
+			if (!catalog_functions) {
+				return builtin(function.GetName(), function.GetCatalogName());
+			}
+			catalog_functions->emplace_back(catalog, function.GetName().GetIdentifierName());
 		}
 		break;
 	}
@@ -1393,7 +1403,7 @@ bool PushableExpression(const Expression &expr, string *why = nullptr) {
 	}
 	bool pushable = true;
 	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
-		if (pushable && !PushableExpression(child, why)) {
+		if (pushable && !PushableExpression(child, why, catalog_functions)) {
 			pushable = false;
 		}
 	});
@@ -1402,7 +1412,7 @@ bool PushableExpression(const Expression &expr, string *why = nullptr) {
 
 //! Whether an operator may be part of a pushed subtree; `worth`: whether it reduces what travels — a subtree of scans,
 //! filters, projections and sorts only is what the table scan already does (it pushes its filter and projection).
-bool PushableOperator(LogicalOperator &op, bool &worth, string &why) {
+bool PushableOperator(LogicalOperator &op, bool &worth, string &why, vector<pair<string, string>> &catalog_functions) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 	case LogicalOperatorType::LOGICAL_FILTER:
@@ -1429,7 +1439,7 @@ bool PushableOperator(LogicalOperator &op, bool &worth, string &why) {
 	}
 	bool pushable = true;
 	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
-		if (pushable && *expr && !PushableExpression(**expr, &why)) {
+		if (pushable && *expr && !PushableExpression(**expr, &why, &catalog_functions)) {
 			pushable = false;
 		}
 	});
@@ -1634,7 +1644,8 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 	}
 	bool worth = false;
 	string why;
-	bool operator_ok = PushableOperator(*op, worth, why);
+	vector<pair<string, string>> catalog_functions;
+	bool operator_ok = PushableOperator(*op, worth, why, catalog_functions);
 	// whether everything below reads one catalog alone
 	bool children_remote = !children.empty();
 	for (auto &child : children) {
@@ -1644,6 +1655,20 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		}
 		result.catalog = child.catalog;
 		worth = worth || child.worth;
+	}
+	// A function of the catalog the subtree reads runs on its server (the provider decides at translation); calling it
+	// there instead of once per batch is worth it on its own. A function of ANOTHER catalog keeps the operator here.
+	for (auto &function : catalog_functions) {
+		if (!operator_ok) {
+			break;
+		}
+		if (children_remote && result.catalog &&
+		    StringUtil::CIEquals(function.first, result.catalog->GetName().GetIdentifierName())) {
+			worth = true;
+		} else {
+			operator_ok = false;
+			why = "it calls " + function.second + "() of catalog " + function.first;
+		}
 	}
 	bool pure = operator_ok && children_remote;
 	if (!operator_ok && children_remote && !why.empty()) {

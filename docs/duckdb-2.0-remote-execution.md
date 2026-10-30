@@ -1343,6 +1343,28 @@ statement); literals instead of parameters fill SQL Server's plan cache with sin
 DuckDB internals (pre-optimize hook, child binder, `ColumnBindingReplacer`, `LogicalOperator::Copy` via serialization,
 the remote optimizer itself — the 2.1 canary already shows two red suites).
 
+### 4.13 SQL Server scalar UDFs inside a pushed part — BUILT (2026-10-30, step 1 of the user-agreed order)
+
+Before, every call of a function of the attached catalog kept its part local, because in the plan a function carries
+only its bare name and `dbo.abs` would have translated as `ABS`. MEASURED before: `SELECT id, db.dbo.f(k) FROM db.dbo.t`
+fetched the table and called `SELECT [dbo].[f](@p0) UNION ALL SELECT [dbo].[f](@p1) …` once per batch.
+
+- **to_substrait** declares a function of a non-system catalog under `extension:fabricator:catalog_function`, named by a
+  JSON array of its schema path and name — never through the YAML built-ins, so no name can resolve as a built-in.
+- **The provider decides** (`TSqlEmitter.CatalogFunctions`, `SqlServerBackend.ServerFunctionName`): a function in the
+  CatalogFunctionSet (C#-authored, Fabric API, CDC) does not exist on the server → declined; every other scalar of the
+  catalog is a discovered routine → `[schema].[name](args)`. The C++ side stays provider-agnostic.
+- **The subtree must read the function's catalog**; a call of the catalog's function makes a part worth pushing on its
+  own (a projection or filter over one scan). A catalog aggregate / window function stays vetoed, and so does a function
+  of another catalog. Catalog scalars are exempt from the stability veto: run by the provider either way.
+- **Same answer by construction:** the catalog UDF is registered SPECIAL_HANDLING (it sees NULL arguments) and its
+  DuckDB result type is the mapping of the server's own return type; inline, the server computes the same value.
+- **Route a still vetoes it** (the decline-after-strip problem of §5b in verify_remote_select_mssql); a whole statement
+  calling a UDF reaches the server through the subtree pass's root replacement instead.
+- Gates: `verify_subtree_pushdown_mssql` P12 (UDF pushed, differential) + §3 dbo.abs pushed as `[dbo].[abs]` (log) +
+  N2 (C# cf_add stays local, reason logged) — 155; guide S8 + L2 (119); remote_select §5b rewritten (536). Mutant
+  "catalog functions by their bare name" killed at P12. Not built: table-valued functions (step 3), UDFs in pushed DML.
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

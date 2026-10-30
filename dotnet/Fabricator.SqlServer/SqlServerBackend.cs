@@ -3197,6 +3197,20 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     private bool HasIgnoreNulls
         => Profile.EngineEdition == ServerProfile.EditionAzureSqlDatabase || Profile.ProductMajorVersion >= 16;
 
+    /// <summary>
+    /// A scalar function of this catalog in a pushed plan (schema, name) as the T-SQL name to call it by, or null when it
+    /// does not run on the server. Every scalar function of this catalog is a discovered SQL routine except the ones the
+    /// provider implements itself (the CatalogFunctionSet: C#-authored, Fabric API, CDC) — those run here, never there.
+    /// </summary>
+    private string? ServerFunctionName(IReadOnlyList<string> path)
+    {
+        if (path.Count != 2 || Functions.TryScalar(new SchemaPath(path[0]), path[1], out _))
+        {
+            return null;
+        }
+        return $"{Quote(path[0])}.{Quote(path[1])}";
+    }
+
     /// <summary>The pushed plan as T-SQL (Substrait → the vendored emitter, ABI v96); refuses what it cannot write exactly.</summary>
     public RemoteQuery? TranslateRemotePlan(byte[] substraitPlan)
     {
@@ -3213,7 +3227,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             var special = UncollatableColumns();
             sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
                 substraitPlan, HasIgnoreNulls, out columnCount, out orderDescending, out write,
-                names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null);
+                names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null,
+                ServerFunctionName);
         }
         catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
         {

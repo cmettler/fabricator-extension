@@ -157,7 +157,7 @@ sealed class SubstraitPlanDecoder
             if (name == null)
                 throw SubstraitTranslationException.MalformedPlan($"Extension function (anchor={anchor}) has no name.");
 
-            var decl = new FunctionDecl();
+            var decl = new FunctionDecl { RawName = name };
             int colon = name.IndexOf(':');
             if (colon >= 0)
             {
