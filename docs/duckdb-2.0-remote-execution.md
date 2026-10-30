@@ -1564,8 +1564,14 @@ upstream (any long synchronous operator on a worker thread spins the client).
 *"Execution Timeout Expired"*. The lateral session opens its OWN connection and transaction (`BeginInOutScope`), so
 under locking READ COMMITTED it waits for the statement's own transaction; under RCSI it would not see the
 transaction's writes (inferred, not measured). The pushed APPLY declines there (repeated reads + pinned connection),
-so it lands on this path. Fix options: run the calls on the pinned connection while the transaction holds one
-(serialized; needs MARS), or refuse the lateral form with a clear message once the transaction has written.
+so it lands on this path.
+**BUILT (2026-10-30):** each call asks the scan router (`PinnedReadConnection`, `RouteScan` with read-your-writes +
+drain) and, when the transaction holds a connection, runs on it under the transaction's `ExecGate` — parallel
+sessions share that one connection, and without MARS it admits a single reader. Otherwise the session keeps its own
+connection as before. Measured: the case above 30 s timeout → 0.16 s, the inserted row in the answer; 100 distinct
+arguments in parallel inside a write transaction, MARS on and off, both see the transaction's own row. Gate
+`verify_table_inout` (97 -> 115, both MARS modes, a local outer so the lateral path is certain); mutant (never the
+pinned connection) dies at the first in-transaction call with the original *"Execution Timeout Expired"*.
 
 **F7 — argument conversion in the APPLY: no difference (measured).** Truncation into VARCHAR(10), Unicode into a
 non-Unicode parameter (emoji → `??`), trailing spaces, DECIMAL(12,4) → DECIMAL(10,2) rounding and NULL: the pushed
@@ -1573,6 +1579,18 @@ APPLY and the lateral path return identical rows (EXCEPT ALL both ways empty).
 
 **F8 — the lateral call cannot be interrupted** (read): `SqlServerTvfLateral` runs `ExecuteReader()` without the
 `InterruptScope` token the scans use, so Ctrl+C waits for the server or the 30 s timeout.
+**BUILT (2026-10-30):** the call executes with the scope's token and hands the scope to the stream. Measured from the
+DuckDB 2.0.0 Python wheel, `interrupt()` after 1 s of a ~23 s server call: returned after **23.5 s** before, **1.0 s**
+after (*"lateral_call failed: A task was canceled"* — a cancelled scan reports the same way, docs/cancellation.md).
+Not in a tier: no suite can send an interrupt mid-statement (harness scratchpad `review/interrupt.py`).
+
+**F5, the decision.** An ASYNCHRONOUS lateral operator is not available in DuckDB 2.0: an intermediate operator may
+return `BLOCKED`, but `ExecutionContext` carries no `InterruptState`, so nothing could reschedule the task — it would
+hang, not spin. And the spin is not ours alone: any synchronous extension operator running on a worker while the
+client thread has no task re-polls the same way (the scalar UDF crossing too). Left as an upstream candidate — the
+client's result loops (`query_result.cpp`, `CompleteDelegatedInternal`) wait on `BLOCKED` but not on
+`NO_TASKS_AVAILABLE` — to be reproduced on a stock build before it is filed (docs/duckdb-upstream-issues.md rule).
+F6 removed its worst trigger here (a 30 s wait on the statement's own locks).
 
 **Chesterton.** F1's fence (one key) had no recorded reason and contradicted §3.6 — but HALF of it was load-bearing
 after all: the UTF-8 conversion is what makes an unpaired surrogate compare as DuckDB reads it. Removed only the

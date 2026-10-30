@@ -73,18 +73,35 @@ internal sealed class SqlServerTvfLateral : ILateralFunctionBinding
             {
                 return LateralResult.Empty;
             }
-            if (_conn == null)
-            {
-                (_conn, _txn) = _b._owner.BeginInOutScope(_b._isolation);
-            }
             var batches = new List<RecordBatch>();
             var origin = new List<int>();
             // SQL Server takes at most ~2100 parameters per statement
             int maxRows = Math.Max(1, 2000 / Math.Max(1, cols));
-            for (int start = 0; start < rows; start += maxRows)
+            // A transaction that holds a connection (it wrote, or mssql_read_isolation pinned it) reads on THAT
+            // connection, as its scans do: on a connection of its own the call would not see the transaction's
+            // writes and, under locking READ COMMITTED, would wait for their locks until the command times out
+            // (docs/duckdb-2.0-remote-execution.md §4.18 F6). Parallel sessions share it, so each call takes the
+            // transaction's gate for its whole execute + read; the call drains its result before it returns.
+            if (_b._owner.PinnedReadConnection() is { } pinned)
             {
-                int end = Math.Min(start + maxRows, rows);
-                RunChunk(input, start, end, batches, origin);
+                lock (pinned.Gate)
+                {
+                    for (int start = 0; start < rows; start += maxRows)
+                    {
+                        RunChunk(pinned.Connection, pinned.Transaction, input, start, Math.Min(start + maxRows, rows), batches, origin);
+                    }
+                }
+            }
+            else
+            {
+                if (_conn == null)
+                {
+                    (_conn, _txn) = _b._owner.BeginInOutScope(_b._isolation);
+                }
+                for (int start = 0; start < rows; start += maxRows)
+                {
+                    RunChunk(_conn, _txn, input, start, Math.Min(start + maxRows, rows), batches, origin);
+                }
             }
             if (origin.Count == 0)
             {
@@ -97,7 +114,8 @@ internal sealed class SqlServerTvfLateral : ILateralFunctionBinding
             return new LateralResult(Concatenate(batches), origin.ToArray());
         }
 
-        private void RunChunk(RecordBatch input, int start, int end, List<RecordBatch> batches, List<int> origin)
+        private void RunChunk(SqlConnection connection, SqlTransaction? transaction, RecordBatch input, int start, int end,
+                              List<RecordBatch> batches, List<int> origin)
         {
             int cols = _b._paramSqlTypes.Length;
             var sb = new StringBuilder("SELECT p.[__fab_row], f.* FROM (VALUES ");
@@ -125,7 +143,7 @@ internal sealed class SqlServerTvfLateral : ILateralFunctionBinding
             }
             sb.Append(") AS f");
 
-            using var command = _conn!.CreateCommand();
+            using var command = connection.CreateCommand();
             command.CommandText = sb.ToString();
             if (Log.IsEnabled(LogLevel.Debug))
             {
@@ -133,10 +151,23 @@ internal sealed class SqlServerTvfLateral : ILateralFunctionBinding
                              input.Length, command.CommandText.Length <= 300 ? command.CommandText : command.CommandText.Substring(0, 300) + "…");
             }
             command.CommandType = CommandType.Text;
-            command.Transaction = _txn;
+            command.Transaction = transaction;
             SqlServerCatalog.AddParameters(command, sqlParams);
-            var reader = command.ExecuteReader();
-            using var stream = new DbDataReaderArrowStream(_conn, command, reader, ownsConnection: false);
+            // Ctrl+C / interrupt() cancels the call on the server, as a scan's read is (docs/duckdb-2.0-remote-execution.md
+            // §4.18 F8); the stream owns the scope and stops its poller when it is disposed
+            var interrupt = new InterruptScope(AmbientOpener.Current);
+            SqlDataReader reader;
+            try
+            {
+                reader = command.ExecuteReaderAsync(interrupt.Token).GetAwaiter().GetResult();
+            }
+            catch
+            {
+                interrupt.Dispose();
+                throw;
+            }
+            using var stream = new DbDataReaderArrowStream(connection, command, reader, ownsConnection: false,
+                                                           interrupt: interrupt);
             while (stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
             {
                 var rowNumbers = (Int32Array)batch.Column(0);

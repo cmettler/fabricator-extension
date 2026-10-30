@@ -170,6 +170,61 @@ SELECT v.n, f.m FROM (VALUES(2)) v(n), iodb.dbo.tf_io(v.n) f ORDER BY 1, 2;
 2	1
 2	2
 
+# ── Inside a transaction that wrote: the call reads on the transaction's own connection ──────────────────────
+# A session of its own would neither see the transaction's writes nor get past their locks: under locking READ
+# COMMITTED it waited 30 s for them and failed with "Execution Timeout Expired" (docs/duckdb-2.0-remote-execution.md
+# §4.18 F6). Each call takes the transaction's gate, so parallel sessions share the connection, MARS or not.
+
+statement ok
+SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_rows; DROP TABLE IF EXISTS dbo.tf_src;
+CREATE TABLE dbo.tf_src (k INT PRIMARY KEY, grp INT); INSERT INTO dbo.tf_src SELECT value, value % 50 FROM GENERATE_SERIES(1, 1000);');
+
+statement ok
+SELECT fabricator_exec('iodb', 'CREATE FUNCTION dbo.tf_rows(@g INT) RETURNS TABLE AS RETURN (SELECT k FROM dbo.tf_src WHERE grp = @g)', refresh_cache := true);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO iodb.dbo.tf_src VALUES (5001, 7), (5002, 49);
+
+query III
+SELECT count(*), sum(f.k), max(f.k) FROM range(0, 50) g(i), iodb.dbo.tf_rows(g.i::INT) f;
+----
+1002	510503	5002
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET mssql_mars = false;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO iodb.dbo.tf_src VALUES (5001, 7), (5002, 49);
+
+query III
+SELECT count(*), sum(f.k), max(f.k) FROM range(0, 50) g(i), iodb.dbo.tf_rows(g.i::INT) f;
+----
+1002	510503	5002
+
+statement ok
+ROLLBACK;
+
+statement ok
+RESET mssql_mars;
+
+# outside the transaction the inserted rows are gone again
+query I
+SELECT count(*) FROM range(0, 50) g(i), iodb.dbo.tf_rows(g.i::INT) f;
+----
+1000
+
+statement ok
+SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_rows; DROP TABLE IF EXISTS dbo.tf_src');
+
 statement ok
 SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_io');
 

@@ -190,4 +190,24 @@ public sealed partial class SqlServerCatalog
         return new ScanRoute(null, null, null, materialize, snapshotRead,
                              snapshotRead ? "pooled at SNAPSHOT (mssql_materialize=false)" : "pooled");
     }
+
+    /// <summary>
+    /// The transaction's own connection when a read inside it must use it (the rules of <see cref="RouteScan"/> for a
+    /// read that drains at once): null outside a transaction or while it holds none. For a caller that is not a scan —
+    /// a lateral TVF call — and so shares the connection with other threads: <c>Gate</c> serializes them.
+    /// </summary>
+    internal (SqlConnection Connection, SqlTransaction? Transaction, object Gate)? PinnedReadConnection()
+    {
+        long txnId = Fabricator.Bridge.AmbientTransaction.Current;
+        if (txnId == 0)
+        {
+            return null;
+        }
+        var route = RouteScan(readYourWrites: true, materialize: true, snapshotRead: false, txnId);
+        if (route.Pinned is null || _txns.TryGet(txnId) is not { } state)
+        {
+            return null;
+        }
+        return (route.Pinned, route.PinnedTransaction, route.ExecGate ?? state.ExecGate);
+    }
 }

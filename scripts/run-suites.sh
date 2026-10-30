@@ -1551,7 +1551,9 @@ case "$TIER" in
         #             193 -> 210 (P17, P18, N6), verify_pushdown_guide_mssql 140 -> 150 (S12)
         # 2026-10-30: 6345 -> 6379: string equality on its own key (UTF-8, varchar(8000) where the column fits) —
         #             verify_remote_select_mssql 536 -> 570 (§16)
-        : "${MIN_ASSERTIONS:=6379}"
+        # 2026-10-30: 6379 -> 6397: a lateral TVF call inside a writing transaction runs on its connection —
+        #             verify_table_inout 97 -> 115
+        : "${MIN_ASSERTIONS:=6397}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
