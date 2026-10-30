@@ -127,16 +127,27 @@ EXPLAIN SELECT count(*), sum(id) FROM rp.dbo.rs_t EXCEPT ALL SELECT count(*), su
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
-# ⚠ BUT NOT A JOIN CHILD: DuckDB's optimizer pushes a node only when the WHOLE node is remote, and it has no
-# partial pushdown for one side of a join (unlike a set operation's branches). So a remote aggregate joined to
-# a local table runs locally today. This row pins upstream's behaviour and fails the day it changes.
+# A JOIN CHILD: DuckDB's optimizer pushes a node only when the WHOLE node is remote, and it has no partial pushdown
+# for one side of a join (unlike a set operation's branches). The subtree pushdown (§4.10,
+# verify_subtree_pushdown_mssql) sends the remote side on its own; with its switch off, upstream's behaviour remains.
 statement ok
 CREATE TEMP TABLE kn AS SELECT i::SMALLINT AS k, 'k' || i AS name FROM range(7) r(i);
 
 query II
 EXPLAIN SELECT kn.name, s.c FROM kn JOIN (SELECT k, count(*) AS c FROM rp.dbo.rs_t GROUP BY k) s ON kn.k = s.k;
 ----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+SET fabricator_subtree_pushdown = false;
+
+query II
+EXPLAIN SELECT kn.name, s.c FROM kn JOIN (SELECT k, count(*) AS c FROM rp.dbo.rs_t GROUP BY k) s ON kn.k = s.k;
+----
 physical_plan	<!REGEX>:.*Fabricator Query.*
+
+statement ok
+SET fabricator_subtree_pushdown = true;
 
 # ═══ §2  Routing — NOT pushed, each for its own reason ═════════════════════════════════════════════════
 
@@ -153,11 +164,23 @@ EXPLAIN SELECT id, s FROM rp.dbo.rs_t WHERE id > 5 ORDER BY s;
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
 # two result columns of one name: DuckDB re-wraps a pushed node as `SELECT * FROM <ref>`, which would rename the
-# second one (id_1) where DuckDB answers id, id
+# second one (id_1) where DuckDB answers id, id — so the remote optimizer declines it. The subtree pushdown (§4.10)
+# replaces the plan's root instead, which leaves the names to DuckDB; with its switch off the statement is local.
+query II
+EXPLAIN SELECT a.id, b.uid AS id FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+SET fabricator_subtree_pushdown = false;
+
 query II
 EXPLAIN SELECT a.id, b.uid AS id FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
+
+statement ok
+SET fabricator_subtree_pushdown = true;
 
 query II
 SELECT a.id, b.uid AS id FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k ORDER BY 1, 2 LIMIT 1;
@@ -176,10 +199,30 @@ EXPLAIN SELECT id, sum(id) OVER (ORDER BY id RANGE BETWEEN 5 PRECEDING AND CURRE
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
+# A window with FILTER has no Substrait form, so the remote optimizer declines it — but DuckDB's own optimizer
+# rewrites this one into a self-join with a grouped aggregate (count(*) FILTER -> COUNT_BIG(CASE …), the partition
+# as IS NOT DISTINCT FROM), which the subtree pushdown's second pass (§4.10) translates exactly
+query II
+EXPLAIN SELECT id, count(*) FILTER (WHERE amount > 100) OVER (PARTITION BY k) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT id, count(*) FILTER (WHERE amount > 100) OVER (PARTITION BY k) AS c FROM rp.dbo.rs_t) EXCEPT ALL (SELECT id, count(*) FILTER (WHERE amount > 100) OVER (PARTITION BY k) AS c FROM db.dbo.rs_t)))
+ + (SELECT count(*) FROM ((SELECT id, count(*) FILTER (WHERE amount > 100) OVER (PARTITION BY k) AS c FROM db.dbo.rs_t) EXCEPT ALL (SELECT id, count(*) FILTER (WHERE amount > 100) OVER (PARTITION BY k) AS c FROM rp.dbo.rs_t)));
+----
+0
+
+statement ok
+SET fabricator_subtree_pushdown = false;
+
 query II
 EXPLAIN SELECT id, count(*) FILTER (WHERE amount > 100) OVER (PARTITION BY k) FROM rp.dbo.rs_t;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
+
+statement ok
+SET fabricator_subtree_pushdown = true;
 
 query II
 EXPLAIN SELECT uid, lead(w, 2 IGNORE NULLS) OVER (ORDER BY uid) FROM rp.dbo.rs_u;

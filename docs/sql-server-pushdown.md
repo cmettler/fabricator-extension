@@ -13,6 +13,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | Statement | Pushed when … | `EXPLAIN` shows | Otherwise |
 |---|---|---|---|
 | `SELECT` | it joins, aggregates, sorts with a limit, uses windows, … over tables of the catalog (S1) | `Fabricator Query` | `Fabricator Scan` (+ DuckDB operators); the scan still sends its filter and columns to the server (S2) |
+| part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5, S6) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
 | `INSERT … SELECT` | the `SELECT` reads tables of the same catalog and translates exactly (I1) | `FABRICATOR_REMOTE_DML` | `Mssql Net Insert`: DuckDB streams the rows into a bulk copy — and still pushes the `SELECT` when worth it |
 | `INSERT … VALUES` | never — a bulk copy is already the fast path (I2) | — | `Mssql Net Insert` |
 | `CREATE TABLE … AS` | its query is pushed (C1) | `Fabricator Remote Ctas` | `Mssql Net Create Table As`: rows stream into a bulk copy (C2) |
@@ -27,7 +28,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 - **`EXPLAIN <statement>`** — the operator names in the table above.
 - **`FABRICATOR_DUMP_REMOTE=1`** (environment variable) prints every pushdown decision and the T-SQL sent, e.g.
   `[fabricator remote] remote: INSERT INTO [dbo].[pg_sales_eu] …` or `[fabricator remote] local: a plain scan keeps
-  the table scan`.
+  the table scan`; for a part of a statement `remote subtree: …` / `local subtree: …`.
 - **`FABRICATOR_DUMP_DML=1`** does the same for `DELETE` / `UPDATE` / `CREATE TABLE … AS`, e.g.
   `[fabricator dml] rowid path: the predicate does not render exactly`.
 
@@ -38,6 +39,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | one catalog | `ATTACH … (TYPE fabricator, remote_pushdown 'false')` | no `SELECT` / `INSERT … SELECT` / `CREATE TABLE … AS` pushdown |
 | every new ATTACH | environment `FABRICATOR_REMOTE_PUSHDOWN=false` | the default for ATTACHes that do not name the option |
 | the session, per statement | `SET fabricator_dml_pushdown = false;` … `RESET fabricator_dml_pushdown;` | `DELETE`, `UPDATE`, `INSERT … SELECT` and `CREATE TABLE … AS` use the regular paths; `SELECT` pushdown is unaffected |
+| the session, parts of statements | `SET fabricator_subtree_pushdown = false;` … `SET fabricator_subtree_pushdown = true;` | a subquery or CTE beside local data runs in DuckDB again (S5, S6); whole statements are unaffected |
 
 Use the per-statement switch when streaming through DuckDB is faster — DuckDB reads and writes in parallel, while a
 single server `INSERT … SELECT` uses whatever plan SQL Server picks.
@@ -86,12 +88,17 @@ SELECT id, amount FROM mssql.dbo.pg_sales WHERE amount > 15;
 equivalent that gives the same answer, so the query runs in DuckDB:
 
 ```sql
-SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^f') GROUP BY id;
+SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, 'i.s') GROUP BY id;
 -- EXPLAIN: Hash Group By -> Filter -> Fabricator Scan.   trace: Could not find function "regexp_matches"
 ```
 
-**S4 — not pushed: a local table in the join.** DuckDB pushes whole queries only; a remote table joined with local
-data is scanned, and the join runs in DuckDB:
+A pattern DuckDB's own optimizer turns into something simpler is pushed after all: `regexp_matches(note, '^f')`
+becomes a prefix test, which T-SQL has exactly (`LIKE N'f%'` in a binary collation), and the second look for
+pushable parts (see S5) sees that form.
+
+**S4 — not pushed: a local table in the join, and the remote part is only a scan.** The aggregate here sits above
+the join with local data, so all that reads the server alone is the scan — which already sends its filter and
+columns:
 
 ```sql
 CREATE TEMP TABLE targets AS SELECT 'EU' AS region, 25 AS target;
@@ -99,6 +106,34 @@ SELECT t.region, sum(s.amount) - t.target AS gap
 FROM mssql.dbo.pg_sales s JOIN targets t USING (region) GROUP BY t.region, t.target;
 -- EXPLAIN: Hash Join over Fabricator Scan.   EU 15.00
 ```
+
+**S5 — pushed: the part that reads the server alone.** Written with the aggregate in a subquery (or a CTE), the
+same question has a part that reads only the catalog and reduces it — that part runs on the server as one query,
+and DuckDB joins its few rows with the local table:
+
+```sql
+SELECT t.region, s.total - t.target AS gap
+FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+-- EXPLAIN: Hash Join -> Fabricator Query (the aggregate) + the local scan.   EU 15.00
+```
+
+Every maximal part of the plan that reads tables of ONE catalog and nothing else is a candidate: an aggregate, a
+join of the catalog's tables, a window, `DISTINCT`, an `ORDER BY … LIMIT`, a set operation. A part that only scans,
+filters and projects stays a `Fabricator Scan` (S4). It is looked for twice, before and after DuckDB's own
+optimizer, because that optimizer rewrites some shapes into forms T-SQL has none for (an aggregate pushed through a
+join, a filtered `row_number()`).
+
+**S6 — pushed: a scalar subquery.** `(SELECT max(…) FROM …)` is such a part too:
+
+```sql
+SELECT region, target - (SELECT max(amount) FROM mssql.dbo.pg_sales) AS below_max FROM targets;
+-- EXPLAIN: Fabricator Query (the max) crossed with the local scan.   EU -5.00
+```
+
+Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
+connection), a part calling a function of the catalog (a SQL Server UDF — in the plan it carries only its bare name,
+which could translate as a built-in of that name), time travel (`AT (…)`), and anything that does not translate
+exactly.
 
 The full list of what translates — functions, window frames, date parts, string functions — and of what does not is
 in the README, section *remote_pushdown*.

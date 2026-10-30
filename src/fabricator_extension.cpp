@@ -748,6 +748,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// cannot interact, and keeping them apart means the kill switch cannot accidentally disable the in-out
 	// finalizer (whose EOF signal is not optional).
 	RegisterFabricatorLateralOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	// Last: the subtree pushdown replaces fabricator_scan subtrees with fabricator_query, after the LIMIT/TopN push
+	// above has decided what a scan that STAYS local asks for.
+	RegisterFabricatorSubtreePushdown(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	// ⚠ NO VARIANT REGISTRATION HERE ANY MORE. We used to register an `ew.variant_transport` Arrow type
 	// extension (a LEAF binary carrying metadata||value) because the canonical struct<metadata,value>
 	// crashed DuckDB's ArrowAppender::FinalizeChild. DuckDB 2.0 registers `arrow.parquet.variant` itself,

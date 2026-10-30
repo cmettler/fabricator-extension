@@ -1233,6 +1233,67 @@ rest. No ABI change. Gate NEW `verify_merge_pushdown_mssql` (90, service).
   duplicate check, no CAST in SET, WHEN conditions dropped, MERGE never pushed, BY SOURCE without the outer join.
   `verify_merge_into_mssql` (120) runs pushed now too and is unchanged; guide M1/M2 (76 -> 80).
 
+### 4.10 The SUBTREE pushdown: a part of a statement that reads the catalog alone — BUILT (2026-10-30, route b)
+
+DuckDB's remote optimizer pushes whole statements, set-operation branches, an INSERT's SELECT and a CTAS query — never
+a part of a statement beside local data (`Rewrite(JoinRef)` / `RewriteNode(SelectNode)` only merge the sides'
+results; a parent CTE blocks pushdown altogether). So `local JOIN (SELECT region, sum(v) FROM db.dbo.big GROUP BY
+region)` scanned all of `big` and aggregated in DuckDB. Measured before: a subquery (Q1) and a CTE (Q2) of that shape
+both showed `HASH_GROUP_BY` over `FABRICATOR_SCAN` (10000 rows read for 5 groups).
+
+**What runs now.** An `OptimizerExtension` (`SubtreePushdownPass` in `fabricator_remote_select.cpp`, registered
+last) walks the logical plan bottom-up and finds every MAXIMAL subtree that reads ONE `remote_pushdown` catalog
+and nothing else, and does more than scan / filter / project / sort (an aggregate, a join of the catalog's tables, a
+window, DISTINCT, LIMIT / TopN, a set operation — the "worth it" rule of `BindToSubstrait`). Each is translated by
+the same pipeline as a whole statement — a COPY of the subtree, `ColumnBindingResolver`, `to_substrait`,
+`remote_translate` — and replaced by `SELECT CAST(c<i> AS <type>) … FROM fabricator_query(…) [ORDER BY k…]`, bound
+by a CHILD of the statement's binder (fresh table indices). `ColumnBindingReplacer` then maps the subtree's old
+output bindings to the replacement's, by position, over the whole plan. Anything that declines keeps the subtree.
+
+- ⚠⚠ **TWO PASSES, and the first one is the one that matters.** Built post-optimize first, two of nine shapes
+  declined: DuckDB's optimizer had rewritten them into forms with no T-SQL — an aggregate pushed through a join
+  (`count_star() EXPORT_STATE` below the join, `combine_aggr` / `finalize` above it) and a filtered `row_number()`
+  (TOP_N_WINDOW_ELIMINATION: `arg_min_nulls_last` + `UNNEST`). So the PRE-optimize pass translates each subtree as
+  `BindToSubstrait` translates a statement (filter pushdown on the copy only) and replaces it before those rewrites;
+  a replaced subtree is then a leaf to the join order optimizer, so it also stays together. The POST pass is a
+  second chance — for a subtree the join order produced, and for one DuckDB rewrote into a translatable form:
+  `regexp_matches(note, '^f')` becomes a prefix test, which T-SQL has exactly (`LIKE N'f%'` under BIN2), so a whole
+  statement the remote optimizer declined is pushed after all (the guide's S3 needed a pattern DuckDB cannot
+  simplify, `'i.s'`).
+- ⚠ **Post-optimize alone cannot find every remote join**: measured, the join order optimizer put
+  `loc ⋈ st_dim` first and `st_big` on top, so no pure subtree existed (Q3). The pre pass sees the query as written —
+  which has the same limit when the SQL itself interleaves local and remote tables.
+- **What is never part of a pushed subtree**, each a rule in `PushableScanCatalog` / `PushableExpression` /
+  `WritesFabricatorCatalog`:
+  - a function of an attached catalog (`catalog != system`): a SQL Server UDF carries only its bare name in the plan,
+    so `dbo.abs` would translate as `ABS` — the gate creates exactly that UDF (`abs(x) = x + 1000`), mutant killed;
+  - a statement that WRITES a table of a fabricator catalog: the write and the reads beside it are routed together
+    (the pinned connection, the same-catalog read+write mark), which a `fabricator_query` would bypass — mutant
+    killed at the routing row;
+  - a scan with time travel, table filters, a row id / virtual column, or `filter_pushdown` (a join's dynamic filter
+    keeps a POINTER to its target scan; never set on SQL Server);
+  - a parameter (`$1`) or a subquery expression. ⚠ The parameter rule is DEFENSE ONLY: DuckDB plans each EXECUTE
+    of a prepared statement with its values (measured: two EXECUTEs, two server queries with different constants),
+    so the mutant without it survives.
+- **The root.** A plan whose root is itself such a subtree is a whole statement the remote optimizer declined (a CTE
+  relation in its plan, a result naming a column twice) — replaced like any other; the result's names are DuckDB's
+  own, they are not in the plan. ⚠ EXPLAIN and every EXCEPT-based differential WRAP the statement, so they reach the
+  subtree as a CHILD; only a top-level statement reaches the root path, and its routing is visible on the server
+  alone — the gate counts the translated query's `execution_count` in `sys.dm_exec_query_stats` before and after
+  (mutant without the root path killed there).
+- **Inside a transaction that wrote the table** the pushed query runs on the transaction's own connection and sees
+  the uncommitted row (measured: A's sum +1000; rolled back after).
+- **CTEs**: one translation per CTE body, whether it is materialized, inlined, or `NOT MATERIALIZED` read twice
+  (DuckDB copies the replaced body; `fabricator_query` survives the copy).
+- Kill switch `SET fabricator_subtree_pushdown = false` (host setting, default true) — the reference oracle.
+- Gate NEW `verify_subtree_pushdown_mssql` (123): routing + a differential against DuckDB on LOCAL COPIES of the
+  server tables for ten shapes (subquery, CTE, LEFT JOIN, a join of two server tables, a scalar subquery, IN with
+  HAVING, a filtered window, ORDER BY … LIMIT, DISTINCT, a CTE read twice) and two that stay local (a filtered scan,
+  a UDF); the `abs` UDF, a write into the catalog, a root CTE, a root with a duplicate name, a prepared statement, a
+  transaction, the switch. Strings with case and a trailing space as group and join keys. Mutants: no pre pass
+  (dies at P4's routing), UDF veto (the `abs` row), write rule, root path — killed; parameter rule — survives (above).
+  Guide S5 / S6 + the switch (`verify_pushdown_guide_mssql` 80 -> 94).
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

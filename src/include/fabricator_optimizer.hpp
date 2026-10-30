@@ -20,4 +20,8 @@ class DBConfig;
 
 void RegisterFabricatorOptimizer(DBConfig &config);
 
+//! Pushes each subtree that reads one SQL Server catalog alone (remote_pushdown) to that server as one query —
+//! catalog/fabricator_remote_select.cpp, docs/duckdb-2.0-remote-execution.md §4.10.
+void RegisterFabricatorSubtreePushdown(DBConfig &config);
+
 } // namespace duckdb

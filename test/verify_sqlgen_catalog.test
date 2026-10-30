@@ -109,6 +109,16 @@ EXECUTE sgc;
 #         member is a normal catalog scan, so the predicate reaches SQL Server per table. Proved from the
 #         plan cache: both member statements carry a parameterized WHERE and a projected column list. ----
 
+# With the subtree pushdown (docs/duckdb-2.0-remote-execution.md §4.10) the whole count runs on the server: the union
+# reads this catalog alone. The member scans' own pushdown is what this section proves, so it runs with that off.
+query II
+EXPLAIN SELECT count(*) FROM db.dbo.cf_union_by_pattern('sg_sales_%') WHERE yr = 2024 AND nm <> 'zz';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+SET fabricator_subtree_pushdown = false;
+
 query I
 SELECT count(*) FROM db.dbo.cf_union_by_pattern('sg_sales_%') WHERE yr = 2024 AND nm <> 'zz';
 ----
@@ -127,6 +137,9 @@ SELECT hits FROM fabricator_query('db',
        AND CHARINDEX(''dm_exec'', st.text) = 0) x');
 ----
 2
+
+statement ok
+SET fabricator_subtree_pushdown = true;
 
 # ---- 5. cleanup ----
 

@@ -49,6 +49,12 @@ internal static class HostSettings
     /// identical. See docs/duckdb-2.0-remote-execution.md §2.</summary>
     public const string DmlPushdownName = "fabricator_dml_pushdown";
 
+    /// <summary>The DuckDB setting that sends each part of a statement reading one SQL Server catalog alone
+    /// (<c>remote_pushdown</c>) — a subquery or CTE aggregating a server table, joined with a local one — to the
+    /// server as one query. Off, such a part runs locally over the table scan, which is also the reference oracle.
+    /// See docs/duckdb-2.0-remote-execution.md §4.10.</summary>
+    public const string SubtreePushdownName = "fabricator_subtree_pushdown";
+
     /// <summary>Answer an ungrouped <c>COUNT(*)</c> / <c>MIN</c> / <c>MAX</c> from the provider's per-file
     /// metadata instead of scanning — ABI v95. Off, the scan always runs, which is the reference oracle the
     /// differential gate compares against.</summary>
@@ -83,6 +89,13 @@ internal static class HostSettings
                          "reading the same catalog (remote_pushdown), as one statement on the provider. On by " +
                          "default; turn it off to use the row-id path and the host's own insert, which are also " +
                          "the reference oracle for it."),
+        new ProviderSetting(
+            SubtreePushdownName,
+            ProviderSettingType.Bool,
+            Default: true,
+            Description: "Run each part of a statement that reads one remote_pushdown catalog alone (a subquery " +
+                         "or CTE over its tables, joined with local data) as one query on the provider. On by " +
+                         "default; turn it off to run such parts locally, which is also the reference oracle."),
         new ProviderSetting(
             PartitionStatsName,
             ProviderSettingType.Bool,

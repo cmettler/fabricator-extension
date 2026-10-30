@@ -50,12 +50,12 @@ physical_plan	<REGEX>:.*Fabricator Scan.*
 
 # S3: a function with no exact T-SQL (regular expressions) keeps the whole query local
 query II
-EXPLAIN SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^f') GROUP BY id;
+EXPLAIN SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, 'i.s') GROUP BY id;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
 query I
-SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^f') GROUP BY id;
+SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, 'i.s') GROUP BY id;
 ----
 1
 
@@ -72,6 +72,46 @@ query TI
 SELECT t.region, sum(s.amount) - t.target AS gap FROM mssql.dbo.pg_sales s JOIN targets t USING (region) GROUP BY t.region, t.target;
 ----
 EU	15.00
+
+# S5: the aggregate in a subquery reads the server alone: that part runs as one query, the join with the local table in
+# DuckDB
+query II
+EXPLAIN SELECT t.region, s.total - t.target AS gap FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT t.region, s.total - t.target AS gap FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+----
+EU	15.00
+
+# S6: a scalar subquery over the catalog
+query II
+EXPLAIN SELECT region, target - (SELECT max(amount) FROM mssql.dbo.pg_sales) AS below_max FROM targets;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT region, target - (SELECT max(amount) FROM mssql.dbo.pg_sales) AS below_max FROM targets;
+----
+EU	-5.00
+
+# the switch for parts of statements: S5 runs locally again, same answer
+statement ok
+SET fabricator_subtree_pushdown = false;
+
+query II
+EXPLAIN SELECT t.region, s.total - t.target AS gap FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT t.region, s.total - t.target AS gap FROM targets t JOIN (SELECT region, sum(amount) AS total FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+----
+EU	15.00
+
+statement ok
+SET fabricator_subtree_pushdown = true;
 
 # ═══ I / C — INSERT … SELECT and CREATE TABLE … AS ═════════════════════════════════════════════════════
 

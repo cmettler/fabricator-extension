@@ -21,6 +21,7 @@
 
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_txn_util.hpp"
+#include "fabricator_optimizer.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -28,6 +29,19 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/main/config.hpp"
 #include "catalog/fabricator_table_entry.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -401,6 +415,105 @@ bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const Q
 	return true;
 }
 
+//! A query the provider translated: its text, the direction of each ORDER BY key it returns as k0…, and whether it
+//! writes (an INSERT … SELECT: fabricator_remote_dml runs it).
+struct RemoteQuery {
+	string sql;
+	vector<bool> descending;
+	bool changes_rows = false;
+};
+
+//! The provider's query for a plan whose root has `column_count` columns (c0…); false, with `reason`, when it
+//! declines.
+bool TranslateQuery(ClientContext &context, FabricatorCatalog &catalog, const string &plan_bytes, idx_t column_count,
+                    RemoteQuery &query, string &reason) {
+	string json;
+	try {
+		// The provider decides with the transaction in view: a query it would have to run beside this
+		// transaction's own uncommitted writes is one it must decline (verify_mars_dynamic §3).
+		FabricatorSetActiveTxn(catalog.GetHandle(), context);
+		json = fabricator::RemoteTranslate(catalog.GetHandle(), plan_bytes);
+	} catch (std::exception &ex) {
+		reason = ErrorData(ex).RawMessage();
+		return false;
+	}
+	auto doc = yyjson_read(json.data(), json.size(), 0);
+	if (!doc) {
+		reason = "remote_translate returned malformed JSON";
+		return false;
+	}
+	auto root = yyjson_doc_get_root(doc);
+	auto sql_value = yyjson_obj_get(root, "sql");
+	auto columns_value = yyjson_obj_get(root, "columns");
+	auto order_value = yyjson_obj_get(root, "order");
+	auto reason_value = yyjson_obj_get(root, "reason");
+	auto writes_value = yyjson_obj_get(root, "changes_rows");
+	query.sql = yyjson_is_str(sql_value) ? yyjson_get_str(sql_value) : "";
+	string declined = yyjson_is_str(reason_value) ? yyjson_get_str(reason_value) : "the provider declined the plan";
+	int64_t columns = yyjson_is_int(columns_value) ? yyjson_get_sint(columns_value) : -1;
+	query.changes_rows = yyjson_is_bool(writes_value) && yyjson_get_bool(writes_value);
+	query.descending.clear();
+	if (yyjson_is_arr(order_value)) {
+		size_t index, count;
+		yyjson_val *item;
+		yyjson_arr_foreach(order_value, index, count, item) {
+			query.descending.push_back(yyjson_get_bool(item));
+		}
+	}
+	yyjson_doc_free(doc);
+	if (query.sql.empty()) {
+		reason = declined;
+		return false;
+	}
+	if (columns != static_cast<int64_t>(column_count)) {
+		reason = "the provider's query has " + std::to_string(columns) + " columns, the plan " +
+		         std::to_string(column_count);
+		return false;
+	}
+	if (!query.changes_rows) {
+		catalog.RememberRemotePlan(query.sql, plan_bytes);
+	}
+	return true;
+}
+
+//!   SELECT CAST(c0 AS <type>) AS <name>, … FROM fabricator_query('<catalog>', '<query>') __fab_remote
+//!     ORDER BY __fab_remote.k0 <dir> <nulls lowest>, …
+//! — a translated query read back with DuckDB's types and names.
+unique_ptr<SelectNode> RemoteWrapper(FabricatorCatalog &catalog, const RemoteQuery &query,
+                                     const vector<LogicalType> &types, const vector<Identifier> &names) {
+	// ⚠ Every reference to the server's columns is QUALIFIED with the function's alias, so a user alias can never
+	// shadow one (a select list sees earlier items' aliases, ORDER BY binds a select alias first).
+	auto server_column = [](const string &name) {
+		return make_uniq<ColumnRefExpression>(vector<Identifier> {Identifier("__fab_remote"), Identifier(name)});
+	};
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(ConstantExpression::String(catalog.GetName().GetIdentifierName()));
+	args.push_back(ConstantExpression::String(query.sql));
+	auto function = make_uniq<TableFunctionRef>();
+	function->function = make_uniq<FunctionExpression>(Identifier("fabricator_query"), std::move(args));
+	function->alias = Identifier("__fab_remote");
+	auto wrapper = make_uniq<SelectNode>();
+	for (idx_t i = 0; i < types.size(); i++) {
+		auto cast = make_uniq<CastExpression>(types[i], server_column("c" + std::to_string(i)));
+		cast->SetAlias(names[i]);
+		wrapper->select_list.push_back(std::move(cast));
+	}
+	if (!query.descending.empty()) {
+		// a pushed result reaches the user through a subquery, which keeps no order: sort again, by the keys
+		// the server sorted by, with nulls as the lowest values — SQL Server's order
+		auto order = make_uniq<OrderModifier>();
+		for (idx_t i = 0; i < query.descending.size(); i++) {
+			auto desc = query.descending[i];
+			order->orders.emplace_back(desc ? OrderType::DESCENDING : OrderType::ASCENDING,
+			                           desc ? OrderByNullType::NULLS_LAST : OrderByNullType::NULLS_FIRST,
+			                           server_column("k" + std::to_string(i)));
+		}
+		wrapper->modifiers.push_back(std::move(order));
+	}
+	wrapper->from_table = std::move(function);
+	return wrapper;
+}
+
 //! The pushed query as the provider's own, through Substrait (ABI v96; docs/duckdb-2.0-remote-execution.md §3.12):
 //!   SELECT CAST(c0 AS <bound type>) AS <bound name>, … FROM fabricator_query('<catalog>', '<query>') __fab_remote
 //!     ORDER BY __fab_remote.k0 <dir> <nulls lowest>, …
@@ -425,89 +538,16 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 		}
 	}
 
-	string json;
-	try {
-		// The provider decides with the transaction in view: a query it would have to run beside this
-		// transaction's own uncommitted writes is one it must decline (verify_mars_dynamic §3).
-		FabricatorSetActiveTxn(catalog.GetHandle(), context);
-		json = fabricator::RemoteTranslate(catalog.GetHandle(), plan_bytes);
-	} catch (std::exception &ex) {
-		reason = ErrorData(ex).RawMessage();
+	RemoteQuery query;
+	if (!TranslateQuery(context, catalog, plan_bytes, types.size(), query, reason)) {
 		return nullptr;
 	}
-	auto doc = yyjson_read(json.data(), json.size(), 0);
-	if (!doc) {
-		reason = "remote_translate returned malformed JSON";
-		return nullptr;
+	RemoteTrace("remote: " + query.sql);
+	if (query.changes_rows) {
+		return RemoteDmlRef(catalog, query.sql);
 	}
-	auto root = yyjson_doc_get_root(doc);
-	auto sql_value = yyjson_obj_get(root, "sql");
-	auto columns_value = yyjson_obj_get(root, "columns");
-	auto order_value = yyjson_obj_get(root, "order");
-	auto reason_value = yyjson_obj_get(root, "reason");
-	auto writes_value = yyjson_obj_get(root, "changes_rows");
-	string sql = yyjson_is_str(sql_value) ? yyjson_get_str(sql_value) : "";
-	string declined = yyjson_is_str(reason_value) ? yyjson_get_str(reason_value) : "the provider declined the plan";
-	int64_t columns = yyjson_is_int(columns_value) ? yyjson_get_sint(columns_value) : -1;
-	bool changes_rows = yyjson_is_bool(writes_value) && yyjson_get_bool(writes_value);
-	vector<bool> descending;
-	if (yyjson_is_arr(order_value)) {
-		size_t index, count;
-		yyjson_val *item;
-		yyjson_arr_foreach(order_value, index, count, item) {
-			descending.push_back(yyjson_get_bool(item));
-		}
-	}
-	yyjson_doc_free(doc);
-	if (sql.empty()) {
-		reason = declined;
-		return nullptr;
-	}
-	if (columns != static_cast<int64_t>(types.size())) {
-		reason = "the provider's query has " + std::to_string(columns) + " columns, the plan " +
-		         std::to_string(types.size());
-		return nullptr;
-	}
-	RemoteTrace("remote: " + sql);
-	if (!changes_rows) {
-		catalog.RememberRemotePlan(sql, plan_bytes);
-	}
-
-	if (changes_rows) {
-		return RemoteDmlRef(catalog, sql);
-	}
-
-	// ⚠ Every reference to the server's columns is QUALIFIED with the function's alias, so a user alias can never
-	// shadow one (a select list sees earlier items' aliases, ORDER BY binds a select alias first).
-	auto server_column = [](const string &name) {
-		return make_uniq<ColumnRefExpression>(vector<Identifier> {Identifier("__fab_remote"), Identifier(name)});
-	};
-	vector<unique_ptr<ParsedExpression>> args;
-	args.push_back(ConstantExpression::String(catalog.GetName().GetIdentifierName()));
-	args.push_back(ConstantExpression::String(sql));
-	auto function = make_uniq<TableFunctionRef>();
-	function->function = make_uniq<FunctionExpression>(Identifier("fabricator_query"), std::move(args));
-	function->alias = Identifier("__fab_remote");
-	auto wrapper = make_uniq<SelectNode>();
-	for (idx_t i = 0; i < types.size(); i++) {
-		auto cast = make_uniq<CastExpression>(types[i], server_column("c" + std::to_string(i)));
-		cast->SetAlias(names[i]);
-		wrapper->select_list.push_back(std::move(cast));
-	}
-	if (!descending.empty()) {
-		// a pushed result reaches the user through a subquery, which keeps no order: sort again, by the keys
-		// the server sorted by, with nulls as the lowest values — SQL Server's order
-		auto order = make_uniq<OrderModifier>();
-		for (idx_t i = 0; i < descending.size(); i++) {
-			order->orders.emplace_back(descending[i] ? OrderType::DESCENDING : OrderType::ASCENDING,
-			                           descending[i] ? OrderByNullType::NULLS_LAST : OrderByNullType::NULLS_FIRST,
-			                           server_column("k" + std::to_string(i)));
-		}
-		wrapper->modifiers.push_back(std::move(order));
-	}
-	wrapper->from_table = std::move(function);
 	auto statement = make_uniq<SelectStatement>();
-	statement->node = std::move(wrapper);
+	statement->node = RemoteWrapper(catalog, query, types, names);
 	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
@@ -1180,6 +1220,315 @@ bool MapToRemoteColumns(LogicalOperator &op, vector<int64_t> &out, optional_ptr<
 	}
 }
 
+//===--- Subtree pushdown (docs/duckdb-2.0-remote-execution.md §4.10) ---===//
+// DuckDB's remote optimizer pushes whole statements only. A part of a statement that reads this catalog alone — a
+// subquery or CTE aggregating a SQL Server table, joined with a local one — runs locally over a full scan. Here every
+// maximal subtree of the logical plan that reads one such catalog and nothing else, and does more than scan / filter /
+// project / sort, is sent to the server as one query and replaced by its result: the same translation the
+// whole-statement pushdown uses (to_substrait + remote_translate), read back with fabricator_query and cast to the
+// types DuckDB bound. Twice: before DuckDB's optimizers and after them (see the two functions at the end). Anything on
+// the way that declines keeps the subtree as it was.
+
+//! The catalog a table scan reads, when the scan may be part of a pushed subtree: a plain fabricator_scan of a catalog
+//! with remote_select — no time travel, no table filters, no row id or other virtual column.
+optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
+	// ⚠ filter_pushdown: a scan that takes table filters may be the target of a join's dynamic filter, which the join
+	// keeps a pointer to — replacing the scan would leave it dangling. A SQL Server scan never declares it.
+	if (get.function.GetName() != "fabricator_scan" || !get.children.empty() || !get.bind_data ||
+	    get.function.filter_pushdown) {
+		return nullptr;
+	}
+	auto table = get.GetTable();
+	if (!table || !FabricatorCatalog::Is(table->ParentCatalog())) {
+		return nullptr;
+	}
+	auto &catalog = table->ParentCatalog().Cast<FabricatorCatalog>();
+	if (!catalog.Supports(RemoteCapability::EXECUTE_QUERY_NODE)) {
+		return nullptr;
+	}
+	if (!get.bind_data->Cast<::fabricator::ArrowStreamBindData>().at_unit.empty() || get.table_filters.HasFilters()) {
+		return nullptr;
+	}
+	for (auto &id : get.GetColumnIds()) {
+		if (id.IsRowIdColumn() || id.IsVirtualColumn()) {
+			return nullptr;
+		}
+	}
+	return &catalog;
+}
+
+//! Whether an expression may run on the server: no parameter (a prepared statement binds its values per EXECUTE, after
+//! the plan was translated), no subquery, and no function of an attached catalog — a SQL Server UDF or a C#-authored
+//! catalog function carries only its bare name in the plan, which could translate as a built-in of that name.
+bool PushableExpression(const Expression &expr) {
+	auto builtin = [](const Identifier &catalog) {
+		auto name = catalog.GetIdentifierName();
+		return name.empty() || StringUtil::CIEquals(name, "system");
+	};
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_PARAMETER:
+	case ExpressionClass::BOUND_SUBQUERY:
+		return false;
+	case ExpressionClass::BOUND_FUNCTION:
+		if (!builtin(expr.Cast<BoundFunctionExpression>().Function().GetCatalogName())) {
+			return false;
+		}
+		break;
+	case ExpressionClass::BOUND_AGGREGATE:
+		if (!builtin(expr.Cast<BoundAggregateExpression>().Function().GetCatalogName())) {
+			return false;
+		}
+		break;
+	case ExpressionClass::BOUND_WINDOW: {
+		auto &aggregate = expr.Cast<BoundWindowExpression>().AggregateFunction();
+		if (aggregate && !builtin(aggregate->GetCatalogName())) {
+			return false;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	bool pushable = true;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		if (pushable && !PushableExpression(child)) {
+			pushable = false;
+		}
+	});
+	return pushable;
+}
+
+//! Whether an operator may be part of a pushed subtree; `worth`: whether it reduces what travels — a subtree of scans,
+//! filters, projections and sorts only is what the table scan already does (it pushes its filter and projection).
+bool PushableOperator(LogicalOperator &op, bool &worth) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+		worth = false;
+		break;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_WINDOW:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+		worth = true;
+		break;
+	default:
+		return false;
+	}
+	if (op.children.empty()) {
+		return false;
+	}
+	bool pushable = true;
+	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
+		if (pushable && *expr && !PushableExpression(**expr)) {
+			pushable = false;
+		}
+	});
+	return pushable;
+}
+
+//! Whether a plan writes a table of an attached fabricator catalog. Such a plan keeps its reads on the catalog's own
+//! scans: the write and the reads beside it are routed together (the same-catalog read+write mark, the pinned
+//! connection), which a pushed subtree's fabricator_query would bypass.
+bool WritesFabricatorCatalog(LogicalOperator &op) {
+	optional_ptr<Catalog> target;
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_INSERT:
+		target = op.Cast<LogicalInsert>().table.ParentCatalog();
+		break;
+	case LogicalOperatorType::LOGICAL_DELETE:
+		target = op.Cast<LogicalDelete>().table.ParentCatalog();
+		break;
+	case LogicalOperatorType::LOGICAL_UPDATE:
+		target = op.Cast<LogicalUpdate>().table.ParentCatalog();
+		break;
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		target = op.Cast<LogicalMergeInto>().table.ParentCatalog();
+		break;
+	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		target = op.Cast<LogicalCreateTable>().schema.ParentCatalog();
+		break;
+	default:
+		break;
+	}
+	if (target && FabricatorCatalog::Is(*target)) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (WritesFabricatorCatalog(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+struct SubtreePushdown {
+	ClientContext &context;
+	Optimizer &optimizer;
+	//! before DuckDB's optimizers: the subtree is translated as the whole-statement pushdown translates a statement
+	bool pre;
+	//! every replaced subtree's output bindings, and its replacement's, by position
+	vector<ColumnBinding> old_bindings;
+	vector<ColumnBinding> new_bindings;
+};
+
+//! What a subtree reads: pure = one catalog and nothing else.
+struct SubtreeReads {
+	optional_ptr<FabricatorCatalog> catalog;
+	bool pure = false;
+	bool worth = false;
+};
+
+//! Sends `op` to `catalog`'s server and puts the result in its place; leaves it alone when anything declines.
+void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog) {
+	op->ResolveOperatorTypes();
+	auto old_bindings = op->GetColumnBindings();
+	auto types = op->types;
+	if (old_bindings.size() != types.size()) {
+		RemoteTrace("local subtree: its bindings and types disagree");
+		return;
+	}
+	string plan_bytes;
+	try {
+		// translated from a copy: positional references are what to_substrait reads, and the plan must stay intact
+		// when the provider declines
+		auto copy = op->Copy(state.context);
+		if (state.pre) {
+			// what BindToSubstrait runs: filter pushdown turns a MARK join filtered on its marker into a SEMI / ANTI
+			// join and moves predicates to the scans of the subtree
+			FilterPushdown filter_pushdown(state.optimizer);
+			copy = filter_pushdown.Rewrite(std::move(copy));
+		}
+		copy->ResolveOperatorTypes();
+		ColumnBindingResolver resolver;
+		resolver.VisitOperator(*copy);
+		copy->ResolveOperatorTypes();
+		vector<string> root_names;
+		for (idx_t i = 0; i < types.size(); i++) {
+			root_names.push_back("c" + std::to_string(i));
+		}
+		DuckDBToSubstrait to_substrait(state.context, *copy, true, root_names);
+		plan_bytes = to_substrait.SerializeToString();
+		DumpPlan(plan_bytes);
+	} catch (std::exception &ex) {
+		RemoteTrace("local subtree: " + ErrorData(ex).RawMessage());
+		return;
+	}
+	string reason;
+	RemoteQuery query;
+	if (!TranslateQuery(state.context, catalog, plan_bytes, types.size(), query, reason) || query.changes_rows) {
+		RemoteTrace("local subtree: " + reason);
+		return;
+	}
+	unique_ptr<LogicalOperator> replacement;
+	try {
+		vector<Identifier> names;
+		for (idx_t i = 0; i < types.size(); i++) {
+			names.emplace_back("c" + std::to_string(i));
+		}
+		// bound by a child of the statement's binder, so its table indices are new to the plan
+		auto binder = Binder::CreateBinder(state.context, &state.optimizer.binder);
+		auto wrapper = RemoteWrapper(catalog, query, types, names);
+		auto bound = binder->Bind(*wrapper);
+		replacement = std::move(bound.plan);
+		replacement->ResolveOperatorTypes();
+	} catch (std::exception &ex) {
+		RemoteTrace("local subtree: " + ErrorData(ex).RawMessage());
+		return;
+	}
+	auto new_bindings = replacement->GetColumnBindings();
+	if (new_bindings.size() != old_bindings.size() || replacement->types != types) {
+		RemoteTrace("local subtree: the pushed query's columns do not match");
+		return;
+	}
+	RemoteTrace("remote subtree: " + query.sql);
+	state.old_bindings.insert(state.old_bindings.end(), old_bindings.begin(), old_bindings.end());
+	state.new_bindings.insert(state.new_bindings.end(), new_bindings.begin(), new_bindings.end());
+	op = std::move(replacement);
+}
+
+SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op) {
+	vector<SubtreeReads> children;
+	for (auto &child : op->children) {
+		children.push_back(AnalyzeSubtree(state, child));
+	}
+	SubtreeReads result;
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		result.catalog = PushableScanCatalog(op->Cast<LogicalGet>());
+		result.pure = result.catalog != nullptr;
+		return result;
+	}
+	bool worth = false;
+	bool pure = PushableOperator(*op, worth);
+	for (auto &child : children) {
+		if (!pure) {
+			break;
+		}
+		if (!child.pure || (result.catalog && result.catalog.get() != child.catalog.get())) {
+			pure = false;
+			break;
+		}
+		result.catalog = child.catalog;
+		worth = worth || child.worth;
+	}
+	if (pure) {
+		result.pure = true;
+		result.worth = worth;
+		return result;
+	}
+	// this operator stays local: each child that reads one catalog alone, and is worth it, goes to its server
+	for (idx_t i = 0; i < op->children.size(); i++) {
+		if (children[i].pure && children[i].worth) {
+			ReplaceSubtree(state, op->children[i], *children[i].catalog);
+		}
+	}
+	return SubtreeReads();
+}
+
+void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, bool pre) {
+	Value enabled;
+	if (input.context.TryGetCurrentSetting("fabricator_subtree_pushdown", enabled) && !enabled.IsNull() &&
+	    !enabled.GetValue<bool>()) {
+		return; // the reference oracle of the differential gate
+	}
+	if (WritesFabricatorCatalog(*plan)) {
+		return;
+	}
+	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}};
+	auto root = AnalyzeSubtree(state, plan);
+	if (root.pure && root.worth) {
+		// a whole statement the remote optimizer did not push (a CTE, a name it cannot repeat, …)
+		ReplaceSubtree(state, plan, *root.catalog);
+	}
+	if (state.old_bindings.empty()) {
+		return;
+	}
+	ColumnBindingReplacer replacer;
+	replacer.AddReplacements(state.old_bindings, state.new_bindings);
+	replacer.VisitOperator(*plan);
+	plan->ResolveOperatorTypes();
+}
+
+//! BEFORE DuckDB's optimizers, which may rewrite a subtree into a form that has no translation (an aggregate pushed
+//! through a join as EXPORT_STATE / combine, a filtered row_number() as arg_min + UNNEST). A replaced subtree is a leaf
+//! to the join order optimizer, so it also stays together.
+void SubtreePushdownPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	SubtreePushdownPass(input, plan, true);
+}
+
+//! AFTER them: a second chance for a subtree the join order produced, and for one that declined before with its
+//! predicates still above it.
+void SubtreePushdownOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	SubtreePushdownPass(input, plan, false);
+}
+
 } // namespace
 
 void FabricatorCatalog::RememberRemotePlan(const string &sql, const string &plan) {
@@ -1400,6 +1749,13 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 	auto declined = make_uniq<SelectStatement>();
 	declined->node = std::move(node);
 	return make_uniq<SubqueryRef>(std::move(declined));
+}
+
+void RegisterFabricatorSubtreePushdown(DBConfig &config) {
+	OptimizerExtension extension;
+	extension.pre_optimize_function = SubtreePushdownPreOptimize;
+	extension.optimize_function = SubtreePushdownOptimize;
+	OptimizerExtension::Register(config, std::move(extension));
 }
 
 } // namespace duckdb

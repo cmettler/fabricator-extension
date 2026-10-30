@@ -1,0 +1,444 @@
+# name: test/verify_subtree_pushdown_mssql.test
+# description: The SUBTREE pushdown on SQL Server (docs/duckdb-2.0-remote-execution.md §4.10): a part of a statement
+#              that reads one remote_pushdown catalog alone — a subquery or CTE aggregating a server table, joined
+#              with a local one — runs on the server as one query, where DuckDB's remote optimizer pushes whole
+#              statements only. Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THE LOAD-BEARING SECTION IS §2, A DIFFERENTIAL AGAINST DuckDB ITSELF: every query also runs on
+#              LOCAL COPIES of the server tables (lb, ld), and the symmetric difference of the two answers must be
+#              empty. §1's routing rows keep §2 from passing vacuously — a build that never pushes agrees perfectly.
+#              §3 pins what must stay local, each with its reason; §4 the kill switch.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS rp (TYPE fabricator, remote_pushdown 'true');
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+# st_big: 3000 rows; region cycles through 'A', 'B', 'C', 'D', 'a', 'A ' (case and a trailing space: an exact
+# string key must keep them apart) and is NULL every 23rd row; v is NULL every 19th. st_dim has one row per
+# region, plus 'E' with no partner. loc (LOCAL) holds regions the server has, one it has not ('Z') and a NULL.
+# dbo.st_fn and dbo.abs are scalar UDFs; abs deliberately shares a built-in's name.
+
+statement ok
+SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.st_big; DROP TABLE IF EXISTS dbo.st_dim; DROP TABLE IF EXISTS dbo.st_out; DROP FUNCTION IF EXISTS dbo.st_fn; DROP FUNCTION IF EXISTS dbo.[abs];');
+
+statement ok
+SELECT fabricator_exec('rp', 'CREATE FUNCTION dbo.st_fn (@x INT) RETURNS INT AS BEGIN RETURN @x * 2 + 1; END');
+
+statement ok
+SELECT fabricator_exec('rp', 'CREATE FUNCTION dbo.[abs] (@x INT) RETURNS INT AS BEGIN RETURN @x + 1000; END');
+
+statement ok
+SELECT fabricator_exec('rp', 'CREATE TABLE dbo.st_big (id INT PRIMARY KEY, region VARCHAR(10) NULL, v INT NULL);
+INSERT INTO dbo.st_big SELECT value, CASE WHEN value % 23 = 0 THEN NULL ELSE CHOOSE(value % 6 + 1, ''A'', ''B'', ''C'', ''D'', ''a'', ''A '') END,
+  CASE WHEN value % 19 = 0 THEN NULL ELSE value % 100 END FROM GENERATE_SERIES(1, 3000);
+CREATE TABLE dbo.st_dim (region VARCHAR(10) NOT NULL, label VARCHAR(20));
+INSERT INTO dbo.st_dim VALUES (''A'', ''alpha''), (''B'', ''beta''), (''C'', ''gamma''), (''a'', ''lower a''), (''E'', ''none'');
+CREATE TABLE dbo.st_out (region VARCHAR(10), s BIGINT);', refresh_cache := true);
+
+statement ok
+CREATE TABLE loc AS SELECT * FROM (VALUES ('A', 1), ('B', 2), ('a', 3), ('A ', 4), ('Z', 5), (NULL, 6), ('C', 7)) t(region, w);
+
+# the local copies: DuckDB's own answer is the oracle
+statement ok
+CREATE TABLE lb AS SELECT * FROM rp.dbo.st_big;
+
+statement ok
+CREATE TABLE ld AS SELECT * FROM rp.dbo.st_dim;
+
+statement ok
+CREATE MACRO st_fn_local(x) AS CAST(x * 2 + 1 AS INTEGER);
+
+query I
+SELECT count(*) FROM lb;
+----
+3000
+
+# ═══ §1  Routing: a subtree that reads the catalog alone and does more than scan runs as one server query ═══
+
+# P1: an aggregate subquery joined with a local table
+query II
+EXPLAIN SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P2: the same as a CTE
+query II
+EXPLAIN WITH r AS (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT l.region, r.s FROM loc l JOIN r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P3: a LEFT JOIN from the local table: keys the server has no group for stay NULL
+query II
+EXPLAIN SELECT l.region, l.w, r.s FROM loc l LEFT JOIN (SELECT region, max(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P4: a join of two server tables, aggregated, joined with a local table
+query II
+EXPLAIN SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c, sum(b.v) AS s FROM rp.dbo.st_big b JOIN rp.dbo.st_dim d ON b.region = d.region GROUP BY d.region, d.label) r ON r.region = l.region;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P5: a scalar subquery: the ungrouped aggregate runs on the server
+query II
+EXPLAIN SELECT l.region, l.w + (SELECT max(v) FROM rp.dbo.st_big) AS x FROM loc l;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P6: an IN subquery with GROUP BY / HAVING
+query II
+EXPLAIN SELECT l.region, l.w FROM loc l WHERE l.region IN (SELECT region FROM rp.dbo.st_big WHERE v > 50 GROUP BY region HAVING count(*) > 100);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P7: a window function, filtered on its result
+query II
+EXPLAIN SELECT l.w, r.id, r.rn FROM loc l JOIN (SELECT * FROM (SELECT id, region, row_number() OVER (PARTITION BY region ORDER BY id) AS rn FROM rp.dbo.st_big) WHERE rn <= 2) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P8: ORDER BY … LIMIT, crossed with a local table
+query II
+EXPLAIN SELECT l.w, t.id, t.v FROM loc l, (SELECT id, v FROM rp.dbo.st_big WHERE v IS NOT NULL ORDER BY v DESC, id LIMIT 5) t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P9: DISTINCT, joined with a local table
+query II
+EXPLAIN SELECT l.region, l.w FROM loc l JOIN (SELECT DISTINCT region FROM rp.dbo.st_big WHERE v < 10) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P10: a CTE read twice, NOT MATERIALIZED: DuckDB copies the replaced body to both places
+query II
+EXPLAIN WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT l.w, a.s, b.s AS s2 FROM loc l JOIN r a USING (region) JOIN r b USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# N1: a scan with a filter only: the table scan pushes that already
+query II
+EXPLAIN SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# N2: a SQL Server UDF in the subtree: its bare name could translate as a built-in
+query II
+EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.st_fn(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# ═══ §2  The answers: each query against DuckDB on the local copies ═══════════════════════════════════
+# (Q) EXCEPT ALL (oracle), both ways, must be empty; the oracle's row count keeps it from being empty by accident.
+
+# P1
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM lb GROUP BY region) r USING (region));
+----
+5
+
+# P2
+query I
+SELECT (SELECT count(*) FROM ((WITH r AS (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT l.region, r.s FROM loc l JOIN r USING (region)) EXCEPT ALL (WITH r AS (SELECT region, sum(v) AS s FROM lb GROUP BY region) SELECT l.region, r.s FROM loc l JOIN r USING (region)))) + (SELECT count(*) FROM ((WITH r AS (SELECT region, sum(v) AS s FROM lb GROUP BY region) SELECT l.region, r.s FROM loc l JOIN r USING (region)) EXCEPT ALL (WITH r AS (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT l.region, r.s FROM loc l JOIN r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (WITH r AS (SELECT region, sum(v) AS s FROM lb GROUP BY region) SELECT l.region, r.s FROM loc l JOIN r USING (region));
+----
+5
+
+# P3
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, l.w, r.s FROM loc l LEFT JOIN (SELECT region, max(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, l.w, r.s FROM loc l LEFT JOIN (SELECT region, max(v) AS s FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, l.w, r.s FROM loc l LEFT JOIN (SELECT region, max(v) AS s FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, l.w, r.s FROM loc l LEFT JOIN (SELECT region, max(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, l.w, r.s FROM loc l LEFT JOIN (SELECT region, max(v) AS s FROM lb GROUP BY region) r USING (region));
+----
+7
+
+# P4
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c, sum(b.v) AS s FROM rp.dbo.st_big b JOIN rp.dbo.st_dim d ON b.region = d.region GROUP BY d.region, d.label) r ON r.region = l.region) EXCEPT ALL (SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c, sum(b.v) AS s FROM lb b JOIN ld d ON b.region = d.region GROUP BY d.region, d.label) r ON r.region = l.region))) + (SELECT count(*) FROM ((SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c, sum(b.v) AS s FROM lb b JOIN ld d ON b.region = d.region GROUP BY d.region, d.label) r ON r.region = l.region) EXCEPT ALL (SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c, sum(b.v) AS s FROM rp.dbo.st_big b JOIN rp.dbo.st_dim d ON b.region = d.region GROUP BY d.region, d.label) r ON r.region = l.region)));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c, sum(b.v) AS s FROM lb b JOIN ld d ON b.region = d.region GROUP BY d.region, d.label) r ON r.region = l.region);
+----
+4
+
+# P5
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, l.w + (SELECT max(v) FROM rp.dbo.st_big) AS x FROM loc l) EXCEPT ALL (SELECT l.region, l.w + (SELECT max(v) FROM lb) AS x FROM loc l))) + (SELECT count(*) FROM ((SELECT l.region, l.w + (SELECT max(v) FROM lb) AS x FROM loc l) EXCEPT ALL (SELECT l.region, l.w + (SELECT max(v) FROM rp.dbo.st_big) AS x FROM loc l)));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, l.w + (SELECT max(v) FROM lb) AS x FROM loc l);
+----
+7
+
+# P6
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, l.w FROM loc l WHERE l.region IN (SELECT region FROM rp.dbo.st_big WHERE v > 50 GROUP BY region HAVING count(*) > 100)) EXCEPT ALL (SELECT l.region, l.w FROM loc l WHERE l.region IN (SELECT region FROM lb WHERE v > 50 GROUP BY region HAVING count(*) > 100)))) + (SELECT count(*) FROM ((SELECT l.region, l.w FROM loc l WHERE l.region IN (SELECT region FROM lb WHERE v > 50 GROUP BY region HAVING count(*) > 100)) EXCEPT ALL (SELECT l.region, l.w FROM loc l WHERE l.region IN (SELECT region FROM rp.dbo.st_big WHERE v > 50 GROUP BY region HAVING count(*) > 100))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, l.w FROM loc l WHERE l.region IN (SELECT region FROM lb WHERE v > 50 GROUP BY region HAVING count(*) > 100));
+----
+5
+
+# P7
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.id, r.rn FROM loc l JOIN (SELECT * FROM (SELECT id, region, row_number() OVER (PARTITION BY region ORDER BY id) AS rn FROM rp.dbo.st_big) WHERE rn <= 2) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.rn FROM loc l JOIN (SELECT * FROM (SELECT id, region, row_number() OVER (PARTITION BY region ORDER BY id) AS rn FROM lb) WHERE rn <= 2) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.id, r.rn FROM loc l JOIN (SELECT * FROM (SELECT id, region, row_number() OVER (PARTITION BY region ORDER BY id) AS rn FROM lb) WHERE rn <= 2) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.rn FROM loc l JOIN (SELECT * FROM (SELECT id, region, row_number() OVER (PARTITION BY region ORDER BY id) AS rn FROM rp.dbo.st_big) WHERE rn <= 2) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.id, r.rn FROM loc l JOIN (SELECT * FROM (SELECT id, region, row_number() OVER (PARTITION BY region ORDER BY id) AS rn FROM lb) WHERE rn <= 2) r USING (region));
+----
+10
+
+# P8
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, t.id, t.v FROM loc l, (SELECT id, v FROM rp.dbo.st_big WHERE v IS NOT NULL ORDER BY v DESC, id LIMIT 5) t) EXCEPT ALL (SELECT l.w, t.id, t.v FROM loc l, (SELECT id, v FROM lb WHERE v IS NOT NULL ORDER BY v DESC, id LIMIT 5) t))) + (SELECT count(*) FROM ((SELECT l.w, t.id, t.v FROM loc l, (SELECT id, v FROM lb WHERE v IS NOT NULL ORDER BY v DESC, id LIMIT 5) t) EXCEPT ALL (SELECT l.w, t.id, t.v FROM loc l, (SELECT id, v FROM rp.dbo.st_big WHERE v IS NOT NULL ORDER BY v DESC, id LIMIT 5) t)));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, t.id, t.v FROM loc l, (SELECT id, v FROM lb WHERE v IS NOT NULL ORDER BY v DESC, id LIMIT 5) t);
+----
+35
+
+# P9
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, l.w FROM loc l JOIN (SELECT DISTINCT region FROM rp.dbo.st_big WHERE v < 10) r USING (region)) EXCEPT ALL (SELECT l.region, l.w FROM loc l JOIN (SELECT DISTINCT region FROM lb WHERE v < 10) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, l.w FROM loc l JOIN (SELECT DISTINCT region FROM lb WHERE v < 10) r USING (region)) EXCEPT ALL (SELECT l.region, l.w FROM loc l JOIN (SELECT DISTINCT region FROM rp.dbo.st_big WHERE v < 10) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, l.w FROM loc l JOIN (SELECT DISTINCT region FROM lb WHERE v < 10) r USING (region));
+----
+5
+
+# P10
+query I
+SELECT (SELECT count(*) FROM ((WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT l.w, a.s, b.s AS s2 FROM loc l JOIN r a USING (region) JOIN r b USING (region)) EXCEPT ALL (WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FROM lb GROUP BY region) SELECT l.w, a.s, b.s AS s2 FROM loc l JOIN r a USING (region) JOIN r b USING (region)))) + (SELECT count(*) FROM ((WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FROM lb GROUP BY region) SELECT l.w, a.s, b.s AS s2 FROM loc l JOIN r a USING (region) JOIN r b USING (region)) EXCEPT ALL (WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT l.w, a.s, b.s AS s2 FROM loc l JOIN r a USING (region) JOIN r b USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (WITH r AS NOT MATERIALIZED (SELECT region, sum(v) AS s FROM lb GROUP BY region) SELECT l.w, a.s, b.s AS s2 FROM loc l JOIN r a USING (region) JOIN r b USING (region));
+----
+5
+
+# N1
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region));
+----
+18
+
+# N2
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.st_fn(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(st_fn_local(v)) AS s FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(st_fn_local(v)) AS s FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.st_fn(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(st_fn_local(v)) AS s FROM lb GROUP BY region) r USING (region));
+----
+5
+
+# ═══ §3  What stays local, and why ════════════════════════════════════════════════════════════════════
+
+# A SQL Server UDF named like a built-in: in the plan a function carries only its bare name, so dbo.abs would
+# translate as ABS. Its calls keep the subtree local (N2 above is the same rule with a name nothing translates).
+query II
+SELECT rp.dbo.abs(-5), abs(-5);
+----
+995	5
+
+query II
+EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.abs(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.abs(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))
+  EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v + 1000) AS s FROM lb GROUP BY region) r USING (region))))
+ + (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v + 1000) AS s FROM lb GROUP BY region) r USING (region))
+  EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.abs(v)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+# A statement that WRITES this catalog keeps its reads on the catalog's own scans: the write and the reads beside it
+# are routed together (the pinned connection, the same-catalog read+write mark), which a pushed subtree would bypass.
+query II
+EXPLAIN INSERT INTO rp.dbo.st_out SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+statement ok
+INSERT INTO rp.dbo.st_out SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+
+query I
+SELECT (SELECT count(*) FROM (FROM rp.dbo.st_out EXCEPT ALL SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM lb GROUP BY region) r USING (region)))
+ + (SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM lb GROUP BY region) r USING (region) EXCEPT ALL FROM rp.dbo.st_out));
+----
+0
+
+# ═══ §4  Statements the subtree pushdown reaches beyond the remote optimizer ═════════════════════════════
+
+# A CTE read by the whole statement: the remote optimizer declines it (its plan has a CTE relation), the subtree
+# pushdown sends the CTE's body
+query II
+EXPLAIN WITH r AS (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT * FROM r;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((WITH r AS (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT * FROM r)
+  EXCEPT ALL (SELECT region, sum(v) AS s FROM lb GROUP BY region)))
+ + (SELECT count(*) FROM ((SELECT region, sum(v) AS s FROM lb GROUP BY region)
+  EXCEPT ALL (WITH r AS (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) SELECT * FROM r)));
+----
+0
+
+# A whole statement whose result names a column twice: the remote optimizer declines it (it re-wraps a pushed query
+# as SELECT * FROM …, and one binding cannot hold two columns of one name); the subtree pushdown replaces the plan's
+# ROOT, which keeps DuckDB's own names
+query II
+EXPLAIN SELECT b.region, d.region, count(*) FROM rp.dbo.st_big b JOIN rp.dbo.st_dim d ON b.region = d.region GROUP BY 1, 2;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT b.region, d.region, count(*) FROM rp.dbo.st_big b JOIN rp.dbo.st_dim d ON b.region = d.region GROUP BY 1, 2)
+  EXCEPT ALL (SELECT b.region, d.region, count(*) FROM lb b JOIN ld d ON b.region = d.region GROUP BY 1, 2)))
+ + (SELECT count(*) FROM ((SELECT b.region, d.region, count(*) FROM lb b JOIN ld d ON b.region = d.region GROUP BY 1, 2)
+  EXCEPT ALL (SELECT b.region, d.region, count(*) FROM rp.dbo.st_big b JOIN rp.dbo.st_dim d ON b.region = d.region GROUP BY 1, 2)));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT b.region, d.region, count(*) FROM lb b JOIN ld d ON b.region = d.region GROUP BY 1, 2);
+----
+4
+
+# ⚠ Above, EXPLAIN and the differential wrap the statement, so the subtree is a CHILD there; only a statement at the
+# top level reaches the root replacement, and its routing shows on the server alone: the pushed query (the join
+# written by the translation) must have run once more
+statement ok
+SET VARIABLE runs_before = (SELECT n FROM fabricator_query('rp', 'SELECT CAST(COALESCE(SUM(qs.execution_count), 0) AS BIGINT) AS n FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t WHERE CHARINDEX(N''[dbo].[st_dim] AS [t1]'', t.text) > 0 AND CHARINDEX(N''dm_exec_query_stats'', t.text) = 0'));
+
+statement ok
+SELECT b.region, d.region, count(*) FROM rp.dbo.st_big b JOIN rp.dbo.st_dim d ON b.region = d.region GROUP BY 1, 2;
+
+query I
+SELECT (SELECT n FROM fabricator_query('rp', 'SELECT CAST(COALESCE(SUM(qs.execution_count), 0) AS BIGINT) AS n FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t WHERE CHARINDEX(N''[dbo].[st_dim] AS [t1]'', t.text) > 0 AND CHARINDEX(N''dm_exec_query_stats'', t.text) = 0')) > getvariable('runs_before');
+----
+true
+
+# A prepared statement: DuckDB plans each EXECUTE with its values, so two executions get two server queries
+statement ok
+PREPARE p AS SELECT l.w, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big WHERE v > $1 GROUP BY region) r USING (region) ORDER BY 1, 2;
+
+query II
+EXECUTE p(50);
+----
+1	16210
+2	17037
+3	16402
+4	17092
+7	16190
+
+query II
+EXECUTE p(95);
+----
+1	1648
+2	1762
+3	1744
+4	1861
+7	1844
+
+query II
+SELECT l.w, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM lb WHERE v > 95 GROUP BY region) r USING (region) ORDER BY 1, 2;
+----
+1	1648
+2	1762
+3	1744
+4	1861
+7	1844
+
+# Inside a transaction that has written the table: the pushed query runs on the transaction's own connection and sees
+# the uncommitted row (A's sum grows by 1000)
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO rp.dbo.st_big VALUES (99999, 'A', 1000);
+
+query II
+EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))
+  EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM (FROM lb UNION ALL SELECT 99999, 'A', 1000) GROUP BY region) r USING (region))))
+ + (SELECT count(*) FROM ((SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM (FROM lb UNION ALL SELECT 99999, 'A', 1000) GROUP BY region) r USING (region))
+  EXCEPT ALL (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(v) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM rp.dbo.st_big WHERE id = 99999;
+----
+0
+
+# ═══ §5  The kill switch ═══════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SET fabricator_subtree_pushdown = false;
+
+query II
+EXPLAIN SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+statement ok
+SET fabricator_subtree_pushdown = true;
+
+query II
+EXPLAIN SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS s, count(*) AS c FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.st_big; DROP TABLE IF EXISTS dbo.st_dim; DROP TABLE IF EXISTS dbo.st_out; DROP FUNCTION IF EXISTS dbo.st_fn; DROP FUNCTION IF EXISTS dbo.[abs];');

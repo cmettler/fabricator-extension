@@ -316,13 +316,21 @@ locally. Whenever any part cannot be translated EXACTLY, the whole statement run
   `starts_with` / `contains` / `ends_with`, `lower` / `upper` (see below).
 
 Runs locally (each measured to answer differently on SQL Server, or not expressible): a plain scan of one table
-(the table scan already pushes its filter and projection), two result columns of the same name, `reverse`,
+(the table scan already pushes its filter and projection), `reverse`,
 regular expressions, `LIKE` patterns with `_`, `substring` with a negative or non-constant start, comparing or
 grouping binary values (SQL Server ignores trailing zero bytes), a float divided by a value that may be zero,
 decimal arithmetic past precision 38 (SQL Server would round), float → string casts, `any_value`, `GROUPS` /
 `RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions with no T-SQL rendering (`date_sub`,
-`strftime`, list and JSON functions, …), prepared-statement parameters, and a subquery joined to a
-local table (DuckDB pushes only whole nodes).
+`strftime`, list and JSON functions, …), and a part of a statement that only scans, filters and projects.
+(A statement naming a result column twice, or reading a CTE, is pushed as a whole by the part-of-a-statement pushdown below; a
+prepared statement is planned per `EXECUTE` with its values, and pushed like a literal one.)
+
+**Parts of a statement.** A subquery or CTE that reads tables of this catalog alone runs on the server even when the
+rest of the statement reads local data — `local JOIN (SELECT region, sum(v) FROM mssql.dbo.big GROUP BY region)`,
+a scalar `(SELECT max(v) FROM mssql.dbo.big)`, an `IN (SELECT … GROUP BY … HAVING …)`: `EXPLAIN` shows
+`Fabricator Query` under DuckDB's own join. The same exactness rule applies; such a part is kept local when it calls
+a function of the catalog (a SQL Server UDF), and nothing is pushed in a statement that writes a table of the
+catalog. `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.
 
 ⚠ **The one accepted difference: `lower` / `upper`.** SQL Server's case tables are Unicode 5.0, DuckDB's are
 current: 298 (`lower`) and 308 (`upper`) rarely used BMP characters map differently — `upper('ß')` is `ẞ` in
@@ -4165,6 +4173,7 @@ Settings the extension itself owns rather than a provider, so they exist even wh
 |---------|--------|-------------|
 | `fabricator_allow_plugin_install` | **Active** | Whether `fabricator_install_plugin()` (see [Function Reference](#function-reference)) may write plugin assemblies into a plugin root. **Default `false`**: an installed plugin is loaded into this process and runs with the extension's privileges, so it is opt-in rather than something a SQL statement can arrange on its own. Session-scoped like every other setting, so `RESET` closes it again |
 | `fabricator_partition_stats` | **Active** | Answer an ungrouped `COUNT(*)` / `MIN` / `MAX` from table metadata instead of scanning — on Delta, the log's per-file counts and statistics (see [Delta Lake provider](#delta-lake-provider)). **Default `true`**; `false` always scans, which is also the reference the metadata answer is tested against |
+| `fabricator_subtree_pushdown` | **Active** | Under `remote_pushdown`, run each part of a statement that reads one catalog alone — a subquery or CTE over its tables beside local data — as one query on the server (see [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md), S5). **Default `true`**; `false` runs such parts locally, which is also the reference the pushdown is tested against |
 | `fabricator_dml_pushdown` | **Active** | Run a DELETE or UPDATE whose whole WHERE (and SET) translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)) — and, under `remote_pushdown`, an `INSERT … SELECT` reading the same catalog. **Default `true`**; `false` sends every DELETE and UPDATE down the row-id path and every INSERT through the regular bulk insert, which are also the reference the shortcut is tested against |
 
 ### Delta read tuning
