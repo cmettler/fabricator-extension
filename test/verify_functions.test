@@ -63,27 +63,27 @@ WHERE database_name = 'fdb' AND schema_name = 'fabric';
 ----
 0
 
-# ── THE PER-ROW `_each` FORM IS DECLARED BY THE PROVIDER, NOT INVENTED BY THE HOST ───────────────
+# ── THE PER-ROW FORM IS THE PROVIDER'S BUSINESS, NOT THE HOST'S ─────────────────────────────────────
 # The host used to synthesise `<name>_each` for EVERY table-kind function of EVERY provider. That made
 # a SQL-Server semantic (CROSS APPLY / per-row EXEC) the host's business, and produced entries that
 # could only fail wherever there is nothing to apply per row — 30 dead siblings on a Fabric attach,
-# all advertised in duckdb_functions(). SqlServerBackend's discovery SQL now emits them itself.
+# all advertised in duckdb_functions(). SqlServerBackend's discovery SQL declares the one it keeps — a
+# stored procedure's `<proc>_each` — and a TVF has none since 2026-10-30: it is called correlated directly.
 statement ok
 SELECT fabricator_exec('fdb', 'CREATE OR ALTER FUNCTION dbo.tf_each_probe(@n INT) RETURNS TABLE AS RETURN (SELECT @n AS v)');
 
 statement ok
 SELECT fabricator_refresh_cache('fdb');
 
-# Declared as an ordinary in-out function alongside the routine itself.
+# The TVF alone, no `_each` sibling.
 query TT
 SELECT name, kind FROM fabricator_functions('fdb') WHERE name LIKE 'tf_each_probe%' ORDER BY name;
 ----
 tf_each_probe	table
-tf_each_probe_each	inout
 
-# …and it still APPLIES the routine once per input row.
+# …and it still APPLIES the routine once per input row, written as a lateral call.
 query II
-SELECT n, v FROM fdb.dbo.tf_each_probe_each((SELECT * FROM (VALUES (7),(9)) t(n))) ORDER BY n;
+SELECT t.n, f.v FROM (VALUES (7),(9)) t(n), fdb.dbo.tf_each_probe(t.n) f ORDER BY t.n;
 ----
 7	7
 9	9

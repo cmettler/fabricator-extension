@@ -1,7 +1,8 @@
 # name: test/verify_inout_isolation.test
-# description: Table-in-out (4g) pins one connection + transaction per call at a configurable isolation
-#              level (ATTACH isolation_level option + SET mssql_isolation_level override), so all per-chunk
-#              CROSS APPLY queries share one consistent view.
+# description: A discovered TVF called with a column argument (`FROM t, db.s.tvf(t.a)`, the lateral session)
+#              pins one connection + transaction per session at a configurable isolation level (ATTACH
+#              isolation_level option + SET mssql_isolation_level override), so all per-chunk CROSS APPLY
+#              queries share one consistent view. (Before 2026-10-30 this was the `tvf_each(<table>)` in-out.)
 # group: [mssql]
 
 require fabricator
@@ -10,7 +11,7 @@ require-env MSSQL_TESTDB_DSN
 
 # Setup: create a TVF that reports its session's current transaction isolation level
 # (1=ReadUncommitted, 2=ReadCommitted, 3=RepeatableRead, 4=Serializable, 5=Snapshot). @d is ignored
-# — it only gives the TVF a parameter so it gets an `_each` in-out alias. (The 'snapshot' case below
+# — it only gives the TVF a parameter, so it can be called correlated. (The 'snapshot' case below
 # needs `ALTER DATABASE TestDB SET ALLOW_SNAPSHOT_ISOLATION ON`, which can't run via fabricator_exec —
 # the test DB has it enabled out-of-band.)
 statement ok
@@ -29,9 +30,9 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS isodb (TYPE fabricator, isolation_level 'seriali
 statement ok
 SELECT fabricator_refresh_cache('isodb');
 
-# Every per-chunk CROSS APPLY of the in-out call runs on the one pinned connection at the ATTACH default.
+# Every per-chunk CROSS APPLY of the correlated call runs on the session's pinned connection at the ATTACH default.
 query I
-SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n)));
+SELECT DISTINCT iso FROM (VALUES(1),(2),(3)) v(n), isodb.dbo.tf_iso(v.n);
 ----
 4
 
@@ -40,7 +41,7 @@ statement ok
 SET mssql_isolation_level = 'repeatable read';
 
 query I
-SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1),(2)) v(n)));
+SELECT DISTINCT iso FROM (VALUES(1),(2)) v(n), isodb.dbo.tf_iso(v.n);
 ----
 3
 
@@ -49,7 +50,7 @@ statement ok
 SET mssql_isolation_level = 'snapshot';
 
 query I
-SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1),(2)) v(n)));
+SELECT DISTINCT iso FROM (VALUES(1),(2)) v(n), isodb.dbo.tf_iso(v.n);
 ----
 5
 
@@ -58,7 +59,7 @@ statement ok
 SET mssql_isolation_level = '';
 
 query I
-SELECT DISTINCT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1)) v(n)));
+SELECT DISTINCT iso FROM (VALUES(1)) v(n), isodb.dbo.tf_iso(v.n);
 ----
 4
 
@@ -67,7 +68,7 @@ statement ok
 SET mssql_isolation_level = 'bogus';
 
 statement error
-SELECT iso FROM isodb.dbo.tf_iso_each((SELECT v.n FROM (VALUES(1)) v(n)));
+SELECT iso FROM (VALUES(1)) v(n), isodb.dbo.tf_iso(v.n);
 ----
 unknown isolation level
 

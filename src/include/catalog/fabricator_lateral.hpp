@@ -52,4 +52,24 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const vecto
 //! Register the optimizer extension that rewrites an eligible correlated LogicalGet onto the batched operator.
 void RegisterFabricatorLateralOptimizer(DBConfig &config);
 
+//! The CORRELATED form of a function whose literal calls stay an ordinary scan — a discovered SQL Server TVF:
+//! `FROM t, db.s.tvf(t.a)` binds as an in-out function (DuckDB picks that form only when an argument is not a
+//! constant), `db.s.tvf(1)` keeps its scan with projection and filter pushdown. One TableFunction carries both;
+//! its bind / init callbacks dispatch on the call shape and these run the lateral half.
+shared_ptr<TableFunctionInfo> FabricatorMakeLateralInfo(FabricatorHandle handle, const vector<string> &schema_path,
+                                                       const string &func_name, vector<string> arg_names,
+                                                       vector<LogicalType> arg_types,
+                                                       vector<FabricatorParamStyle> arg_styles);
+//! Whether a call binds correlated: DuckDB synthesized an input relation from the argument expressions (named
+//! columns). A literal call reports its parameter types with EMPTY names.
+bool FabricatorIsCorrelatedCall(const TableFunctionBindInput &input);
+unique_ptr<FunctionData> FabricatorLateralBind(ClientContext &context, TableFunctionBindInput &input,
+                                               TableFunctionInfo &lateral_info, vector<LogicalType> &return_types,
+                                               vector<Identifier> &names);
+bool FabricatorIsLateralBindData(optional_ptr<const FunctionData> bind_data);
+unique_ptr<LocalTableFunctionState> FabricatorLateralInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                              GlobalTableFunctionState *global);
+OperatorResultType FabricatorLateralInOut(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
+                                          DataChunk &output);
+
 } // namespace duckdb

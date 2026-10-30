@@ -855,8 +855,12 @@ struct LateralBatchedLogical : public LogicalExtensionOperator {
 //! `!projected_input.empty()`, which IS the correlated-LATERAL signal (empty means the plain uncorrelated
 //! shape, where DuckDB's own driver already passes the whole chunk and is therefore already batched).
 bool LateralIsEligible(LogicalGet &get) {
-	if (!get.bind_data || get.function.in_out_function != LateralInOutFunction) {
+	if (!get.bind_data || (get.function.in_out_function != LateralInOutFunction &&
+	                       get.function.in_out_function != FabricatorLateralInOut)) {
 		return false; // not one of ours
+	}
+	if (!FabricatorIsLateralBindData(get.bind_data.get())) {
+		return false; // a function carrying both forms, called with constants (its scan)
 	}
 	if (get.function.in_out_function_final) {
 		return false; // DuckDB refuses finalize + projected_input anyway; defensive
@@ -1034,6 +1038,52 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const vecto
 	info->arg_styles = std::move(arg_styles);
 	tf.function_info = std::move(info);
 	return tf;
+}
+
+shared_ptr<TableFunctionInfo> FabricatorMakeLateralInfo(FabricatorHandle handle, const vector<string> &schema_path,
+                                                       const string &func_name, vector<string> arg_names,
+                                                       vector<LogicalType> arg_types,
+                                                       vector<FabricatorParamStyle> arg_styles) {
+	auto info = make_shared_ptr<LateralFunctionInfo>();
+	info->handle = handle;
+	info->schema_path = schema_path;
+	info->func = func_name;
+	info->arg_names = std::move(arg_names);
+	info->arg_types = std::move(arg_types);
+	info->arg_styles = std::move(arg_styles);
+	return std::move(info);
+}
+
+bool FabricatorIsCorrelatedCall(const TableFunctionBindInput &input) {
+	for (auto &name : input.input_table_names) {
+		if (!name.empty()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+unique_ptr<FunctionData> FabricatorLateralBind(ClientContext &context, TableFunctionBindInput &input,
+                                               TableFunctionInfo &lateral_info, vector<LogicalType> &return_types,
+                                               vector<Identifier> &names) {
+	TableFunctionBindInput lateral_input(input.inputs, input.named_parameters, input.input_table_types,
+	                                     input.input_table_names, &lateral_info, input.binder, input.table_function,
+	                                     input.ref, input.input_plan);
+	return LateralBind(context, lateral_input, return_types, names);
+}
+
+bool FabricatorIsLateralBindData(optional_ptr<const FunctionData> bind_data) {
+	return bind_data && dynamic_cast<const LateralBindData *>(bind_data.get()) != nullptr;
+}
+
+unique_ptr<LocalTableFunctionState> FabricatorLateralInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                              GlobalTableFunctionState *global) {
+	return LateralInitLocal(context, input, global);
+}
+
+OperatorResultType FabricatorLateralInOut(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
+                                          DataChunk &output) {
+	return LateralInOutFunction(context, data, input, output);
 }
 
 void RegisterFabricatorLateralOptimizer(DBConfig &config) {

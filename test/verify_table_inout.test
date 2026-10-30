@@ -1,6 +1,9 @@
 # name: test/verify_table_inout.test
-# description: Table-in-out (4g) — a discovered TVF's `<name>_each(<input table>)` alias applies it
-#              once per input row via SQL-Server CROSS APPLY (parallel input coordinated in C#).
+# description: A discovered TVF called with a column argument — `FROM t, db.s.tvf(t.a)` — applies it once per
+#              input row: the lateral session sends each chunk of distinct argument tuples as ONE statement,
+#              `(VALUES …) CROSS APPLY [s].[tvf](…)`, and the row number in VALUES says which input row each
+#              output row belongs to. Until 2026-10-30 this was the `<tvf>_each(<input table>)` in-out form,
+#              which is gone; a literal call (`db.s.tvf(1)`) keeps its scan with pushdown.
 # group: [mssql]
 
 require fabricator
@@ -21,18 +24,27 @@ statement ok
 SELECT fabricator_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_div(@n INT) RETURNS TABLE AS RETURN (SELECT 100/@n AS q)');
 
 statement ok
+SELECT fabricator_exec('iodb', 'CREATE OR ALTER FUNCTION dbo.tf_wide(@a INT, @b INT, @c INT, @d INT, @e INT, @f INT, @g INT, @h INT) RETURNS TABLE AS RETURN (SELECT @a * 10 AS v, @a + @b + @c + @d + @e + @f + @g + @h AS s)');
+
+statement ok
 SELECT fabricator_refresh_cache('iodb');
 
-# The scalar-arg scan form (4c) is unchanged and coexists with the `_each` in-out alias.
+# The literal form is the scan (4c), with its pushdown; the correlated form is the lateral session.
 query I
 SELECT m FROM iodb.dbo.tf_io(2) ORDER BY m;
 ----
 1
 2
 
-# Basic table-in-out: apply tf_io once per input row. Output = the echoed input column (n) + tf output (m).
+# The `_each` in-out form is gone.
+statement error
+SELECT * FROM iodb.dbo.tf_io_each((SELECT 1 AS n));
+----
+does not exist
+
+# Basic: apply tf_io once per input row.
 query II
-SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n))) ORDER BY n, m;
+SELECT v.n, f.m FROM (VALUES(1),(2),(3)) v(n), iodb.dbo.tf_io(v.n) f ORDER BY 1, 2;
 ----
 1	1
 2	1
@@ -41,11 +53,15 @@ SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n)))
 3	2
 3	3
 
-# Parallel UNION ALL input — both branches feed ONE session; one coherent result (the case that
-# historically broke: in_out_function_final fires once per branch, so the single all-input-done
-# finish is driven by the last-branch counter, not per-branch).
+# It goes through the batched operator, one call per chunk of input rows.
 query II
-SELECT n, m FROM iodb.dbo.tf_io_each((SELECT 2 AS n UNION ALL SELECT 3)) ORDER BY n, m;
+EXPLAIN SELECT v.n, f.m FROM (VALUES(1),(2),(3)) v(n), iodb.dbo.tf_io(v.n) f;
+----
+physical_plan	<REGEX>:.*Fabricator Lateral Batched.*
+
+# Input from a UNION ALL (parallel branches).
+query II
+SELECT s.n, f.m FROM (SELECT 2 AS n UNION ALL SELECT 3) s, iodb.dbo.tf_io(s.n) f ORDER BY 1, 2;
 ----
 2	1
 2	2
@@ -53,59 +69,103 @@ SELECT n, m FROM iodb.dbo.tf_io_each((SELECT 2 AS n UNION ALL SELECT 3)) ORDER B
 3	2
 3	3
 
-# WHERE on the output (applied by DuckDB above the operator — no pushdown into an in-out).
+# Duplicate input rows: DuckDB calls the function once per DISTINCT argument and stamps every outer row.
 query II
-SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(2),(3)) v(n))) WHERE m > 1 ORDER BY n, m;
+SELECT v.n, f.m FROM (VALUES(2),(2)) v(n), iodb.dbo.tf_io(v.n) f ORDER BY 1, 2;
+----
+2	1
+2	1
+2	2
+2	2
+
+# WHERE on the output (applied by DuckDB above the operator).
+query II
+SELECT v.n, f.m FROM (VALUES(2),(3)) v(n), iodb.dbo.tf_io(v.n) f WHERE f.m > 1 ORDER BY 1, 2;
 ----
 2	2
 3	2
 3	3
 
-# ORDER BY + LIMIT on the output (a TopN pipeline-breaker above the operator; LIMIT short-circuits
-# — the operator-state destructor's inout_abort is the cleanup backstop).
+# ORDER BY + LIMIT on the output.
 query II
-SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n))) ORDER BY n, m LIMIT 3;
+SELECT v.n, f.m FROM (VALUES(1),(2),(3)) v(n), iodb.dbo.tf_io(v.n) f ORDER BY 1, 2 LIMIT 3;
 ----
 1	1
 2	1
 2	2
 
-# Aggregate over the in-out output.
+# Aggregate over the output.
 query II
-SELECT count(*), sum(m) FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1),(2),(3)) v(n)));
+SELECT count(*), sum(f.m) FROM (VALUES(1),(2),(3)) v(n), iodb.dbo.tf_io(v.n) f;
 ----
 6	10
 
 # Empty input -> no output, no hang.
 query I
-SELECT count(*) FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(1)) v(n) WHERE 1=0));
+SELECT count(*) FROM (SELECT v.n FROM (VALUES(1)) v(n) WHERE 1=0) s, iodb.dbo.tf_io(s.n) f;
 ----
 0
 
-# Multi-column input table (2 params) -> echoed input columns + TVF output columns.
+# LEFT JOIN LATERAL keeps an input row the function returns nothing for (n = 0: TOP (0)).
+query II
+SELECT v.n, f.m FROM (VALUES(0),(1)) v(n) LEFT JOIN LATERAL iodb.dbo.tf_io(v.n) f ON true ORDER BY 1, 2;
+----
+0	NULL
+1	1
+
+# A NULL argument reaches the function as NULL.
+query IIT
+SELECT v.id, f.v, f.lbl FROM (VALUES(NULL::INT, 'n'), (3, NULL)) v(id, label), iodb.dbo.tf_kv(v.id, v.label) f ORDER BY 1 NULLS LAST;
+----
+3	30	NULL
+NULL	NULL	n
+
+# Two parameters, a string among them.
 query ITIT
-SELECT id, label, v, lbl FROM iodb.dbo.tf_kv_each((SELECT v.id, v.label FROM (VALUES(1,'a'),(2,'b')) v(id,label))) ORDER BY id;
+SELECT v.id, v.label, f.v, f.lbl FROM (VALUES(1,'a'),(2,'b')) v(id,label), iodb.dbo.tf_kv(v.id, v.label) f ORDER BY 1;
 ----
 1	a	10	a
 2	b	20	b
 
-# Large input (50 rows; BIGINT input from range -> INT param echo exercises the type round-trip)
-# + sub-chunking under the ~2100-parameter cap + backpressure. count = sum(1..50)=1275; sum(m)=22100.
-query II
-SELECT count(*), sum(m) FROM iodb.dbo.tf_io_each((SELECT t.n FROM range(1, 51) t(n)));
+# 3000 distinct rows of two parameters, a string among them; the last column counts output rows stamped onto the wrong
+# input row. A BIGINT does not narrow to the INT parameter by itself: cast it.
+query IIII
+SELECT count(*), sum(f.v), count(DISTINCT f.lbl), count(*) FILTER (WHERE f.v <> t.i * 10 OR f.lbl <> 'x' || (t.i % 7)::VARCHAR)
+FROM range(1, 3001) t(i), iodb.dbo.tf_kv(t.i::INT, 'x' || (t.i % 7)::VARCHAR) f;
 ----
-1275	22100
+3000	45015000	7	0
 
-# Error mid-stream (divide by zero for n=0) surfaces as a query failure (the consumer faults the
-# output channel; it's raised on the next push/finish), and the session is released.
+# Eight parameters: at most 250 rows per statement. DuckDB hands over the distinct arguments in chunks of one radix
+# partition each (measured ~1200 rows at 20 000, but only ~200 at 3 000, where nothing would split), so each chunk
+# becomes several statements and the provenance must carry the offset of each — the last column counts output rows
+# stamped onto the wrong input row.
+query III
+SELECT count(*), sum(f.s), count(*) FILTER (WHERE f.v <> t.i * 10) FROM range(1, 20001) t(i), iodb.dbo.tf_wide(t.i::INT, 1, 2, 3, 4, 5, 6, 7) f;
+----
+20000	200570000	0
+
+# Row-by-row (the batched operator switched off) answers the same.
+statement ok
+SET fabricator_batched_lateral = false;
+
+query IIII
+SELECT count(*), sum(f.v), count(DISTINCT f.lbl), count(*) FILTER (WHERE f.v <> t.i * 10 OR f.lbl <> 'x' || (t.i % 7)::VARCHAR)
+FROM range(1, 3001) t(i), iodb.dbo.tf_kv(t.i::INT, 'x' || (t.i % 7)::VARCHAR) f;
+----
+3000	45015000	7	0
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# An error from the function surfaces as a query failure.
 statement error
-SELECT q FROM iodb.dbo.tf_div_each((SELECT v.n FROM (VALUES(1),(0)) v(n)));
+SELECT f.q FROM (VALUES(1),(0)) v(n), iodb.dbo.tf_div(v.n) f;
 ----
 Divide by zero
 
-# After the error the catalog/session is healthy — a normal in-out still works.
+# After the error the catalog is healthy.
 query II
-SELECT n, m FROM iodb.dbo.tf_io_each((SELECT v.n FROM (VALUES(2)) v(n))) ORDER BY n, m;
+SELECT v.n, f.m FROM (VALUES(2)) v(n), iodb.dbo.tf_io(v.n) f ORDER BY 1, 2;
 ----
 2	1
 2	2
@@ -118,6 +178,9 @@ SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_kv');
 
 statement ok
 SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_div');
+
+statement ok
+SELECT fabricator_exec('iodb', 'DROP FUNCTION IF EXISTS dbo.tf_wide');
 
 statement ok
 DETACH iodb;

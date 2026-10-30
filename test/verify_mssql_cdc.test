@@ -122,9 +122,8 @@ SELECT count(*) FROM duckdb_tables() WHERE database_name = 'c0' AND schema_name 
 0
 
 # ⚠ Filtered to OUR four names on purpose. Once CDC is enabled, SQL Server's own per-instance TVFs also live
-# in this schema — and this provider declares a `<routine>_each` sibling for every discovered TVF that takes
-# parameters, so each capture instance contributes FOUR entries
-# (fn_cdc_get_{all,net}_changes_<inst>{,_each}). An unfiltered count would therefore be a function of how
+# in this schema, so each capture instance contributes entries of its own
+# (fn_cdc_get_{all,net}_changes_<inst>). An unfiltered count would therefore be a function of how
 # many tables happen to be captured, which is not what this section is about.
 query II
 SELECT function_name, function_type FROM duckdb_functions() WHERE database_name = 'c0' AND schema_name = 'cdc' AND function_name IN ('max_position', 'min_position', 'tables', 'health') ORDER BY function_name;

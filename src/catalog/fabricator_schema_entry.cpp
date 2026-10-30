@@ -2152,6 +2152,9 @@ struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	//! are re-added by name at bind), so the two lists do not share indices there.
 	idx_t varargs_index = DConstants::INVALID_INDEX;
 	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
+	//! A discovered TVF's CORRELATED form (`FROM t, db.s.tvf(t.a)`): the lateral session's info. Null for every
+	//! other function. See FabricatorTvfBind.
+	shared_ptr<TableFunctionInfo> lateral;
 	// SQL-generating (`table_sql`, v68) functions only: the DuckDB ATTACH ALIAS of the catalog this entry
 	// belongs to (empty for a global function). Passed to generate_table_sql so a catalog-bound generator can
 	// emit references back into its own catalog — C# never sees the alias otherwise.
@@ -3931,6 +3934,44 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 	}
 }
 
+// A discovered TVF carries both forms on one TableFunction: DuckDB binds a call with constant arguments as an
+// ordinary table function (our scan, projection and filter pushdown) and a call with a column argument as an
+// in-out function (the lateral session, one CROSS APPLY per input chunk). bind and the init / filter callbacks
+// are shared by both, so they dispatch: on the call shape at bind, on the bind data afterwards.
+static unique_ptr<FunctionData> FabricatorTvfBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
+	if (info.lateral && FabricatorIsCorrelatedCall(input)) {
+		return FabricatorLateralBind(context, input, *info.lateral, return_types, names);
+	}
+	return FabricatorTableFunctionBind(context, input, return_types, names);
+}
+
+static unique_ptr<GlobalTableFunctionState> FabricatorTvfInitGlobal(ClientContext &context,
+                                                                    TableFunctionInitInput &input) {
+	if (FabricatorIsLateralBindData(input.bind_data)) {
+		return make_uniq<GlobalTableFunctionState>(); // the lateral session keeps its state per thread
+	}
+	return fabricator::ArrowStreamInitGlobal(context, input);
+}
+
+static unique_ptr<LocalTableFunctionState> FabricatorTvfInitLocal(ExecutionContext &context,
+                                                                  TableFunctionInitInput &input,
+                                                                  GlobalTableFunctionState *global) {
+	if (FabricatorIsLateralBindData(input.bind_data)) {
+		return FabricatorLateralInitLocal(context, input, global);
+	}
+	return fabricator::ArrowStreamInitLocal(context, input, global);
+}
+
+static void FabricatorTvfFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data,
+                                        vector<unique_ptr<Expression>> &filters) {
+	if (FabricatorIsLateralBindData(bind_data)) {
+		return; // nothing is pushed into a correlated call; DuckDB filters its output
+	}
+	FabricatorComplexFilterPushdown(context, get, bind_data, filters);
+}
+
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(ClientContext &context,
                                                                          const string &func_name) {
 	lock_guard<mutex> lock(entry_lock_);
@@ -4026,7 +4067,19 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 		// predicates are left in the plan so DuckDB re-applies them — an over-approximation
 		// is safe). `SELECT <cols> FROM tvf(@args) WHERE <filter>` is emitted by C#. Procs
 		// are not inline-wrappable, so they get no filter pushdown (DuckDB filters locally).
-		tf.pushdown_complex_filter = FabricatorComplexFilterPushdown;
+		tf.pushdown_complex_filter = FabricatorTvfFilterPushdown;
+		// …and the correlated form, `FROM t, db.s.tvf(t.a)`, through the lateral session (see FabricatorTvfBind).
+		// Only a function of positional parameters: a correlated argument is passed by position.
+		bool positional_only = varargs_index == DConstants::INVALID_INDEX;
+		for (auto style : arg_styles) {
+			positional_only = positional_only && style == FabricatorParamStyle::POSITIONAL;
+		}
+		if (positional_only && !arg_types.empty()) {
+			tf.bind = FabricatorTvfBind;
+			tf.init_global = FabricatorTvfInitGlobal;
+			tf.init_local = FabricatorTvfInitLocal;
+			tf.in_out_function = FabricatorLateralInOut;
+		}
 	}
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
@@ -4037,6 +4090,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	fn_info->arg_styles = arg_styles;
 	fn_info->varargs_index = varargs_index;
 	fn_info->is_proc = is_proc;
+	if (tf.in_out_function) {
+		fn_info->lateral = FabricatorMakeLateralInfo(handle_, SchemaPathStrings(), func_name, arg_names, arg_types,
+		                                             arg_styles);
+	}
 	// ABI v81: this is the ONE registration path whose scans go through tablefn_execute, so it is the one
 	// that can be told "my execution performed DDL". A GLOBAL function belongs to no catalog and leaves this
 	// null; the sqlgen and in-out paths do not use tablefn_execute at all.

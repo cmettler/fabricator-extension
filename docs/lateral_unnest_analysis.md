@@ -1101,3 +1101,31 @@ to this directory, so it still resolves from here.
   - Consumers: `fabricator_lat_fields` (host, type-generic demo: VARCHAR names / int count / LIST) and the
     sample plugin's `plug_lat_fields` (ZERO plugin-side machinery — the prototype's dictionary/scalar/count
     probe were deleted as superseded).
+
+## 10. Discovered SQL Server TVFs as lateral functions (2026-10-30)
+
+A discovered TVF is called per input row the lateral way, `FROM t, db.dbo.tvf(t.a)`, and the `<tvf>_each(<table>)`
+in-out form is GONE (user decision). A stored procedure keeps its `_each`: it is EXEC'd per row on DuckDB's pinned
+write transaction, which a parallel lateral session must not share.
+
+- **One TableFunction, two forms.** DuckDB binds a call whose arguments are all scalar as an ordinary table
+  function, and one with a column argument as an in-out function (bind_table_function.cpp: `GetTableFunctionBindType`
+  returns STANDARD for all-scalar arguments before looking at the overloads). So the TVF's entry keeps its scan
+  (`function`, projection and filter pushdown) and gains `in_out_function`; `bind`, `init_global`, `init_local` and
+  `pushdown_complex_filter` dispatch — on the call shape at bind (`FabricatorIsCorrelatedCall`: the synthesized input
+  relation has NAMED columns, a literal call reports its parameter types with empty names), on the bind data's type
+  afterwards. `LateralIsEligible` also accepts the TVF's in-out pointer, so the batched operator takes it.
+- **The managed half is `SqlServerTvfLateral`:** each chunk of distinct argument tuples is ONE statement,
+  `SELECT p.[__fab_row], f.* FROM (VALUES (0, CAST(@p0_0 AS <param type>), …), …) p(…) CROSS APPLY [s].[tvf](p.[a0], …) f`,
+  and `__fab_row` is the provenance. ~2100 parameters per statement ⇒ a chunk is split by `2000 / params` rows, the row
+  number staying the chunk's (not the part's). One connection + read transaction per session at the in-out isolation
+  rule (`SET mssql_isolation_level` over the ATTACH `isolation_level`). Every statement is logged under `Fabricator.Sql`.
+- ⚠ **A chunk is one radix partition of the distinct arguments, not 2048 rows**: measured ~200 rows at 3 000 distinct
+  values and ~1 200 at 20 000. A test that wants the per-statement split has to be large and wide — the first one
+  (3 000 rows, 2 parameters) never split, so a mutant that numbered rows per PART survived it twice, once even with an
+  assertion relating the outer column to the output. `verify_table_inout` now uses 20 000 rows of an 8-parameter TVF
+  (250 rows per statement), and the mutant dies there.
+- ⚠ An argument must match or WIDEN to the parameter type: the in-out bind does not narrow a `BIGINT` to `INT`
+  (`range()` gives BIGINT) — write `t.i::INT`. The `_each` form accepted it because its input was a TABLE.
+- Measured: 20 000 distinct argument tuples in 0.82 s through the batched operator.
+

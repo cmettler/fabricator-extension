@@ -103,7 +103,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Discovered table-valued functions → `SELECT * FROM db.schema.tvf(args)` (+ projection/filter pushdown) | ✅ |
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
 | | Custom C#-authored scalar / table / table-in-out functions | ✅ |
-| | **Table-in-out**: `db.schema.fn_each(<input table>)` — apply a TVF (CROSS APPLY) or proc per input row | ✅ |
+| | **Per input row**: `FROM t, db.schema.tvf(t.a)` — a TVF applied per row (CROSS APPLY); `db.schema.proc_each(<input table>)` — a proc per row | ✅ |
 | | **Correlated LATERAL**: `FROM t, db.schema.fn(t.a, t.b)` — batched, 1→1/1→0/1→N | ✅ |
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
@@ -556,7 +556,7 @@ What the profile drives automatically:
   SELECT * FROM ducklake_delta_sync('lake');   -- one row per Delta version written
   ```
 - **Functions.** Discovered scalar UDFs, TVFs, and stored procedures work on Fabric (proc result sets resolved
-  via `sp_describe_first_result_set`), as do custom C# functions and the `fn_each` table-in-out exchange.
+  via `sp_describe_first_result_set`), as do custom C# functions, a TVF called per row and a proc's `_each`.
 
 > **Collation reality:** no single collation is ideal across the whole OneLake stack (DuckDB + the SQL endpoint
 > are case-sensitive/binary; the DAX/Vertipaq engine is case-insensitive). The extension is *adaptive* —
@@ -1327,9 +1327,8 @@ SELECT * FROM db.cdc.health();
   answer is `NULL` rather than the other one. `cdc.tables()` lists the instance names.
 - **`max_lsn_age_seconds` is not lag.** It is the age of the newest *captured* transaction, so on an idle
   database it grows without bound while capture is perfectly current.
-- SQL Server's own per-instance functions (`cdc.fn_cdc_get_all_changes_<instance>`, and the `_each` per-row
-  form this extension adds for every discovered table function) are ordinary discovered functions and are
-  callable directly.
+- SQL Server's own per-instance functions (`cdc.fn_cdc_get_all_changes_<instance>`) are ordinary discovered
+  functions and are callable directly — with constant arguments, or per row (`FROM t, cdc.fn_…(t.a, …)`).
 
 #### Reading the change stream — `db.cdc.changes(...)`
 
@@ -3872,8 +3871,7 @@ Notes and limits:
   lists a schema-enabled lakehouse's tables anyway.
 - `reset_shortcut_cache()` needs a **user identity** — a service principal is refused with
   `PrincipalTypeNotSupported`. It is the remedy when a re-created shortcut name transiently conflicts.
-- `duckdb_functions()` also lists an `<name>_each` sibling for each table function. That is the generic
-  per-row form and is not usable on this provider.
+- `duckdb_functions()` lists an `<name>_each` sibling only for a stored procedure (the per-row `EXEC`).
 
 ## Callable Functions
 
@@ -4007,22 +4005,32 @@ SELECT * FROM fabricator_va_values(1, 'x', TRUE);              -- SELECT 1 AS v0
 - Aggregate functions **cannot** take one — their state marshal has no per-call-site width. Declaring one
   there is refused by name rather than silently registered as an ordinary argument.
 
-### Table-in-out (`fn_each`)
+### A function per input row (`FROM t, tvf(t.a)` and `proc_each`)
 
-A discovered TVF or stored proc *also* gets a sibling `fn_each(<input table>)` that applies the function
-**once per input row** — output = the input columns + the function's output columns. (DuckDB forbids a
-`TABLE`-parameter overload from sharing the scalar-arg name, hence the `_each` suffix.)
+A discovered **TVF** is called per input row by passing it a column — the usual lateral spelling:
 
 ```sql
--- Apply tf_orders to every region in a table (CROSS APPLY, run in SQL Server):
-SELECT * FROM mssql.dbo.tf_orders_each((SELECT region FROM regions));
+-- Apply tf_orders to every region (one CROSS APPLY per chunk of input rows, run in SQL Server):
+SELECT r.region, o.* FROM regions r, mssql.dbo.tf_orders(r.region) o;
+-- keep the regions it returns nothing for:
+SELECT r.region, o.* FROM regions r LEFT JOIN LATERAL mssql.dbo.tf_orders(r.region) o ON true;
+```
 
--- Apply a stored procedure per input row:
+- DuckDB calls the function once per **distinct** argument tuple and repeats the result for duplicate rows; the
+  extension sends each chunk of them as ONE statement, `(VALUES …) CROSS APPLY [dbo].[tf_orders](…)`.
+- With constant arguments (`mssql.dbo.tf_orders('EU')`) it stays the ordinary scan, with its columns and `WHERE`
+  pushed into the query.
+- An argument must match the parameter type or widen to it: DuckDB does not narrow a `BIGINT` to an `INT`
+  parameter here by itself — write `t.i::INT`.
+- ⚠ Until 2026-10-30 this was spelled `tf_orders_each((SELECT region FROM regions))`; that form is gone for TVFs.
+
+A **stored procedure** cannot be CROSS-APPLY'd, so it keeps a sibling `proc_each(<input table>)` that `EXEC`s it
+**once per input row** — output = the input columns + the procedure's result columns:
+
+```sql
 SELECT * FROM mssql.dbo.usp_process_each((SELECT id FROM mssql.dbo.queue));
 ```
 
-- **TVFs** combine via SQL-Server `CROSS APPLY` (T-SQL generated by C#); **stored procs** can't be
-  CROSS-APPLY'd, so they're `EXEC`'d once per row.
 - **Consistent view:** each call wraps all its per-chunk queries in one transaction at a configurable
   isolation level — set per catalog with the `isolation_level` ATTACH option, or per session with
   `SET mssql_isolation_level` (`read uncommitted` / `read committed` / `repeatable read` / `serializable`
@@ -4040,7 +4048,7 @@ SELECT * FROM mssql.dbo.usp_process_each((SELECT id FROM mssql.dbo.queue));
 
 ### Correlated LATERAL functions (`ILateralFunction`)
 
-A **row-mapped** function is the shape `fn_each` cannot express: its arguments are ordinary values, so it can
+A **row-mapped** function takes its arguments as ordinary values (the shape a discovered TVF uses too), so it can
 be written the way you would expect — correlated against an outer relation.
 
 ```sql
@@ -4163,7 +4171,7 @@ use: a transaction's pinned connection keeps the MARS mode it was opened with fo
 | `mssql_add_identity` | **Active** | Auto-add a `BIGINT IDENTITY` surrogate key (`<table>_id`) to created tables (CREATE + CTAS); overrides the per-catalog `add_identity` ATTACH option (`SET false` to skip for fact tables) |
 | `mssql_ctas_text_type` | **Active** | Whole-type override for text columns on CREATE/CTAS/COPY (e.g. `'VARCHAR(64)'`); wins over the collation choice + length |
 | `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `fabricator_exec` (default `false`) |
-| `mssql_isolation_level` | **Active** | SQL transaction isolation level for table-in-out (`fn_each`) calls; overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |
+| `mssql_isolation_level` | **Active** | SQL transaction isolation level for per-row calls (a TVF called with a column, a proc's `_each`); overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |
 | `mssql_read_isolation` | **Active** | **Opt-in, unset by default.** Isolation level for READS inside a DuckDB transaction: routes ordinary scans onto that transaction's own connection, opened at this level, so successive statements share **one view** (without it two identical `SELECT`s can differ — see [known-limitations.md](docs/known-limitations.md) 1.16). Use `'snapshot'`: it is the only level that delivers it (`'repeatable read'` still permits the phantoms a `count(*)` sees, `'serializable'` works by blocking writers), and on box it needs `ALLOW_SNAPSHOT_ISOLATION`. **Costs** a held connection + open transaction for the transaction's life, and on a no-MARS engine (Fabric/Synapse) reads are buffered instead of streamed, with no spill — measured 83 MB peak working set streaming vs 471 MB for a 389 MB result, so the ceiling is the largest single result the transaction reads. Overrides the per-catalog `read_isolation` ATTACH option |
 | `mssql_copy_into_staging` | **Active** | **Opt-in, unset by default.** A storage location this extension may write temporary parquet to (`abfss://<fs>@<host>/<path>` or the equivalent `https://<host>/<fs>/<path>`). Set on a **Fabric Warehouse / Synapse** attach, a bulk write stages its parquet there with DuckDB's parallel writer and the warehouse ingests the folder with one `COPY INTO`, instead of streaming rows over TDS with `SqlBulkCopy`. Unset ⇒ `SqlBulkCopy`; **ignored** on engines without `COPY INTO`, so one session setting can span a mixed set of attaches. The staging identity needs read access via **Entra ID only** (no SAS/key), and the path must have no `_`- or `.`-prefixed segment — `COPY INTO` skips such names, which would load zero rows without an error, so it is refused at ATTACH. Overrides the per-catalog `copy_into_staging` ATTACH option |
 | `mssql_insert_batch_size`, `mssql_insert_max_rows_per_statement`, `mssql_insert_max_sql_bytes`, `mssql_insert_use_returning_output` | Accepted | Registered with defaults + `>= 1` validation; no-op (INSERT streams via SqlBulkCopy) |

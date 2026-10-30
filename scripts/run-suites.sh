@@ -1539,7 +1539,9 @@ case "$TIER" in
         # verify_pushdown_guide_mssql 109 -> 113 (S7).
         # 2026-10-30: 6205 -> 6227: SQL Server UDFs pushed — verify_subtree_pushdown_mssql 144 -> 155,
         # verify_pushdown_guide_mssql 113 -> 119 (S8, L2 on cf_add), verify_remote_select_mssql 531 -> 536 (§5b).
-        : "${MIN_ASSERTIONS:=6227}"
+        # 2026-10-30: 6227 -> 6259: TVFs per row as lateral calls, `_each` gone for TVFs — verify_table_inout 63 -> 97,
+        # verify_functions 105 -> 103. Nothing else moved.
+        : "${MIN_ASSERTIONS:=6259}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -3539,17 +3539,17 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         "'' AS varargs " +
         "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
         "WHERE o.type IN ('FN','FS','IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
-        // THIS PROVIDER'S per-row form. A discovered TVF or proc also gets `<name>_each`, which applies it
-        // ONCE PER INPUT ROW — a TVF via CROSS APPLY, a proc via a per-row EXEC. It is declared HERE, as an
-        // ordinary in-out function, because it is a SQL-Server semantic: the host used to invent a `_each`
-        // alias for every table-kind function of every provider, which produced entries that could only fail
-        // on providers with nothing to apply per row (30 dead siblings on a Fabric attach alone).
-        // Only routines that TAKE parameters get one — there is nothing to apply per input row otherwise.
+        // THIS PROVIDER'S per-row form for a stored procedure: `<proc>_each`, an EXEC per input row. It is
+        // declared HERE, as an ordinary in-out function, because it is a SQL-Server semantic: the host used to
+        // invent a `_each` alias for every table-kind function of every provider, which produced entries that
+        // could only fail on providers with nothing to apply per row (30 dead siblings on a Fabric attach alone).
+        // A TVF has no `_each` any more: it is called correlated directly, `FROM t, db.s.tvf(t.a)` (the lateral
+        // session, SqlServerTvfLateral). Only procs that TAKE parameters get one.
         "UNION ALL " +
         "SELECT s.name AS schema_name, o.name + '_each' AS name, 'inout' AS kind, '0' AS param_count, " +
         "'' AS return_type, '' AS varargs " +
         "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
-        "WHERE o.type IN ('IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
+        "WHERE o.type IN ('P','PC') AND o.is_ms_shipped = 0 " +
         "AND EXISTS (SELECT 1 FROM sys.parameters p WHERE p.object_id = o.object_id AND p.parameter_id > 0) " +
         "ORDER BY schema_name, name";
 
@@ -4986,9 +4986,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // which is exactly the coupling that made a SQL-Server semantic the host's business.
         var routine = StripEach(functionName);
         var binding = Functions.InOutBind(schemaName, functionName, args, inputSchema)
-                      ?? (FunctionOutputColumns(Flat(schemaName), routine).Count > 0
-                          ? new SqlServerTvfEach(this, Flat(schemaName), routine, inputSchema)
-                          : (IInOutFunctionBinding)new SqlServerProcEach(this, Flat(schemaName), routine, inputSchema));
+                      ?? new SqlServerProcEach(this, Flat(schemaName), routine, inputSchema);
         // Resolve the SQL isolation for this in-out call and set it on the binding (if it honors isolation):
         // a SET mssql_isolation_level (pushed to the provider settings store) overrides this catalog's ATTACH
         // isolation_level default; pure-C# / proc bindings ignore it. Replaces the former C++
@@ -5001,13 +4999,23 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         return binding;
     }
 
-    // Row-mapped (correlated LATERAL) bind. Only provider-AUTHORED lateral functions exist: a discovered SQL
-    // routine has no row-mapped form to fall back to — its per-row shape is the `_each` in-out above, which
-    // takes a table argument — so an unknown name is an error rather than a fallback.
-    public ILateralFunctionBinding LateralBind(SchemaPath schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
-        Functions.LateralBind(schemaName, functionName, args, inputSchema)
-        ?? throw new ArgumentException(
-            $"fabricator: '{schemaName}.{functionName}' is not a lateral function");
+    // Row-mapped (correlated LATERAL) bind: a provider-AUTHORED lateral function, else a discovered TVF called
+    // with a column argument (`FROM t, db.s.tvf(t.a)` — one CROSS APPLY per input chunk). Its isolation follows
+    // the in-out rule: a SET mssql_isolation_level overrides the ATTACH isolation_level.
+    public ILateralFunctionBinding LateralBind(SchemaPath schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    {
+        if (Functions.LateralBind(schemaName, functionName, args, inputSchema) is { } binding)
+        {
+            return binding;
+        }
+        if (FunctionOutputColumns(Flat(schemaName), functionName).Count == 0)
+        {
+            throw new ArgumentException($"fabricator: '{schemaName}.{functionName}' is not a lateral function");
+        }
+        var setLevel = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_isolation_level");
+        return new SqlServerTvfLateral(this, Flat(schemaName), functionName, inputSchema,
+                                       string.IsNullOrEmpty(setLevel) ? _isolationLevel : setLevel);
+    }
 
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
     // accumulators (IAggregateFunction). Only provider-authored aggregates exist (SQL Server has no
