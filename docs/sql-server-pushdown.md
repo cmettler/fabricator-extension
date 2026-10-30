@@ -307,6 +307,21 @@ DuckDB plans such a filter only where the server table is worth filtering — no
 
 Measured over 1M server rows and a 2-row local table: 1.36 s → 0.19 s (20 000 rows cross instead of 1 000 000).
 
+**J2 — a part computed per local key runs for those keys only.** A Top-N or a scalar subquery per row of a local table
+is pushed as one query (S5–S9); the join's keys then go around it, and SQL Server applies them below the window or
+aggregate, at the index:
+
+```sql
+SELECT t.region, c.id FROM targets t,
+       LATERAL (SELECT id FROM mssql.dbo.pg_clicks c WHERE c.region = t.region ORDER BY id DESC LIMIT 2) c;
+-- Fabricator.Sql: … ) AS [q] WHERE [c1] = @p0 OPTION (RECOMPILE)
+```
+
+Measured over 1M server rows and 3 local keys: a Top-3 per key 0.27 s → 0.044 s, a scalar max and count per key
+0.16 s → 0.048 s. For the column to be usable there it must be `varchar`/`char` (an `nvarchar` key is grouped by its
+exact form only). With a NULL among the local keys of a scalar subquery DuckDB builds no key list (only a range), so
+that query is computed for every key — the answer is the same.
+
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
 connection), a part calling a function the provider implements itself (scalar or table) or a function of another
 catalog, a part

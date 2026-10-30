@@ -12,6 +12,18 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v99 (2026-10-30) — `execute_query_filtered`: a pushed query under DuckDB's table filters
+
+ONE entry appended after `execute_modify_returning`: `execute_query` plus the scan spec a catalog scan takes (columns,
+filter tree) and the filter's typed constants (`filter_values`, nullable, consumed). The host calls it for the
+`fabricator_query` that replaces a pushed part of a statement once that part has taken DuckDB's table filters — a hash
+join's runtime keys above all — and it RE-APPLIES every filter, so a provider may render a superset or ignore it.
+It executes at once (no describe): the bind-time schema came from `execute_query`. `IProviderCatalog.ExecuteQuery(sql,
+parameters, scanSpec, filterValues)` is a DIM that runs the plain query. SQL Server wraps the query as a derived table
+under its scan rendering (`… ) AS [q] WHERE [c1] IN (…) OPTION (RECOMPILE)`), and runs it plainly when the spec holds
+no filter or the query must read at SNAPSHOT. Record: [duckdb-2.0-remote-execution.md](duckdb-2.0-remote-execution.md)
+§5.1.
+
 ## v98 (2026-10-29) — `execute_modify_returning`: DELETE / UPDATE … RETURNING
 
 ONE entry appended after `remote_translate`: the rowid DML of `execute_delete` / `execute_update` (a negative

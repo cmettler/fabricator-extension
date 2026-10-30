@@ -642,6 +642,19 @@ void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStr
 	}
 }
 
+void ExecuteQueryFiltered(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out,
+                          ArrowArrayStream *params, const std::string &spec_json, ArrowArrayStream *filter_values) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.execute_query_filtered) {
+		throw duckdb::IOException("Fabricator: bridge does not provide execute_query_filtered");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.execute_query_filtered(handle, sql.c_str(), params, spec_json.c_str(), filter_values, &out, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: execute_query_filtered failed");
+	}
+}
+
 int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema_may_change,
                    ArrowArrayStream *params) {
 	const FabricatorVTable &vt = GetBridge();

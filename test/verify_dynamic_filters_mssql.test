@@ -126,5 +126,124 @@ SELECT count(*) > 0 FROM duckdb_logs WHERE type = 'Fabricator.Sql'
 ----
 true
 
+# ═══ §4  A pushed part takes the join's keys too (§5.1) ══════════════════════════════════════════════════════
+# A remote window or aggregate correlated with local keys is computed on the server for those keys only: the
+# decorrelation's `key IS NOT DISTINCT FROM key` becomes `=` where one side cannot be NULL, the pushed query reports
+# the size of what it reads (so DuckDB probes it), and it takes the join's runtime filter — sent around the query as
+# `… ) AS [q] WHERE [c<i>] IN (…)`. The keys below include ones the server's collation folds together ('r1', 'R1 ').
+
+statement ok
+SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.df_n; CREATE TABLE dbo.df_n (id INT PRIMARY KEY, region VARCHAR(10) NULL);
+INSERT INTO dbo.df_n VALUES (1, NULL), (2, NULL), (3, ''R2''), (4, ''x'');', refresh_cache := true);
+
+statement ok
+CREATE TABLE keys AS SELECT * FROM (VALUES ('r1', 1), ('R1 ', 2), ('R2', 3), ('nope', 4)) t(region, w);
+
+statement ok
+CREATE TABLE keysn AS SELECT * FROM (VALUES ('r1', 1), (NULL, 2), ('R2', 3), ('nope', 4)) t(region, w);
+
+statement ok
+SET VARIABLE df_t0 = (SELECT t FROM fabricator_query('rp', 'SELECT SYSDATETIME() AS t'));
+
+statement ok
+CALL enable_logging(['Fabricator.Sql', 'Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Top-N per local key (a window over the remote table)
+query III
+SELECT l.w, r.id, r.v FROM keys l, LATERAL (SELECT b.id, b.v FROM rp.dbo.df_big b WHERE b.region = l.region
+  ORDER BY b.v DESC, b.id LIMIT 2) r ORDER BY 1, 2;
+----
+1	199	99
+1	499	99
+2	98	98
+2	398	98
+3	99	99
+3	399	99
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND contains(message, ') AS [q] WHERE [c')
+  AND contains(message, 'OPTION (RECOMPILE)');
+----
+1
+
+# the window partitions by the exact key AND the column, which is what lets SQL Server apply the keys below it
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND contains(message, 'BIN2_UTF8), [t0].[region] ORDER BY');
+----
+1
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.id FROM keys l, LATERAL (SELECT b.id FROM rp.dbo.df_big b WHERE b.region = l.region ORDER BY b.v DESC, b.id LIMIT 2) r)
+        EXCEPT ALL (SELECT l.w, r.id FROM keys l, LATERAL (SELECT b.id FROM off.dbo.df_big b WHERE b.region = l.region ORDER BY b.v DESC, b.id LIMIT 2) r)))
+     + (SELECT count(*) FROM ((SELECT l.w, r.id FROM keys l, LATERAL (SELECT b.id FROM off.dbo.df_big b WHERE b.region = l.region ORDER BY b.v DESC, b.id LIMIT 2) r)
+        EXCEPT ALL (SELECT l.w, r.id FROM keys l, LATERAL (SELECT b.id FROM rp.dbo.df_big b WHERE b.region = l.region ORDER BY b.v DESC, b.id LIMIT 2) r)));
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# scalar subqueries per local key (an aggregate over the remote table)
+query III
+SELECT l.w, (SELECT max(b.v) FROM rp.dbo.df_big b WHERE b.region = l.region) AS m,
+       (SELECT count(*) FROM rp.dbo.df_big b WHERE b.region = l.region) AS c FROM keys l ORDER BY 1;
+----
+1	99	1000
+2	98	1000
+3	99	1000
+4	NULL	0
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND contains(message, ') AS [q] WHERE [c');
+----
+2
+
+# a varchar key column groups by itself too
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND contains(message, 'GROUP BY')
+  AND contains(message, 'BIN2_UTF8), [t0].[region]');
+----
+true
+
+# a NULL among the local keys: the answers stay exact (DuckDB builds no IN list from keys holding a NULL)
+query III
+SELECT l.w, (SELECT max(b.v) FROM rp.dbo.df_big b WHERE b.region = l.region) AS m,
+       (SELECT count(*) FROM rp.dbo.df_big b WHERE b.region = l.region) AS c FROM keysn l ORDER BY 1;
+----
+1	99	1000
+2	NULL	0
+3	99	1000
+4	NULL	0
+
+# ⚠ an explicit IS NOT DISTINCT FROM matches NULL with NULL, and nothing makes the key non-NULL: it must stay as written
+query II
+SELECT l.w, (SELECT count(*) FROM rp.dbo.df_n b WHERE b.region IS NOT DISTINCT FROM l.region) AS c FROM keysn l ORDER BY 1;
+----
+1	0
+2	2
+3	1
+4	0
+
+# the keys of a plain join arrive as varchar, so the varchar column's index is sought (an nvarchar value converts the
+# column under a SQL_ collation and scans it)
+query II
+SELECT count(*), sum(b.v) FROM keys l JOIN rp.dbo.df_big b ON b.region = l.region;
+----
+3000	149000
+
+query I
+SELECT n > 0 FROM fabricator_query('rp', 'SELECT COUNT(*) AS n FROM sys.dm_exec_query_stats qs
+  CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st WHERE qs.last_execution_time >= @t
+  AND st.text LIKE ''(@p0 varchar(8000)%'' AND CHARINDEX(''FROM [dbo].[df_big] WHERE [region] IN'', st.text) > 0',
+  params := {'t': getvariable('df_t0')});
+----
+true
+
+statement ok
+SELECT fabricator_exec('rp', 'DROP TABLE dbo.df_n');
+
 statement ok
 SELECT fabricator_exec('rp', 'DROP TABLE dbo.df_big');

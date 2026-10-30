@@ -197,6 +197,23 @@ true
 statement ok
 CALL truncate_duckdb_logs();
 
+# J2: a part computed per local key (here a Top-2 per region) runs on the server for those keys only
+query TI
+SELECT t.region, c.id FROM targets t,
+       LATERAL (SELECT id FROM mssql.dbo.pg_clicks c WHERE c.region = t.region ORDER BY id DESC LIMIT 2) c ORDER BY 2;
+----
+EU	2997
+EU	3000
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND contains(message, ') AS [q] WHERE [c')
+  AND contains(message, 'OPTION (RECOMPILE)');
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
 # the switch for parts of statements: S5 runs locally again, same answer
 statement ok
 SET fabricator_subtree_pushdown = false;

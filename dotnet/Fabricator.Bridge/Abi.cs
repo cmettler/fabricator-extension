@@ -351,6 +351,8 @@ public unsafe struct FabricatorVTable
     //   const char* table, int32 set_count, ArrowArrayStream* in, ArrowArrayStream* out, char** err)
     // set_count < 0: a DELETE, `in` = the keys; otherwise an UPDATE, `in` = [set values…, keys…].
     public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, int, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteModifyReturning;
+    // ABI v99: execute_query + a scan spec and its filter constants.
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteQueryFiltered;
 }
 
 /// <summary>

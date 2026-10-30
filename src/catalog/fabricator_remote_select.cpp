@@ -21,6 +21,11 @@
 
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_lateral.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
 #include "catalog/fabricator_txn_util.hpp"
 #include "fabricator_optimizer.hpp"
 #include "fabricator_trace.hpp"
@@ -1738,7 +1743,153 @@ void ResolveGetInputs(LogicalOperator &op) {
 	}
 }
 
-void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog) {
+//! The most rows any table the subtree scans holds (its provider's estimate), or -1.
+int64_t LargestScan(LogicalOperator &op) {
+	int64_t largest = -1;
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto data = get.bind_data ? dynamic_cast<::fabricator::ArrowStreamBindData *>(get.bind_data.get()) : nullptr;
+		if (data) {
+			largest = data->row_count;
+		}
+	}
+	for (auto &child : op.children) {
+		largest = MaxValue(largest, LargestScan(*child));
+	}
+	return largest;
+}
+
+//! The pushed query's scan (fabricator_query) takes table filters: filter_pushdown, re-applied by the scan. It reports
+//! the largest table it reads as its cardinality: with no estimate DuckDB took it for 1 row, built the hash join over
+//! it and pushed the join's keys into the LOCAL side instead.
+void TakeTableFilters(LogicalOperator &op, int64_t estimate) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto data = get.bind_data ? dynamic_cast<::fabricator::ArrowStreamBindData *>(get.bind_data.get()) : nullptr;
+		if (data && get.function.GetName() == "fabricator_query") {
+			get.function.filter_pushdown = true;
+			data->reapply_filters = true;
+			if (estimate >= 0) {
+				data->row_count = estimate;
+				get.function.cardinality = [](ClientContext &, const FunctionData *bind_data) -> unique_ptr<NodeStatistics> {
+					auto rows = bind_data->Cast<::fabricator::ArrowStreamBindData>().row_count;
+					return rows < 0 ? nullptr : make_uniq<NodeStatistics>(static_cast<idx_t>(rows));
+				};
+			}
+			// the spec projects the query's columns, so its result maps BY NAME, as a catalog scan's does
+			data->push_projection = true;
+		}
+	}
+	for (auto &child : op.children) {
+		TakeTableFilters(*child, estimate);
+	}
+}
+
+//! Whether a filter expression rejects every row where `binding` is NULL: an IS NOT NULL on it, or a comparison of it
+//! (NULL compares to NULL, which a filter drops) — within an AND.
+bool RejectsNull(const Expression &expr, const ColumnBinding &binding) {
+	auto is_binding = [&](const Expression &e) {
+		return e.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		       e.Cast<BoundColumnRefExpression>().Binding() == binding;
+	};
+	if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+			if (RejectsNull(*child, binding)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		auto &children = expr.Cast<BoundOperatorExpression>().GetChildren();
+		return children.size() == 1 && is_binding(*children[0]);
+	}
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		auto type = expr.GetExpressionType();
+		if (type == ExpressionType::COMPARE_DISTINCT_FROM || type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			return false;
+		}
+		auto &comparison = expr.Cast<BoundFunctionExpression>();
+		return is_binding(BoundComparisonExpression::Left(comparison)) ||
+		       is_binding(BoundComparisonExpression::Right(comparison));
+	}
+	return false;
+}
+
+//! Whether the column `binding`, as `op` produces it, is never NULL: a filter on the way rejects NULL there, followed
+//! through projections, ordering, limits, windows and an aggregate's group key (one grouping set).
+bool NeverNull(LogicalOperator &op, const ColumnBinding &binding) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_FILTER:
+		for (auto &expr : op.expressions) {
+			if (RejectsNull(*expr, binding)) {
+				return true;
+			}
+		}
+		return NeverNull(*op.children[0], binding);
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto &projection = op.Cast<LogicalProjection>();
+		if (binding.table_index != projection.table_index || binding.column_index >= op.expressions.size()) {
+			return false;
+		}
+		auto &expr = *op.expressions[binding.column_index];
+		return expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		       NeverNull(*op.children[0], expr.Cast<BoundColumnRefExpression>().Binding());
+	}
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+		auto &aggregate = op.Cast<LogicalAggregate>();
+		if (binding.table_index != aggregate.group_index || aggregate.grouping_sets.size() > 1 ||
+		    binding.column_index >= aggregate.groups.size()) {
+			return false;
+		}
+		auto &group = *aggregate.groups[binding.column_index];
+		return group.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		       NeverNull(*op.children[0], group.Cast<BoundColumnRefExpression>().Binding());
+	}
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		if (binding.table_index == op.Cast<LogicalWindow>().window_index) {
+			return false;
+		}
+		return NeverNull(*op.children[0], binding);
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+		return NeverNull(*op.children[0], binding);
+	default:
+		return false;
+	}
+}
+
+//! DuckDB joins a decorrelated subquery back on `key IS NOT DISTINCT FROM key`, and its join filter skips that
+//! comparison (join_filter_pushdown_optimizer.cpp: "TODO: Need OR predicates") — so a few local keys never narrow the
+//! remote side. Where one side's key is never NULL the two comparisons agree on every row (they differ only when BOTH
+//! are NULL), so the condition becomes `=`.
+void EqualizeJoinKeys(LogicalOperator &op) {
+	for (auto &child : op.children) {
+		EqualizeJoinKeys(*child);
+	}
+	if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.children.size() != 2) {
+		return;
+	}
+	auto &join = op.Cast<LogicalComparisonJoin>();
+	for (auto &cond : join.conditions) {
+		if (!cond.IsComparison() || cond.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			continue;
+		}
+		auto never_null = [](Expression &expr, LogicalOperator &side) {
+			return expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+			       NeverNull(side, expr.Cast<BoundColumnRefExpression>().Binding());
+		};
+		if (never_null(cond.GetLHS(), *op.children[0]) || never_null(cond.GetRHS(), *op.children[1])) {
+			auto left = std::move(cond.LeftReference());
+			auto right = std::move(cond.RightReference());
+			cond = JoinCondition(std::move(left), std::move(right), ExpressionType::COMPARE_EQUAL);
+		}
+	}
+}
+
+void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog,
+                    bool whole_statement = false) {
 	op->ResolveOperatorTypes();
 	auto old_bindings = op->GetColumnBindings();
 	auto types = op->types;
@@ -1807,6 +1958,13 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		auto bound = binder->Bind(*wrapper);
 		replacement = std::move(bound.plan);
 		replacement->ResolveOperatorTypes();
+		if (catalog.SupersetFilterPushdown() && !whole_statement) {
+			// The pushed query takes DuckDB's table filters — above all a hash join's runtime keys — renders them around
+			// itself on the server and re-applies them (docs/duckdb-2.0-remote-execution.md §5.1): a remote aggregate or
+			// window joined with a few local keys is computed for those keys only. Not a whole statement: no join sits
+			// above it, and its own ORDER BY could not stand inside the derived table the filter would wrap it in.
+			TakeTableFilters(*replacement, LargestScan(*op));
+		}
 	} catch (std::exception &ex) {
 		state.Trace("local subtree", ErrorData(ex).RawMessage());
 		return;
@@ -1980,13 +2138,14 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	}
 	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}, {}, {}, {}};
 	if (pre) {
+		EqualizeJoinKeys(*plan);
 		SinkCtes(plan);
 		CollectFilterConjuncts(*plan, state.filter_conjuncts);
 	}
 	auto root = AnalyzeSubtree(state, plan);
 	if (state.Replaceable(root)) {
 		// a whole statement the remote optimizer did not push (a CTE, a name it cannot repeat, …)
-		ReplaceSubtree(state, plan, *root.catalog);
+		ReplaceSubtree(state, plan, *root.catalog, true);
 	}
 	if (state.old_bindings.empty()) {
 		return;

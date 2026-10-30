@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 98;
+        vtable->AbiVersion = 99;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -178,6 +178,7 @@ public static unsafe class Bootstrap
         vtable->TablePartitionStats = &TablePartitionStats;
         vtable->RemoteTranslate = &RemoteTranslate;
         vtable->ExecuteModifyReturning = &ExecuteModifyReturning;
+        vtable->ExecuteQueryFiltered = &ExecuteQueryFiltered;
         return FabricatorStatus.Ok;
     }
 
@@ -332,6 +333,39 @@ public static unsafe class Bootstrap
         }
         catch (Exception ex)
         {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // ABI v99: a pushed query with the scan spec the host's table filters became. Unlike execute_query it EXECUTES
+    // AT ONCE: the host calls it only at execution (the bind-time schema came from execute_query), and the columns
+    // follow the spec's projection, which a describe of the bare query would not report.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ExecuteQueryFiltered(nint handle, byte* sql, CArrowArrayStream* parameters, byte* specJson,
+                                            CArrowArrayStream* filterValues, CArrowArrayStream* outStream, byte** err)
+    {
+        IArrowArrayStream? values = null;
+        try
+        {
+            values = filterValues is null ? null : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+            if (outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var query = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
+            var spec = specJson is null ? null : Marshal.PtrToStringUTF8((nint)specJson);
+            var bag = ReadParameterBag(parameters);
+            var stream = catalog.ExecuteQuery(query, bag, spec, values);
+            values = null; // the provider owns it now
+            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            values?.Dispose();
             SetError(err, ex);
             return FabricatorStatus.Error;
         }

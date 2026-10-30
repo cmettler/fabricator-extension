@@ -89,13 +89,14 @@ internal sealed class TSqlEmitter
 
     /// <summary>
     /// [FABRICATOR-PATCH: OURS-BY-DESIGN] For a table (or table function) by its names: the declared byte length of each
-    /// string column short enough for the bounded equality key (see <see cref="EqualityKey"/>); null when unknown.
+    /// string column short enough for the bounded equality key (see <see cref="EqualityKey"/>) and whether it is
+    /// nvarchar/nchar; null when unknown.
     /// </summary>
-    public Func<IReadOnlyList<string>, IReadOnlyDictionary<string, int>?>? ColumnByteLengths { get; init; }
+    public Func<IReadOnlyList<string>, IReadOnlyDictionary<string, (int Bytes, bool Unicode)>?>? ColumnByteLengths { get; init; }
 
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Rendered string columns with a known declared length: the column
-    /// reference without collation and its length in bytes.</summary>
-    private readonly Dictionary<string, (string Raw, int Bytes)> _boundedStrings = new(StringComparer.Ordinal);
+    /// reference without collation, its length in bytes and whether it is nvarchar/nchar.</summary>
+    private readonly Dictionary<string, (string Raw, int Bytes, bool Unicode)> _boundedStrings = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Writes the query. With <paramref name="nested"/>, the query is meant
@@ -519,9 +520,9 @@ internal sealed class TSqlEmitter
             var column = ColumnOf(alias, rel.ColumnNames[i], rel.ColumnTypes[i], sqlType);
             block.Columns.Add(column);
             if (sqlType == null && column.Type.IsStringLike && byteLengths != null &&
-                byteLengths.TryGetValue(rel.ColumnNames[i], out int bytes))
+                byteLengths.TryGetValue(rel.ColumnNames[i], out var length))
             {
-                _boundedStrings[column.Expr.Value] = (column.Raw ?? column.Expr.Value, bytes);
+                _boundedStrings[column.Expr.Value] = (column.Raw ?? column.Expr.Value, length.Bytes, length.Unicode);
             }
         }
 
@@ -858,9 +859,9 @@ internal sealed class TSqlEmitter
             block = Wrap(block, keepOrder: false);
         }
 
-        var keys = groupingExpressions.Select(e => Render(e, block.Columns)).ToList();
+        var rawKeys = groupingExpressions.Select(e => Render(e, block.Columns)).ToList();
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] a string groups by its exact key and is read back from it
-        keys = keys.Select(k => k.Type.IsStringLike ? new SqlExpr(EqualityKey(k.Value), null, k.Type, k.Props) : new SqlExpr(Comparable(k.Type, k.Value), null, k.Type, k.Props)).ToList();
+        var keys = rawKeys.Select(k => k.Type.IsStringLike ? new SqlExpr(EqualityKey(k.Value), null, k.Type, k.Props) : new SqlExpr(Comparable(k.Type, k.Value), null, k.Type, k.Props)).ToList();
         string Out(SqlExpr key, string value) => key.Type.IsStringLike ? StringFromEqualityKey(value) : value;
         var measures = measureList.Select(m => TSqlFunctionCatalog.WriteAggregate(this, m, block.Columns)).ToList();
 
@@ -868,11 +869,14 @@ internal sealed class TSqlEmitter
         var sets = rel.GroupingSets;
         if (sets.Count <= 1)
         {
-            var distinctKeys = keys.Select(k => k.Value).Distinct(StringComparer.Ordinal).ToList();
+            // [FABRICATOR-PATCH: OURS-BY-DESIGN] a varchar key column groups by itself too and is read back as itself
+            var columns = rawKeys.Select(k => k.Type.IsStringLike ? KeyColumn(k.Value) : null).ToList();
+            var distinctKeys = keys.Select(k => k.Value).Concat(columns.Where(c => c != null).Select(c => c!))
+                .Distinct(StringComparer.Ordinal).ToList();
             block.GroupBy = distinctKeys.Count == 0 ? null : string.Join(", ", distinctKeys);
             for (int i = 0; i < keys.Count; i++)
             {
-                output.Add(new SqlColumn(KeyName(rel.GroupingExpressions[i], scope), new SqlExpr(Out(keys[i], keys[i].Value), null, keys[i].Type, keys[i].Props), isBare: false));
+                output.Add(new SqlColumn(KeyName(rel.GroupingExpressions[i], scope), new SqlExpr(columns[i] ?? Out(keys[i], keys[i].Value), null, keys[i].Type, keys[i].Props), isBare: false));
             }
         }
         else
@@ -965,6 +969,10 @@ internal sealed class TSqlEmitter
                 continue; // a constant puts every row in one partition, as no partition does
             }
             partitions.Add(e.Type.IsStringLike ? EqualityKey(e.Value) : Comparable(e.Type, e.Value));
+            if (e.Type.IsStringLike && KeyColumn(e.Value) is { } column)
+            {
+                partitions.Add(column); // [FABRICATOR-PATCH: OURS-BY-DESIGN] the same partitions; see KeyColumn
+            }
         }
         foreach (var sort in rel.Sorts)
         {
@@ -1334,7 +1342,7 @@ internal sealed class TSqlEmitter
             if (_boundedStrings.TryGetValue(block.Columns[i].Expr.Value, out var bound))
             {
                 var outer = wrapped.Columns[i];
-                _boundedStrings[outer.Expr.Value] = (outer.Raw ?? outer.Expr.Value, bound.Bytes);
+                _boundedStrings[outer.Expr.Value] = (outer.Raw ?? outer.Expr.Value, bound.Bytes, bound.Unicode);
             }
         }
         foreach (var (name, descending) in hidden)
@@ -1585,6 +1593,16 @@ internal sealed class TSqlEmitter
         }
         return $"CONVERT(varchar(max), ({value} + N'|') COLLATE Latin1_General_100_BIN2_UTF8)";
     }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] The varchar/char column an <see cref="EqualityKey"/> over <paramref name="value"/>
+    /// is made from, or null. Its UTF-8 conversion is one-to-one, so equal keys mean byte-equal values: partitioning or
+    /// grouping by the key AND the column forms the same groups — and lets SQL Server push a filter on the column below
+    /// the window or aggregate (a pushed query under a hash join's keys, docs/duckdb-2.0-remote-execution.md §5.1). Not
+    /// for nvarchar: an unpaired surrogate becomes U+FFFD in the key, so equal keys do not mean equal values there.
+    /// </summary>
+    internal string? KeyColumn(string value)
+        => _boundedStrings.TryGetValue(value, out var bound) && !bound.Unicode ? bound.Raw : null;
 
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The string an <see cref="EqualityKey"/> was made from.</summary>
     internal static string StringFromEqualityKey(string key)

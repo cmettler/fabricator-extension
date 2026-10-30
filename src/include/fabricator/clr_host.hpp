@@ -176,6 +176,9 @@ void CloseCatalog(FabricatorHandle handle);
 // Execute a query and populate `out` with the resulting Arrow stream.
 // `params` (nullable, ABI v88): the caller's parameter bag — see abi.h execute_query. The managed side
 // CONSUMES it, so a caller invoked more than once (a bind + a scan) must build a fresh one per call.
+//! A pushed query with its scan spec and filter constants (ABI v99); the provider may ignore them.
+void ExecuteQueryFiltered(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out,
+                          ArrowArrayStream *params, const std::string &spec_json, ArrowArrayStream *filter_values);
 void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out,
                   ArrowArrayStream *params = nullptr);
 

@@ -366,25 +366,26 @@ SELECT s.name, o.name, c.name, dc.definition
     /// <summary>
     /// [FABRICATOR-PATCH: OURS-BY-DESIGN] The string columns (of tables, views and table functions) whose values fit an
     /// exact equality key of varchar(8000) — at most 2666 characters, three UTF-8 bytes each plus the key's sentinel —
-    /// with their declared length in bytes, keyed by <see cref="ExternalKey"/>. The emitter checks every value against
+    /// with their declared length in bytes and whether they are nvarchar/nchar, keyed by <see cref="ExternalKey"/>. The emitter checks every value against
     /// that length, so a column widened since this was loaded fails the query instead of being cut. Loaded once, dropped
     /// with the other database-wide metadata.
     /// </summary>
-    internal System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, int>> BoundedStringColumns()
+    internal System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, (int Bytes, bool Unicode)>> BoundedStringColumns()
     {
         if (_boundedStrings is { } cached)
         {
             return cached;
         }
-        var loaded = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
+        var loaded = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, (int Bytes, bool Unicode)>>(StringComparer.OrdinalIgnoreCase);
         const string sql =
-            "SELECT s.name, o.name, c.name, CAST(c.max_length AS VARCHAR(10)) " +
+            "SELECT s.name, o.name, c.name, CAST(c.max_length AS VARCHAR(10)), " +
+            "CASE WHEN c.system_type_id IN (231, 239) THEN '1' ELSE '0' END " +
             "FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id " +
             "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
             "WHERE o.type IN ('U', 'V', 'IF', 'TF') AND c.max_length > 0 AND (" +
             "(c.system_type_id IN (167, 175) AND c.max_length <= 2666) OR " +
             "(c.system_type_id IN (231, 239) AND c.max_length <= 5332))";
-        foreach (var row in ReadMetadataRows(sql, 4))
+        foreach (var row in ReadMetadataRows(sql, 5))
         {
             if (row[0] is null || row[1] is null || row[2] is null ||
                 !int.TryParse(row[3], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int bytes))
@@ -394,16 +395,16 @@ SELECT s.name, o.name, c.name, dc.definition
             string key = ExternalKey(row[0]!, row[1]!);
             if (!loaded.TryGetValue(key, out var columns))
             {
-                columns = new System.Collections.Generic.Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                columns = new System.Collections.Generic.Dictionary<string, (int Bytes, bool Unicode)>(StringComparer.OrdinalIgnoreCase);
                 loaded[key] = columns;
             }
-            columns[row[2]!] = bytes;
+            columns[row[2]!] = (bytes, row[4] == "1");
         }
         _boundedStrings = loaded;
         return loaded;
     }
 
-    private System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, int>>? _boundedStrings;
+    private System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, (int Bytes, bool Unicode)>>? _boundedStrings;
 
     /// <summary>The table's own comment (the MS_Description extended property), or null.</summary>
     internal string? TableCommentCore(string schemaName, string tableName) =>

@@ -1577,7 +1577,8 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	// Catalog scans push the projected column list (and superset-safe filters) to the
 	// provider; raw queries fetch the full result (the SQL is user-supplied).
 	ArrowScanRequest request;
-	if (bind_data.push_projection) {
+	// a pushed query that takes table filters (reapply_filters) sends them too, under a spec over its own columns
+	if (bind_data.push_projection || bind_data.reapply_filters) {
 		// Render the live runtime filters (static-erased + dynamic/join) for an exact-filter scan
 		// (filter_pushdown=true); empty for SQL/DAX/non-exact (input.filters null). This runs per execution,
 		// so a hash-join dynamic filter materialized before the probe scan is captured here — twice: as the

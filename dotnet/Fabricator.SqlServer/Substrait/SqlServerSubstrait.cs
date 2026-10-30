@@ -77,7 +77,7 @@ public static class SqlServerSubstrait
                                              Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
                                              Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null,
                                              Func<bool>? consistentReads = null,
-                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, int>?>? columnByteLengths = null)
+                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, (int Bytes, bool Unicode)>?>? columnByteLengths = null)
         => TranslatePushdown(plan, ignoreNulls, out columnCount, out orderDescending, out _, columnSqlTypes, catalogFunctions,
                              catalogTableFunctions, consistentReads, columnByteLengths);
 
@@ -91,7 +91,7 @@ public static class SqlServerSubstrait
                                              Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
                                              Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null,
                                              Func<bool>? consistentReads = null,
-                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, int>?>? columnByteLengths = null)
+                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, (int Bytes, bool Unicode)>?>? columnByteLengths = null)
     {
         if (plan == null || plan.Length == 0)
         {

@@ -1676,6 +1676,60 @@ It does not: the scan RE-APPLIES the filters itself.
   the statement in `Fabricator.Sql`. DuckDB plans one only for a probe side worth filtering (none for the guide's
   4-row `pg_sales`, hence its 3000-row `pg_clicks`).
 
+### 5.1 A pushed part takes the join's keys too — BUILT (2026-10-30, step 4 way B, ABI v99)
+
+Way A narrows a plain scan. A remote part correlated with local keys — a Top-N per key (a window), a scalar
+`max`/`count` per key (an aggregate) — is not a scan: the subtree pushdown (§4.10) sends it as one query, and before
+this the server computed it over EVERY key (measured on the 1M-row `rv_big`, 100 regions, 3 local keys: Top-3 per key
+0.27 s, scalar max+count 0.16 s). Five pieces were needed, and none of them alone changed anything:
+
+1. **`IS NOT DISTINCT FROM` → `=`** (`EqualizeJoinKeys`, PRE pass). DuckDB joins a decorrelated subquery back on
+   `key IS NOT DISTINCT FROM key`, and its join-filter optimizer skips that comparison
+   (`join_filter_pushdown_optimizer.cpp`: `TODO: Need OR predicates`). The two comparisons differ only when BOTH keys
+   are NULL, so where one side is provably never NULL they agree on every row — any join type, any aggregate, `count`
+   included (the non-null side has no NULL-key row to count). `NeverNull` follows a binding through filters that
+   reject NULL (`IS NOT NULL`, a comparison other than (NOT) DISTINCT FROM), projections, order/limit, windows and a
+   single-grouping-set aggregate's group key. An explicit `IS NOT DISTINCT FROM` written by the user over a nullable
+   remote column stays as written (gate row).
+2. **The replacement takes table filters** (`TakeTableFilters`): `filter_pushdown`, `reapply_filters` and
+   `push_projection` on the `fabricator_query` get. Not for a WHOLE statement — no join sits above it, and its own
+   ORDER BY could not stand in the derived table the filter would wrap it in (measured: Msg 1033).
+3. **A cardinality** (the largest table the part reads). Without one DuckDB took the replacement for ONE row, built the
+   hash table over it, and the join's keys went into the LOCAL side — the plan showed `FABRICATOR_QUERY (est=1)` as
+   the build side.
+4. **ABI v99 `execute_query_filtered`**: the query plus the scan spec its filters became. SQL Server renders it with
+   the catalog scan's own code as `SELECT [c…] FROM (<query>) AS [q] WHERE [c<i>] IN (@p0, …) OPTION (RECOMPILE)`;
+   with no filter in the spec the query runs as it is. The host re-applies every filter, so the WHERE only has to be a
+   superset (way A's rule).
+5. **SQL Server has to apply the keys BELOW the window or aggregate**, and it did not: the partition/group key was the
+   exact UTF-8 key expression (§4.18 F1), not the column the outer filter names — measured 210 ms with the outer IN
+   against 200 ms without. For a `varchar`/`char` column the key's conversion is one-to-one, so `PARTITION BY key,
+   [col]` / `GROUP BY key, [col]` forms the same groups, and the column is read back as itself (`KeyColumn`); SQL
+   Server then pushes the IN to the index. Not for `nvarchar`: an unpaired surrogate becomes U+FFFD in the key.
+
+**Two findings on the way, both general:**
+- **An ASCII equality value is bound as `varchar`** (`FilterWhereBuilder.Param`). Inferred `nvarchar` against a
+  `varchar` column under a SQL_ collation converts the COLUMN, so the index is scanned: the plain scan of way A
+  measured **200 ms → 4 ms** on the server for three keys. ASCII has the same bytes in every code page, so the row
+  equal to the value still matches under any collation (superset). Ranges and `<>` keep the old binding.
+- **The cached parameterized plan of the wrapped query ran parallel and WAITED** — 1.7 s elapsed, 0.7 s CPU; with
+  the values embedded 30 ms, `MAXDOP 1` 40 ms. Hence `OPTION (RECOMPILE)`: the keys differ per execution anyway, and
+  the compile costs a few milliseconds. Not applied to plain scans.
+
+**Measured** (warm, 1M rows, 3 local keys): Top-3 per key **0.27 s → 0.044 s**, scalar max+count per key
+**0.16 s → 0.048 s**, plain join **0.37–0.67 s → 0.017 s**.
+
+**Not covered — a DuckDB limit, an upstream candidate:** with a NULL among the local keys a RIGHT join (the scalar
+shape) keeps the NULL build row, and `JoinFilterPushdownInfo::PushInFilter` refuses an IN list that contains a NULL
+(`FilterCombiner::ContainsNull`); only a min/max range is pushed, which a case-insensitive server cannot render. An
+equality never matches NULL, so dropping it from the list would be sound. The answers stay exact; the query is computed
+for every key, as before.
+
+**Gate:** `verify_dynamic_filters_mssql` §4 (30 → 96): Top-N and scalar per local key with keys the server folds
+together ('r1', 'R1 '), answers against the switched-off catalog; the wrapped statement and `OPTION (RECOMPILE)` in
+`Fabricator.Sql`; the partition and group by key + column in `Fabricator.Remote`; NULL local keys; an explicit
+`IS NOT DISTINCT FROM` over NULLs; the varchar keys in the plan cache. Guide J2.
+
 ### The record before it was built (2026-10-27)
 
 

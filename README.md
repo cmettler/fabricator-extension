@@ -294,8 +294,10 @@ ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, remote_pushdown 'fal
 table reads only the rows whose keys the other side has: once DuckDB has read the build side of the hash join, its
 keys go into the scan's `WHERE` (`[region] IN (…)`, or a range). The scan applies every filter DuckDB hands it again
 to the rows it receives, so the server's collation (case-insensitive, padded) cannot add rows. The filter is made
-while the query runs, so `EXPLAIN` does not show it; the statement logged under `Fabricator.Sql` does. `ATTACH … (TYPE fabricator, dynamic_filters 'false')` turns it off for a
-catalog.
+while the query runs, so `EXPLAIN` does not show it; the statement logged under `Fabricator.Sql` does. The same holds
+for a pushed part of a statement: a Top-N or a scalar subquery per row of a local table is computed on the server for
+those rows' keys only (`… ) AS [q] WHERE [c1] IN (…)`). An ASCII key is sent as `varchar`, so an index on a `varchar`
+column is sought. `ATTACH … (TYPE fabricator, dynamic_filters 'false')` turns it off for a catalog.
 
 **`remote_pushdown` (on by default since 2026-10-27; `'false'` opts out, any other value is refused).** The
 environment variable `FABRICATOR_REMOTE_PUSHDOWN=false` changes the default for every ATTACH that does not name the

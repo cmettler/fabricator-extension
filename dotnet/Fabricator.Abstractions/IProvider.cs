@@ -463,6 +463,19 @@ public interface IProviderCatalog : IDisposable
     /// dialect, which coincides with T-SQL for strings and integers and diverges for booleans, blobs and
     /// temporals.</para>
     /// </remarks>
+    /// <summary>
+    /// As <see cref="ExecuteQuery(string, RecordBatch?)"/>, with the scan spec a catalog scan takes — its columns and
+    /// its filter tree — and the filter's typed constants (ABI v99). The host sends it for a query it pushed and then
+    /// handed table filters (a hash join's runtime keys among them), and it RE-APPLIES every one of them to the rows:
+    /// the filter is a hint a provider may render as a superset. The default ignores both and runs the query.
+    /// <paramref name="filterValues"/> is owned by the callee.
+    /// </summary>
+    IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters, string? scanSpec, IArrowArrayStream? filterValues)
+    {
+        filterValues?.Dispose();
+        return ExecuteQuery(sql, parameters);
+    }
+
     IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters)
         => parameters is null
             ? ExecuteQuery(sql)

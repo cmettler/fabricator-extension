@@ -94,13 +94,13 @@ internal sealed class FilterWhereBuilder
             _ => throw new NotSupportedException($"fabricator: unsupported comparison '{node.Cmp}'"),
         };
         var idx = node.Val ?? throw new InvalidOperationException("compare without val");
-        return $"{Col(node)} {op} {Param(idx)}";
+        return $"{Col(node)} {op} {Param(idx, equality: op is "=" or "IS NOT DISTINCT FROM")}";
     }
 
     private string In(FilterNode node)
     {
         var idxs = node.Vals ?? throw new InvalidOperationException("in without vals");
-        return $"{Col(node)} IN ({string.Join(", ", idxs.Select(Param))})";
+        return $"{Col(node)} IN ({string.Join(", ", idxs.Select(i => Param(i, equality: true)))})";
     }
 
     private static string Col(FilterNode node)
@@ -135,14 +135,35 @@ internal sealed class FilterWhereBuilder
     /// BOTH, and the widening conversion is lossless so no row is dropped.</para>
     /// <para>⚠ A <see cref="DateTimeOffset"/> is left to inference deliberately: it maps to
     /// <c>datetimeoffset</c>, which is the MATCHING type for the only column type that produces one.</para>
+    /// <para><b>An ASCII string compared for EQUALITY is bound as <c>varchar</c>, not inferred
+    /// <c>nvarchar</c>.</b> Against a <c>varchar</c> column under a SQL_ collation an <c>nvarchar</c> value
+    /// converts the COLUMN, so the index is scanned instead of sought — measured on 1M rows, a join's three keys:
+    /// 650 ms CPU against 60 ms. ASCII has the same bytes in every code page, so the row that equals the value
+    /// still equals it under any collation: the server's WHERE stays a superset of what the host re-applies.
+    /// Not for ranges or <c>&lt;&gt;</c>, where the comparison's ORDER would change with the type.</para>
     /// </remarks>
-    private string Param(int valueIndex)
+    private string Param(int valueIndex, bool equality = false)
     {
         var name = "@p" + Parameters.Count;
+        var value = _values[valueIndex];
         // ⚠ ONE rule, in ONE place. SqlServerCatalog.MakeParameter applies the datetime2 pin above; the
         // caller-supplied `params` bag (ABI v88) goes through the same helper, so a fix to the inference
         // rule cannot reach one surface and miss the other.
-        Parameters.Add(SqlServerCatalog.MakeParameter(name, _values[valueIndex]));
+        Parameters.Add(equality && value is string text && IsAscii(text)
+            ? new SqlParameter(name, System.Data.SqlDbType.VarChar, text.Length <= 8000 ? 8000 : -1) { Value = text }
+            : SqlServerCatalog.MakeParameter(name, value));
         return name;
+    }
+
+    private static bool IsAscii(string text)
+    {
+        foreach (char c in text)
+        {
+            if (c > '\u007f')
+            {
+                return false;
+            }
+        }
+        return true;
     }
 }

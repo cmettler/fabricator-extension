@@ -449,10 +449,16 @@ static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionB
 	// The factory runs ONCE at bind (to read the schema) and again when the scan executes; only the second
 	// marks the catalog, so an EXPLAIN — which binds and never executes — leaves the cache alone.
 	auto executing = make_shared_ptr<bool>(false);
-	bind_data->factory = [handle, sql, params, props, refresh_catalog, executing](const fabricator::ArrowScanRequest &,
-	                                                                              ArrowArrayStream &out) {
+	bind_data->factory = [handle, sql, params, props, refresh_catalog, executing](
+	                         const fabricator::ArrowScanRequest &request, ArrowArrayStream &out) {
 		auto param_stream = MakeParamsStream(params, props);
-		fabricator::ExecuteQuery(handle, sql, out, param_stream ? param_stream->Stream() : nullptr);
+		if (!request.spec_json.empty()) {
+			// a pushed query that took table filters (fabricator_remote_select.cpp: the subtree replacement)
+			fabricator::ExecuteQueryFiltered(handle, sql, out, param_stream ? param_stream->Stream() : nullptr,
+			                                 request.spec_json, request.filter_values);
+		} else {
+			fabricator::ExecuteQuery(handle, sql, out, param_stream ? param_stream->Stream() : nullptr);
+		}
 		if (refresh_catalog && *executing) {
 			refresh_catalog->MarkSchemaMayChange();
 		}

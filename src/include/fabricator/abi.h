@@ -1222,6 +1222,17 @@ typedef struct FabricatorVTable {
 	int32_t (*execute_modify_returning)(FabricatorHandle handle, const char *const *schema_path,
 	                                    int32_t schema_path_len, const char *table, int32_t set_count,
 	                                    struct ArrowArrayStream *in, struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// A query with a scan spec — ABI v99. execute_query, plus the spec a catalog scan takes (its columns, its filter
+	// tree) and the filter's typed constants (`filter_values`, nullable, consumed). The host sends it for a query it
+	// pushed and then handed DuckDB's table filters — a hash join's runtime keys among them — and it RE-APPLIES those
+	// filters to the rows, so a provider may treat the filter as a superset hint or ignore it: run the query alone.
+	// Executes at once (no describe): the columns follow the spec.
+	// -------------------------------------------------------------------------
+	int32_t (*execute_query_filtered)(FabricatorHandle handle, const char *sql, struct ArrowArrayStream *params,
+	                                  const char *spec_json, struct ArrowArrayStream *filter_values,
+	                                  struct ArrowArrayStream *out, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1458,7 +1469,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 98
+#define FABRICATOR_ABI_VERSION 99
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

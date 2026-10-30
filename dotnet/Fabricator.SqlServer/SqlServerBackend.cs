@@ -426,12 +426,15 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // is visible without a profiler. Category "Fabricator.Sql".
     private static readonly ILogger Log = FabricatorLog.CreateLogger("Fabricator.Sql");
 
-    // Trims a statement to a bounded single line for log output (queries can be large; the WHERE/mode of
-    // interest is at the front). Collapses interior whitespace so one statement is one log line.
-    private static string Trunc(string sql, int max = 400)
+    // Trims a statement to a bounded single line for log output: the head and the tail, since a query wrapped as a
+    // derived table (a pushed query under a join's keys) carries its WHERE at the end. Collapses interior whitespace
+    // so one statement is one log line.
+    private static string Trunc(string sql, int max = 400, int tail = 200)
     {
         var s = Regex.Replace(sql, @"\s+", " ").Trim();
-        return s.Length <= max ? s : s.Substring(0, max) + "…(" + s.Length + " chars)";
+        return s.Length <= max + tail
+            ? s
+            : s.Substring(0, max) + "…(" + s.Length + " chars)…" + s.Substring(s.Length - tail);
     }
 
     // Non-standard trailing segment used by SqlServerBackend.BuildConnectionString to carry an Azure
@@ -1694,6 +1697,27 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
 
     public IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters) =>
         ExecuteQuery(sql, ToSqlParameters(parameters));
+
+    // ABI v99: a pushed query under the scan spec its table filters became — the query as a derived table under this
+    // catalog's own scan rendering (projection, the superset WHERE, parameterized), so a hash join's runtime keys
+    // reach the server: `SELECT [c0], … FROM (<query>) AS [q] WHERE [c1] IN (@p0, …)`, which SQL Server pushes down to
+    // the index under a GROUP BY / PARTITION BY on that column. A query that must read at SNAPSHOT (its repeated reads)
+    // runs alone: the host re-applies the filters either way.
+    public IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters, string? scanSpec,
+                                          IArrowArrayStream? filterValues)
+    {
+        // no filter arrived (the join had none to give): the query alone — the host maps the columns by name
+        if (string.IsNullOrEmpty(scanSpec) || ScanSpec.Parse(scanSpec)?.Filter is null || _snapshotQueries.ContainsKey(sql))
+        {
+            filterValues?.Dispose();
+            return ExecuteQuery(sql, parameters);
+        }
+        // ⚠ RECOMPILED: the cached plan for `… IN (@p0, …)` over a window or aggregate ran parallel and WAITED —
+        // measured 1.7 s against 30 ms with the values embedded (MAXDOP 1: 40 ms). The keys differ per execution
+        // anyway, and the compile costs a few milliseconds.
+        return ScanFromSource("(" + sql + ") AS [q]", (IReadOnlyList<SqlParameter>?)ToSqlParameters(parameters) ??
+                              System.Array.Empty<SqlParameter>(), scanSpec, filterValues, recompileFiltered: true);
+    }
 
     public long ExecuteNonQuery(string sql, RecordBatch? parameters) =>
         ExecuteNonQueryCore(sql, ToSqlParameters(parameters));
@@ -3909,9 +3933,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // best-effort — on any failure we fall back to no WHERE (DuckDB re-applies every
     // predicate, so correctness holds).
     internal IArrowArrayStream ScanFromSource(string source, IReadOnlyList<SqlParameter> sourceParams, string? specJson,
-                                             IArrowArrayStream? filterValues, string? touchKey = null)
+                                             IArrowArrayStream? filterValues, string? touchKey = null,
+                                             bool recompileFiltered = false)
     {
-        var stream = ScanFromSourceCore(source, sourceParams, specJson, filterValues, touchKey);
+        var stream = ScanFromSourceCore(source, sourceParams, specJson, filterValues, touchKey, recompileFiltered);
         // A `SELECT *` (no projection: the bind-time describe, or a scan that names no columns) returns the hidden
         // row-id column too, and the host maps those columns BY POSITION against the table's schema — so with the
         // column anywhere but last (an ALTER ADD COLUMN puts new columns after it) every later column shifts and
@@ -3924,7 +3949,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
 
     private IArrowArrayStream ScanFromSourceCore(string source, IReadOnlyList<SqlParameter> sourceParams,
                                                  string? specJson, IArrowArrayStream? filterValues,
-                                                 string? touchKey)
+                                                 string? touchKey, bool recompileFiltered = false)
     {
         var spec = ScanSpec.Parse(specJson);
         // Only a CATALOG TABLE scan passes a touchKey — a TVF source has no table identity to compare.
@@ -4023,7 +4048,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 var allParams = new List<SqlParameter>(sourceParams);
                 allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint
                 bool drainF = spec.HasSink && SinkRequiresDrainedScan(spec.Sink!, touchKey, spec.SchemaOnly);
-                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{optionClause}", allParams,
+                string option = recompileFiltered && optionClause.Length == 0 ? " OPTION (RECOMPILE)" : optionClause;
+                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{option}", allParams,
                                     readYourWrites: false, materialize: drainF && ResolveMaterialize(),
                                     snapshotRead: drainF && !ResolveMaterialize());
             }

@@ -1556,7 +1556,9 @@ case "$TIER" in
         # 2026-10-30: 6397 -> 6410: table statistics from sys.partitions, a view unknown — verify_cardinality 4 -> 17
         # 2026-10-30: 6410 -> 6446 (84 runs): dynamic join filters for SQL Server scans — NEW verify_dynamic_filters_mssql
         #             (30), verify_pushdown_guide_mssql 150 -> 156 (J1)
-        : "${MIN_ASSERTIONS:=6446}"
+        # 2026-10-30: 6446 -> 6518 (84 runs): a pushed part takes the join's keys (ABI v99) — verify_dynamic_filters_mssql
+        #   30 -> 96 (§4), verify_pushdown_guide_mssql 156 -> 162 (J2); nothing else moved
+        : "${MIN_ASSERTIONS:=6518}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
