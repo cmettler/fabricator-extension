@@ -19,6 +19,7 @@
 #include "catalog/fabricator_schema_entry.hpp"
 #include "catalog/fabricator_txn_util.hpp"
 #include "catalog/fabricator_table_entry.hpp"
+#include "fabricator_trace.hpp"
 #include "dml/fabricator_ctas.hpp"
 #include "dml/fabricator_insert.hpp"
 #include "dml/fabricator_modify.hpp"
@@ -529,7 +530,7 @@ static bool FabricatorParallelWrite(ClientContext &context, optional_ptr<Physica
 }
 
 static bool DmlPushdownEnabled(ClientContext &context);
-static void DmlTrace(const string &message);
+static void DmlTrace(ClientContext &context, const string &message);
 
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
@@ -564,7 +565,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 			return planner.Make<FabricatorPhysicalRemoteCreateTableAs>(std::move(remote_types),
 			                                                         op.estimated_cardinality, std::move(info));
 		}
-		DmlTrace("ctas streams its rows: " + reason);
+		DmlTrace(context, "ctas streams its rows: " + reason);
 	}
 
 	vector<LogicalType> result_types {LogicalType::BIGINT};
@@ -719,14 +720,8 @@ FabricatorModifyTarget FabricatorBuildModifyTarget(TableCatalogEntry &table) {
 // FABRICATOR_DUMP_DML=1 prints why a DELETE kept the rowid path (or that it took the shortcut). What route a
 // DELETE takes is visible in EXPLAIN, but WHY it fell back is not, and a silent fallback is the one failure
 // mode of this path that costs performance without saying so.
-static void DmlTrace(const string &message) {
-	static const bool enabled = [] {
-		auto v = std::getenv("FABRICATOR_DUMP_DML");
-		return v && *v && string(v) != "0";
-	}();
-	if (enabled) {
-		Printer::Print("[fabricator dml] " + message);
-	}
+static void DmlTrace(ClientContext &context, const string &message) {
+	FabricatorRoutingTrace(context, FABRICATOR_LOG_DML, "FABRICATOR_DUMP_DML", message);
 }
 
 // The kill switch, and the reference oracle the differential gates run against. Absent (no bridge) or on
@@ -735,7 +730,7 @@ static bool DmlPushdownEnabled(ClientContext &context) {
 	Value enabled;
 	if (context.TryGetCurrentSetting("fabricator_dml_pushdown", enabled) && !enabled.IsNull() &&
 	    !enabled.GetValue<bool>()) {
-		DmlTrace("rowid path: fabricator_dml_pushdown = false");
+		DmlTrace(context, "rowid path: fabricator_dml_pushdown = false");
 		return false;
 	}
 	return true;
@@ -749,7 +744,7 @@ static bool DmlPushdownEnabled(ClientContext &context) {
 // output, but its OUTPUT is narrowed by that map (plan_filter.cpp turns it into a projection), so anything
 // ABOVE it — an UPDATE's SET values — indexes the narrowed list and must be remapped through it before a
 // position means a scan column. Measured: `UPDATE … SET n = n + 1, v = 'z' WHERE id > 1` carries one.
-static optional_ptr<LogicalGet> FindExactScan(LogicalOperator &child, TableCatalogEntry &table,
+static optional_ptr<LogicalGet> FindExactScan(ClientContext &context, LogicalOperator &child, TableCatalogEntry &table,
                                               vector<unique_ptr<Expression>> *&filters,
                                               vector<unique_ptr<Expression>> &no_filters,
                                               const vector<ProjectionIndex> *&filter_map) {
@@ -759,7 +754,7 @@ static optional_ptr<LogicalGet> FindExactScan(LogicalOperator &child, TableCatal
 	if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
 		auto &filter = node->Cast<LogicalFilter>();
 		if (node->children.size() != 1) {
-			DmlTrace("rowid path: filter with several children");
+			DmlTrace(context, "rowid path: filter with several children");
 			return nullptr;
 		}
 		if (filter.HasProjectionMap()) {
@@ -769,12 +764,12 @@ static optional_ptr<LogicalGet> FindExactScan(LogicalOperator &child, TableCatal
 		node = node->children[0].get();
 	}
 	if (node->type != LogicalOperatorType::LOGICAL_GET) {
-		DmlTrace("rowid path: child is " + LogicalOperatorToString(node->type) + ", not a scan");
+		DmlTrace(context, "rowid path: child is " + LogicalOperatorToString(node->type) + ", not a scan");
 		return nullptr;
 	}
 	auto &get = node->Cast<LogicalGet>();
 	if (get.GetTable().get() != &table) {
-		DmlTrace("rowid path: the scan is not of the statement's table");
+		DmlTrace(context, "rowid path: the scan is not of the statement's table");
 		return nullptr;
 	}
 	if (get.table_filters.HasFilters()) {
@@ -792,13 +787,13 @@ static optional_ptr<LogicalGet> FindExactScan(LogicalOperator &child, TableCatal
 		for (auto &entry : get.table_filters) {
 			auto idx = entry.GetIndex();
 			if (idx.GetIndex() >= column_ids.size()) {
-				DmlTrace("rowid path: a scan filter on an unknown column");
+				DmlTrace(context, "rowid path: a scan filter on an unknown column");
 				return nullptr;
 			}
 			auto &col = column_ids[idx.GetIndex()];
 			if (!col.HasPrimaryIndex() || col.HasChildren() || col.IsVirtualColumn() ||
 			    col.GetPrimaryIndex() >= get.returned_types.size()) {
-				DmlTrace("rowid path: a scan filter on a virtual or nested column");
+				DmlTrace(context, "rowid path: a scan filter on a virtual or nested column");
 				return nullptr;
 			}
 			BoundColumnRefExpression ref(get.returned_types[col.GetPrimaryIndex()],
@@ -823,20 +818,20 @@ static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context,
                                                          LogicalDelete &op, Catalog &catalog,
                                                          FabricatorHandle catalog_handle) {
 	if (op.return_chunk) {
-		DmlTrace("rowid path: RETURNING");
+		DmlTrace(context, "rowid path: RETURNING");
 		return nullptr; // RETURNING needs the deleted rows themselves
 	}
 	if (!DmlPushdownEnabled(context)) {
 		return nullptr;
 	}
 	if (&op.table.ParentCatalog() != &catalog || op.children.size() != 1) {
-		DmlTrace("rowid path: not this catalog's single-child DELETE");
+		DmlTrace(context, "rowid path: not this catalog's single-child DELETE");
 		return nullptr;
 	}
 	vector<unique_ptr<Expression>> no_filters;
 	vector<unique_ptr<Expression>> *filters = nullptr;
 	const vector<ProjectionIndex> *filter_map = nullptr; // irrelevant here: a DELETE reads nothing above it
-	auto get = FindExactScan(*op.children[0], op.table, filters, no_filters, filter_map);
+	auto get = FindExactScan(context, *op.children[0], op.table, filters, no_filters, filter_map);
 	if (!get) {
 		return nullptr;
 	}
@@ -845,21 +840,22 @@ static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context,
 	// the provider's answer. One crossing, cached per entry after the first DELETE/UPDATE.
 	auto &caps = entry.DmlCapabilities();
 	if (!caps.delete_where) {
-		DmlTrace("rowid path: the table does not support predicate DELETE");
+		DmlTrace(context, "rowid path: the table does not support predicate DELETE");
 		return nullptr;
 	}
 	if (caps.delete_where_autocommit_only && !context.transaction.IsAutoCommit()) {
 		// The provider's predicate statement cannot see this transaction's pending writes (Delta: the
 		// engine deletes against the BASE snapshot), so inside BEGIN … COMMIT the rowid path keeps
 		// read-your-writes.
-		DmlTrace("rowid path: explicit transaction");
+		DmlTrace(context, "rowid path: explicit transaction");
 		return nullptr;
 	}
 	string json;
 	vector<Value> constants;
 	vector<string> referenced;
-	if (!FabricatorSerializeExactFilter(*get, *filters, json, constants, caps.exact_strings, &referenced)) {
-		DmlTrace("rowid path: the predicate does not render exactly");
+	string why;
+	if (!FabricatorSerializeExactFilter(*get, *filters, json, constants, caps.exact_strings, &referenced, &why)) {
+		DmlTrace(context, "rowid path: the predicate does not render exactly: " + why);
 		return nullptr;
 	}
 	if (caps.restrict_delete_columns) {
@@ -867,13 +863,13 @@ static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context,
 			if (caps.delete_where_columns.find(col) == caps.delete_where_columns.end()) {
 				// Delta: a column the provider cannot decide a whole file on (not a partition column, and no
 				// statistics opt-in) — the native rowid scan is the faster path for it.
-				DmlTrace("rowid path: column " + col + " is not one the provider deletes by");
+				DmlTrace(context, "rowid path: column " + col + " is not one the provider deletes by");
 				return nullptr;
 			}
 		}
 	}
 	string spec = json.empty() ? "{}" : "{\"filter\":" + json + "}";
-	DmlTrace("delete-where: " + spec);
+	DmlTrace(context, "delete-where: " + spec);
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	return planner.Make<FabricatorPhysicalDmlWhere>(std::move(result_types), op.estimated_cardinality,
 	                                                catalog_handle, entry.TableHandle(), std::move(spec),
@@ -898,7 +894,7 @@ static optional_ptr<PhysicalOperator> TryPlanUpdateWhere(ClientContext &context,
                                                          LogicalUpdate &op, Catalog &catalog,
                                                          FabricatorHandle catalog_handle) {
 	if (op.return_chunk || op.capture_old_rows) {
-		DmlTrace("rowid path: RETURNING");
+		DmlTrace(context, "rowid path: RETURNING");
 		return nullptr;
 	}
 	if (!DmlPushdownEnabled(context)) {
@@ -906,26 +902,27 @@ static optional_ptr<PhysicalOperator> TryPlanUpdateWhere(ClientContext &context,
 	}
 	if (&op.table.ParentCatalog() != &catalog || op.children.size() != 1 ||
 	    op.columns.size() != op.expressions.size() || op.columns.empty()) {
-		DmlTrace("rowid path: not this catalog's single-child UPDATE");
+		DmlTrace(context, "rowid path: not this catalog's single-child UPDATE");
 		return nullptr;
 	}
 	auto &proj = *op.children[0];
 	if (proj.type != LogicalOperatorType::LOGICAL_PROJECTION || proj.children.size() != 1) {
-		DmlTrace("rowid path: UPDATE child is " + LogicalOperatorToString(proj.type) + ", not one projection");
+		DmlTrace(context, "rowid path: UPDATE child is " + LogicalOperatorToString(proj.type) + ", not one projection");
 		return nullptr;
 	}
 	vector<unique_ptr<Expression>> no_filters;
 	vector<unique_ptr<Expression>> *filters = nullptr;
 	const vector<ProjectionIndex> *filter_map = nullptr;
-	auto get = FindExactScan(*proj.children[0], op.table, filters, no_filters, filter_map);
+	auto get = FindExactScan(context, *proj.children[0], op.table, filters, no_filters, filter_map);
 	if (!get) {
 		return nullptr;
 	}
 	auto &entry = op.table.Cast<FabricatorTableEntry>();
 	string filter_json;
 	vector<Value> constants;
-	if (!FabricatorSerializeExactFilter(*get, *filters, filter_json, constants)) {
-		DmlTrace("rowid path: the predicate does not render exactly");
+	string why;
+	if (!FabricatorSerializeExactFilter(*get, *filters, filter_json, constants, false, nullptr, &why)) {
+		DmlTrace(context, "rowid path: the predicate does not render exactly: " + why);
 		return nullptr;
 	}
 	auto names = op.table.GetColumns().GetColumnNames();
@@ -936,12 +933,12 @@ static optional_ptr<PhysicalOperator> TryPlanUpdateWhere(ClientContext &context,
 		// FabricatorFillUpdateSetColumns); the value itself is that projection expression.
 		auto &ref = *op.expressions[i];
 		if (ref.GetExpressionType() != ExpressionType::BOUND_REF) {
-			DmlTrace("rowid path: SET target is not a projection reference");
+			DmlTrace(context, "rowid path: SET target is not a projection reference");
 			return nullptr;
 		}
 		auto pos = ref.Cast<BoundReferenceExpression>().Index();
 		if (pos >= proj.expressions.size() || op.columns[i].index >= names.size()) {
-			DmlTrace("rowid path: SET target out of range");
+			DmlTrace(context, "rowid path: SET target out of range");
 			return nullptr;
 		}
 		auto &value = *proj.expressions[pos];
@@ -960,8 +957,8 @@ static optional_ptr<PhysicalOperator> TryPlanUpdateWhere(ClientContext &context,
 			    });
 		}
 		string value_json;
-		if (!mapped_ok || !FabricatorSerializeExactValue(*get, *mapped, value_json, constants)) {
-			DmlTrace("rowid path: a SET value does not render exactly");
+		if (!mapped_ok || !FabricatorSerializeExactValue(*get, *mapped, value_json, constants, &why)) {
+			DmlTrace(context, "rowid path: a SET value does not render exactly: " + why);
 			return nullptr;
 		}
 		auto &col = names[op.columns[i].index];
@@ -972,11 +969,11 @@ static optional_ptr<PhysicalOperator> TryPlanUpdateWhere(ClientContext &context,
 	}
 	set_json += "]";
 	if (!entry.DmlCapabilities().update_where) {
-		DmlTrace("rowid path: the table does not support predicate UPDATE");
+		DmlTrace(context, "rowid path: the table does not support predicate UPDATE");
 		return nullptr;
 	}
 	string spec = "{\"set\":" + set_json + (filter_json.empty() ? "" : ",\"filter\":" + filter_json) + "}";
-	DmlTrace("update-where: " + spec);
+	DmlTrace(context, "update-where: " + spec);
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	return planner.Make<FabricatorPhysicalDmlWhere>(std::move(result_types), op.estimated_cardinality,
 	                                                catalog_handle, entry.TableHandle(), std::move(spec),

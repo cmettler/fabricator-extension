@@ -1294,6 +1294,29 @@ output bindings to the replacement's, by position, over the whole plan. Anything
   (dies at P4's routing), UDF veto (the `abs` row), write rule, root path — killed; parameter rule — survives (above).
   Guide S5 / S6 + the switch (`verify_pushdown_guide_mssql` 80 -> 94).
 
+### 4.11 Every routing decision in `duckdb_logs` — BUILT (2026-10-30, user-asked)
+
+Until here a decision was visible only with `FABRICATOR_DUMP_REMOTE=1` / `FABRICATOR_DUMP_DML=1`, printed to
+stderr; EXPLAIN shows where a statement ran, never why. Now `FabricatorRoutingTrace`
+(`src/include/fabricator_trace.hpp`) writes each decision to DuckDB's logger at DEBUG under `Fabricator.Remote` /
+`Fabricator.Dml`, and still prints when the variable is set.
+
+- **Registered log types.** `enable_logging(['Fabricator.Remote'])` REFUSES an unregistered type ("Unknown log
+  type"), so the extension registers `Fabricator.Remote`, `Fabricator.Dml` and `Fabricator.Sql` at load (DEBUG —
+  selecting one also sets the level). `Fabricator.Sql` is the managed category, forwarded through `host_log`.
+  ⚠ The managed categories reach `duckdb_logs` WITHOUT `FABRICATOR_LOG_LEVEL` — that variable only drives the file
+  sink; the README said otherwise and was corrected.
+- **Reasons that were thrown away before:** the exact conjunct / SET value that does not render (the serializers'
+  new `why`, which replaced their own env-gated prints); for a subtree that reads only the server, the expression
+  that keeps it local (`AGGREGATE stays local because it calls pg_net() of catalog mssql`, or a parameter). The
+  provider's own decline reasons (`TranslateRemotePlan`) already reached C++ as `reason` and are logged there, once.
+- to_substrait's strict-mode preamble ("Strict Mode is set to true, and the following warnings/errors happened.") is
+  replaced by `no Substrait translation:`.
+- Subtree messages name the pass (`before` / `after the optimizers`), since both passes see most plans.
+- Gate: `verify_pushdown_guide_mssql` L1–L4 (94 -> 109); documented in sql-server-pushdown.md §Why it ran where it ran.
+- Seen on the way, not changed: a bare `SELECT count(*) FROM db.t` stays local (`row id and virtual columns are not
+  supported` — the empty projection carries DuckDB's empty-column id). It always did; nothing asserted it.
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

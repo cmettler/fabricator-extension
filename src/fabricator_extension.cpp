@@ -22,6 +22,7 @@
 #include "catalog/fabricator_txn_util.hpp"
 #include "copy/fabricator_copy.hpp"
 #include "fabricator_optimizer.hpp"
+#include "fabricator_trace.hpp"
 #include "fabricator_fs_spike.hpp"
 #include "fabricator_wait.hpp"
 #include "fabricator_host_query.hpp"
@@ -751,6 +752,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Last: the subtree pushdown replaces fabricator_scan subtrees with fabricator_query, after the LIMIT/TopN push
 	// above has decided what a scan that STAYS local asks for.
 	RegisterFabricatorSubtreePushdown(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	FabricatorRegisterLogTypes(loader.GetDatabaseInstance());
 	// ⚠ NO VARIANT REGISTRATION HERE ANY MORE. We used to register an `ew.variant_transport` Arrow type
 	// extension (a LEAF binary carrying metadata||value) because the canonical struct<metadata,value>
 	// crashed DuckDB's ArrowAppender::FinalizeChild. DuckDB 2.0 registers `arrow.parquet.variant` itself,

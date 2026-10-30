@@ -1534,7 +1534,8 @@ case "$TIER" in
         # 2026-10-30: 6011 -> 6165, from a green 83-run tier: +verify_subtree_pushdown_mssql (123, new — the subtree
         # pushdown), verify_pushdown_guide_mssql 80 -> 94 (S5/S6), verify_remote_select_mssql 518 -> 531 (three rows
         # the subtree pushdown now pushes, each with its switch-off control), verify_sqlgen_catalog 30 -> 34.
-        : "${MIN_ASSERTIONS:=6165}"
+        # 2026-10-30: 6165 -> 6180: verify_pushdown_guide_mssql 94 -> 109 (L1-L4, the routing decisions in duckdb_logs).
+        : "${MIN_ASSERTIONS:=6180}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

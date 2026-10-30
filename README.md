@@ -360,7 +360,9 @@ types and `WITH` options), then filled by one `INSERT … SELECT` on the server;
 rows as before, and so does every CTAS under `SET fabricator_dml_pushdown = false`.
 
 Needs SQL Server 2019+ or Azure SQL (exact string semantics rest on UTF-8 collations); ignored on a Fabric /
-Synapse warehouse; read once at ATTACH. `FABRICATOR_DUMP_REMOTE=1` prints each decision and the T-SQL sent.
+Synapse warehouse; read once at ATTACH. To see why something ran where it ran,
+`CALL enable_logging(['Fabricator.Remote', 'Fabricator.Dml'], storage := 'memory')` and read `duckdb_logs`
+(see [Diagnostic logging](#diagnostic-logging)).
 
 On a **Fabric** SQL endpoint the catalog also gains a `fabric` schema of platform functions, which need no
 extra options (they derive the workspace and item from the connection string; `API_WORKSPACE` / `API_ITEM`
@@ -4339,20 +4341,37 @@ ours.
 
 ## Diagnostic logging
 
-Logging is **off by default** and configured by environment variables, not by `SET` — the bridge boots before
-any session exists.
+Logging is **off by default**. It goes to two places, switched on independently:
+
+- **DuckDB's own log (`duckdb_logs`)** — switched on with DuckDB's `enable_logging`; no environment variable
+  needed. Each category below is the log `type`; `Fabricator.Remote`, `Fabricator.Dml` and `Fabricator.Sql` can be selected by name, which also sets the
+  level they need:
+
+  ```sql
+  CALL enable_logging(['Fabricator.Remote', 'Fabricator.Dml', 'Fabricator.Sql'], storage := 'memory');
+  -- … statements …
+  SELECT type, message FROM duckdb_logs;
+  ```
+
+  `CALL enable_logging(level := 'debug', storage := 'memory')` logs every category (and DuckDB's own).
+  `storage := 'memory'` makes `duckdb_logs` queryable in the CLI, whose default prints to the console instead.
+- **A file** — configured by environment variables, not by `SET`, because the bridge boots before any session
+  exists. It carries the managed categories (not `Fabricator.Remote` / `Fabricator.Dml`, which are written by the
+  native layer).
 
 | Variable | Meaning |
 |---|---|
-| `FABRICATOR_LOG_LEVEL` | `Trace` \| `Debug` \| `Information` \| `Warning` \| `Error`. Unset ⇒ off |
-| `FABRICATOR_LOG_FILE` | Write to this file as well as forwarding to DuckDB's `duckdb_logs` |
+| `FABRICATOR_LOG_LEVEL` | `Trace` \| `Debug` \| `Information` \| `Warning` \| `Error`. Unset ⇒ no file |
+| `FABRICATOR_LOG_FILE` | The file (default `fabricator.log` in the temp directory) |
 
-Categories, so you can grep for the layer you care about:
+Categories, so you can select or grep the layer you care about:
 
 | Category | At level | What it shows |
 |---|---|---|
+| `Fabricator.Remote` | `Debug` | Every SQL Server pushdown decision: `remote: <T-SQL>` for a pushed statement, `remote subtree (…): <T-SQL>` for a pushed part, and `local: <reason>` / `local subtree (…): <reason>` for what stayed in DuckDB — see [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md#why-it-ran-where-it-ran) |
+| `Fabricator.Dml` | `Debug` | Why a `DELETE` / `UPDATE` took the key path instead of one `… WHERE` statement, naming the condition that has no exact form |
 | `Fabricator.Bridge` | `Debug` | Every **failed** managed↔native crossing, plus `open_catalog` / `get_metadata`. Connection strings are never logged |
-| `Fabricator.Sql` | `Debug` | Every T-SQL statement: scans with the pushed projection/WHERE/TOP/ORDER BY, connection routing, DML, DDL, bulk |
+| `Fabricator.Sql` | `Debug` | Every T-SQL statement: scans with the pushed projection/WHERE/TOP/ORDER BY, connection routing, DML, DDL, bulk. Whitespace collapsed and cut after 400 characters |
 | `Fabricator.Delta`, `Fabricator.Delta.Write`, `Fabricator.Delta.Fs` | `Information` | Scan mode, active/scanned/pruned file counts, the resolved snapshot version, which filesystem a table opened with, and per-commit lines during a transaction flush |
 | `Fabricator.Memory` | `Debug` | Memory marks on the **row-scaling** paths — UPDATE, DELETE, bulk write, OPTIMIZE, transaction flush |
 

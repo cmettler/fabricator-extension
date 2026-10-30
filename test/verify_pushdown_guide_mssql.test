@@ -276,6 +276,71 @@ WHEN MATCHED THEN UPDATE SET amount = src.amount RETURNING merge_action, id;
 ----
 physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
 
+# ═══ L — why it ran where it ran (duckdb_logs) ══════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END', refresh_cache := true);
+
+statement ok
+CALL enable_logging(['Fabricator.Remote', 'Fabricator.Dml', 'Fabricator.Sql'], storage := 'memory');
+
+# L1: a statement that stays local says why
+statement ok
+SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, 'i.s') GROUP BY id;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote'
+  AND message LIKE 'local: no Substrait translation: Could not find function "regexp_matches"%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# L2: a part of a statement that reads only the server and still stays local
+statement ok
+SELECT t.region, s.net FROM (VALUES ('EU')) t(region) JOIN (SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote'
+  AND message = 'local subtree (before the optimizers): AGGREGATE stays local because it calls pg_net() of catalog mssql';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# L3: a DELETE that takes the key path names the condition that has no exact T-SQL
+statement ok
+EXPLAIN DELETE FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^l');
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Dml'
+  AND message = 'rowid path: the predicate does not render exactly: prefix(note, ''l'') (BOUND_FUNCTION)';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# L4: what was pushed, and the T-SQL SQL Server received
+statement ok
+SELECT r.name, count(*) AS n FROM mssql.dbo.pg_sales s JOIN mssql.dbo.pg_regions r USING (region) GROUP BY r.name;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND message LIKE 'remote: SELECT %GROUP BY%';
+----
+1
+
+# the statement as sent (whitespace collapsed, cut after 400 characters — the Fabricator.Remote line has it whole)
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE 'query [%]: SELECT CONVERT(nvarchar(max), %';
+----
+1
+
+statement ok
+CALL disable_logging();
+
 # ═══ Switches ══════════════════════════════════════════════════════════════════════════════════════════
 
 statement ok
@@ -308,4 +373,4 @@ DETACH mssql_off;
 # ═══ Cleanup ═══════════════════════════════════════════════════════════════════════════════════════════
 
 statement ok
-SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_archive;');
+SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_archive; DROP FUNCTION IF EXISTS dbo.pg_net;');

@@ -811,7 +811,7 @@ void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, Fu
 }
 
 bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Expression>> &filters, string &json,
-                                    vector<Value> &constants, bool exact_strings, vector<string> *referenced) {
+                                    vector<Value> &constants, bool exact_strings, vector<string> *referenced, string *why) {
 	json.clear();
 	constants.clear();
 	// exact_strings: the provider orders strings by bytes, so a string RANGE (BETWEEN) is exact as well.
@@ -821,10 +821,8 @@ bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Exp
 	for (auto &f : filters) {
 		string js, cs;
 		if (!ser.Serialize(*f, js, cs)) {
-			auto v = std::getenv("FABRICATOR_DUMP_DML");
-			if (v && *v && string(v) != "0") {
-				Printer::Print("[fabricator dml] not exact: " + f->ToString() + " (" +
-				               ExpressionClassToString(f->GetExpressionClass()) + ")");
+			if (why) {
+				*why = f->ToString() + " (" + ExpressionClassToString(f->GetExpressionClass()) + ")";
 			}
 			constants.clear();
 			return false; // one conjunct that does not render exactly sends the whole DELETE to the rowid path
@@ -849,7 +847,8 @@ bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Exp
 	return true;
 }
 
-bool FabricatorSerializeExactValue(LogicalGet &get, const Expression &value, string &json, vector<Value> &constants) {
+bool FabricatorSerializeExactValue(LogicalGet &get, const Expression &value, string &json, vector<Value> &constants,
+                                   string *why) {
 	// A second serializer over the SAME constants vector: its indices continue after the predicate's, so the
 	// filter and every SET value share one value batch.
 	FilterSerializer ser(get, constants, /*string_order_pushable=*/false, /*strict=*/true);
@@ -857,10 +856,8 @@ bool FabricatorSerializeExactValue(LogicalGet &get, const Expression &value, str
 	if (ser.SerializeValue(value, json)) {
 		return true;
 	}
-	auto v = std::getenv("FABRICATOR_DUMP_DML");
-	if (v && *v && string(v) != "0") {
-		Printer::Print("[fabricator dml] SET value not exact: " + value.ToString() + " (" +
-		               ExpressionClassToString(value.GetExpressionClass()) + ")");
+	if (why) {
+		*why = value.ToString() + " (" + ExpressionClassToString(value.GetExpressionClass()) + ")";
 	}
 	return false;
 }

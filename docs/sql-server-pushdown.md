@@ -25,12 +25,80 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 
 ## Seeing what happens
 
-- **`EXPLAIN <statement>`** — the operator names in the table above.
-- **`FABRICATOR_DUMP_REMOTE=1`** (environment variable) prints every pushdown decision and the T-SQL sent, e.g.
-  `[fabricator remote] remote: INSERT INTO [dbo].[pg_sales_eu] …` or `[fabricator remote] local: a plain scan keeps
-  the table scan`; for a part of a statement `remote subtree: …` / `local subtree: …`.
-- **`FABRICATOR_DUMP_DML=1`** does the same for `DELETE` / `UPDATE` / `CREATE TABLE … AS`, e.g.
-  `[fabricator dml] rowid path: the predicate does not render exactly`.
+- **`EXPLAIN <statement>`** — the operator names in the table above: *where* it runs.
+- **`duckdb_logs`** — *why* it runs there; see [Why it ran where it ran](#why-it-ran-where-it-ran).
+- **`FABRICATOR_DUMP_REMOTE=1`** / **`FABRICATOR_DUMP_DML=1`** (environment variables) print the same decisions to
+  the console, prefixed `[fabricator remote]` / `[fabricator dml]`.
+
+## Why it ran where it ran
+
+Every decision — pushed or not, and for what reason — is written to DuckDB's log under two types:
+`Fabricator.Remote` (statements and parts of statements) and `Fabricator.Dml` (the `DELETE` / `UPDATE … WHERE`
+shortcut). The T-SQL SQL Server actually received is under `Fabricator.Sql`.
+
+```sql
+CALL enable_logging(['Fabricator.Remote', 'Fabricator.Dml', 'Fabricator.Sql'], storage := 'memory');
+-- run the statements
+SELECT type, message FROM duckdb_logs WHERE type LIKE 'Fabricator.%';
+CALL truncate_duckdb_logs();   -- start over
+CALL disable_logging();
+```
+
+`storage := 'memory'` is what makes `duckdb_logs` queryable in the DuckDB CLI (its default prints to the console).
+
+| message | meaning |
+|---|---|
+| `remote: <T-SQL>` | the whole statement ran on the server as this T-SQL |
+| `remote subtree (before the optimizers): <T-SQL>` | a part of the statement ran on the server; *before* / *after* names which of the two passes found it |
+| `local: <reason>` | the whole statement stays in DuckDB; its tables are still scanned with their filter and columns pushed |
+| `local subtree (…): <reason>` | a part that reads only the server stays in DuckDB |
+| `rowid path: <reason>` | a `DELETE` / `UPDATE` scans the keys and changes by key |
+| `delete-where: …` / `update-where: …` | the `DELETE` / `UPDATE` ran as one statement through the shortcut |
+
+The reasons you will meet most:
+
+| reason | what to do |
+|---|---|
+| `no Substrait translation: Could not find function "<f>" …` | the function has no exact T-SQL; rewrite with one that has, or accept the local run |
+| `a plain scan keeps the table scan` | nothing to gain: the scan already sends its filter and columns |
+| `… stays local because it calls <f>() of catalog <c>` | a SQL Server or C# function of the attached catalog (not pushed: its bare name could mean a built-in) |
+| `… stays local because it uses a prepared-statement parameter` | only for a part of a statement; a whole prepared statement is planned per `EXECUTE` with its values |
+| `the predicate does not render exactly: <condition>` | the named condition has no exact T-SQL |
+| `fabricator_dml_pushdown = false` | switched off in this session |
+
+**L1** — a statement that stays local says why:
+
+```sql
+SELECT id FROM mssql.dbo.pg_sales WHERE regexp_matches(note, 'i.s') GROUP BY id;
+-- Fabricator.Remote | local: no Substrait translation: Could not find function "regexp_matches" with argument types: ('string', 'string')
+```
+
+**L2** — a part that reads only the server, and still stays local:
+
+```sql
+SELECT t.region, s.net
+FROM (VALUES ('EU')) t(region)
+JOIN (SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
+-- Fabricator.Remote | local subtree (before the optimizers): AGGREGATE stays local because it calls pg_net() of catalog mssql
+```
+
+**L3** — a `DELETE` that takes the key path names the condition (DuckDB rewrote `'^l'` to `prefix`):
+
+```sql
+DELETE FROM mssql.dbo.pg_sales WHERE regexp_matches(note, '^l');
+-- Fabricator.Dml | rowid path: the predicate does not render exactly: prefix(note, 'l') (BOUND_FUNCTION)
+```
+
+**L4** — what was pushed, and what SQL Server received:
+
+```sql
+SELECT r.name, count(*) AS n FROM mssql.dbo.pg_sales s JOIN mssql.dbo.pg_regions r USING (region) GROUP BY r.name;
+-- Fabricator.Remote | remote: SELECT CONVERT(nvarchar(max), … FROM [dbo].[pg_sales] AS [t0] INNER JOIN [dbo].[pg_regions] … GROUP BY …
+-- Fabricator.Sql    | query [pooled txn=… route=pooled]: SELECT CONVERT(nvarchar(max), …
+```
+
+The `Fabricator.Sql` line collapses whitespace and stops after 400 characters; the `Fabricator.Remote` line has
+the whole statement. `Fabricator.Sql` also shows the catalog's own metadata queries, which are not pushdowns.
 
 ## Switching it off
 
@@ -57,6 +125,13 @@ SELECT fabricator_exec('mssql', '
   INSERT INTO dbo.pg_regions VALUES (''EU'', N''Europe''), (''US'', N''Americas'');
   INSERT INTO dbo.pg_sales VALUES (1,''EU'',10,''2026-01-05'',N''first''), (2,''US'',20,''2026-02-01'',NULL),
                                   (3,''EU'',30,''2026-02-07'',N''Größe''), (4,''US'',5,''2025-12-30'',N''late'');',
+  refresh_cache := true);
+```
+
+L2 also uses a SQL Server function:
+
+```sql
+SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END',
   refresh_cache := true);
 ```
 

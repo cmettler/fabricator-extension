@@ -22,6 +22,7 @@
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_txn_util.hpp"
 #include "fabricator_optimizer.hpp"
+#include "fabricator_trace.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -92,14 +93,21 @@ namespace duckdb {
 
 namespace {
 
-void RemoteTrace(const string &message) {
-	static const bool enabled = [] {
-		auto v = std::getenv("FABRICATOR_DUMP_REMOTE");
-		return v && *v && string(v) != "0";
-	}();
-	if (enabled) {
-		Printer::Print("[fabricator remote] " + message);
+void RemoteTrace(ClientContext &context, const string &message) {
+	FabricatorRoutingTrace(context, FABRICATOR_LOG_REMOTE, "FABRICATOR_DUMP_REMOTE", message);
+}
+
+//! The reason of a refused translation. to_substrait's strict mode wraps every refusal in the same preamble, which
+//! would lead every logged reason.
+string DeclineReason(const std::exception &ex) {
+	auto message = ErrorData(ex).RawMessage();
+	static const string preamble = "Strict Mode is set to true, and the following warnings/errors happened.";
+	if (StringUtil::StartsWith(message, preamble)) {
+		message = message.substr(preamble.size());
+		StringUtil::Trim(message);
+		message = "no Substrait translation: " + message;
 	}
+	return message;
 }
 
 //! FABRICATOR_DUMP_SUBSTRAIT_PLAN=<file>: the last plan sent to the provider, for the harness that measures the
@@ -409,7 +417,7 @@ bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const Q
 		depth--;
 	} catch (std::exception &ex) {
 		depth--;
-		reason = ErrorData(ex).RawMessage();
+		reason = DeclineReason(ex);
 		return false;
 	}
 	return true;
@@ -542,7 +550,7 @@ unique_ptr<TableRef> SubstraitPushdown(ClientContext &context, FabricatorCatalog
 	if (!TranslateQuery(context, catalog, plan_bytes, types.size(), query, reason)) {
 		return nullptr;
 	}
-	RemoteTrace("remote: " + query.sql);
+	RemoteTrace(context, "remote: " + query.sql);
 	if (query.changes_rows) {
 		return RemoteDmlRef(catalog, query.sql);
 	}
@@ -639,7 +647,7 @@ unique_ptr<TableRef> SubstraitDml(ClientContext &context, FabricatorCatalog &cat
 	if (sql.empty()) {
 		return nullptr;
 	}
-	RemoteTrace("remote: " + sql);
+	RemoteTrace(context, "remote: " + sql);
 	return RemoteDmlRef(catalog, sql);
 }
 
@@ -833,7 +841,7 @@ unique_ptr<TableRef> SubstraitMoved(ClientContext &context, FabricatorCatalog &c
 	if (sql.empty()) {
 		return nullptr;
 	}
-	RemoteTrace("remote: " + sql);
+	RemoteTrace(context, "remote: " + sql);
 	return RemoteDmlRef(catalog, sql);
 }
 
@@ -1141,7 +1149,7 @@ unique_ptr<TableRef> SubstraitMerge(ClientContext &context, FabricatorCatalog &c
 	if (sql.empty()) {
 		return nullptr;
 	}
-	RemoteTrace("remote: " + sql);
+	RemoteTrace(context, "remote: " + sql);
 	return RemoteDmlRef(catalog, sql);
 }
 
@@ -1260,28 +1268,46 @@ optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 //! Whether an expression may run on the server: no parameter (a prepared statement binds its values per EXECUTE, after
 //! the plan was translated), no subquery, and no function of an attached catalog — a SQL Server UDF or a C#-authored
 //! catalog function carries only its bare name in the plan, which could translate as a built-in of that name.
-bool PushableExpression(const Expression &expr) {
-	auto builtin = [](const Identifier &catalog) {
+//! `why`, when given, receives the reason of a refusal.
+bool PushableExpression(const Expression &expr, string *why = nullptr) {
+	auto builtin = [&](const Identifier &function, const Identifier &catalog) {
 		auto name = catalog.GetIdentifierName();
-		return name.empty() || StringUtil::CIEquals(name, "system");
+		if (name.empty() || StringUtil::CIEquals(name, "system")) {
+			return true;
+		}
+		if (why) {
+			*why = "it calls " + function.GetIdentifierName() + "() of catalog " + name;
+		}
+		return false;
 	};
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_PARAMETER:
-	case ExpressionClass::BOUND_SUBQUERY:
+		if (why) {
+			*why = "it uses a prepared-statement parameter";
+		}
 		return false;
-	case ExpressionClass::BOUND_FUNCTION:
-		if (!builtin(expr.Cast<BoundFunctionExpression>().Function().GetCatalogName())) {
+	case ExpressionClass::BOUND_SUBQUERY:
+		if (why) {
+			*why = "it contains a subquery expression";
+		}
+		return false;
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>().Function();
+		if (!builtin(function.GetName(), function.GetCatalogName())) {
 			return false;
 		}
 		break;
-	case ExpressionClass::BOUND_AGGREGATE:
-		if (!builtin(expr.Cast<BoundAggregateExpression>().Function().GetCatalogName())) {
+	}
+	case ExpressionClass::BOUND_AGGREGATE: {
+		auto &function = expr.Cast<BoundAggregateExpression>().Function();
+		if (!builtin(function.GetName(), function.GetCatalogName())) {
 			return false;
 		}
 		break;
+	}
 	case ExpressionClass::BOUND_WINDOW: {
 		auto &aggregate = expr.Cast<BoundWindowExpression>().AggregateFunction();
-		if (aggregate && !builtin(aggregate->GetCatalogName())) {
+		if (aggregate && !builtin(aggregate->GetName(), aggregate->GetCatalogName())) {
 			return false;
 		}
 		break;
@@ -1291,7 +1317,7 @@ bool PushableExpression(const Expression &expr) {
 	}
 	bool pushable = true;
 	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
-		if (pushable && !PushableExpression(child)) {
+		if (pushable && !PushableExpression(child, why)) {
 			pushable = false;
 		}
 	});
@@ -1300,7 +1326,7 @@ bool PushableExpression(const Expression &expr) {
 
 //! Whether an operator may be part of a pushed subtree; `worth`: whether it reduces what travels — a subtree of scans,
 //! filters, projections and sorts only is what the table scan already does (it pushes its filter and projection).
-bool PushableOperator(LogicalOperator &op, bool &worth) {
+bool PushableOperator(LogicalOperator &op, bool &worth, string &why) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 	case LogicalOperatorType::LOGICAL_FILTER:
@@ -1327,7 +1353,7 @@ bool PushableOperator(LogicalOperator &op, bool &worth) {
 	}
 	bool pushable = true;
 	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
-		if (pushable && *expr && !PushableExpression(**expr)) {
+		if (pushable && *expr && !PushableExpression(**expr, &why)) {
 			pushable = false;
 		}
 	});
@@ -1377,6 +1403,11 @@ struct SubtreePushdown {
 	//! every replaced subtree's output bindings, and its replacement's, by position
 	vector<ColumnBinding> old_bindings;
 	vector<ColumnBinding> new_bindings;
+
+	//! A decision of this pass. Both passes see most plans, so each message says which one decided.
+	void Trace(const string &decision, const string &detail) {
+		RemoteTrace(context, decision + (pre ? " (before the optimizers): " : " (after the optimizers): ") + detail);
+	}
 };
 
 //! What a subtree reads: pure = one catalog and nothing else.
@@ -1392,7 +1423,7 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 	auto old_bindings = op->GetColumnBindings();
 	auto types = op->types;
 	if (old_bindings.size() != types.size()) {
-		RemoteTrace("local subtree: its bindings and types disagree");
+		state.Trace("local subtree", "its bindings and types disagree");
 		return;
 	}
 	string plan_bytes;
@@ -1418,13 +1449,13 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		plan_bytes = to_substrait.SerializeToString();
 		DumpPlan(plan_bytes);
 	} catch (std::exception &ex) {
-		RemoteTrace("local subtree: " + ErrorData(ex).RawMessage());
+		state.Trace("local subtree", DeclineReason(ex));
 		return;
 	}
 	string reason;
 	RemoteQuery query;
 	if (!TranslateQuery(state.context, catalog, plan_bytes, types.size(), query, reason) || query.changes_rows) {
-		RemoteTrace("local subtree: " + reason);
+		state.Trace("local subtree", reason);
 		return;
 	}
 	unique_ptr<LogicalOperator> replacement;
@@ -1440,15 +1471,15 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		replacement = std::move(bound.plan);
 		replacement->ResolveOperatorTypes();
 	} catch (std::exception &ex) {
-		RemoteTrace("local subtree: " + ErrorData(ex).RawMessage());
+		state.Trace("local subtree", ErrorData(ex).RawMessage());
 		return;
 	}
 	auto new_bindings = replacement->GetColumnBindings();
 	if (new_bindings.size() != old_bindings.size() || replacement->types != types) {
-		RemoteTrace("local subtree: the pushed query's columns do not match");
+		state.Trace("local subtree", "the pushed query's columns do not match");
 		return;
 	}
-	RemoteTrace("remote subtree: " + query.sql);
+	state.Trace("remote subtree", query.sql);
 	state.old_bindings.insert(state.old_bindings.end(), old_bindings.begin(), old_bindings.end());
 	state.new_bindings.insert(state.new_bindings.end(), new_bindings.begin(), new_bindings.end());
 	op = std::move(replacement);
@@ -1466,17 +1497,22 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		return result;
 	}
 	bool worth = false;
-	bool pure = PushableOperator(*op, worth);
+	string why;
+	bool operator_ok = PushableOperator(*op, worth, why);
+	// whether everything below reads one catalog alone
+	bool children_remote = !children.empty();
 	for (auto &child : children) {
-		if (!pure) {
-			break;
-		}
 		if (!child.pure || (result.catalog && result.catalog.get() != child.catalog.get())) {
-			pure = false;
+			children_remote = false;
 			break;
 		}
 		result.catalog = child.catalog;
 		worth = worth || child.worth;
+	}
+	bool pure = operator_ok && children_remote;
+	if (!operator_ok && children_remote && !why.empty()) {
+		// the one refusal a reader would not guess: the subtree reads only the server, and still stays here
+		state.Trace("local subtree", LogicalOperatorToString(op->type) + " stays local because " + why);
 	}
 	if (pure) {
 		result.pure = true;
@@ -1499,6 +1535,10 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		return; // the reference oracle of the differential gate
 	}
 	if (WritesFabricatorCatalog(*plan)) {
+		if (pre) {
+			RemoteTrace(input.context, "local subtree: the statement writes a table of a fabricator catalog, so its "
+			                           "reads keep the catalog's own scans");
+		}
 		return;
 	}
 	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}};
@@ -1605,7 +1645,7 @@ string FabricatorCatalog::RemoteInsertForCtas(ClientContext &context, LogicalOpe
 	if (sql.empty()) {
 		return "";
 	}
-	RemoteTrace("remote ctas: " + sql);
+	RemoteTrace(context, "remote ctas: " + sql);
 	return sql;
 }
 
@@ -1723,7 +1763,7 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 	}
 	// DECLINE: the statement as written, this catalog's name restored on every table (the optimizer stripped it),
 	// so it binds and runs locally
-	RemoteTrace("local: " + reason);
+	RemoteTrace(context, "local: " + reason);
 	RestoreCatalog(*node, GetName(), default_schema);
 	if (is_insert && node->cte_map.map.empty()) {
 		// the rows go through the host's own insert, but the query that produces them can still run on the server.
@@ -1737,7 +1777,7 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 			select->from_table = std::move(pushed);
 			insert.select_statement->node = std::move(select);
 		} else {
-			RemoteTrace("local select: " + select_reason);
+			RemoteTrace(context, "local select: " + select_reason);
 		}
 	}
 	// A data-modifying CTE binds only at the top level, and the declined statement now sits in a subquery. That rule
