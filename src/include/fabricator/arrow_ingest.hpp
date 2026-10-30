@@ -181,6 +181,12 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! the generated SQL is executed BY DuckDB, so the comparator that picks the top-n IS the comparator of
 	//! the TopN kept above the scan. Same flag, same meaning ("this source orders strings as DuckDB does").
 	bool string_order_pushable = false;
+	//! A catalog-bound TABLE FUNCTION called with constant arguments (not a table scan): its schema path + name, its
+	//! positional arguments as bound, and its catalog — what a pushed query needs to call it on the server
+	//! (fabricator_remote_select.cpp). Empty for a table scan and for a function the pushdown cannot call.
+	duckdb::vector<duckdb::string> table_function_path;
+	duckdb::vector<duckdb::Value> table_function_args;
+	duckdb::optional_ptr<duckdb::Catalog> table_function_catalog;
 
 	//! Whether the provider renders a pushed key's NULL placement (`NULLS FIRST`/`NULLS LAST`) rather than
 	//! owning one fixed convention. Set at scan bind from FabricatorCatalog::NullOrderExpressible; read by

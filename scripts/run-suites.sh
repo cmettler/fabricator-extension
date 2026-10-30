@@ -1543,7 +1543,9 @@ case "$TIER" in
         # verify_functions 105 -> 103. Nothing else moved.
         # 2026-10-30: 6259 -> 6277: correlated subqueries / materialized CTEs pushed — verify_subtree_pushdown_mssql
         # 155 -> 167 (P13-P15), verify_pushdown_guide_mssql 119 -> 125 (S9).
-        : "${MIN_ASSERTIONS:=6277}"
+        # 2026-10-30: 6277 -> 6309: TVFs with constant arguments in pushed parts — verify_subtree_pushdown_mssql
+        # 167 -> 184 (P16, N4), verify_pushdown_guide_mssql 125 -> 140 (S10, S11).
+        : "${MIN_ASSERTIONS:=6309}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

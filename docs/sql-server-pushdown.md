@@ -132,10 +132,11 @@ SELECT fabricator_exec('mssql', '
   refresh_cache := true);
 ```
 
-S8 also uses a SQL Server function:
+S8, S10 and S11 also use two SQL Server functions:
 
 ```sql
-SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END',
+SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END');
+SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_region_sales(@r VARCHAR(2)) RETURNS TABLE AS RETURN (SELECT id, amount FROM dbo.pg_sales WHERE region = @r)',
   refresh_cache := true);
 ```
 
@@ -247,8 +248,29 @@ FROM (SELECT region, name, CASE region WHEN 'EU' THEN 9 ELSE 4 END AS region_ran
 
 A correlated subquery whose OUTER side is local data stays as before: its remote part is sent uncorrelated.
 
+**S10 — pushed: a table-valued function with constant arguments.** It is called by its schema and name inside the
+server query, like a table:
+
+```sql
+SELECT r.name, s.id, s.amount
+FROM mssql.dbo.pg_region_sales('EU') s CROSS JOIN mssql.dbo.pg_regions r WHERE r.region = 'EU';
+-- sent: … FROM [dbo].[pg_region_sales](… 'EU' …) AS [t0] CROSS JOIN [dbo].[pg_regions] AS [t1] …
+```
+
+**S11 — per row: a table-valued function with a column argument.** `FROM t, f(t.a)` calls it once per distinct
+argument; each chunk of them goes to the server as ONE `(VALUES …) CROSS APPLY [dbo].[f](…)`. `EXPLAIN` shows
+`Fabricator Lateral Batched`:
+
+```sql
+SELECT t.region, s.id FROM targets t, mssql.dbo.pg_region_sales(t.region) s;   -- EU 1 / EU 3
+```
+
+With a column argument from a table OF THE CATALOG the same plan runs (the outer table is read, the function applied
+per chunk) — not yet as one statement.
+
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
-connection), a part calling a function the provider implements itself or a function of another catalog, a part
+connection), a part calling a function the provider implements itself (scalar or table) or a function of another
+catalog, a part
 calling a function whose value is not fixed by its arguments
 (`now()`, `current_date`, `random()` — the server would use its own clock, time zone or generator; this holds for whole
 statements too), time travel (`AT (…)`), and anything that does not translate exactly.

@@ -82,6 +82,12 @@ internal sealed class TSqlEmitter
     public Func<IReadOnlyList<string>, string?>? CatalogFunctions { get; init; }
 
     /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A table function of the attached catalog (its schema path and name) as the
+    /// T-SQL name to call it by in a FROM clause, or null when it does not run on the server. Unset: refused.
+    /// </summary>
+    public Func<IReadOnlyList<string>, string?>? CatalogTableFunctions { get; init; }
+
+    /// <summary>
     /// Writes the query. With <paramref name="nested"/>, the query is meant
     /// to be used as a derived table, so a final ORDER BY (which T-SQL does not
     /// allow there, and which would not order the outer query anyway) is left out.
@@ -451,7 +457,16 @@ internal sealed class TSqlEmitter
         string alias = NewAlias();
         var block = new SelectBlock();
         IReadOnlyDictionary<string, string>? sqlTypes = null;
-        if (rel.VirtualRows != null)
+        if (rel.TableFunctionArgs != null)
+        {
+            // [FABRICATOR-PATCH: OURS-BY-DESIGN] a table function of the catalog, called with its constant arguments
+            string display = string.Join(".", rel.TableNames);
+            string name = CatalogTableFunctions?.Invoke(rel.TableNames)
+                          ?? throw SubstraitTranslationException.Unsupported($"{display}() is not a table function of the server");
+            var args = rel.TableFunctionArgs.Select(arg => Render(arg, Array.Empty<SqlColumn>()).Value);
+            block.From = $"{name}({string.Join(", ", args)}) AS {alias}";
+        }
+        else if (rel.VirtualRows != null)
         {
             block.From = VirtualTable(rel, alias);
         }

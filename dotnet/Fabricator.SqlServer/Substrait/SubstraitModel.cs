@@ -304,6 +304,9 @@ sealed class ReadRel : Rel
     public Expr? Filter;
     public Expr? BestEffortFilter;
     public List<int>? Projection;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] For a table-function read (<c>fabricator.table_function</c>): the
+    /// arguments of the call, <see cref="TableNames"/> naming the function. Null for a table.</summary>
+    public List<Expr>? TableFunctionArgs;
 }
 
 /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] A write to a named table (only INSERT is translated).</summary>

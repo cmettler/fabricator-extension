@@ -380,6 +380,43 @@ sealed class SubstraitPlanDecoder
         return rel;
     }
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A ReadRel's advanced extension: <c>fabricator.table_function</c> makes it a
+    /// call of the named table function, its value a struct of the argument expressions (returned); any other
+    /// enhancement changes its meaning in a way this consumer does not know. Null without an enhancement.
+    /// </summary>
+    List<Expr>? ReadReadEnhancement(ProtoReader r)
+    {
+        List<Expr>? args = null;
+        while (r.Next(out int field, out int wire))
+        {
+            if (field != F.AdvancedExtension_Enhancement)
+            {
+                r.Skip(wire);
+                continue;
+            }
+            var any = r.ReadMessage(wire);
+            string? typeUrl = null;
+            byte[] value = Array.Empty<byte>();
+            while (any.Next(out int af, out int aw))
+            {
+                if (af == F.Any_TypeUrl) typeUrl = any.ReadString(aw);
+                else if (af == F.Any_Value) value = any.ReadBytes(aw);
+                else any.Skip(aw);
+            }
+            if (typeUrl != F.Enhancement_FabricatorTableFunction)
+                throw SubstraitTranslationException.Unsupported($"ReadRel carries the enhancement '{typeUrl}', which changes its semantics.");
+            args = new List<Expr>();
+            var fields = new ProtoReader(value, 0, value.Length);
+            while (fields.Next(out int sf, out int sw))
+            {
+                if (sf == 1) args.Add(ReadExpression(fields.ReadMessage(sw))); // Expression.Nested.Struct.fields
+                else fields.Skip(sw);
+            }
+        }
+        return args;
+    }
+
     ReadRel ReadReadRel(ProtoReader r)
     {
         var rel = new ReadRel();
@@ -394,7 +431,7 @@ sealed class SubstraitPlanDecoder
                 case F.ReadRel_BestEffortFilter: rel.BestEffortFilter = ReadExpression(r.ReadMessage(wire)); break;
                 case F.ReadRel_Projection: rel.Projection = ReadMaskExpression(r.ReadMessage(wire)); break;
                 case F.ReadRel_NamedTable: ReadNamedTable(r.ReadMessage(wire), rel); hasTable = true; break;
-                case F.Rel_AdvancedExtension: CheckAdvancedExtension(r.ReadMessage(wire), "ReadRel"); break;
+                case F.Rel_AdvancedExtension: rel.TableFunctionArgs ??= ReadReadEnhancement(r.ReadMessage(wire)); break;
                 case F.ReadRel_VirtualTable: rel.VirtualRows = ReadVirtualTable(r.ReadMessage(wire)); hasTable = true; break;
                 case F.ReadRel_LocalFiles:
                 case F.ReadRel_ExtensionTable:
@@ -408,6 +445,12 @@ sealed class SubstraitPlanDecoder
             throw SubstraitTranslationException.MalformedPlan("ReadRel has no named_table or virtual_table.");
         if (!hasSchema)
             throw SubstraitTranslationException.MalformedPlan("ReadRel has no base_schema.");
+        if (rel.TableFunctionArgs != null)
+        {
+            if (rel.TableNames.Count == 0 || rel.VirtualRows != null)
+                throw SubstraitTranslationException.MalformedPlan("A table-function ReadRel must name the function.");
+            return rel;
+        }
         if (rel.VirtualRows != null && rel.VirtualRows.Any(row => row.Count != rel.ColumnNames.Count))
             throw SubstraitTranslationException.MalformedPlan("A virtual table row does not have one value per base_schema column.");
         return rel;

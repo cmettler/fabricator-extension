@@ -3211,6 +3211,22 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         return $"{Quote(path[0])}.{Quote(path[1])}";
     }
 
+    /// <summary>
+    /// A table function of this catalog in a pushed plan (schema, name) as the T-SQL name to call it by in a FROM
+    /// clause, or null when it does not run on the server: one the provider implements itself (the CatalogFunctionSet),
+    /// or a stored procedure (no result columns in ROUTINE_COLUMNS — a procedure cannot be selected from).
+    /// </summary>
+    private string? ServerTableFunctionName(IReadOnlyList<string> path)
+    {
+        var schema = new SchemaPath(path.Count == 2 ? path[0] : "");
+        if (path.Count != 2 || Functions.TryTable(schema, path[1], out _) || Functions.TrySqlTable(schema, path[1], out _) ||
+            FunctionOutputColumns(path[0], path[1]).Count == 0)
+        {
+            return null;
+        }
+        return $"{Quote(path[0])}.{Quote(path[1])}";
+    }
+
     /// <summary>The pushed plan as T-SQL (Substrait → the vendored emitter, ABI v96); refuses what it cannot write exactly.</summary>
     public RemoteQuery? TranslateRemotePlan(byte[] substraitPlan)
     {
@@ -3228,7 +3244,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
                 substraitPlan, HasIgnoreNulls, out columnCount, out orderDescending, out write,
                 names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null,
-                ServerFunctionName);
+                ServerFunctionName, ServerTableFunctionName);
         }
         catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
         {

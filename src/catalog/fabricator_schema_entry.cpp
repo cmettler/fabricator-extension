@@ -2316,6 +2316,19 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 	// A byte-ordered source (e.g. a Delta/Parquet global reader) can safely push string ordering + BETWEEN;
 	// discovered SQL TVFs leave this false (collation-dependent). Read by the shared FilterSerializer.
 	bind_data->string_order_pushable = info.string_order_pushable;
+	// For the pushdown: a function of positional parameters only, called with constants (a TVF; the provider decides
+	// at translation whether it runs on its server).
+	bool positional_call = !info.is_proc && info.catalog && info.varargs_index == DConstants::INVALID_INDEX &&
+	                       input.named_parameters.empty();
+	for (auto style : info.arg_styles) {
+		positional_call = positional_call && style == FabricatorParamStyle::POSITIONAL;
+	}
+	if (positional_call) {
+		bind_data->table_function_path = info.schema_path;
+		bind_data->table_function_path.push_back(info.func);
+		bind_data->table_function_args = input.inputs;
+		bind_data->table_function_catalog = info.catalog;
+	}
 
 	auto properties = fabricator::BoundaryClientProperties(context);
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);

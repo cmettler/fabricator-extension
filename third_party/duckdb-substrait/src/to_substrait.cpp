@@ -2442,16 +2442,24 @@ substrait::Rel *DuckDBToSubstrait::TransformEmptyResult(LogicalOperator &dop) {
 	return get_rel.release();
 }
 
+std::function<bool(LogicalGet &get, vector<string> &path, vector<Value> &args)>
+    DuckDBToSubstrait::table_function_resolver;
+
 substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 	auto get_rel = make_uniq<substrait::Rel>();
 	auto &dget = dop.Cast<LogicalGet>();
 
-	if (!dget.function.get_bind_info) {
+	// [FABRICATOR-PATCH: OURS-BY-DESIGN] a catalog table function called with constants (see table_function_resolver)
+	vector<string> function_path;
+	vector<Value> function_args;
+	bool table_function = table_function_resolver && table_function_resolver(dget, function_path, function_args);
+
+	if (!table_function && !dget.function.get_bind_info) {
 		throw NotImplementedException("This Scanner Type can't be used in substrait because a get bind info "
 		                              "is not yet implemented");
 	}
 	TableFunctionGetBindInfoInput bind_info_input(context, dget.bind_data.get()); // [FABRICATOR-PATCH: DUCKDB-2.0] get_bind_info takes an input struct
-	auto bind_info = dget.function.get_bind_info(bind_info_input);
+	auto bind_info = table_function ? BindInfo(ScanType::EXTERNAL) : dget.function.get_bind_info(bind_info_input);
 	auto sget = get_rel->mutable_read();
 
 	// [FABRICATOR-PATCH: OURS-BY-DESIGN] table filters exist only after DuckDB's optimizer, which the remote
@@ -2556,6 +2564,33 @@ substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 	}
 
 	// Add Table Schema
+	if (table_function) {
+		for (auto &name : function_path) {
+			sget->mutable_named_table()->add_names(name);
+		}
+		auto base_schema = make_uniq<substrait::NamedStruct>();
+		auto type_info = make_uniq<substrait::Type_Struct>();
+		type_info->set_nullability(substrait::Type_Nullability_NULLABILITY_REQUIRED);
+		for (idx_t i = 0; i < dget.names.size(); i++) {
+			base_schema->add_names(dget.names[i].GetIdentifierName());
+			for (auto &name : DepthFirstNames(dget.returned_types[i])) {
+				base_schema->add_names(name);
+			}
+			*type_info->add_types() = DuckToSubstraitType(dget.returned_types[i]);
+		}
+		base_schema->set_allocated_struct_(type_info.release());
+		sget->set_allocated_base_schema(base_schema.release());
+		// the arguments ride the enhancement's value as a struct of literals: a ReadRel names ONE source (named_table is
+		// a oneof with virtual_table), so they cannot be a virtual table beside the name
+		substrait::Expression_Nested_Struct arguments;
+		for (auto &arg : function_args) {
+			TransformConstant(arg, *arguments.add_fields());
+		}
+		auto any = sget->mutable_advanced_extension()->mutable_enhancement();
+		any->set_type_url("fabricator.table_function");
+		any->set_value(arguments.SerializeAsString());
+		return get_rel.release();
+	}
 	switch (bind_info.type) {
 	case ScanType::TABLE: {
 		unordered_set<idx_t> read_columns;

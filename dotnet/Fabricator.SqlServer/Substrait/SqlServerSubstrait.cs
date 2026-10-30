@@ -74,8 +74,10 @@ public static class SqlServerSubstrait
     /// </summary>
     internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending,
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null,
-                                             Func<IReadOnlyList<string>, string?>? catalogFunctions = null)
-        => TranslatePushdown(plan, ignoreNulls, out columnCount, out orderDescending, out _, columnSqlTypes, catalogFunctions);
+                                             Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
+                                             Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null)
+        => TranslatePushdown(plan, ignoreNulls, out columnCount, out orderDescending, out _, columnSqlTypes, catalogFunctions,
+                             catalogTableFunctions);
 
     /// <param name="write">For a plan that writes (INSERT … SELECT, DELETE, UPDATE), the operation, the target table
     /// and the columns it writes; the query is then a statement with no result, and <paramref name="columnCount"/>
@@ -84,7 +86,8 @@ public static class SqlServerSubstrait
     internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending,
                                              out (int Op, IReadOnlyList<string> Table, IReadOnlyList<string> Columns, IReadOnlyList<string>? Source)? write,
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null,
-                                             Func<IReadOnlyList<string>, string?>? catalogFunctions = null)
+                                             Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
+                                             Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null)
     {
         if (plan == null || plan.Length == 0)
         {
@@ -95,7 +98,8 @@ public static class SqlServerSubstrait
         // IGNORE NULLS and DATETRUNC arrived together, with SQL Server 2022
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes)
         {
-            SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, CatalogFunctions = catalogFunctions
+            SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, CatalogFunctions = catalogFunctions,
+            CatalogTableFunctions = catalogTableFunctions
         };
         if (root.Input is WriteRel writeRel)
         {

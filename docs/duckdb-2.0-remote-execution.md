@@ -1385,6 +1385,23 @@ decline was "local: CTE".
   never replaceable" killed at P13. Not built: a correlated subquery whose OUTER side is local (step 4, key shipping),
   TVFs inside a pushed part (step 3b, needs a table-function relation in Substrait).
 
+### 4.15 A table-valued function with constant arguments in a pushed part — BUILT (2026-10-30, step 3b-1)
+
+- The TVF scan keeps its call on the bind data (`ArrowStreamBindData::table_function_path/_args/_catalog`, set by
+  `FabricatorTableFunctionBind` for a positional-only, non-proc function called with constants).
+- **to_substrait** gets a static `table_function_resolver` (set at load): such a scan becomes a ReadRel naming the
+  function, its base schema the function's columns, marked by the enhancement `fabricator.table_function` whose VALUE
+  is an `Expression.Nested.Struct` of the argument literals. ⚠ Not a virtual table beside the name: `named_table` and
+  `virtual_table` are a protobuf ONEOF, so the first attempt lost the name and declined every call.
+- **The C# decoder** reads that enhancement (any other still refuses the plan); the emitter writes
+  `FROM [s].[f](<literals>) AS [tN]` through `TSqlEmitter.CatalogTableFunctions` → `ServerTableFunctionName`, which
+  declines a function of the CatalogFunctionSet (C#) and a stored procedure (no result columns in ROUTINE_COLUMNS).
+- `PushableScanCatalog` takes such a scan as a leaf of its catalog. A correlated call (`FROM db.t, db.tvf(t.a)`) is
+  still read and applied per chunk (§10 of lateral_unnest_analysis.md), not one statement — that needs an APPLY
+  relation (step 3b-2).
+- Gates: `verify_subtree_pushdown_mssql` P16 (TVF sent by name, differential vs a local table macro) + N4 (`cf_range`,
+  C#, refused by the provider) — 184; guide S10/S11. Mutant "the resolver never recognizes a TVF" killed at P16.
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

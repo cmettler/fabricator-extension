@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "duckdb/planner/expression/bound_window_expression.hpp" // [FABRICATOR-PATCH: DUCKDB-2.0]
 #include "custom_extensions/custom_extensions.hpp"
 #include "duckdb/common/helper.hpp"
@@ -34,6 +36,10 @@ public:
 	~DuckDBToSubstrait() {
 		plan.Clear();
 	}
+	//! [FABRICATOR-PATCH: OURS-BY-DESIGN] Resolves a scan that is a call of a catalog TABLE FUNCTION with constant
+	//! arguments: its name path and arguments. It is read as a ReadRel naming the function, its arguments the one
+	//! row of a virtual table, marked by the enhancement `fabricator.table_function`. Set once at load.
+	static std::function<bool(LogicalGet &get, vector<string> &path, vector<Value> &args)> table_function_resolver;
 	//! Serializes the substrait plan to a string
 	string SerializeToString() const;
 	string SerializeToJson() const;

@@ -24,7 +24,7 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS rp (TYPE fabricator, remote_pushdown 'true');
 # dbo.st_fn and dbo.abs are scalar UDFs; abs deliberately shares a built-in's name.
 
 statement ok
-SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.st_big; DROP TABLE IF EXISTS dbo.st_dim; DROP TABLE IF EXISTS dbo.st_out; DROP FUNCTION IF EXISTS dbo.st_fn; DROP FUNCTION IF EXISTS dbo.[abs];');
+SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.st_big; DROP TABLE IF EXISTS dbo.st_dim; DROP TABLE IF EXISTS dbo.st_out; DROP FUNCTION IF EXISTS dbo.st_fn; DROP FUNCTION IF EXISTS dbo.[abs]; DROP FUNCTION IF EXISTS dbo.st_tvf;');
 
 statement ok
 SELECT fabricator_exec('rp', 'CREATE FUNCTION dbo.st_fn (@x INT) RETURNS INT AS BEGIN RETURN @x * 2 + 1; END');
@@ -38,7 +38,10 @@ INSERT INTO dbo.st_big SELECT value, CASE WHEN value % 23 = 0 THEN NULL ELSE CHO
   CASE WHEN value % 19 = 0 THEN NULL ELSE value % 100 END FROM GENERATE_SERIES(1, 3000);
 CREATE TABLE dbo.st_dim (region VARCHAR(10) NOT NULL, label VARCHAR(20));
 INSERT INTO dbo.st_dim VALUES (''A'', ''alpha''), (''B'', ''beta''), (''C'', ''gamma''), (''a'', ''lower a''), (''E'', ''none'');
-CREATE TABLE dbo.st_out (region VARCHAR(10), s BIGINT);', refresh_cache := true);
+CREATE TABLE dbo.st_out (region VARCHAR(10), s BIGINT);');
+
+statement ok
+SELECT fabricator_exec('rp', 'CREATE FUNCTION dbo.st_tvf (@lo INT) RETURNS TABLE AS RETURN (SELECT id, region, v FROM dbo.st_big WHERE v >= @lo)', refresh_cache := true);
 
 statement ok
 CREATE TABLE loc AS SELECT * FROM (VALUES ('A', 1), ('B', 2), ('a', 3), ('A ', 4), ('Z', 5), (NULL, 6), ('C', 7)) t(region, w);
@@ -55,6 +58,12 @@ CREATE MACRO st_fn_local(x) AS CAST(x * 2 + 1 AS INTEGER);
 
 statement ok
 CREATE MACRO cf_add_local(a, b) AS CAST(a + b AS INTEGER);
+
+statement ok
+CREATE MACRO st_tvf_local(lo) AS TABLE SELECT id, region, v FROM lb WHERE v >= lo;
+
+statement ok
+CREATE MACRO cf_range_local(n) AS TABLE SELECT range::INT AS value, (range * range)::INT AS squared FROM range(1, n + 1);
 
 query I
 SELECT count(*) FROM lb;
@@ -147,6 +156,12 @@ EXPLAIN WITH s AS MATERIALIZED (SELECT region, sum(v) AS s FROM rp.dbo.st_big GR
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
+# P16: a TVF with constant arguments, aggregated and joined with a server table: called by name in the server query
+query II
+EXPLAIN SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c FROM rp.dbo.st_tvf(90) f JOIN rp.dbo.st_dim d ON d.region = f.region GROUP BY d.region, d.label) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
 # N1: a scan with a filter only: the table scan pushes that already
 query II
 EXPLAIN SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region);
@@ -162,6 +177,12 @@ physical_plan	<REGEX>:.*Fabricator Query.*
 # N2: a function the provider implements in C# (cf_add): it does not exist on the server, so the part stays here
 query II
 EXPLAIN SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.cf_add(v, 1)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# N4: a table function the provider implements in C# (cf_range): it does not exist on the server
+query II
+EXPLAIN SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM rp.dbo.cf_range(5) x JOIN rp.dbo.st_big b ON b.id = x.value GROUP BY b.region) r USING (region);
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -328,6 +349,17 @@ SELECT count(*) FROM (WITH s AS MATERIALIZED (SELECT region, sum(v) AS s FROM lb
 ----
 5
 
+# P16
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c FROM rp.dbo.st_tvf(90) f JOIN rp.dbo.st_dim d ON d.region = f.region GROUP BY d.region, d.label) r USING (region)) EXCEPT ALL (SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c FROM st_tvf_local(90) f JOIN ld d ON d.region = f.region GROUP BY d.region, d.label) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c FROM st_tvf_local(90) f JOIN ld d ON d.region = f.region GROUP BY d.region, d.label) r USING (region)) EXCEPT ALL (SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c FROM rp.dbo.st_tvf(90) f JOIN rp.dbo.st_dim d ON d.region = f.region GROUP BY d.region, d.label) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c FROM st_tvf_local(90) f JOIN ld d ON d.region = f.region GROUP BY d.region, d.label) r USING (region));
+----
+4
+
 # N1
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region))));
@@ -360,6 +392,17 @@ query I
 SELECT count(*) FROM (SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(cf_add_local(v, 1)) AS s FROM lb GROUP BY region) r USING (region));
 ----
 5
+
+# N4
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM rp.dbo.cf_range(5) x JOIN rp.dbo.st_big b ON b.id = x.value GROUP BY b.region) r USING (region)) EXCEPT ALL (SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM cf_range_local(5) x JOIN lb b ON b.id = x.value GROUP BY b.region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM cf_range_local(5) x JOIN lb b ON b.id = x.value GROUP BY b.region) r USING (region)) EXCEPT ALL (SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM rp.dbo.cf_range(5) x JOIN rp.dbo.st_big b ON b.id = x.value GROUP BY b.region) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM cf_range_local(5) x JOIN lb b ON b.id = x.value GROUP BY b.region) r USING (region));
+----
+4
 
 # N3
 query I
@@ -472,6 +515,30 @@ query I
 SELECT count(*) FROM duckdb_logs WHERE message LIKE 'local subtree (before the optimizers): %dbo.cf_add() is not a function of the server';
 ----
 1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# P16 — the TVF is called by its schema and name, with its argument, inside the server query
+statement ok
+SELECT l.w, r.label, r.c FROM loc l JOIN (SELECT d.region, d.label, count(*) AS c FROM rp.dbo.st_tvf(90) f JOIN rp.dbo.st_dim d ON d.region = f.region GROUP BY d.region, d.label) r USING (region);
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'remote subtree (%): %FROM [dbo].[st_tvf](%) AS [t%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# N4 — a table function the provider implements itself is refused by the provider
+statement ok
+SELECT l.w, r.s FROM loc l JOIN (SELECT b.region, sum(x.squared) AS s FROM rp.dbo.cf_range(5) x JOIN rp.dbo.st_big b ON b.id = x.value GROUP BY b.region) r USING (region);
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE 'local subtree (%): %dbo.cf_range() is not a table function of the server';
+----
+true
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -626,4 +693,4 @@ EXPLAIN SELECT l.region, l.w, r.s, r.c FROM loc l JOIN (SELECT region, sum(v) AS
 physical_plan	<REGEX>:.*Fabricator Query.*
 
 statement ok
-SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.st_big; DROP TABLE IF EXISTS dbo.st_dim; DROP TABLE IF EXISTS dbo.st_out; DROP FUNCTION IF EXISTS dbo.st_fn; DROP FUNCTION IF EXISTS dbo.[abs];');
+SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.st_big; DROP TABLE IF EXISTS dbo.st_dim; DROP TABLE IF EXISTS dbo.st_out; DROP FUNCTION IF EXISTS dbo.st_fn; DROP FUNCTION IF EXISTS dbo.[abs]; DROP FUNCTION IF EXISTS dbo.st_tvf;');

@@ -1322,15 +1322,26 @@ bool MapToRemoteColumns(LogicalOperator &op, vector<int64_t> &out, optional_ptr<
 optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 	// ⚠ filter_pushdown: a scan that takes table filters may be the target of a join's dynamic filter, which the join
 	// keeps a pointer to — replacing the scan would leave it dangling. A SQL Server scan never declares it.
-	if (get.function.GetName() != "fabricator_scan" || !get.children.empty() || !get.bind_data ||
-	    get.function.filter_pushdown) {
+	if (!get.children.empty() || !get.bind_data || get.function.filter_pushdown) {
 		return nullptr;
 	}
-	auto table = get.GetTable();
-	if (!table || !FabricatorCatalog::Is(table->ParentCatalog())) {
+	optional_ptr<Catalog> owner;
+	if (get.function.GetName() == "fabricator_scan") {
+		auto table = get.GetTable();
+		if (table) {
+			owner = &table->ParentCatalog();
+		}
+	} else if (get.function.function == ::fabricator::ArrowStreamScan) {
+		// a table function of the catalog called with constants (see ResolveTableFunction)
+		auto data = dynamic_cast<::fabricator::ArrowStreamBindData *>(get.bind_data.get());
+		if (data) {
+			owner = data->table_function_catalog;
+		}
+	}
+	if (!owner || !FabricatorCatalog::Is(*owner)) {
 		return nullptr;
 	}
-	auto &catalog = table->ParentCatalog().Cast<FabricatorCatalog>();
+	auto &catalog = owner->Cast<FabricatorCatalog>();
 	if (!catalog.Supports(RemoteCapability::EXECUTE_QUERY_NODE)) {
 		return nullptr;
 	}
@@ -1808,8 +1819,11 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 
 //! Whether the plan scans a fabricator table at all — every other plan leaves this pass untouched.
 bool ReadsFabricatorTable(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET && op.Cast<LogicalGet>().function.GetName() == "fabricator_scan") {
-		return true;
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (get.function.GetName() == "fabricator_scan" || get.function.function == ::fabricator::ArrowStreamScan) {
+			return true;
+		}
 	}
 	for (auto &child : op.children) {
 		if (ReadsFabricatorTable(*child)) {
@@ -2102,7 +2116,22 @@ unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, un
 	return make_uniq<SubqueryRef>(std::move(declined));
 }
 
+//! A table function of an attached catalog called with constants, for to_substrait (its table_function_resolver).
+static bool ResolveTableFunction(LogicalGet &get, vector<string> &path, vector<Value> &args) {
+	if (get.function.function != ::fabricator::ArrowStreamScan || !get.bind_data || !get.children.empty()) {
+		return false;
+	}
+	auto data = dynamic_cast<::fabricator::ArrowStreamBindData *>(get.bind_data.get());
+	if (!data || data->table_function_path.empty()) {
+		return false;
+	}
+	path = data->table_function_path;
+	args = data->table_function_args;
+	return true;
+}
+
 void RegisterFabricatorSubtreePushdown(DBConfig &config) {
+	DuckDBToSubstrait::table_function_resolver = ResolveTableFunction;
 	OptimizerExtension extension;
 	extension.pre_optimize_function = SubtreePushdownPreOptimize;
 	extension.optimize_function = SubtreePushdownOptimize;

@@ -24,7 +24,10 @@ INSERT INTO dbo.pg_regions VALUES (''EU'', N''Europe''), (''US'', N''Americas'')
 INSERT INTO dbo.pg_sales VALUES (1,''EU'',10,''2026-01-05'',N''first''),(2,''US'',20,''2026-02-01'',NULL),(3,''EU'',30,''2026-02-07'',N''Größe''),(4,''US'',5,''2025-12-30'',N''late'');', refresh_cache := true);
 
 statement ok
-SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END', refresh_cache := true);
+SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_net(@a DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN @a * 0.8 END');
+
+statement ok
+SELECT fabricator_exec('mssql', 'CREATE OR ALTER FUNCTION dbo.pg_region_sales(@r VARCHAR(2)) RETURNS TABLE AS RETURN (SELECT id, amount FROM dbo.pg_sales WHERE region = @r)', refresh_cache := true);
 
 # ═══ S — SELECT ════════════════════════════════════════════════════════════════════════════════════════
 
@@ -133,6 +136,30 @@ SELECT r.name, (SELECT count(*) FROM mssql.dbo.pg_sales s WHERE s.region = r.reg
 ----
 Americas	2
 Europe	2
+
+# S10: a table-valued function with constant arguments, joined with a table of the catalog: one statement
+query II
+EXPLAIN SELECT r.name, s.id, s.amount FROM mssql.dbo.pg_region_sales('EU') s CROSS JOIN mssql.dbo.pg_regions r WHERE r.region = 'EU' ORDER BY 2;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TIT
+SELECT r.name, s.id, s.amount FROM mssql.dbo.pg_region_sales('EU') s CROSS JOIN mssql.dbo.pg_regions r WHERE r.region = 'EU' ORDER BY 2;
+----
+Europe	1	10.00
+Europe	3	30.00
+
+# S11: the same function called per row of a local table: one CROSS APPLY per chunk of distinct arguments
+query II
+EXPLAIN SELECT t.region, s.id FROM targets t, mssql.dbo.pg_region_sales(t.region) s;
+----
+physical_plan	<REGEX>:.*Fabricator Lateral Batched.*
+
+query TI
+SELECT t.region, s.id FROM targets t, mssql.dbo.pg_region_sales(t.region) s ORDER BY 2;
+----
+EU	1
+EU	3
 
 # the switch for parts of statements: S5 runs locally again, same answer
 statement ok
@@ -409,4 +436,4 @@ DETACH mssql_off;
 # ═══ Cleanup ═══════════════════════════════════════════════════════════════════════════════════════════
 
 statement ok
-SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_archive; DROP FUNCTION IF EXISTS dbo.pg_net;');
+SELECT fabricator_exec('mssql', 'DROP TABLE IF EXISTS dbo.pg_sales; DROP TABLE IF EXISTS dbo.pg_regions; DROP TABLE IF EXISTS dbo.pg_sales_eu; DROP TABLE IF EXISTS dbo.pg_totals; DROP TABLE IF EXISTS dbo.pg_archive; DROP FUNCTION IF EXISTS dbo.pg_net; DROP FUNCTION IF EXISTS dbo.pg_region_sales;');
