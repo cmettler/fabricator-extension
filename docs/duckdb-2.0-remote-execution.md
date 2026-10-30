@@ -1607,6 +1607,41 @@ provenance/drain logic was measured on the synchronous shape. F6: a pinned conne
 sessions must be serialized, and a warehouse has no MARS. Wrong, each of these degrades into "runs locally" or an
 error — except F1's decoder, the one change here that could alter values.
 
+### 4.19 Table statistics compared with mssql-adbc's GetStatistics — BUILT (2026-10-30, user-asked)
+
+mssql-adbc (`SqlServerStatistics.cs`, commit `7fbf0dd`) reads the same kind of server metadata: approximate row counts
+and per-column distinct counts, none on Synapse dedicated / Fabric Warehouse (no `sys.dm_db_stats_histogram`; we gate
+on `Profile.IsWarehouse` likewise). Four differences, each checked:
+
+| | mssql-adbc | ours before | ours now |
+|---|---|---|---|
+| row count | `sys.partitions.rows` | `sys.dm_db_partition_stats` | `sys.partitions` |
+| object without partitions (a VIEW) | not reported (tables only) | **0** | unknown (NULL) |
+| distinct count, several stats objects | the one that sampled most rows, then the newest | the MAX | as mssql-adbc |
+| the histogram's NULL step | not counted | counted as a value | not counted |
+| null count | reported | not reported | not reported |
+
+- **A view counted as EMPTY (measured).** `COALESCE(SUM(row_count), 0)` gave a view 0, which DuckDB believes: a view
+  over the 1M-row `rv_big` showed `est=0` beside the table's `est=1000000`, and a join with the 100-row `rv_dim` built
+  its hash table over the million rows. Here that cost ~10% (0.35 s vs 0.32 s — the transfer dominates); in a
+  multi-way join a false zero misorders the plan. Unknown now, so DuckDB falls back to its own default.
+- **The DMV needs VIEW DATABASE PERFORMANCE STATE (measured).** A user DENIED it gets *"The user does not have
+  permission to perform this action"* from `sys.dm_db_partition_stats` and the count from `sys.partitions`;
+  `sys.dm_db_stats_histogram` and `sys.dm_db_stats_properties` work for it either way. That was the long-recorded
+  WARNING for low-privileged logins (and why `verify_default_schema_mssql` grants the permission to its login —
+  no longer needed, left in place).
+- **Distinct counts** follow mssql-adbc's rule: a stale stats object can carry the larger count, and the NULL step is
+  not a value. Costing only — ungated, since the rig's tables have one stats object per column.
+- **Null counts are deliberately NOT adopted**, for the reason min/max are not: DuckDB would treat "no NULLs" as a
+  fact (dropping `IS NULL` branches), and a stale statistic would then drop rows. Distinct counts only ever weigh
+  join and filter estimates.
+- mssql-adbc also offers EXACT row counts (`COUNT_BIG(*)`) and reads a whole database at once; neither fits a scan's
+  lazy per-table estimate (and `count(*)` is pushed to the server anyway).
+
+Gate: `verify_cardinality` rewritten from "the query text reached the plan cache" (which an earlier run satisfies) to
+behaviour — a table's `~500 rows`, a view never `~0 rows`, and the estimate for a login denied the permission — 4 ->
+17. Mutants killed at their own rows: the view's 0 back (the view row), the DMV back (the low-privileged row).
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

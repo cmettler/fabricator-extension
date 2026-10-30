@@ -3643,33 +3643,46 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         "ORDER BY schema_name, name";
 
     // Per-column distinct-value estimate (NDV) from existing statistics — (column,
-    // ndv) rows. Derived from the leading-column histogram of each stats object:
-    // sum of distinct values strictly inside the steps + one per step boundary. Cheap
-    // (metadata, no scan); only columns that are a leading stat key appear (others =>
-    // no row => unknown). Used ONLY for selectivity estimation, so stale/approximate
-    // is safe (never drives pruning); min/max is deliberately not exposed.
+    // ndv) rows. Derived from the leading-column histogram of a stats object: one per
+    // step boundary (the NULL step excepted) + the distinct values strictly inside the
+    // steps. Where several stats objects lead with the column, the one that sampled the
+    // most rows (then the newest) answers — not the largest, which a stale object can
+    // be (the rule mssql-adbc's GetStatistics uses). Cheap (metadata, no scan); only
+    // columns that are a leading stat key appear (others => no row => unknown). Used
+    // ONLY for selectivity estimation, so stale/approximate is safe (never drives
+    // pruning); min/max and null counts are deliberately not exposed (docs/duckdb-2.0-
+    // remote-execution.md §4.19).
     private static string ColumnNdvSql(string schema, string table)
     {
         string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
         return
-            "SELECT c.name AS column_name, CAST(MAX(h.ndv) AS VARCHAR(32)) AS ndv " +
+            "SELECT c.name AS column_name, CAST(b.ndv AS VARCHAR(32)) AS ndv FROM (" +
+            "SELECT sc.column_id, h.ndv, ROW_NUMBER() OVER (PARTITION BY sc.column_id " +
+            "ORDER BY p.rows_sampled DESC, p.last_updated DESC) AS rn " +
             "FROM sys.stats s " +
             "JOIN sys.stats_columns sc ON sc.object_id = s.object_id AND sc.stats_id = s.stats_id AND sc.stats_column_id = 1 " +
-            "JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id " +
-            "CROSS APPLY (SELECT SUM(hist.distinct_range_rows) + COUNT_BIG(*) AS ndv " +
+            "CROSS APPLY (SELECT COUNT_BIG(*) - MAX(CASE WHEN hist.range_high_key IS NULL THEN 1 ELSE 0 END) " +
+            "             + SUM(hist.distinct_range_rows) AS ndv " +
             "             FROM sys.dm_db_stats_histogram(s.object_id, s.stats_id) hist) h " +
-            "WHERE s.object_id = OBJECT_ID(" + objectLiteral + ") AND h.ndv > 0 " +
-            "GROUP BY c.name";
+            "CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) p " +
+            "WHERE s.object_id = OBJECT_ID(" + objectLiteral + ")) b " +
+            "JOIN sys.columns c ON c.object_id = OBJECT_ID(" + objectLiteral + ") AND c.column_id = b.column_id " +
+            "WHERE b.rn = 1 AND b.ndv > 0";
     }
 
-    // Approximate row count (one VARCHAR cell) from partition stats — a cheap
+    // Approximate row count (one VARCHAR cell) from the partition catalog — a cheap
     // metadata read (not COUNT(*)) used for the optimizer's cardinality estimate.
-    // Views / tables with no partition rows yield 0.
+    // sys.partitions, not sys.dm_db_partition_stats: the DMV needs VIEW DATABASE
+    // PERFORMANCE STATE, the catalog view only what makes the table visible at all
+    // (measured: a user denied that permission gets an error from one, the count from
+    // the other). An object without partitions — a view — yields NULL, i.e. unknown:
+    // a 0 told DuckDB a view over a million rows was EMPTY (est=0), which made it the
+    // build side of a hash join.
     private static string RowCountSql(string schema, string table)
     {
         string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
-        return "SELECT CAST(COALESCE(SUM(p.row_count), 0) AS VARCHAR(32)) AS n " +
-               "FROM sys.dm_db_partition_stats p " +
+        return "SELECT CAST(SUM(p.rows) AS VARCHAR(32)) AS n " +
+               "FROM sys.partitions p " +
                "WHERE p.object_id = OBJECT_ID(" + objectLiteral + ") AND p.index_id IN (0, 1)";
     }
 

@@ -1553,7 +1553,8 @@ case "$TIER" in
         #             verify_remote_select_mssql 536 -> 570 (§16)
         # 2026-10-30: 6379 -> 6397: a lateral TVF call inside a writing transaction runs on its connection —
         #             verify_table_inout 97 -> 115
-        : "${MIN_ASSERTIONS:=6397}"
+        # 2026-10-30: 6397 -> 6410: table statistics from sys.partitions, a view unknown — verify_cardinality 4 -> 17
+        : "${MIN_ASSERTIONS:=6410}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -1,5 +1,8 @@
 # name: test/verify_cardinality.test
-# description: Verify the scan reports a row-count cardinality estimate to the optimizer
+# description: The scan's row-count estimate (docs/duckdb-2.0-remote-execution.md §4.19): the number of rows a table
+#              holds, from sys.partitions — for a login without VIEW DATABASE PERFORMANCE STATE too — and UNKNOWN for
+#              a view, which has no partitions (it used to be 0: DuckDB took a view over many rows for an empty one
+#              and built its hash join over it).
 # group: [fabricator]
 
 require fabricator
@@ -7,23 +10,58 @@ require fabricator
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'false');
 
-# Binding the table fetches its approximate row count for the optimizer.
 statement ok
-SELECT * FROM db.dbo.TestSimplePK LIMIT 1;
+SELECT fabricator_exec('db', 'DROP VIEW IF EXISTS dbo.cd_v; DROP TABLE IF EXISTS dbo.cd_t;
+CREATE TABLE dbo.cd_t (id INT PRIMARY KEY, g INT); INSERT INTO dbo.cd_t SELECT value, value % 7 FROM GENERATE_SERIES(1, 500);');
 
-# The partition-stats row-count query reached SQL Server.
-query I
-SELECT hit FROM fabricator_query('db',
-  'SELECT CAST(CASE WHEN EXISTS (
-     SELECT 1 FROM sys.dm_exec_query_stats qs
-     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
-     WHERE CHARINDEX(''dm_db_partition_stats'', st.text) > 0
-       AND CHARINDEX(''dm_exec'', st.text) = 0
-   ) THEN 1 ELSE 0 END AS INT) AS hit');
+statement ok
+SELECT fabricator_exec('db', 'CREATE VIEW dbo.cd_v AS SELECT id, g FROM dbo.cd_t');
+
+statement ok
+SELECT fabricator_exec('db', 'IF SUSER_ID(''cd_low_login'') IS NULL CREATE LOGIN cd_low_login WITH PASSWORD = ''Cd_Low_Pw_123!'', CHECK_POLICY = OFF;
+IF USER_ID(''cd_low_user'') IS NULL CREATE USER cd_low_user FOR LOGIN cd_low_login;
+GRANT SELECT ON dbo.cd_t TO cd_low_user; GRANT SELECT ON dbo.cd_v TO cd_low_user;
+DENY VIEW DATABASE PERFORMANCE STATE TO cd_low_user;', refresh_cache := true);
+
+# a table: its row count
+query II
+EXPLAIN SELECT * FROM db.dbo.cd_t;
 ----
-1
+physical_plan	<REGEX>:.*~500 rows.*
+
+# a view: no partitions, so no row count — never "empty"
+query II
+EXPLAIN SELECT * FROM db.dbo.cd_v;
+----
+physical_plan	<!REGEX>:.*~0 rows.*
+
+# a login denied VIEW DATABASE PERFORMANCE STATE still gets the table's row count
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN};User Id=cd_low_login;Password=Cd_Low_Pw_123!' AS low (TYPE fabricator, remote_pushdown 'false');
+
+query I
+SELECT HAS_PERMS FROM fabricator_query('low', 'SELECT HAS_PERMS_BY_NAME(NULL, ''DATABASE'', ''VIEW DATABASE PERFORMANCE STATE'') AS HAS_PERMS');
+----
+0
+
+query II
+EXPLAIN SELECT * FROM low.dbo.cd_t;
+----
+physical_plan	<REGEX>:.*~500 rows.*
+
+# the estimates change no answer
+query II
+SELECT count(*), sum(g) FROM low.dbo.cd_v;
+----
+500	1497
+
+statement ok
+DETACH low;
+
+statement ok
+SELECT fabricator_exec('db', 'DROP VIEW dbo.cd_v; DROP TABLE dbo.cd_t;');
 
 statement ok
 DETACH db;
