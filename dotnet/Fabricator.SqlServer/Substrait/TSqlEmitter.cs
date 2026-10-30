@@ -88,6 +88,16 @@ internal sealed class TSqlEmitter
     public Func<IReadOnlyList<string>, string?>? CatalogTableFunctions { get; init; }
 
     /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] For a table (or table function) by its names: the declared byte length of each
+    /// string column short enough for the bounded equality key (see <see cref="EqualityKey"/>); null when unknown.
+    /// </summary>
+    public Func<IReadOnlyList<string>, IReadOnlyDictionary<string, int>?>? ColumnByteLengths { get; init; }
+
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Rendered string columns with a known declared length: the column
+    /// reference without collation and its length in bytes.</summary>
+    private readonly Dictionary<string, (string Raw, int Bytes)> _boundedStrings = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// Writes the query. With <paramref name="nested"/>, the query is meant
     /// to be used as a derived table, so a final ORDER BY (which T-SQL does not
     /// allow there, and which would not order the outer query anyway) is left out.
@@ -501,11 +511,18 @@ internal sealed class TSqlEmitter
             _reads.Add((rel.TableNames, block.From));
             sqlTypes = _columnSqlTypes?.Invoke(rel.TableNames); // [FABRICATOR-PATCH: OURS-BY-DESIGN]
         }
+        var byteLengths = rel.VirtualRows == null ? ColumnByteLengths?.Invoke(rel.TableNames) : null;
         for (int i = 0; i < rel.ColumnNames.Count; i++)
         {
             string? sqlType = null;
             sqlTypes?.TryGetValue(rel.ColumnNames[i], out sqlType);
-            block.Columns.Add(ColumnOf(alias, rel.ColumnNames[i], rel.ColumnTypes[i], sqlType));
+            var column = ColumnOf(alias, rel.ColumnNames[i], rel.ColumnTypes[i], sqlType);
+            block.Columns.Add(column);
+            if (sqlType == null && column.Type.IsStringLike && byteLengths != null &&
+                byteLengths.TryGetValue(rel.ColumnNames[i], out int bytes))
+            {
+                _boundedStrings[column.Expr.Value] = (column.Raw ?? column.Expr.Value, bytes);
+            }
         }
 
         // The filters apply to the base schema, before the projection.
@@ -843,8 +860,8 @@ internal sealed class TSqlEmitter
 
         var keys = groupingExpressions.Select(e => Render(e, block.Columns)).ToList();
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] a string groups by its exact key and is read back from it
-        keys = keys.Select(k => k.Type.IsStringLike ? new SqlExpr(StringKey(k.Value), null, k.Type, k.Props) : new SqlExpr(Comparable(k.Type, k.Value), null, k.Type, k.Props)).ToList();
-        string Out(SqlExpr key, string value) => key.Type.IsStringLike ? StringFromKey(value) : value;
+        keys = keys.Select(k => k.Type.IsStringLike ? new SqlExpr(EqualityKey(k.Value), null, k.Type, k.Props) : new SqlExpr(Comparable(k.Type, k.Value), null, k.Type, k.Props)).ToList();
+        string Out(SqlExpr key, string value) => key.Type.IsStringLike ? StringFromEqualityKey(value) : value;
         var measures = measureList.Select(m => TSqlFunctionCatalog.WriteAggregate(this, m, block.Columns)).ToList();
 
         var output = new List<SqlColumn>(keys.Count + measures.Count + 1);
@@ -947,7 +964,7 @@ internal sealed class TSqlEmitter
             {
                 continue; // a constant puts every row in one partition, as no partition does
             }
-            partitions.Add(e.Type.IsStringLike ? StringKey(e.Value) : Comparable(e.Type, e.Value));
+            partitions.Add(e.Type.IsStringLike ? EqualityKey(e.Value) : Comparable(e.Type, e.Value));
         }
         foreach (var sort in rel.Sorts)
         {
@@ -1311,6 +1328,15 @@ internal sealed class TSqlEmitter
             From = TSql.Parenthesize(inner) + " AS " + alias,
             Columns = names.Select((n, i) => ColumnOf(alias, n, block.Columns[i].Type)).ToList(),
         };
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] a bounded column passed through keeps its bound
+        for (int i = 0; i < wrapped.Columns.Count; i++)
+        {
+            if (_boundedStrings.TryGetValue(block.Columns[i].Expr.Value, out var bound))
+            {
+                var outer = wrapped.Columns[i];
+                _boundedStrings[outer.Expr.Value] = (outer.Raw ?? outer.Expr.Value, bound.Bytes);
+            }
+        }
         foreach (var (name, descending) in hidden)
         {
             wrapped.OrderBy.Add(new OrderItem(alias + "." + TSql.Identifier(name), descending));
@@ -1485,7 +1511,8 @@ internal sealed class TSqlEmitter
     // where the collation the original relies on ignores trailing spaces and orders UTF-16 code units. The key
     // is UTF-8 under a binary collation (byte order = code point order), with CHAR(1) and CHAR(0) escaped and a
     // CHAR(0) appended, so that a prefix sorts first and no two different strings compare equal despite padding.
-    // One key serves equality, grouping, distinct and order. Measured: docs/duckdb-2.0-remote-execution.md §3.6.
+    // For ORDER (ORDER BY, < and >, min/max); equality uses the cheaper EqualityKey. Measured: docs/duckdb-2.0-remote-
+    // execution.md §3.6.
     internal static string StringKey(string value)
         => $"(REPLACE(REPLACE(CONVERT(varchar(max), ({value}) COLLATE Latin1_General_100_BIN2_UTF8), CHAR(1), CHAR(1) + CHAR(2)), CHAR(0), CHAR(1) + CHAR(1)) + CHAR(0))";
 
@@ -1537,6 +1564,31 @@ internal sealed class TSqlEmitter
         => type.IsBinaryLike
             ? throw SubstraitTranslationException.Unsupported("comparing, grouping or sorting binary values is not supported; SQL Server ignores trailing zero bytes.")
             : value;
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Exact string EQUALITY (=, IN, GROUP BY, DISTINCT, PARTITION BY, join keys):
+    /// the value as UTF-8 under a binary collation, with a sentinel the padding cannot reach. UTF-8 because the scan reads
+    /// an unpaired surrogate as U+FFFD, and so does this conversion — a UTF-16 key would keep values apart that DuckDB
+    /// sees as one. The varchar(MAX) it needs in general is what makes a key expensive (docs/duckdb-2.0-remote-execution.md
+    /// §4.18: 2.7 s against 0.43 s CPU over 1M rows), so a column whose declared length fits varchar(8000) gets that —
+    /// with a check that turns a value longer than that length (the column was widened since) into an error, never into
+    /// a cut key.
+    /// </summary>
+    internal string EqualityKey(string value)
+    {
+        if (_boundedStrings.TryGetValue(value, out var bound))
+        {
+            string guarded = $"CASE WHEN DATALENGTH({bound.Raw}) > {bound.Bytes.ToString(CultureInfo.InvariantCulture)} " +
+                             "THEN CONVERT(nvarchar(1), CAST(N'fabricator: a string is longer than its column was when the query was translated; run fabricator_refresh_cache' AS int)) " +
+                             $"ELSE {value} END";
+            return $"CONVERT(varchar(8000), ({guarded} + N'|') COLLATE Latin1_General_100_BIN2_UTF8)";
+        }
+        return $"CONVERT(varchar(max), ({value} + N'|') COLLATE Latin1_General_100_BIN2_UTF8)";
+    }
+
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The string an <see cref="EqualityKey"/> was made from.</summary>
+    internal static string StringFromEqualityKey(string key)
+        => $"CONVERT(nvarchar(max), LEFT({key}, LEN({key}) - 1))";
 
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The string a <see cref="StringKey"/> was made from.</summary>
     internal static string StringFromKey(string key)
@@ -1622,7 +1674,7 @@ internal sealed class TSqlEmitter
         Comparable(value.Type, value.Value); // [FABRICATOR-PATCH: OURS-BY-DESIGN] binary values decline
         if (value.Type.IsStringLike) // [FABRICATOR-PATCH: OURS-BY-DESIGN] strings compare by their exact key
         {
-            string exact = $"({StringKey(value.Value)} IN ({string.Join(", ", options.Select(o => StringKey(o.Value)))}))";
+            string exact = $"({EqualityKey(value.Value)} IN ({string.Join(", ", options.Select(o => EqualityKey(o.Value)))}))";
             // [FABRICATOR-PATCH: OURS-BY-DESIGN] an indexable superset first (see IndexableString)
             string? column = IndexableString(value.Value);
             var literals = options.Select(o => IndexableString(o.Value)).ToList();
@@ -1651,7 +1703,7 @@ internal sealed class TSqlEmitter
             {
                 var o = Render(record[i], scope);
                 props |= o.Props;
-                terms.Add(values[i].Type.IsStringLike ? $"{StringKey(values[i].Value)} = {StringKey(o.Value)}" : $"{Comparable(values[i].Type, values[i].Value)} = {o.Value}"); // [FABRICATOR-PATCH: OURS-BY-DESIGN] exact string equality
+                terms.Add(values[i].Type.IsStringLike ? $"{EqualityKey(values[i].Value)} = {EqualityKey(o.Value)}" : $"{Comparable(values[i].Type, values[i].Value)} = {o.Value}"); // [FABRICATOR-PATCH: OURS-BY-DESIGN] exact string equality
             }
             records.Add("(" + string.Join(" AND ", terms) + ")");
         }

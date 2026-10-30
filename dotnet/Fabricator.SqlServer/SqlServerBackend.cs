@@ -3260,10 +3260,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         try
         {
             var special = UncollatableColumns();
+            var bounded = BoundedStringColumns();
             sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
                 substraitPlan, HasIgnoreNulls, out columnCount, out orderDescending, out write,
                 names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null,
-                ServerFunctionName, ServerTableFunctionName, ConsistentReads);
+                ServerFunctionName, ServerTableFunctionName, ConsistentReads,
+                names => names.Count == 2 && bounded.TryGetValue(ExternalKey(names[0], names[1]), out var b) ? b : null);
         }
         catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
         {

@@ -609,7 +609,8 @@ REPLACE(REPLACE(CONVERT(VARCHAR(MAX), x COLLATE Latin1_General_100_BIN2_UTF8),
   U+1D11E): identical to DuckDB's order; decoding (`LEFT(k, LEN(k) - 1)`, then the two REPLACEs reversed)
   round-trips all 11. `rs_s` (VARCHAR and NVARCHAR) ordered identically too.
 - **Use**: string `min`/`max` (aggregate the key, decode the result), ORDER BY, `<`/`>`, and window ORDER BY.
-  Equality/GROUP BY keep the cheaper §4.3 key. ⚠ Needs UTF-8 collations (SQL Server 2019+, Fabric Warehouse);
+  Equality/GROUP BY use the cheaper equality key (§4.18 F1 — NOT §4.3's UTF-16 key, which splits unpaired
+  surrogates that the scan reads as one U+FFFD). ⚠ Needs UTF-8 collations (SQL Server 2019+, Fabric Warehouse);
   older engines decline. ⚠ A per-row expression: no index seek and possibly no batch-mode aggregate on it —
   exact, but not free; measure on columnstore before relying on the speed.
 
@@ -1461,6 +1462,132 @@ introduced by §4.14, measured, and fixed:
   [dbo].[st_tvf]`), P18 (LEFT JOIN LATERAL, computed argument, NULL argument), N6 (local outer stays `Fabricator
   Lateral Batched`) — 193 -> 210; guide S12. Mutants killed at P17: the apply never recognized; the passthrough fix
   reverted.
+
+### 4.18 Review of the pushdown stack — Roofline/Amdahl → Inverse Thinking/Napkin Math → Chesterton → Pre-Mortem (2026-10-30, user-asked)
+
+Method (user-proposed): find where it pays (which resource bounds a query shape, which share of a statement the pushed
+part is), look there for waste and wrong answers, check each fence before removing it, and ask what the fix itself
+could break. Correctness was taken as its own axis: the performance lenses cannot see a silent wrong row.
+
+**Rig.** TestDB: `rv_big` 1,000,000 rows (`id` PK, `region VARCHAR(10)` with 100 values, `v INT`), nonclustered index
+on `region INCLUDE (v)`, `rv_dim` 100 rows (`region` PK), inline TVF `rv_tvf(@r)` = `rv_big WHERE region = @r`. Server
+numbers from `sys.dm_exec_query_stats` (last run, warm), plan operators from `sys.dm_exec_query_plan`. Baseline = the
+same query hand-written in T-SQL through `fabricator_query`. Harness: scratchpad `review/`. ⚠ Wrapping a pushed query
+in `SELECT count(*) FROM (…)` changes what is sent (the server elided a one-row aggregate: 0 reads) — measure the
+statement itself.
+
+| case | pushed: server ms / CPU ms / reads | hand-written: server ms / CPU ms / reads |
+|---|---|---|
+| C1 `WHERE region = 'R042'` (count, sum) | seek, 31 reads — the indexable prefilter `[region] = 'R042' AND <exact key>` holds | seek, 31 |
+| C2 string join + filter on the dimension | 81.9 / 81.9 / 33 | 1.4 / 1.4 / 33 |
+| C3 `GROUP BY region` | 536.9 / **6740** / 2825 | 148.7 / 148.7 / 2751 |
+| C4 TVF per row of `rv_dim` (CROSS APPLY, 3 regions) | 93.3 / 93.3 / 97 | 4.6 / 4.6 / 95 |
+| C5 `SELECT DISTINCT region` | 536.3 / **6496** / 2825 | 116.2 / 116.2 / 2751 |
+
+Same reads, same access paths: the gap is CPU, all of it in the string key.
+
+**F1 — equality runs on the ORDER key since the Substrait port (measured; the biggest lever).** §3.6 says *"Equality /
+GROUP BY keep the cheaper §4.3 key"*; the emitter uses `StringKey` (VARCHAR(MAX) + two REPLACEs + sentinel, built for
+exact ORDER) for `=`, IN, GROUP BY, DISTINCT, PARTITION BY and join keys alike. The comment *"One key serves equality,
+grouping, distinct and order"* has no reason recorded beside it, and the hand-written renderer that carried the §4.3
+key was deleted with the port. Grouping 1M rows by `region`:
+
+| key | server ms | CPU ms |
+|---|---|---|
+| K0 today's `StringKey` | 564 | 7229 |
+| K5 §4.3 `(s + N'\|') COLLATE Latin1_General_100_BIN2` | 28 | 336 |
+| K1 `s COLLATE …_BIN2_UTF8` + `DATALENGTH(s)` | 39 | 416 |
+| K2 `CAST(s AS varbinary(8000))` + `DATALENGTH(s)` | 34 | 359 |
+| K3 plain `GROUP BY region` (inexact, serial plan) | 171 | 171 |
+
+⇒ K5 looked like the answer (~21× less CPU, exact by §4.3's measurement for case, padding and VARCHAR = NVARCHAR).
+K1/K2 are NOT safe as general keys: DATALENGTH differs between VARCHAR and NVARCHAR for the same text, and a BIN2
+collation without `_UTF8` converts a UTF-8 VARCHAR to code page 1252.
+
+**⚠⚠ AND K5 IS WRONG TOO — found because the user asked to check mssql-adbc's new UTF-16 work first ("riecht nach
+ähnlichen collation und size problemen").** mssql-adbc's Substrait translator had not changed since our port; its new
+`adbc.mssql.string_encoding=utf16` (text as `clast.utf16`, for UTF-16 consumers) is of no use to DuckDB, whose strings
+are UTF-8 — but its notes name UNPAIRED SURROGATES, and that is the case K5 gets wrong. NVARCHAR may hold one; our scan
+reads it as U+FFFD, so DuckDB sees `NCHAR(0xD800)`, `NCHAR(0xDC00)` and `NCHAR(0xFFFD)` as ONE value. K5 compares UTF-16
+code units and keeps them apart. Measured over 14 adversarial values (case, trailing space, NUL and `\x01` after a
+prefix, lone surrogates, U+FFFD, `?`, precomposed vs combining é, an emoji, empty, NULL): DuckDB over the read rows 12
+groups, today's key 12, **K5 14**. The UTF-8 conversion stays; what made it expensive is the MAX type:
+
+| key | CPU ms over 1M rows | groups of the 14 (DuckDB: 12) |
+|---|---|---|
+| K0 today (`varchar(max)`, two REPLACEs, NUL sentinel) | 7353 | 12 |
+| K6 `CONVERT(varchar(max), (s + N'\|') COLLATE Latin1_General_100_BIN2_UTF8)` | 2700 | 12 |
+| K7 the same as `varchar(8000)` | 431 | 12 |
+| K7 with the length check below | 477 | 12 |
+| K5 `(s + N'\|') COLLATE Latin1_General_100_BIN2` | 337 | **14** |
+
+**BUILT (2026-10-30): `TSqlEmitter.EqualityKey`** — for every EQUALITY context (`=`, `<>`, IN, GROUP BY, DISTINCT,
+`count(DISTINCT)`, PARTITION BY, IS [NOT] DISTINCT FROM, join keys); `StringKey` stays for ORDER BY, `<`/`>`/BETWEEN,
+string min/max. A grouped string is read back with `StringFromEqualityKey` (`LEFT(k, LEN(k) - 1)`).
+- **varchar(8000) only where it cannot cut**: a bare column whose declared length is at most 2666 characters (three
+  UTF-8 bytes per UTF-16 unit, plus the sentinel). The lengths come from one cached `sys.columns` read
+  (`BoundedStringColumns`, tables, views and table functions; dropped with the other metadata), and a column passed
+  through a derived table keeps its bound. Everything else — expressions, literals, long or MAX columns — takes K6.
+- **The check**: the bounded key is `CASE WHEN DATALENGTH(col) > <declared bytes> THEN <conversion error naming
+  fabricator_refresh_cache> ELSE col END`, so a column widened out of band since the lengths were read FAILS the query
+  rather than cutting two different values to one key. (A NULL does not trip it: `DATALENGTH(NULL) > n` is unknown.)
+- Measured after (server ms / CPU ms): C3 GROUP BY 537 / 6740 → **58 / 643**; C5 DISTINCT 536 / 6496 → **52 / 612**;
+  C4 APPLY 93 → **5.4** (hand-written 4.6).
+- Gate: `verify_remote_select_mssql` §16 (536 -> 570): the 14 values, eight equality shapes each pushed and compared
+  with DuckDB over the read rows (EXCEPT ALL both ways), and the widened-column check. Mutants, each killed at its own
+  row: a UTF-16 key (the surrogate groups), the bounded key without the check (two values cut to one group), and
+  varchar(8000) for every key (the long values after the refresh).
+
+**F2 — the CONVERT side (user's point), checked.** A string FILTER already keeps an indexable superset ANDed beside
+the exact key (`IndexableString`: the column without the query collation, an ASCII literal as non-Unicode) — C1
+seeks. The expensive contexts are those with no such prefilter: GROUP BY / DISTINCT / IS NOT DISTINCT FROM (DuckDB's
+decorrelation join-back). F1 is what makes them cheap; a key on the column side forfeits index ORDER there (no stream
+aggregate over the index), which is acceptable at K5's cost.
+
+**F3 — fixed cost per pushed statement ≈ 5–10 ms** (describe + execute + compile; by Amdahl it dominates small
+statements only). Seen on the way: one statement's bind described `rv_big` twice (`WHERE 1 = 0`). Minor.
+
+**F4 — the APPLY reads its outer side twice** (DISTINCT over the arguments + join back), so it needs a consistent read
+(§4.16) and costs a second scan of the outer. A direct `t CROSS APPLY f(t.a)` is not built.
+
+**F5 — a waiting lateral call SPINS A CORE (measured).** A lateral TVF call blocked 13.7 s by another session's lock
+cost **13.6 s of process CPU**; the same query at `SET threads = 1` 0.1 s; a blocked plain scan 0.2 s; a slow but
+unblocked lateral call 0.03 s over 1.2 s. Cause (DuckDB 2.0, read): the client's result loops wait only on `BLOCKED`
+(`query_result.cpp`, `CompleteDelegatedInternal`); when the one running task is another thread's synchronous call,
+the executor answers `NO_TASKS_AVAILABLE` and the loop polls again without waiting. Our scan avoids it because its
+pull returns BLOCKED (scan-concurrency.md §5f); the lateral operator calls synchronously. Not SqlClient: an
+`ExecuteReaderAsync` probe spun the same. Fix options: an asynchronous lateral call (operator BLOCKED + reschedule), or
+upstream (any long synchronous operator on a worker thread spins the client).
+
+**F6 — a lateral TVF inside a transaction that wrote BLOCKS ON ITS OWN LOCKS (measured, pre-existing since step 2).**
+`BEGIN; INSERT INTO db.dbo.rv_big …; SELECT … FROM db.dbo.rv_dim d, db.dbo.rv_tvf(d.region) f …` → 30 s, then
+*"Execution Timeout Expired"*. The lateral session opens its OWN connection and transaction (`BeginInOutScope`), so
+under locking READ COMMITTED it waits for the statement's own transaction; under RCSI it would not see the
+transaction's writes (inferred, not measured). The pushed APPLY declines there (repeated reads + pinned connection),
+so it lands on this path. Fix options: run the calls on the pinned connection while the transaction holds one
+(serialized; needs MARS), or refuse the lateral form with a clear message once the transaction has written.
+
+**F7 — argument conversion in the APPLY: no difference (measured).** Truncation into VARCHAR(10), Unicode into a
+non-Unicode parameter (emoji → `??`), trailing spaces, DECIMAL(12,4) → DECIMAL(10,2) rounding and NULL: the pushed
+APPLY and the lateral path return identical rows (EXCEPT ALL both ways empty).
+
+**F8 — the lateral call cannot be interrupted** (read): `SqlServerTvfLateral` runs `ExecuteReader()` without the
+`InterruptScope` token the scans use, so Ctrl+C waits for the server or the 30 s timeout.
+
+**Chesterton.** F1's fence (one key) had no recorded reason and contradicted §3.6 — but HALF of it was load-bearing
+after all: the UTF-8 conversion is what makes an unpaired surrogate compare as DuckDB reads it. Removed only the
+half that was not (the MAX type and the ORDER-only escaping). Kept, each with a
+recorded reason: string ORDER only via `StringKey` (padding, UTF-16 order), `lower`/`upper` (Unicode 5.0 tables), the
+SINGLE-join refusal (§4.16), the `filter_pushdown` veto (dangling dynamic filter), binary comparisons declined
+(trailing zero bytes).
+
+**Pre-mortem of the fixes.** F1: a grouped string travels as its key and the wrapper decodes it — a decoder that does
+not match the key garbles every grouped string (loud in the differential suites); a VARCHAR = NVARCHAR join must
+still meet one representation (`+ N'|'` does that); the adversarial values (NUL, `\x01` after a prefix, non-BMP,
+trailing space, case) must stay in the gate. F5: an asynchronous in-out operator changes when output appears — the
+provenance/drain logic was measured on the synchronous shape. F6: a pinned connection shared by parallel lateral
+sessions must be serialized, and a warehouse has no MARS. Wrong, each of these degrades into "runs locally" or an
+error — except F1's decoder, the one change here that could alter values.
 
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 

@@ -771,6 +771,10 @@ internal static class TSqlFunctionCatalog
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Argument <paramref name="i"/>, a string as its exact key.</summary>
     private static string K(TSqlCall c, int i) => c.T(i).IsStringLike ? TSqlEmitter.StringKey(c.V(i)) : TSqlEmitter.Comparable(c.T(i), c.V(i));
 
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Argument <paramref name="i"/> for an EQUALITY, a string as its equality
+    /// key (cheaper than the order key <see cref="K"/>).</summary>
+    private static string KE(TSqlCall c, int i) => c.T(i).IsStringLike ? c.Emitter.EqualityKey(c.V(i)) : TSqlEmitter.Comparable(c.T(i), c.V(i));
+
     /// <summary>
     /// [FABRICATOR-PATCH: OFFER-READY] An average computed as its exact sum divided by its count, in float; null
     /// when no value counts (SUM is null then, and the count is nulled so nothing divides by zero).
@@ -934,8 +938,8 @@ internal static class TSqlFunctionCatalog
         // shorter string with spaces, and binary values with zeros, before comparing.
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] ...except that a string compares by its exact key (K), so neither padding nor
         // case nor UTF-16 order changes the answer; see TSqlEmitter.StringKey.
-        Condition(ComparisonUrn, "equal", "=", "INFIX", c => Indexable(c, $"({K(c, 0)} = {K(c, 1)})"), V("any_any"));
-        Condition(ComparisonUrn, "not_equal", "<>", "INFIX", c => $"({K(c, 0)} <> {K(c, 1)})", V("any_any"));
+        Condition(ComparisonUrn, "equal", "=", "INFIX", c => Indexable(c, $"({KE(c, 0)} = {KE(c, 1)})"), V("any_any"));
+        Condition(ComparisonUrn, "not_equal", "<>", "INFIX", c => $"({KE(c, 0)} <> {KE(c, 1)})", V("any_any"));
         foreach (var (name, op) in new[] { ("lt", "<"), ("lte", "<="), ("gt", ">"), ("gte", ">=") })
         {
             Condition(ComparisonUrn, name, op, "INFIX", c => Ordered(c, $"({K(c, 0)} {op} {K(c, 1)})"), V("any_any"));
@@ -954,8 +958,8 @@ internal static class TSqlFunctionCatalog
         Scalar(ComparisonUrn, "nullif", "NULLIF", "FUNCTION", SameAsFirst, c => $"NULLIF({c.V(0)}, {c.V(1)})", V("any_any"));
         Scalar(ComparisonUrn, "coalesce", "COALESCE", "FUNCTION", SameAsFirst, c => $"COALESCE({c.Join(", ")})",
             new TSqlFunctionVariant(["any"]) { VariadicMin = 2 });
-        Condition(ComparisonUrn, "is_distinct_from", "IS DISTINCT FROM", "INFIX", c => $"({K(c, 0)} IS DISTINCT FROM {K(c, 1)})", V("any_any"));
-        Condition(ComparisonUrn, "is_not_distinct_from", "IS NOT DISTINCT FROM", "INFIX", c => $"({K(c, 0)} IS NOT DISTINCT FROM {K(c, 1)})", V("any_any"));
+        Condition(ComparisonUrn, "is_distinct_from", "IS DISTINCT FROM", "INFIX", c => $"({KE(c, 0)} IS DISTINCT FROM {KE(c, 1)})", V("any_any"));
+        Condition(ComparisonUrn, "is_not_distinct_from", "IS NOT DISTINCT FROM", "INFIX", c => $"({KE(c, 0)} IS NOT DISTINCT FROM {KE(c, 1)})", V("any_any"));
         // LEAST and GREATEST skip nulls; Substrait's least and greatest return null if any argument is null.
         foreach (var (name, sql) in new[] { ("least", "LEAST"), ("greatest", "GREATEST") })
         {
@@ -1265,7 +1269,7 @@ internal static class TSqlFunctionCatalog
         }
         if (c.Distinct && c.T(0).IsStringLike) // [FABRICATOR-PATCH: OURS-BY-DESIGN] distinct strings by their exact key
         {
-            return $"COUNT_BIG(DISTINCT {TSqlEmitter.StringKey(c.AggArg(0))})";
+            return $"COUNT_BIG(DISTINCT {c.Emitter.EqualityKey(c.AggArg(0))})";
         }
         return $"COUNT_BIG({c.DistinctPrefix}{c.AggArg(0)})";
     }

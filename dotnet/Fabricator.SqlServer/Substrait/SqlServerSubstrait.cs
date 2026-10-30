@@ -76,9 +76,10 @@ public static class SqlServerSubstrait
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null,
                                              Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
                                              Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null,
-                                             Func<bool>? consistentReads = null)
+                                             Func<bool>? consistentReads = null,
+                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, int>?>? columnByteLengths = null)
         => TranslatePushdown(plan, ignoreNulls, out columnCount, out orderDescending, out _, columnSqlTypes, catalogFunctions,
-                             catalogTableFunctions, consistentReads);
+                             catalogTableFunctions, consistentReads, columnByteLengths);
 
     /// <param name="write">For a plan that writes (INSERT … SELECT, DELETE, UPDATE), the operation, the target table
     /// and the columns it writes; the query is then a statement with no result, and <paramref name="columnCount"/>
@@ -89,7 +90,8 @@ public static class SqlServerSubstrait
                                              Func<IReadOnlyList<string>, IReadOnlyDictionary<string, string>?>? columnSqlTypes = null,
                                              Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
                                              Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null,
-                                             Func<bool>? consistentReads = null)
+                                             Func<bool>? consistentReads = null,
+                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, int>?>? columnByteLengths = null)
     {
         if (plan == null || plan.Length == 0)
         {
@@ -107,7 +109,7 @@ public static class SqlServerSubstrait
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes)
         {
             SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, CatalogFunctions = catalogFunctions,
-            CatalogTableFunctions = catalogTableFunctions
+            CatalogTableFunctions = catalogTableFunctions, ColumnByteLengths = columnByteLengths
         };
         if (root.Input is WriteRel writeRel)
         {

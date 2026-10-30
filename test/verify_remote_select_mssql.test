@@ -1581,3 +1581,143 @@ RESET mssql_mars;
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_ty');
+
+# ═══ §16  Exact string equality: the equality key (docs/duckdb-2.0-remote-execution.md §4.18 F1) ═══════════
+# Equality (=, IN, GROUP BY, DISTINCT, PARTITION BY, join keys) compares strings as UTF-8 under a binary collation
+# with a sentinel: varchar(8000) for a column whose declared length fits, varchar(max) otherwise. UTF-8, not the
+# server's UTF-16: the scan reads an unpaired surrogate as U+FFFD, and so does the key — a UTF-16 key would keep
+# NCHAR(0xD800), NCHAR(0xDC00) and NCHAR(0xFFFD) apart where DuckDB sees one value. Each query also runs on a local
+# copy (le, the rows as read); both directions of EXCEPT ALL must be empty.
+
+statement ok
+SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.rs_eq; CREATE TABLE dbo.rs_eq (k INT, s NVARCHAR(20), l NVARCHAR(MAX), v VARCHAR(10));
+INSERT INTO dbo.rs_eq (k, s) VALUES (1, N''a''), (2, N''a ''), (3, N''A''), (4, N''a'' + NCHAR(0)), (5, N''a'' + NCHAR(1)),
+  (6, NCHAR(0xD800)), (7, NCHAR(0xDC00)), (8, NCHAR(0xFFFD)), (9, N''?''), (10, NCHAR(233)), (11, N''e'' + NCHAR(769)),
+  (12, NCHAR(0xD83D) + NCHAR(0xDE00)), (13, N''''), (14, NULL), (15, N''a''), (16, NCHAR(0xD800)), (17, N''A  '');
+UPDATE dbo.rs_eq SET l = s, v = CONVERT(VARCHAR(10), s);', refresh_cache := true);
+
+statement ok
+CREATE TABLE le AS SELECT * FROM rp.dbo.rs_eq;
+
+query I
+SELECT count(*) FROM (SELECT s FROM le GROUP BY s);
+----
+13
+
+# Q1: GROUP BY a short column (the bounded key)
+query II
+EXPLAIN SELECT s, count(*) AS n FROM rp.dbo.rs_eq GROUP BY s;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT s, count(*) AS n FROM rp.dbo.rs_eq GROUP BY s) EXCEPT ALL (SELECT s, count(*) AS n FROM le GROUP BY s))) + (SELECT count(*) FROM ((SELECT s, count(*) AS n FROM le GROUP BY s) EXCEPT ALL (SELECT s, count(*) AS n FROM rp.dbo.rs_eq GROUP BY s)));
+----
+0
+
+# Q2: GROUP BY nvarchar(max) (the unbounded key)
+query II
+EXPLAIN SELECT l, count(*) AS n FROM rp.dbo.rs_eq GROUP BY l;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT l, count(*) AS n FROM rp.dbo.rs_eq GROUP BY l) EXCEPT ALL (SELECT l, count(*) AS n FROM le GROUP BY l))) + (SELECT count(*) FROM ((SELECT l, count(*) AS n FROM le GROUP BY l) EXCEPT ALL (SELECT l, count(*) AS n FROM rp.dbo.rs_eq GROUP BY l)));
+----
+0
+
+# Q3: DISTINCT over varchar
+query II
+EXPLAIN SELECT DISTINCT v FROM rp.dbo.rs_eq;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT DISTINCT v FROM rp.dbo.rs_eq) EXCEPT ALL (SELECT DISTINCT v FROM le))) + (SELECT count(*) FROM ((SELECT DISTINCT v FROM le) EXCEPT ALL (SELECT DISTINCT v FROM rp.dbo.rs_eq)));
+----
+0
+
+# Q4: count(DISTINCT)
+query II
+EXPLAIN SELECT count(DISTINCT s) AS d, count(DISTINCT l) AS dl FROM rp.dbo.rs_eq;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT count(DISTINCT s) AS d, count(DISTINCT l) AS dl FROM rp.dbo.rs_eq) EXCEPT ALL (SELECT count(DISTINCT s) AS d, count(DISTINCT l) AS dl FROM le))) + (SELECT count(*) FROM ((SELECT count(DISTINCT s) AS d, count(DISTINCT l) AS dl FROM le) EXCEPT ALL (SELECT count(DISTINCT s) AS d, count(DISTINCT l) AS dl FROM rp.dbo.rs_eq)));
+----
+0
+
+# Q5: a join on nvarchar(20) = nvarchar(max)
+query II
+EXPLAIN SELECT a.k, b.k AS k2 FROM rp.dbo.rs_eq a JOIN rp.dbo.rs_eq b ON a.s = b.l;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT a.k, b.k AS k2 FROM rp.dbo.rs_eq a JOIN rp.dbo.rs_eq b ON a.s = b.l) EXCEPT ALL (SELECT a.k, b.k AS k2 FROM le a JOIN le b ON a.s = b.l))) + (SELECT count(*) FROM ((SELECT a.k, b.k AS k2 FROM le a JOIN le b ON a.s = b.l) EXCEPT ALL (SELECT a.k, b.k AS k2 FROM rp.dbo.rs_eq a JOIN rp.dbo.rs_eq b ON a.s = b.l)));
+----
+0
+
+# Q6: a join on nvarchar = varchar
+query II
+EXPLAIN SELECT a.k, b.k AS k2 FROM rp.dbo.rs_eq a JOIN rp.dbo.rs_eq b ON a.s = b.v;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT a.k, b.k AS k2 FROM rp.dbo.rs_eq a JOIN rp.dbo.rs_eq b ON a.s = b.v) EXCEPT ALL (SELECT a.k, b.k AS k2 FROM le a JOIN le b ON a.s = b.v))) + (SELECT count(*) FROM ((SELECT a.k, b.k AS k2 FROM le a JOIN le b ON a.s = b.v) EXCEPT ALL (SELECT a.k, b.k AS k2 FROM rp.dbo.rs_eq a JOIN rp.dbo.rs_eq b ON a.s = b.v)));
+----
+0
+
+# Q7: IN with literals
+query II
+EXPLAIN SELECT count(*) AS n, sum(k) AS sk FROM rp.dbo.rs_eq WHERE s IN ('a', 'a ', '?', 'A');
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT count(*) AS n, sum(k) AS sk FROM rp.dbo.rs_eq WHERE s IN ('a', 'a ', '?', 'A')) EXCEPT ALL (SELECT count(*) AS n, sum(k) AS sk FROM le WHERE s IN ('a', 'a ', '?', 'A')))) + (SELECT count(*) FROM ((SELECT count(*) AS n, sum(k) AS sk FROM le WHERE s IN ('a', 'a ', '?', 'A')) EXCEPT ALL (SELECT count(*) AS n, sum(k) AS sk FROM rp.dbo.rs_eq WHERE s IN ('a', 'a ', '?', 'A'))));
+----
+0
+
+# Q8: PARTITION BY a string
+query II
+EXPLAIN SELECT k, count(*) OVER (PARTITION BY s) AS n FROM rp.dbo.rs_eq;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT k, count(*) OVER (PARTITION BY s) AS n FROM rp.dbo.rs_eq) EXCEPT ALL (SELECT k, count(*) OVER (PARTITION BY s) AS n FROM le))) + (SELECT count(*) FROM ((SELECT k, count(*) OVER (PARTITION BY s) AS n FROM le) EXCEPT ALL (SELECT k, count(*) OVER (PARTITION BY s) AS n FROM rp.dbo.rs_eq)));
+----
+0
+
+# the bounded key checks every value against the length it was translated for: a column widened out of band (no
+# refresh) fails the query, never cuts two keys to one. Both long values are 9001 bytes in UTF-8 and differ only in
+# the last character, after varchar(8000) would have cut them.
+statement ok
+SELECT fabricator_exec('rp', 'DROP TABLE IF EXISTS dbo.rs_wide; CREATE TABLE dbo.rs_wide (s NVARCHAR(10)); INSERT INTO dbo.rs_wide VALUES (N''x'');', refresh_cache := true);
+
+query I
+SELECT count(*) FROM (SELECT s FROM rp.dbo.rs_wide GROUP BY s);
+----
+1
+
+statement ok
+SELECT fabricator_exec('db', 'ALTER TABLE dbo.rs_wide ALTER COLUMN s NVARCHAR(4000); INSERT INTO dbo.rs_wide VALUES (REPLICATE(NCHAR(8364), 3000) + N''a''), (REPLICATE(NCHAR(8364), 3000) + N''b'');');
+
+statement error
+SELECT s, count(*) FROM rp.dbo.rs_wide GROUP BY s;
+----
+is longer than its column was when the query was translated
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+query I
+SELECT count(*) FROM (SELECT s FROM rp.dbo.rs_wide GROUP BY s);
+----
+3
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_eq; DROP TABLE dbo.rs_wide');

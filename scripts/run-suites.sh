@@ -1549,7 +1549,9 @@ case "$TIER" in
         # 184 -> 193 (P14 at SNAPSHOT, the in-transaction decline, P13 -> N5).
         # 2026-10-30: 6318 -> 6345: a TVF called per row of a server table as CROSS APPLY — verify_subtree_pushdown_mssql
         #             193 -> 210 (P17, P18, N6), verify_pushdown_guide_mssql 140 -> 150 (S12)
-        : "${MIN_ASSERTIONS:=6345}"
+        # 2026-10-30: 6345 -> 6379: string equality on its own key (UTF-8, varchar(8000) where the column fits) —
+        #             verify_remote_select_mssql 536 -> 570 (§16)
+        : "${MIN_ASSERTIONS:=6379}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
