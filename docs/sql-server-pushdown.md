@@ -13,7 +13,7 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | Statement | Pushed when … | `EXPLAIN` shows | Otherwise |
 |---|---|---|---|
 | `SELECT` | it joins, aggregates, sorts with a limit, uses windows, … over tables of the catalog (S1) | `Fabricator Query` | `Fabricator Scan` (+ DuckDB operators); the scan still sends its filter and columns to the server (S2) |
-| part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5–S8) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
+| part of a statement — a subquery or CTE | it reads tables of the catalog alone and aggregates, joins, … while the rest of the statement reads local data (S5–S9) | `Fabricator Query` under DuckDB's own join | `Fabricator Scan` (S4) |
 | `INSERT … SELECT` | the `SELECT` reads tables of the same catalog and translates exactly (I1) | `FABRICATOR_REMOTE_DML` | `Mssql Net Insert`: DuckDB streams the rows into a bulk copy — and still pushes the `SELECT` when worth it |
 | `INSERT … VALUES` | never — a bulk copy is already the fast path (I2) | — | `Mssql Net Insert` |
 | `CREATE TABLE … AS` | its query is pushed (C1) | `Fabricator Remote Ctas` | `Mssql Net Create Table As`: rows stream into a bulk copy (C2) |
@@ -234,6 +234,18 @@ Without this the table came over and the function was called once per batch, `SE
 the server's value. It crosses as its schema and name, never by its bare name — a `dbo.abs` is called as `[dbo].[abs]`,
 not as `ABS`. A function the provider implements itself (C#-authored, a plugin's, the Fabric API and CDC functions)
 does not exist on the server and keeps its part local (L2). Table-valued functions are not covered yet.
+
+**S9 — pushed: a correlated subquery.** DuckDB decorrelates it before planning — the outer rows become a CTE, the
+correlation a join with their distinct keys — and the server gets that CTE inlined, as one statement. This covers what
+cannot be written as a plain join: an inequality, a `LIMIT` per outer row, a `WITH … AS MATERIALIZED` read twice.
+
+```sql
+SELECT r.name, (SELECT count(*) FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount > r.region_rank) AS n
+FROM (SELECT region, name, CASE region WHEN 'EU' THEN 9 ELSE 4 END AS region_rank FROM mssql.dbo.pg_regions) r;
+-- one statement; the outer query is read once per reference.   Americas 2 / Europe 2
+```
+
+A correlated subquery whose OUTER side is local data stays as before: its remote part is sent uncorrelated.
 
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
 connection), a part calling a function the provider implements itself or a function of another catalog, a part

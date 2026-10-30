@@ -1541,7 +1541,9 @@ case "$TIER" in
         # verify_pushdown_guide_mssql 113 -> 119 (S8, L2 on cf_add), verify_remote_select_mssql 531 -> 536 (§5b).
         # 2026-10-30: 6227 -> 6259: TVFs per row as lateral calls, `_each` gone for TVFs — verify_table_inout 63 -> 97,
         # verify_functions 105 -> 103. Nothing else moved.
-        : "${MIN_ASSERTIONS:=6259}"
+        # 2026-10-30: 6259 -> 6277: correlated subqueries / materialized CTEs pushed — verify_subtree_pushdown_mssql
+        # 155 -> 167 (P13-P15), verify_pushdown_guide_mssql 119 -> 125 (S9).
+        : "${MIN_ASSERTIONS:=6277}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

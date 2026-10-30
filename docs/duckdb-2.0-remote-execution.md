@@ -1365,6 +1365,26 @@ fetched the table and called `SELECT [dbo].[f](@p0) UNION ALL SELECT [dbo].[f](@
   N2 (C# cf_add stays local, reason logged) — 155; guide S8 + L2 (119); remote_select §5b rewritten (536). Mutant
   "catalog functions by their bare name" killed at P12. Not built: table-valued functions (step 3), UDFs in pushed DML.
 
+### 4.14 Correlated subqueries and materialized CTEs in a pushed part — BUILT (2026-10-30, step 3a)
+
+The plan was an APPLY encoding; looking at the plans first showed it is not needed here. DuckDB 2.0 decorrelates
+BEFORE the optimizers into a `__duckdb_delim_<n>` CTE: the outer rows, their distinct correlation keys, plain joins
+(an inequality becomes a join `k > k`, a LIMIT per row a window). Everything but the CTE already translated; the
+decline was "local: CTE".
+
+- `InlineCtes` (on the translated COPY, after the pre pass's FilterPushdown): each CTE reference becomes a projection
+  carrying the reference's own table index over a copy of the definition. Copies keep the definition's internal
+  indices — each sits under its projection, which is all the operators above can see.
+- **DuckDB hangs the decorrelation CTE at the TOP of the statement**, above the join with local data. So a reference
+  may be inlined from a definition ABOVE the replaced subtree: `SubtreePushdown::Replaceable` accepts a subtree whose
+  outside CTE references all have a pure definition reading the same catalog. Without that, a correlated subquery in a
+  derived table joined with local data (P13) produced no trace at all — nothing was even attempted.
+- Measured pushed: correlated scalar with inequality, LATERAL with inequality + LIMIT, WITH … AS MATERIALIZED read
+  twice. Still local: a correlated EXISTS with an OR (to_substrait fails to bind a column — declines safely).
+- Gates: `verify_subtree_pushdown_mssql` P13–P15 (167, each with its differential), guide S9. Mutant "a CTE reference is
+  never replaceable" killed at P13. Not built: a correlated subquery whose OUTER side is local (step 4, key shipping),
+  TVFs inside a pushed part (step 3b, needs a table-function relation in Substrait).
+
 ## 5. Open: dynamic join filters for SQL Server scans (recorded 2026-10-27, nothing built)
 
 DuckDB hands a hash join's DYNAMIC filter (the build side's min/max, an IN list) only to a scan whose function sets

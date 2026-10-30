@@ -122,6 +122,18 @@ SELECT region, sum(mssql.dbo.pg_net(amount)) AS net FROM mssql.dbo.pg_sales GROU
 EU	32.00
 US	20.00
 
+# S9: a correlated subquery — DuckDB turns it into a CTE and joins, which the server gets inlined, as one statement
+query II
+EXPLAIN SELECT r.name, (SELECT count(*) FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount > r.region_rank) AS n FROM (SELECT region, name, CASE region WHEN 'EU' THEN 9 ELSE 4 END AS region_rank FROM mssql.dbo.pg_regions) r ORDER BY 1;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query TI
+SELECT r.name, (SELECT count(*) FROM mssql.dbo.pg_sales s WHERE s.region = r.region AND s.amount > r.region_rank) AS n FROM (SELECT region, name, CASE region WHEN 'EU' THEN 9 ELSE 4 END AS region_rank FROM mssql.dbo.pg_regions) r ORDER BY 1;
+----
+Americas	2
+Europe	2
+
 # the switch for parts of statements: S5 runs locally again, same answer
 statement ok
 SET fabricator_subtree_pushdown = false;

@@ -333,7 +333,10 @@ a scalar `(SELECT max(v) FROM mssql.dbo.big)`, an `IN (SELECT … GROUP BY … H
 `Fabricator Query` under DuckDB's own join. The same exactness rule applies, and nothing is pushed in a statement that
 writes a table of the catalog. A **SQL Server scalar UDF** (`mssql.dbo.f(x)`) is called on the server, by its schema and
 name — in a part, or in a whole query that reads the catalog alone; before, the table came over and the function was
-called once per batch. A function the provider implements itself (C#, a plugin) keeps its part local. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
+called once per batch. A function the provider implements itself (C#, a plugin) keeps its part local. A
+**correlated subquery** over the catalog — an inequality, a `LATERAL (… LIMIT n)` per row, a
+`WITH … AS MATERIALIZED` read twice — goes as one statement too: DuckDB turns it into a CTE and joins, and the
+CTE is inlined for the server. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
 condition down). `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.
 
 ⚠ **The one accepted difference: `lower` / `upper`.** SQL Server's case tables are Unicode 5.0, DuckDB's are
