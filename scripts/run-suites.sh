@@ -1038,7 +1038,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=84}"   # 2026-10-30: +verify_dynamic_filters_mssql; 2026-10-30: +verify_subtree_pushdown_mssql; 2026-10-29: +verify_merge_pushdown_mssql; 2026-10-29: +verify_moved_rows_mssql; 2026-10-29: +verify_remote_dml_mssql; 2026-10-29: +verify_returning_mssql, +verify_pushdown_guide_mssql; 2026-10-29: +verify_remote_insert_mssql; 2026-10-29: +verify_session_context_mssql; 2026-10-29: +verify_default_schema_mssql; 2026-10-27: +verify_ducklake_mssql; 2026-10-27: +verify_sql_variant_mssql; 2026-10-27: +6 runs, the remote-pushdown-off leg (PUSHDOWN_OFF); 2026-10-27: +verify_hidden_rowid, +verify_bind_schema_cache; 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql; 2026-10-26: +verify_mssql_external_delete, +verify_mssql_external_txn
+        : "${MIN_SUITES:=87}"   # 2026-10-31: +verify_tpch_mssql, +verify_tpcds_mssql, +verify_pushdown_edges_mssql
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1570,7 +1570,7 @@ case "$TIER" in
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
         # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
         #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
-        : "${MIN_ASSERTIONS:=6803}"   # 2026-10-31: +29 IN / NOT IN as a WHERE condition (remote_select §22); +45 grouping sets; +15 single join
+        : "${MIN_ASSERTIONS:=137113}"   # 2026-10-31: +130310 TPC-H / TPC-DS (every value counts) and the edge cases; +29 IN / NOT IN; +45 grouping sets; +15 single join
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

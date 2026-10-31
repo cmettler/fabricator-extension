@@ -34,7 +34,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-LINKED='fabricator json icu parquet httpfs ducklake'
+LINKED='fabricator json icu parquet httpfs ducklake tpch tpcds'
 SATISFIABLE_ENV='FABRICATOR_DELTA_WRITE_DIR FABRICATOR_DELTA_DIR DELTA_PROVIDER'
 
 for f in test/*.test; do

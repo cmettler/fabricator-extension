@@ -32,6 +32,14 @@ duckdb_extension_load(icu)
 # ships parquet, but the test binaries need it linked (v0.0.1 can't autoload it).
 duckdb_extension_load(parquet)
 
+# TPC-H / TPC-DS generators and queries, for the distributed benchmark suites (test/verify_tpch_mssql.test,
+# test/verify_tpcds_mssql.test). Linked in so CI needs no download: a test build reports a dev version, for which the
+# extension repository has nothing, and a `require` that cannot load SKIPS the suite.
+duckdb_extension_load(tpch)
+duckdb_extension_statically_link(tpch)
+duckdb_extension_load(tpcds)
+duckdb_extension_statically_link(tpcds)
+
 # And `httpfs` — s3:// (MinIO) targets for the Delta providers (verify_delta_catalog_s3 +
 # verify_mssql_s3_polybase). Out-of-tree since DuckDB 1.3 — pinned to the SAME sha DuckDB v2.0-cyanoptera's own
 # CI uses (duckdb/.github/config/extensions/httpfs.cmake; v1.5.6's own CI pin).
