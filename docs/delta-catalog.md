@@ -256,6 +256,34 @@ wins (it's also reusable for the UPDATE WHERE).
 evaluator (confirm engineered-wood exposes `Expression → column`, not just `Predicate → bool`) or a
 batch-transform we build from the bound SET assignments. DELETE is the cleaner target first.
 
+## DML … RETURNING — BUILT (2026-10-31)
+
+`DELETE` / `UPDATE` / `INSERT` / `MERGE … RETURNING` on Delta (`DeltaCatalog.Returning.cs`, capability
+`dml_returning`; MERGE needs nothing of its own — each action operator runs in RETURNING mode and DuckDB appends
+`merge_action`). The ABI is v98's `execute_modify_returning` and `insert_returning`; no ABI change.
+
+- **The rows come from the READ-BACK, not from the change feed.** A DELETE reads the rows its row ids name at the
+  scanned version (`ReadRowsByRowIds`, the read the buffered UPDATE already does), then deletes as before; an
+  UPDATE reads the same way and substitutes the SET values (`MergeSetValues`, factored out of the buffered UPDATE, so
+  the returned post-image and the one a buffered UPDATE writes are one computation); an INSERT returns its input in
+  table order (a copy — the writer disposes the input). All of it before anything is written: a statement that
+  cannot return its rows changes nothing.
+- **Why not the change feed** (user-raised alternative): inside `BEGIN … COMMIT` the commit — and so the version to
+  read — exists only at COMMIT; CDF would become a precondition with its write cost; and the change files would be
+  an extra read of rows already in memory.
+- **Refused, before writing:** rows written earlier in the same transaction (in files the scanned version does not
+  hold — the read-back returns fewer rows than the row ids, `EnsureEveryRowRead`); an UPDATE after an ALTER in the
+  same transaction; `INSERT … RETURNING` into a table with an IDENTITY column (assigned at commit).
+- Costs one extra read of the affected rows (DELETE / UPDATE); without RETURNING nothing changes.
+- Gate `verify_delta_returning` (hermetic, 164, on both engines): every statement also on a DuckDB table with the
+  same expected rows, merge-on-read and copy-on-write tables, autocommit, ROLLBACK, COMMIT, RETURNING inside a CTE
+  (`WITH u AS (UPDATE … RETURNING v) SELECT sum(v) FROM u`, and the "moved" `WITH m AS (DELETE … RETURNING *)
+  INSERT INTO … SELECT * FROM m` — a DML statement may feed a query only from a CTE), the refusals. Mutants killed:
+  an UPDATE returning the pre-image, a DELETE returning nothing, the row-count check removed.
+  `verify_merge_into` §9 asserted the old refusal of MERGE … RETURNING and now asserts the returned row.
+- engineered-wood's predicate DELETE / MERGE (#562 / #563, tracking #569) would not help: RETURNING forces reading
+  the rows, and our MERGE is DuckDB's, lowered to the rowid operators.
+
 ## Transaction semantics caveat
 
 engineered-wood commits **per write** (atomic version-N + conflict detection). A DuckDB multi-statement

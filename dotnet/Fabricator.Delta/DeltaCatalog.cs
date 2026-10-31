@@ -191,7 +191,7 @@ public sealed class DeltaBackend : IProvider
 /// <summary>An ATTACH'd Delta folder catalog. Lazy: holds the root path; all FS access happens during metadata
 /// discovery / scan, using the active host-FS opener (<see cref="AmbientOpener"/>, set by the host before each
 /// catalog metadata + scan + bulk-write call).</summary>
-public sealed class DeltaCatalog : IProviderCatalog
+public sealed partial class DeltaCatalog : IProviderCatalog
 {
     internal const string MainSchema = "main";
     // The stable row-tracking id surfaced as the DuckDB rowid for UPDATE/DELETE (a VIRTUAL column — not part
@@ -1317,6 +1317,8 @@ public sealed class DeltaCatalog : IProviderCatalog
             {
                 caps += ",\"supports_nested_schemas\":true";
             }
+            // DELETE / UPDATE / MERGE … RETURNING (DeltaCatalog.Returning.cs)
+            caps += ",\"dml_returning\":true";
             return "{" + caps + "}";
         }
     }
@@ -4420,54 +4422,7 @@ public sealed class DeltaCatalog : IProviderCatalog
             var srcIds = srcTracking is { Count: > 0 } ? srcTracking[srcTracking.Count - 1].Ids : null;
             srcTracking?.Clear();
             preGroup?.Add(batch);
-            var newCols = new IArrowArray[fields.Count];
-            for (int c = 0; c < fields.Count; c++)
-            {
-                int slot = setSlotByColumn[c];
-                if (slot < 0)
-                {
-                    newCols[c] = batch.Column(c); // unchanged column (batch owns its buffers — safe to alias)
-                    continue;
-                }
-                // ⚠⚠ THIS IS AN ELEMENT-WISE MERGE OF TWO ARROW ARRAYS — per row, the NEW value if this row
-                // is in the update set, else the row's EXISTING value. Done with boxed values it is a trivial
-                // loop, which is why it was written that way; the price was that it only worked for the types
-                // the scalar ladder enumerates, so a LIST column could not be updated at all.
-                // Expressed in Arrow it is CONCATENATE the two columns, then TAKE with an index that points
-                // at the old half for untouched rows and the new half for updated ones — type-agnostic, so a
-                // list, a map or a nested struct costs nothing extra.
-                // ⚠ Only when the two types AGREE. Where they differ the boxing path below is the thing doing
-                // the conversion, and Concatenate would refuse them anyway.
-                var oldCol = batch.Column(c);
-                var newCol = updates.Values!.Column(slot);
-                if (oldCol.Data.DataType.TypeId != ArrowTypeId.Null
-                    && ArrowTypeCompare.SameType(oldCol.Data.DataType, newCol.Data.DataType, namesMatter: false))
-                {
-                    var joined = ArrowArrayConcatenator.Concatenate(new List<IArrowArray> { oldCol, newCol });
-                    var idx = new int[batch.Length];
-                    for (int i = 0; i < batch.Length; i++)
-                    {
-                        long rid = i < rids.Length ? rids[i] : -1;
-                        // ⚠ The updated half starts at oldCol's length, so an updated row's index is
-                        // batch.Length + its row in the updates batch.
-                        idx[i] = updates.RowByRid.TryGetValue(rid, out int ur) ? batch.Length + ur : i;
-                    }
-                    newCols[c] = EngineeredWood.Arrow.ArrowCompute.Take(joined, idx);
-                    continue;
-                }
-                var values = new List<object?>(batch.Length);
-                for (int i = 0; i < batch.Length; i++)
-                {
-                    long rid = i < rids.Length ? rids[i] : -1;
-                    // The SET value now comes out of the parsed Arrow batch rather than a retained box; the
-                    // read is the same ReadScalarDeep call, one row at a time, nothing held.
-                    values.Add(updates.RowByRid.TryGetValue(rid, out int ur)
-                        ? updates.Value(ur, slot)
-                        : ArrowValueReader.ReadScalarDeep(batch.Column(c), i));
-                }
-                newCols[c] = BuildArray(fields[c].DataType, values);
-            }
-            var post = new RecordBatch(userSchema, newCols, batch.Length);
+            var post = MergeSetValues(batch, rids, fields, setSlotByColumn, updates, userSchema);
             postGroup.Add(post);
             matched += batch.Length;
             groupAccum += DeltaReader.ApproxBatchBytes(batch) + DeltaReader.ApproxBatchBytes(post);
@@ -5547,6 +5502,13 @@ public sealed class DeltaCatalog : IProviderCatalog
     }
 
     public long ExecuteUpdate(IReadOnlyList<string> schemaPath, string tableName, int setColumnCount, IArrowArrayStream data)
+        => ExecuteUpdateCore(schemaPath, tableName, setColumnCount, data, returning: null);
+
+    /// <param name="returning">UPDATE … RETURNING: receives the post-image of every updated row, computed BEFORE
+    /// anything is written (read back at the scanned version, SET values substituted), so a statement that cannot
+    /// return its rows changes nothing.</param>
+    private long ExecuteUpdateCore(IReadOnlyList<string> schemaPath, string tableName, int setColumnCount,
+                                   IArrowArrayStream data, List<RecordBatch>? returning)
     {
         // The LEAF of the path, for the log lines and the messages below — the DIRECTORY is resolved
         // from the whole path by TablePath, which is the only place the difference matters.
@@ -5614,6 +5576,11 @@ public sealed class DeltaCatalog : IProviderCatalog
                     DeltaNullability.ValidateSetValue(null, targetField, tableName);
                 }
             }
+        }
+
+        if (returning != null)
+        {
+            ReturningPostImages(opener, path, updates, fields, setSlotByColumn, userSchema, returning);
         }
 
         // Explicit transaction (v60): BUFFER the update — the old rows become pending deletion-vector
@@ -5704,6 +5671,64 @@ public sealed class DeltaCatalog : IProviderCatalog
             schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite,
             scanned?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "?");
         return updates.Count; // each distinct rowid is one updated row
+    }
+
+    /// <summary>
+    /// The post-image of read-back rows: per column, the row's NEW value where the row is in the update set,
+    /// else its existing one — in the table's types. Shared by the buffered UPDATE and UPDATE … RETURNING.
+    /// </summary>
+    private static RecordBatch MergeSetValues(RecordBatch batch, long[] rids, IReadOnlyList<Field> fields,
+                                              int[] setSlotByColumn, UpdateInput updates,
+                                              Apache.Arrow.Schema userSchema)
+    {
+        var newCols = new IArrowArray[fields.Count];
+        for (int c = 0; c < fields.Count; c++)
+        {
+            int slot = setSlotByColumn[c];
+            if (slot < 0)
+            {
+                newCols[c] = batch.Column(c); // unchanged column (batch owns its buffers — safe to alias)
+                continue;
+            }
+            // ⚠⚠ THIS IS AN ELEMENT-WISE MERGE OF TWO ARROW ARRAYS — per row, the NEW value if this row
+            // is in the update set, else the row's EXISTING value. Done with boxed values it is a trivial
+            // loop, which is why it was written that way; the price was that it only worked for the types
+            // the scalar ladder enumerates, so a LIST column could not be updated at all.
+            // Expressed in Arrow it is CONCATENATE the two columns, then TAKE with an index that points
+            // at the old half for untouched rows and the new half for updated ones — type-agnostic, so a
+            // list, a map or a nested struct costs nothing extra.
+            // ⚠ Only when the two types AGREE. Where they differ the boxing path below is the thing doing
+            // the conversion, and Concatenate would refuse them anyway.
+            var oldCol = batch.Column(c);
+            var newCol = updates.Values!.Column(slot);
+            if (oldCol.Data.DataType.TypeId != ArrowTypeId.Null
+                && ArrowTypeCompare.SameType(oldCol.Data.DataType, newCol.Data.DataType, namesMatter: false))
+            {
+                var joined = ArrowArrayConcatenator.Concatenate(new List<IArrowArray> { oldCol, newCol });
+                var idx = new int[batch.Length];
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long rid = i < rids.Length ? rids[i] : -1;
+                    // ⚠ The updated half starts at oldCol's length, so an updated row's index is
+                    // batch.Length + its row in the updates batch.
+                    idx[i] = updates.RowByRid.TryGetValue(rid, out int ur) ? batch.Length + ur : i;
+                }
+                newCols[c] = EngineeredWood.Arrow.ArrowCompute.Take(joined, idx);
+                continue;
+            }
+            var values = new List<object?>(batch.Length);
+            for (int i = 0; i < batch.Length; i++)
+            {
+                long rid = i < rids.Length ? rids[i] : -1;
+                // The SET value now comes out of the parsed Arrow batch rather than a retained box; the
+                // read is the same ReadScalarDeep call, one row at a time, nothing held.
+                values.Add(updates.RowByRid.TryGetValue(rid, out int ur)
+                    ? updates.Value(ur, slot)
+                    : ArrowValueReader.ReadScalarDeep(batch.Column(c), i));
+            }
+            newCols[c] = BuildArray(fields[c].DataType, values);
+        }
+        return new RecordBatch(userSchema, newCols, batch.Length);
     }
 
     /// <summary>Builds an Arrow array of <paramref name="type"/> from boxed CLR values (the inverse of
@@ -5811,7 +5836,8 @@ public sealed class DeltaCatalog : IProviderCatalog
     public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column) =>
         AlterTable(spec, new[] { schemaName }, tableName, column);
 
-    public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
+    public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows) =>
+        InsertReturning(new[] { schemaName }, tableName, rows);
     /// <summary>DROP SCHEMA. In <c>schemas</c> mode (non-OneLake) it recursively removes the
     /// <c>&lt;root&gt;/&lt;schema&gt;/</c> subfolder (and every table under it). Unsupported otherwise (OneLake
     /// schemas mirror the lakehouse; the flat layout has only "main").</summary>

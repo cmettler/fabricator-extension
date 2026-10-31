@@ -59,9 +59,9 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Projection + filter pushdown (best-effort, parameterized WHERE) | ✅ |
 | | `LIMIT` → `TOP n`; `ORDER BY`+`LIMIT` → TopN (safe keys only) | ✅ |
 | | Statistics → optimizer: cardinality + per-column NDV | ✅ (NDV only; min/max intentionally not reported) |
-| **Write** | INSERT, INSERT…SELECT, `RETURNING` on INSERT / UPDATE / DELETE / MERGE (T-SQL `OUTPUT`) | ✅ (SQL Server; not on external tables) |
+| **Write** | INSERT, INSERT…SELECT, `RETURNING` on INSERT / UPDATE / DELETE / MERGE | ✅ (SQL Server via T-SQL `OUTPUT`, not on external tables; Delta via the read-back, see below) |
 | | UPDATE / DELETE (rowid-based, parameterized) | ✅ |
-| | `MERGE INTO` — all actions incl. `NOT MATCHED BY SOURCE`, `DO NOTHING`, `ERROR` | ✅ (needs a rowid; 2+ `UPDATE`/`DELETE` actions are fused into one commit on Delta; `RETURNING` on SQL Server) |
+| | `MERGE INTO` — all actions incl. `NOT MATCHED BY SOURCE`, `DO NOTHING`, `ERROR` | ✅ (needs a rowid; 2+ `UPDATE`/`DELETE` actions are fused into one commit on Delta; `RETURNING` on SQL Server and Delta) |
 | | `UPDATE … SET col = DEFAULT` | ❌ (write the value explicitly) |
 | | `INSERT … ON CONFLICT` | ❌ (no unique constraint is advertised — use `MERGE INTO`) |
 | | CREATE TABLE AS / COPY TO (streaming bulk via `SqlBulkCopy`) | ✅ |
@@ -852,7 +852,7 @@ COMMIT;
 Each action is executed by the same rowid machinery as the standalone statement, so the same
 requirements apply: **the target needs a primary key or unique index** (row identity is how DuckDB tells
 a matched row from an unmatched one, so this holds even for a merge whose only action is an INSERT).
-`MERGE … RETURNING` works on SQL Server (each action's rows, with `merge_action`).
+`MERGE … RETURNING` works on SQL Server and on Delta (each action's rows, with `merge_action`).
 
 **On Delta, a merge carrying two or more `UPDATE`/`DELETE` actions is FUSED into one commit — in autocommit
 as well as inside a transaction — and that is a correctness mechanism, not a convenience.** Those actions all
@@ -4848,6 +4848,24 @@ COMMIT;                                  -- ONE commit; the change feed reports 
 - `WHEN MATCHED THEN UPDATE` on rows **this same transaction inserted** is refused, as it is for a plain
   `UPDATE` — but a merge does not hit that: matched and not-matched rows are disjoint by construction, and
   the guard keys on the rowid's file ordinal, so matched rows carry committed ordinals.
+
+#### `RETURNING` on Delta
+
+`DELETE`, `UPDATE`, `INSERT` and `MERGE … RETURNING` work on Delta tables, in autocommit and inside `BEGIN … COMMIT`:
+
+```sql
+DELETE FROM lake.main.t WHERE id IN (1, 4) RETURNING *;          -- the deleted rows, as they were
+UPDATE lake.main.t SET v = v + 1 WHERE id >= 3 RETURNING id, v;  -- the new values
+MERGE INTO lake.main.t USING src ON t.id = src.id
+  WHEN MATCHED THEN UPDATE SET v = src.v
+  WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v)
+  RETURNING merge_action, *;
+```
+
+The rows are read back from the table at the version the statement scanned — no change feed is needed — and
+computed before anything is written, so a statement that cannot return its rows changes nothing. Two cases are
+refused: rows written earlier in the same transaction (they live in files the scanned version does not hold), and
+`INSERT … RETURNING` into a table with an `IDENTITY` column (the values are assigned at commit).
 
 #### Exactly-once appends — Delta application transactions
 

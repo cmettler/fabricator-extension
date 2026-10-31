@@ -328,15 +328,20 @@ SELECT id, v FROM lake.main.nothing WHERE id = 77;
 77	770
 
 # ==============================================================================================
-# 9. REFUSALS. MERGE ... RETURNING is not implemented; it must say so rather than silently drop the
-#    returning list.
+# 9. MERGE ... RETURNING. Refused here until 2026-10-31; since then each action's rows come back
+#    (the Delta read-back, DeltaCatalog.Returning.cs — verify_delta_returning covers it in full).
 # ==============================================================================================
 
-statement error
+query II
 MERGE INTO lake.main.nothing USING (VALUES (1, 1)) s(id, v) ON nothing.id = s.id
   WHEN MATCHED THEN UPDATE SET v = s.v RETURNING *;
 ----
-MERGE INTO ... RETURNING is not supported
+1	1
+
+query I
+SELECT v FROM lake.main.nothing WHERE id = 1;
+----
+1
 
 # ==============================================================================================
 # 10. ON CONFLICT. Since DuckDB 1.5.x the binder REWRITES `INSERT ... ON CONFLICT` into a MERGE, so it

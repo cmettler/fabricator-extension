@@ -1,0 +1,252 @@
+# name: test/verify_delta_returning.test
+# description: DELETE / UPDATE / INSERT / MERGE … RETURNING on Delta tables. The rows come from the read-back at the
+#              scanned version (DeltaCatalog.Returning.cs), computed BEFORE anything is written. Every statement runs
+#              on a DuckDB table too, with the same expected rows, so the expectations are DuckDB's own. Merge-on-read
+#              (deletion vectors, the default) and copy-on-write tables, autocommit and BEGIN … COMMIT / ROLLBACK, and
+#              the refusals: a refused statement changes nothing. Both engines (DELTA_PROVIDER: the read-back reads
+#              through each). Set FABRICATOR_DELTA_WRITE_DIR.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+require-env DELTA_PROVIDER
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/returning' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+statement ok
+CREATE TABLE lake.main.dv AS SELECT range::INTEGER AS id, (range * 10)::INTEGER AS v, 'r' || range AS s FROM range(6);
+
+statement ok
+CREATE TABLE lake.main.cow WITH (deletion_vectors = false) AS SELECT * FROM lake.main.dv;
+
+statement ok
+CREATE TABLE dv AS SELECT * FROM lake.main.dv;
+
+statement ok
+CREATE TABLE cow AS SELECT * FROM lake.main.dv;
+
+# ── DELETE … RETURNING: the deleted rows' old values ───────────────────────────────────────────────────────────────
+
+foreach t dv cow
+
+query III rowsort
+DELETE FROM ${t} WHERE id IN (1, 4) RETURNING *;
+----
+1	10	r1
+4	40	r4
+
+query III rowsort
+DELETE FROM lake.main.${t} WHERE id IN (1, 4) RETURNING *;
+----
+1	10	r1
+4	40	r4
+
+# nothing matched: no row, nothing written
+query I
+DELETE FROM lake.main.${t} WHERE id = 99 RETURNING id;
+----
+
+endloop
+
+# ── UPDATE … RETURNING: the new values, the untouched columns as they were ────────────────────────────────────────
+
+foreach t dv cow
+
+query III rowsort
+UPDATE ${t} SET v = v + 1 WHERE id >= 3 RETURNING *;
+----
+3	31	r3
+5	51	r5
+
+query III rowsort
+UPDATE lake.main.${t} SET v = v + 1 WHERE id >= 3 RETURNING *;
+----
+3	31	r3
+5	51	r5
+
+# expressions in the RETURNING list, and two SET columns
+query II rowsort
+UPDATE lake.main.${t} SET s = upper(s), v = -v WHERE id = 0 RETURNING id * 100, s || '!';
+----
+0	R0!
+
+query III
+SELECT * FROM lake.main.${t} ORDER BY id;
+----
+0	0	R0
+2	20	r2
+3	31	r3
+5	51	r5
+
+endloop
+
+# ── INSERT … RETURNING: table order, an omitted column NULL ───────────────────────────────────────────────────────
+
+query III rowsort
+INSERT INTO lake.main.dv (s, id) VALUES ('new', 9), ('x', 10) RETURNING *;
+----
+10	NULL	x
+9	NULL	new
+
+query I
+SELECT count(*) FROM lake.main.dv WHERE id IN (9, 10) AND v IS NULL;
+----
+2
+
+# ── RETURNING inside a CTE — the one place a DML statement may feed a query ───────────────────────────────────────
+
+query I
+WITH u AS (UPDATE lake.main.dv SET v = v * 2 WHERE id = 5 RETURNING v) SELECT sum(v) FROM u;
+----
+102
+
+# the "moved" form: the returned rows become another table's INSERT, in one transaction
+statement ok
+CREATE TABLE lake.main.archive (id INTEGER, v INTEGER, s VARCHAR);
+
+query I
+WITH moved AS (DELETE FROM lake.main.dv WHERE id IN (9, 10) RETURNING *) INSERT INTO lake.main.archive SELECT * FROM moved;
+----
+2
+
+query III rowsort
+SELECT * FROM lake.main.archive;
+----
+10	NULL	x
+9	NULL	new
+
+query I
+SELECT count(*) FROM lake.main.dv WHERE id IN (9, 10);
+----
+0
+
+statement ok
+DROP TABLE lake.main.archive;
+
+# ── MERGE … RETURNING: every action's rows with merge_action ──────────────────────────────────────────────────────
+
+statement ok
+DELETE FROM dv;
+
+statement ok
+INSERT INTO dv SELECT * FROM lake.main.dv;
+
+query IIII rowsort
+MERGE INTO dv AS t USING (VALUES (2, 200), (3, NULL), (7, 70)) AS src(id, v) ON t.id = src.id
+WHEN MATCHED AND src.v IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET v = src.v
+WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, 'm')
+RETURNING merge_action, *;
+----
+DELETE	3	31	r3
+INSERT	7	70	m
+UPDATE	2	200	r2
+
+query IIII rowsort
+MERGE INTO lake.main.dv AS t USING (VALUES (2, 200), (3, NULL), (7, 70)) AS src(id, v) ON t.id = src.id
+WHEN MATCHED AND src.v IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET v = src.v
+WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v, 'm')
+RETURNING merge_action, *;
+----
+DELETE	3	31	r3
+INSERT	7	70	m
+UPDATE	2	200	r2
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lake.main.dv) EXCEPT ALL (SELECT * FROM dv)) UNION ALL SELECT count(*) FROM ((SELECT * FROM dv) EXCEPT ALL (SELECT * FROM lake.main.dv));
+----
+0
+0
+
+# ── inside BEGIN … COMMIT / ROLLBACK ──────────────────────────────────────────────────────────────────────────────
+
+statement ok
+BEGIN
+
+query III rowsort
+UPDATE lake.main.cow SET v = 1000 WHERE id = 2 RETURNING *;
+----
+2	1000	r2
+
+query III rowsort
+DELETE FROM lake.main.cow WHERE id = 5 RETURNING *;
+----
+5	51	r5
+
+statement ok
+ROLLBACK
+
+query III
+SELECT * FROM lake.main.cow ORDER BY id;
+----
+0	0	R0
+2	20	r2
+3	31	r3
+5	51	r5
+
+statement ok
+BEGIN
+
+query III rowsort
+DELETE FROM lake.main.dv WHERE id = 0 RETURNING *;
+----
+0	0	R0
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM lake.main.dv WHERE id = 0;
+----
+0
+
+# ── refusals, and nothing changes ─────────────────────────────────────────────────────────────────────────────────
+
+# a row written earlier in the same transaction lives in a file the scanned version does not hold
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.main.cow VALUES (50, 500, 'tx');
+
+statement error
+DELETE FROM lake.main.cow WHERE id = 50 RETURNING *;
+----
+<REGEX>:.*RETURNING of rows written earlier in the same transaction.*
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM lake.main.cow;
+----
+4
+
+# an IDENTITY column is assigned at commit
+statement ok
+CREATE TABLE lake.main.ident (id BIGINT AS (0), s VARCHAR);
+
+statement error
+INSERT INTO lake.main.ident (s) VALUES ('a') RETURNING *;
+----
+<REGEX>:.*IDENTITY.*
+
+query I
+SELECT count(*) FROM lake.main.ident;
+----
+0
+
+statement ok
+DROP TABLE lake.main.ident;
+
+statement ok
+DROP TABLE lake.main.dv;
+
+statement ok
+DROP TABLE lake.main.cow;
