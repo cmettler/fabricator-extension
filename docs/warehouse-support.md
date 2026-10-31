@@ -601,7 +601,9 @@ harness in the session scratchpad (`wret/m1.py`, `wret/m2.py`); every test table
 - **Staging table for exact INSERT values** (bulk into a staging table, `INSERT … SELECT` into the target, read the
   staging table back): 100k rows +0.8–1.2 s over a direct SqlBulkCopy (1.9–3.1 s). Reading 200k rows back over TDS:
   0.5–0.7 s.
-- **⚠ `COPY INTO` is the slow one at this size:** 100k rows 18 s (SqlBulkCopy 1.9–3.1 s); 1M rows 31 s.
+- **⚠ `COPY INTO` is the slow one at this size:** 100k rows 18 s (SqlBulkCopy 1.9–3.1 s); 1M rows 31 s. Accepted as
+  is (user, 2026-10-31): the parquet is written in parallel, but the load starts only once all of it is written, and
+  what it buys is the warehouse applying its clustering to the whole load at once.
 - **Conversions on insert, identical on SqlBulkCopy and `COPY INTO`:** `datetime2(3)` and `time(3)` TRUNCATE
   (`.1235` → `.123`, `59.9995` → `59.999` — box SQL Server rounds); `char(5)` pads with blanks; DECIMAL and REAL are
   cast by DuckDB to the mapped type before sending, so the server stores DuckDB's value. A client-side INSERT
@@ -634,10 +636,11 @@ capability `dml_returning` on; Synapse dedicated stays refused (it may round whe
   UUID crosses the boundary as text. The bulk path reads those columns as `Guid` now (`ArrowDataReader(stream,
   guidColumns)`), learned in the identity-column query it already ran. Gate `verify_granular_types` 26 -> 34, mutant
   killed at the INSERT.
-- **Gate: live only**, `wret/m6.py` in the session scratchpad: every returned row is compared with what the server
-  stores afterwards (DELETE: before), on SqlBulkCopy and `COPY INTO`, incl. MERGE, the moved CTE, BEGIN … ROLLBACK /
-  COMMIT and both refusals. Three mutants killed (no conversion; DELETE reading after; UPDATE reading before). No CI
-  tier reaches a warehouse.
+- **Gate: live only**, `python -I scripts/fabric_returning_check.py [--staging <OneLake GUID location>]`: every
+  returned row is compared with what the server stores afterwards (DELETE: before), on SqlBulkCopy and — with
+  `--staging` — `COPY INTO`, incl. MERGE, the moved CTE, BEGIN … ROLLBACK / COMMIT and both refusals; exit code 1 on
+  a failure. Three mutants killed (no conversion; DELETE reading after; UPDATE reading before). No CI tier reaches a
+  warehouse, so run it after changing this path.
 
 ## 7. Open decisions
 
