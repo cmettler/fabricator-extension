@@ -53,6 +53,11 @@ internal sealed class ServerProfile
     /// <summary>True for Synapse (dedicated/serverless) + Fabric — the "warehouse" family.</summary>
     public bool IsWarehouse => EngineEdition is EditionSynapseDedicated or EditionFabricOrSynapseServerless;
 
+    /// <summary>RETURNING without an OUTPUT clause: the DELETE/UPDATE rows read back on the write connection, the
+    /// INSERT rows computed with the server's own store conversions (measured on Fabric only — Synapse dedicated
+    /// may round where Fabric truncates; docs/warehouse-support.md §6.8a).</summary>
+    public bool ReturnsByReadBack => EngineEdition == EditionFabricOrSynapseServerless;
+
     /// <summary>
     /// Change data capture exists on this engine — the whole <c>db.cdc.*</c> surface is gated on it.
     /// FALSE for the entire warehouse family: Fabric Warehouse, the Fabric Lakehouse SQL endpoint (both

@@ -2673,7 +2673,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         var keyColumns = keys.Schema.FieldsList.Select(f => f.Name).ToList();
         var keyBindings = DateTimeBindings(connection, transaction, schemaName, tableName, keys.Schema.FieldsList);
-        var shape = returned is null ? ("", "", "") : ReturningShape(connection, transaction, schemaName, tableName);
+        // a warehouse has no OUTPUT: its RETURNING reads the rows back on this connection (ReadBackReturning)
+        var shape = returned is null || Profile.IsWarehouse
+            ? ("", "", "") : ReturningShape(connection, transaction, schemaName, tableName);
 
         using var reader = new ArrowDataReader(keys);
         long total = 0;
@@ -2688,9 +2690,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandTimeout = ResolveCommandTimeout();
-            // RETURNING: the deleted rows, from the statement itself (no second read)
-            var sb = new StringBuilder(shape.Item1).Append("DELETE FROM ").Append(qualified)
-                .Append(returned is null ? "" : " OUTPUT DELETED.*" + shape.Item2).Append(" WHERE ");
+            // RETURNING: the deleted rows, from the statement itself (no second read) — or, on a warehouse,
+            // from a SELECT of the same rows just before it, in the same batch and transaction
+            bool readBack = returned is not null && Profile.IsWarehouse;
+            var sb = new StringBuilder();
             int p = 0;
             for (int r = 0; r < batch.Count; r++)
             {
@@ -2711,8 +2714,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 }
                 sb.Append(')');
             }
-            sb.Append(shape.Item3);
-            cmd.CommandText = sb.ToString();
+            string where = sb.ToString();
+            cmd.CommandText = readBack
+                ? "SELECT * FROM " + qualified + " WHERE " + where + "; DELETE FROM " + qualified + " WHERE " + where
+                : shape.Item1 + "DELETE FROM " + qualified
+                  + (returned is null ? "" : " OUTPUT DELETED.*" + shape.Item2) + " WHERE " + where + shape.Item3;
             if (Log.IsEnabled(LogLevel.Debug))
                 Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
             if (returned is null)
@@ -2877,11 +2883,14 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// <c>UPDATE t SET … FROM t JOIN (VALUES …) v ON &lt;key&gt;</c>. A warehouse has no index, so every per-row
     /// statement of the regular path is a scan plus a write of its own — measured on Fabric Warehouse: 10 rows in
     /// 5.3 s (docs/warehouse-support.md §6.8a). A row id that appears twice keeps its LAST row, as the per-row
-    /// statements do; two matches in one join would let the server pick either.
+    /// statements do; two matches in one join would let the server pick either. RETURNING (<paramref name="returned"/>)
+    /// reads the updated rows back by the same VALUES in the same batch: a warehouse has no OUTPUT clause, and its
+    /// write transaction (SNAPSHOT) sees its own update.
     /// </summary>
     private long UpdateByValuesJoin(SqlConnection connection, SqlTransaction? transaction, string qualified,
                                     List<string> columns, int setColumnCount, System.Data.SqlDbType?[] bindings,
-                                    ArrowDataReader reader, CancellationToken token, string schemaName, string tableName)
+                                    ArrowDataReader reader, CancellationToken token, string schemaName, string tableName,
+                                    ReturnedRows? returned)
     {
         int rowsPerStatement = Math.Max(1, 2000 / columns.Count);
         var head = new StringBuilder("UPDATE t SET ");
@@ -2889,8 +2898,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             head.Append(c > 0 ? ", " : "").Append(Quote(columns[c])).Append(" = v.[c").Append(c).Append(']');
         }
-        head.Append(" FROM ").Append(qualified).Append(" AS t JOIN (VALUES ");
-        var tail = new StringBuilder(") AS v(");
+        head.Append(" FROM ").Append(qualified).Append(" AS t JOIN ");
+        var tail = new StringBuilder(" AS v(");
         for (int c = 0; c < columns.Count; c++)
         {
             tail.Append(c > 0 ? ", " : "").Append("[c").Append(c).Append(']');
@@ -2900,6 +2909,24 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             tail.Append(c > setColumnCount ? " AND " : "").Append("t.").Append(Quote(columns[c])).Append(" = v.[c")
                 .Append(c).Append(']');
+        }
+
+        // RETURNING reads the rows back by their key, so a row must keep its key. Under RETURNING DuckDB assigns
+        // EVERY column, the key included (`id = id`, BindUpdateConstraints), so the test is per row: a key column's
+        // new value must equal its old one.
+        var keyAssignments = new List<(int Set, int Key)>();
+        if (returned is not null)
+        {
+            for (int c = 0; c < setColumnCount; c++)
+            {
+                for (int k = setColumnCount; k < columns.Count; k++)
+                {
+                    if (string.Equals(columns[c], columns[k], StringComparison.OrdinalIgnoreCase))
+                    {
+                        keyAssignments.Add((c, k));
+                    }
+                }
+            }
         }
 
         long total = 0;
@@ -2915,25 +2942,35 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandTimeout = ResolveCommandTimeout();
-            var sb = new StringBuilder(head.ToString());
+            var values = new StringBuilder("(VALUES ");
             int p = 0;
             for (int r = 0; r < order.Count; r++)
             {
                 var row = block[order[r]];
-                sb.Append(r > 0 ? ", (" : "(");
+                values.Append(r > 0 ? ", (" : "(");
                 for (int c = 0; c < row.Length; c++)
                 {
                     string pn = "@p" + p++;
-                    sb.Append(c > 0 ? ", " : "").Append(pn);
+                    values.Append(c > 0 ? ", " : "").Append(pn);
                     cmd.Parameters.Add(BindColumnValue(pn, row[c], bindings[c]));
                 }
-                sb.Append(')');
+                values.Append(')');
             }
-            sb.Append(tail);
-            cmd.CommandText = sb.ToString();
+            values.Append(')');
+            cmd.CommandText = head + values.ToString() + tail
+                + (returned is null ? "" : "; SELECT t.* FROM " + qualified + " AS t JOIN " + values + tail);
             if (Log.IsEnabled(LogLevel.Debug))
                 Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
-            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            if (returned is null)
+            {
+                total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            }
+            else
+            {
+                using var rdr = cmd.ExecuteReaderAsync(token).GetAwaiter().GetResult();
+                returned.ReadAll(connection, cmd, rdr);
+                total += Math.Max(0, rdr.RecordsAffected);
+            }
             block.Clear();
             order.Clear();
         }
@@ -2955,6 +2992,15 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         IFormattable f => f.GetType().Name + ":" + f.ToString(null, System.Globalization.CultureInfo.InvariantCulture),
                         var o => o.GetType().Name + ":" + o,
                     }).Append('\u0001');
+                }
+            }
+            foreach (var (set, keyCol) in keyAssignments)
+            {
+                if (!Equals(row[set], row[keyCol]))
+                {
+                    throw new NotSupportedException(
+                        $"UPDATE ... RETURNING that changes the key column '{columns[keyCol]}' is not supported on a "
+                        + "warehouse engine (it has no OUTPUT clause, so the rows are read back by their key).");
                 }
             }
             var k = key.ToString();
@@ -3008,11 +3054,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         var columns = data.Schema.FieldsList.Select(f => f.Name).ToList();
         int keyStart = setColumnCount;
         var bindings = DateTimeBindings(connection, transaction, schemaName, tableName, data.Schema.FieldsList);
-        if (returned is null && Profile.IsWarehouse)
+        if (Profile.IsWarehouse)
         {
             using var rows = new ArrowDataReader(data);
             long n = UpdateByValuesJoin(connection, transaction, qualified, columns, setColumnCount, bindings, rows,
-                                        token, schemaName, tableName);
+                                        token, schemaName, tableName, returned);
             Fabricator.Bridge.MemoryProbe.Mark("mssql update: rowid DML complete", n);
             return n;
         }
@@ -3020,7 +3066,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // One statement per row, the same text for every row, sent UpdateBatchRows at a time as one SqlBatch: one
         // round trip per block instead of per row, while each row keeps its own statement — so a row id that
         // appears twice still means "the last one wins", exactly as row by row.
-        var shape = returned is null ? ("", "", "") : ReturningShape(connection, transaction, schemaName, tableName);
+        // a warehouse has no OUTPUT: its RETURNING reads the rows back on this connection (ReadBackReturning)
+        var shape = returned is null || Profile.IsWarehouse
+            ? ("", "", "") : ReturningShape(connection, transaction, schemaName, tableName);
         var sb = new StringBuilder(shape.Item1).Append("UPDATE ").Append(qualified).Append(" SET ");
         for (int c = 0; c < setColumnCount; c++)
         {
@@ -3103,14 +3151,17 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
 
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows)
     {
+        if (Profile.ReturnsByReadBack)
+        {
+            return InsertReturningComputed(schemaName, tableName, rows);
+        }
         if (Profile.IsWarehouse)
         {
-            // refused BEFORE any statement reaches the server: on Fabric a failing statement aborts the whole
-            // transaction (warehouse-support.md §6.5)
+            // refused BEFORE any statement reaches the server: on a warehouse a failing statement aborts the
+            // whole transaction (warehouse-support.md §6.5)
             rows.Dispose();
             throw new NotSupportedException(
-                "INSERT ... RETURNING is not supported on a warehouse engine (Fabric Warehouse / Synapse have no "
-                + "OUTPUT clause) — use a plain INSERT.");
+                "INSERT ... RETURNING is not supported on Synapse (no OUTPUT clause) — use a plain INSERT.");
         }
         RecordTouch(schemaName, tableName, schemaChanged: false);
         if (DetectExternalTable(schemaName, tableName) is not null)
@@ -3329,7 +3380,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
            $"\"superset_filter_pushdown\":{(_dynamicFilters ? "true" : "false")}," +
            // RETURNING comes from T-SQL OUTPUT, which a warehouse engine does not have (measured on Fabric Warehouse:
            // "OUTPUT is not supported." on DELETE, UPDATE, INSERT and MERGE alike) — the host then refuses at plan time
-           $"\"dml_returning\":{(Profile.IsWarehouse ? "false" : "true")}," +
+           $"\"dml_returning\":{(!Profile.IsWarehouse || Profile.ReturnsByReadBack ? "true" : "false")}," +
            $"\"default_schema\":{JsonSerializer.Serialize(Profile.DefaultSchema)}," +
            $"\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
            $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";

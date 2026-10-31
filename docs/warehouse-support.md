@@ -567,6 +567,9 @@ in 49 s, which it had never been.
 
 ## 6.8 No `OUTPUT` on Fabric Warehouse, so no `RETURNING` (2026-10-29, user-raised, MEASURED live)
 
+> ⚠ SUPERSEDED for Fabric by §6.8b (2026-10-31): `RETURNING` works there now without `OUTPUT`. What follows is
+> still true of Synapse dedicated, and of the `OUTPUT` clause itself.
+
 Every DML `RETURNING` on SQL Server comes from T-SQL `OUTPUT` (ABI v98). Fabric Warehouse answers *"OUTPUT is not
 supported."* to `DELETE … OUTPUT`, `UPDATE … OUTPUT`, `INSERT … OUTPUT` and `MERGE … OUTPUT` alike, while a plain
 `MERGE` works. The capability `dml_returning` is therefore `false` on a warehouse profile (`Profile.IsWarehouse`):
@@ -607,6 +610,34 @@ harness in the session scratchpad (`wret/m1.py`, `wret/m2.py`); every test table
 - **⚠ Side finding, not RETURNING:** the rowid UPDATE sends ONE statement PER ROW
   (`UPDATE … SET [s] = @s0 WHERE [id] = @k1`): 10 rows took 5.3 s inside `BEGIN`. That costs far more than any
   emulation would.
+
+## 6.8b RETURNING on Fabric Warehouse without `OUTPUT` — BUILT 2026-10-31 (C#-only, no ABI)
+
+From the measurements of §6.8a, user-agreed: no staging table, the declared SQL types as Arrow metadata
+(`fabricator.sql.*`, `SqlTypeMetadata`). `ServerProfile.ReturnsByReadBack` (EngineEdition 11, Fabric) turns the
+capability `dml_returning` on; Synapse dedicated stays refused (it may round where Fabric truncates — unmeasured).
+
+- **DELETE** (`ExecuteDeleteCore`): each batch sends `SELECT * FROM t WHERE <keys>; DELETE FROM t WHERE <keys>` on the
+  write connection; the SELECT result is what is returned.
+- **UPDATE** (`UpdateByValuesJoin`): `UPDATE t … FROM t JOIN (VALUES …) v …; SELECT t.* FROM t JOIN (VALUES …) v …`
+  with the same parameters. ⚠ Under RETURNING DuckDB assigns EVERY column, the key included (`id = id`,
+  `BindUpdateConstraints`), so a key column always looks "set": the refusal is per row, only where the new key value
+  differs from the old one, and it fires before that block is written.
+- **INSERT** (`SqlServerComputedInsert.cs`): the returned rows are the input converted with the store conversions
+  measured in §6.8a — `datetime2/datetimeoffset/time(p)` truncated, `char(n)` padded to n UTF-8 bytes, `nchar(n)` to
+  n characters — in the table's shape (omitted columns NULL: a warehouse has no DEFAULT constraints). The bulk path
+  receives the same converted values in the input's own columns and types, so SqlBulkCopy and `COPY INTO` store
+  exactly what is returned. A table with an IDENTITY column is refused.
+- **MERGE** and the moved CTE need nothing of their own: they run through the three above.
+- **Found on the way, a separate defect, FIXED:** every bulk INSERT into a `uniqueidentifier` column failed, box and
+  warehouse alike (*"The given value … of type String … cannot be converted to type uniqueidentifier"*) — a DuckDB
+  UUID crosses the boundary as text. The bulk path reads those columns as `Guid` now (`ArrowDataReader(stream,
+  guidColumns)`), learned in the identity-column query it already ran. Gate `verify_granular_types` 26 -> 34, mutant
+  killed at the INSERT.
+- **Gate: live only**, `wret/m6.py` in the session scratchpad: every returned row is compared with what the server
+  stores afterwards (DELETE: before), on SqlBulkCopy and `COPY INTO`, incl. MERGE, the moved CTE, BEGIN … ROLLBACK /
+  COMMIT and both refusals. Three mutants killed (no conversion; DELETE reading after; UPDATE reading before). No CI
+  tier reaches a warehouse.
 
 ## 7. Open decisions
 
