@@ -444,6 +444,76 @@ SELECT count(*), sum(id) FROM lake.race;
 102	16971
 
 # ============================================================================
+# 8b. THE SAME RACE OVER MANY SNAPSHOTS, WITH DELETES BETWEEN THEM. Two defects (found 2026-10-31 from a red
+#     Windows CI run of §8). (1) A sync counted EVERY lost race against its retry budget of 32, although each loss
+#     means another sync made progress: 6 syncs over 76 snapshots failed "version N already exists" 3 of 3 runs.
+#     Now only a loss WITHOUT progress counts. (2) After its own commit a sync re-read the log, by then holding
+#     other syncs' commits, and diffed its next, OLDER snapshot against it: across a delete that reads as deleted
+#     rows coming back ("deletes cannot shrink", not retried — the CI failure). It skips snapshots already
+#     recorded now. ⚠ (2) is timing: it happens 1-2 times a run here, but the stale commit almost always loses
+#     the next race, so this section kills mutant (1) every run and mutant (2) only occasionally.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.race2 (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO lake.race2 SELECT i, 'a' FROM range(100) r(i);
+
+query I
+SELECT count(*) FROM ducklake_delta_sync('lake', table_name := 'main.race2');
+----
+1
+
+loop i 0 4
+
+statement ok
+INSERT INTO lake.race2 VALUES (1000 + ${i}, 'b');
+
+endloop
+
+statement ok
+DELETE FROM lake.race2 WHERE id < 10;
+
+loop i 0 70
+
+statement ok
+INSERT INTO lake.race2 VALUES (2000 + ${i}, 'c');
+
+endloop
+
+statement ok
+DELETE FROM lake.race2 WHERE id >= 10 AND id < 20;
+
+concurrentloop k 0 6
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.race2');
+
+endloop
+
+query III
+WITH commits AS (
+  SELECT regexp_extract(filename, '(\d+)\.json$', 1)::BIGINT AS version,
+         regexp_extract(content, '"ducklakeSnapshot":"(\d+)"', 1)::BIGINT AS snapshot
+  FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/race2/_delta_log/*.json'))
+SELECT count(*), count(DISTINCT snapshot),
+       bool_and(snapshot > coalesce(prev, -1))
+FROM (SELECT version, snapshot, lag(snapshot) OVER (ORDER BY version) AS prev FROM commits);
+----
+77	77	true
+
+query II
+SELECT count(*), sum(id) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/race2');
+----
+154	151181
+
+query II
+SELECT count(*), sum(id) FROM lake.race2;
+----
+154	151181
+
+# ============================================================================
 # 9. A REMOTE PATH NEEDS A CONDITIONAL COMMIT. Through the host filesystem an object store only checks for the
 #    file before writing it, so two syncs could both "win" a version. Without a credential from an attached
 #    Delta catalog covering the path, the sync refuses — before any IO, so this needs no endpoint.

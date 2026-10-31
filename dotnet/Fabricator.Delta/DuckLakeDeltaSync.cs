@@ -318,23 +318,35 @@ internal sealed class DuckLakeDeltaSync
             // the version it was computed on, so recomputing it is always safe; and a sync never writes an older
             // snapshot after a newer one, because each write targets exactly one version past what it read.
             var results = new List<Result>();
-            for (int attempt = 0; ; attempt++)
+            // A lost race means another sync committed, so the log moved towards _current and the loop ends once it
+            // gets there. Only a conflict that brings NO progress counts against the budget — counting every one made
+            // a sync with more than 32 snapshots to write fail under contention (6 syncs, 36 versions: 13 of 15 runs).
+            int stalled = 0;
+            long synced = -1;
+            while (true)
             {
                 try
                 {
                     SyncAll(results, ct);
                     return results;
                 }
-                catch (DeltaConflictException) when (attempt < MaxConflictRetries)
+                catch (DeltaConflictException) when (stalled < MaxConflictRetries)
                 {
                     // ⚠ the deletion vectors written for the lost commit stay behind as unreferenced .bin
                     // files: engineered-wood owns the DV path scheme (DeletionVectorPath, internal), and DuckLake's
                     // orphan cleanup only knows .parquet/.puffin. Rare, and harmless to every reader.
-                    _log.LogDebug("ducklake sync {Root}: lost a commit race (attempt {Attempt}), re-reading the log",
-                        _root, attempt + 1);
+                    long now = SyncedSnapshot(Open(ct));
+                    stalled = now > synced ? 0 : stalled + 1;
+                    synced = now;
+                    _log.LogDebug("ducklake sync {Root}: lost a commit race (log at snapshot {Synced}, {Stalled} without " +
+                        "progress), re-reading the log", _root, now, stalled);
                 }
             }
         }
+
+        // The DuckLake snapshot the log has been brought to, -1 when there is no log yet.
+        private static long SyncedSnapshot(EngineeredWood.DeltaLake.Snapshot.Snapshot? state) =>
+            state is not null && state.AppTransactions.TryGetValue(AppId, out var txn) ? txn.Version : -1;
 
         private const int MaxConflictRetries = 32;
 
@@ -385,6 +397,14 @@ internal sealed class DuckLakeDeltaSync
             }
             foreach (long s in RelevantSnapshots(last))
             {
+                // ⚠ state is re-read after each of our commits and may hold other syncs' commits by then: a snapshot
+                // they already recorded must not be diffed against that newer state (rows would seem to come back —
+                // "deletes cannot shrink", which is no conflict and was not retried).
+                if (s <= SyncedSnapshot(state))
+                {
+                    _log.LogDebug("ducklake sync {Root}: snapshot {Snapshot} already recorded by another sync", _root, s);
+                    continue;
+                }
                 // an incomplete snapshot is skipped; the next complete one carries its changes (a state diff)
                 var r = SyncTo(state, s, ct, out _);
                 if (r is not null)

@@ -475,6 +475,18 @@ care which process committed in DuckLake. Two syncs running at once race for the
   continues from there, up to 32 times. MEASURED: six concurrent syncs over 12 inserts + a delete land 14
   versions, contiguous, and the table reads the DuckLake values exactly (suite §8; a mutant without the retry
   dies there).
+- **⚠⚠ FIXED 2026-10-31 — two defects in that retry, found from a red Windows CI run of §8** (suite §8b, a race
+  over 76 snapshots with two deletes). (1) Every lost race counted against the budget of 32, although a loss
+  means another sync made progress — so with more snapshots than that a sync gave up: 6 syncs over 76 snapshots
+  failed *"version N already exists"* 3 of 3 runs. Only a loss WITHOUT progress (the log's synced snapshot did not
+  advance) counts now. (2) After its own commit a sync re-reads the log, which by then can hold other syncs'
+  commits, and diffed its next, OLDER snapshot against that newer state: across a delete that reads as rows
+  coming back (*"deletes cannot shrink"*, a plain error, not retried — the CI failure); without a delete the stale
+  commit usually loses the next race, but if it wins the log goes back in time. It now skips snapshots the log
+  already records. Measured: the skip fires 1-2 times per run of §8b locally. Gate: mutant (1) dies at §8b every
+  run; mutant (2) survived 10 local runs (the harmful interleaving is timing; Windows CI hit it once). It surfaced
+  only once local Windows commits became atomic (delta-transactions.md §8.5b) — before, the same race failed
+  earlier with a sharing violation.
 - **⚠ That needs a REAL conditional write.** A local file uses `O_EXCL` (atomic). On an object store the host
   filesystem only checks for the file before writing it — measured: 40 of 48 commits silently lost on S3,
   7 of 48 on ADLS (delta-transactions.md §8.3, §8.4). So on a remote path the sync takes a credential and uses the
