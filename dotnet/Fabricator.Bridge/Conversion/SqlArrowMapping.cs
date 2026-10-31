@@ -24,15 +24,20 @@ public static class SqlArrowMapping
         // extension so DuckDB's import lands it as the JSON logical type (when the json extension is
         // available; an unregistered extension falls back to the Utf8 storage type = VARCHAR, so the
         // value round-trips either way). Storage type is Utf8 in both cases.
-        IReadOnlyDictionary<string, string>? metadata = (col.DataTypeName ?? string.Empty).ToLowerInvariant() switch
+        var sql = (col.DataTypeName ?? string.Empty).ToLowerInvariant();
+        var metadata = SqlTypeMetadata.Describe(col);
+        switch (sql)
         {
             // Canonical Arrow extensions DuckDB's import recognizes: json (Utf8 storage) -> JSON,
             // uuid (FixedSizeBinary(16) storage) -> UUID. Unregistered => graceful fallback to storage type.
-            "json" => new Dictionary<string, string> { ["ARROW:extension:name"] = "arrow.json" },
-            "uniqueidentifier" => new Dictionary<string, string> { ["ARROW:extension:name"] = "arrow.uuid" },
-            _ => null,
-        };
-        return new Field(name, MapType(col), nullable, metadata);
+            case "json":
+                metadata["ARROW:extension:name"] = "arrow.json";
+                break;
+            case "uniqueidentifier":
+                metadata["ARROW:extension:name"] = "arrow.uuid";
+                break;
+        }
+        return new Field(name, MapType(col), nullable, metadata.Count == 0 ? null : metadata);
     }
 
     public static IArrowType MapType(DbColumn col)

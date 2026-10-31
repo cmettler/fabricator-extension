@@ -74,6 +74,8 @@
       it) is invisible from SQL — a suite that sets the variable, as verify_plugin must, is by construction
       not testing what happens when it is unset.
     -->
+    <!-- the declared SQL Server type as Arrow field metadata: Describe(DbColumn) + the readers -->
+    <Compile Include="..\Fabricator.Bridge\Conversion\SqlTypeMetadata.cs" Link="Linked\SqlTypeMetadata.cs" />
     <Compile Include="..\Fabricator.Bridge\PluginPaths.cs"
              Link="Linked\PluginPaths.cs" />
     <!--
