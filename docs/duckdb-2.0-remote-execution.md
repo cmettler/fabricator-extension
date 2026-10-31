@@ -1721,6 +1721,16 @@ with T-SQL's "Invalid length parameter" as the answer), the optional filter kept
 `verify_merge_pushdown_mssql` and `verify_moved_rows_mssql` used `||` as their "no translation" control; it is
 `reverse` now (counts unchanged, 90 / 126).
 
+**Inversion pass, 2026-10-31 — a CODE-PAGE varchar: no defect.** The differential above used nvarchar and a UTF-8
+varchar only. Measured on `VARCHAR(40) COLLATE SQL_Latin1_General_CP1_CI_AS` (case-insensitive, code page 1252),
+filled by the server from the same strings — it maps what CP1252 lacks by best fit: the ideographic and hair
+spaces become a plain space, the zero-width space and the supplementary character `?`, the combining acute `´`:
+all 13 select-list expressions pushed and equal both ways, and 21 WHERE predicates pushed and equal, among them
+the ones the collation could have broken — `left(c, 2) = 'gr'` / `trim(c) = 'PAD'` / `trim(c) = 'GRÖSSE'` (case),
+`rtrim(c) = 'abc '` (trailing space), `ltrim(c) = 'nandu'` (accent): 0 rows on both paths. The binary equality key
+(§4.3, `EqualityKey`) shields the comparison from the column's collation. Harness: scratchpad `inv/cp*.sql`. ⚠ Grepping `duckdb.exe` output for `Fabricator Query`
+fails in agent mode (`AI_AGENT` set), which prints the operator as `FABRICATOR_QUERY` — use `-no-agent` or the log.
+
 ### 4.22 Bare names through `USE` — PUSHED (2026-10-31)
 
 MEASURED first: under `USE rp.dbo` a bare SELECT was pushed — by the subtree pass, which works on the BOUND plan —
@@ -1750,6 +1760,16 @@ pushed under `USE rp.dbo`; under `USE rp.rs_use_s` the same names hold other row
 UPDATE reach those; a real `main` wins; a dropped `main` leaves at the refresh. Guide S15 (185 -> 195). Four mutants
 killed: no search-path qualification (the rs_use_s sums), no alias (the `rp.main` row), the alias over a real `main`
 (its row), no retirement (run with a stale `main` on the server: the alias row).
+
+**Inversion pass, 2026-10-31 — the refresh's schema retirement: no defect.** Measured on box (scratchpad
+`inv/retire.sql`): a schema holding ONLY a scalar UDF stays listed and callable across `fabricator_refresh_cache`
+(the schema list comes from `sys.schemas`, not from the tables); a schema dropped out of band leaves the listing
+(1.5.6 without this change: still listed after the refresh — the defect fixed here); a schema the ATTACH's
+`schema_filter` excludes is never in `discovered_roots_`, so nothing retires it. ⚠ FOUND ON THE WAY, PRE-EXISTING
+(1.5 too), NOT FIXED: a table in a schema `schema_filter` EXCLUDES is NOT reachable by name — *"schema rt_hid does
+not exist"*. The 2026-07-15 "filters bound enumeration, not by-name access" lift (feature-history.md) works on a
+TABLE miss inside a schema entry, and an excluded schema never gets an entry. `table_filter` / `function_filter`
+behave as documented; `schema_filter` cages.
 
 ### 4.23 Correlated scalar subqueries: the single join — PUSHED (2026-10-31)
 

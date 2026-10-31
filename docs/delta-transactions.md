@@ -927,6 +927,11 @@ access the file because it is being used by another process"*.
   one file never overlapped here, in-process or across 8 processes × 6 statements (0 conflicts with the strict
   check), so a relaxation there would be unmeasured. ⚠ Its transaction is based on the snapshot it OPENED, not on
   the pin — safe only because the strict check covers the gap; drop the check and it must move to the pin.
+- **A crash between the temp write and the move leaves `.<version>.json.<guid>.tmp` in `_delta_log`** — the
+  `finally` that deletes it never runs. MEASURED harmless (a planted, truncated one for v1): the table reads, the next
+  commit takes v1 itself (another guid, so no clash), a path scan reads it — the name ends in `.tmp` and starts with
+  `.`, which no Delta reader parses. Litter only: VACUUM skips `_delta_log` (0 deleted) and log cleanup matches
+  version files only. Not swept.
 - Gate: NEW hermetic `verify_delta_concurrent_dml` (105; 353 since the same-file sections — one file with
   concurrent deletes, and the same with concurrent inserts shifting the ordinals, where a mutant resolving at the
   latest version ends with a wrong count 5 of 5 runs, every statement succeeding): 8 `concurrentloop` threads, each updating (merge-on-read,
