@@ -218,6 +218,29 @@ EXPLAIN SELECT id, left(note, -1) FROM mssql.dbo.pg_sales ORDER BY id LIMIT 3;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
+# S15: bare names through USE are pushed, DML too
+statement ok
+USE mssql.dbo;
+
+query II
+EXPLAIN SELECT region, sum(amount) FROM pg_sales GROUP BY region ORDER BY region;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+SELECT region, sum(amount) FROM pg_sales GROUP BY region ORDER BY region;
+----
+EU	40.00
+US	25.00
+
+query II
+EXPLAIN DELETE FROM pg_sales_eu WHERE id IN (SELECT id FROM pg_sales WHERE region = 'US');
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+statement ok
+USE memory;
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok

@@ -21,6 +21,8 @@
 
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_lateral.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -222,6 +224,67 @@ void RestoreCatalog(QueryNode &node, const Identifier &catalog, const Identifier
 		auto &name = insert.qualified_name;
 		if (name.Catalog().empty()) {
 			insert.SetQualifiedName(catalog, name.Schema().empty() ? default_schema : name.Schema(), name.Name());
+		}
+	}
+}
+
+//! Every bare table name of a pushed node (and a bare INSERT target), qualified with the schema the session's search
+//! path finds it in — the binder's rule: the first search-path schema of this catalog that holds it. Before anything
+//! else in RemoteExecute, because the rest qualifies a bare name with the catalog's DEFAULT schema: after
+//! `USE db.sales` that would read dbo.t where DuckDB reads sales.t, pushed or declined. A name no such schema holds
+//! gets the first of them, so it fails to bind exactly as it would have. CTE names stay bare.
+void QualifyBareNames(ClientContext &context, Catalog &catalog, QueryNode &node, const Identifier &fallback) {
+	auto schemas = ClientData::Get(context).catalog_search_path->GetSchemasForCatalog(catalog.GetName());
+	if (schemas.empty()) {
+		schemas.push_back(fallback);
+	}
+	auto resolve = [&](const Identifier &table) -> Identifier {
+		for (auto &schema : schemas) {
+			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+			                       QualifiedName(vector<Identifier> {catalog.GetName(), schema}, table));
+			if (Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL)) {
+				return schema;
+			}
+		}
+		return schemas.front();
+	};
+	case_insensitive_set_t ctes;
+	CollectCteNames(node, ctes);
+	std::function<void(QueryNode &)> visit_node;
+	std::function<void(ParsedExpression &)> visit_expression = [&](ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			visit_node(*expr.Cast<SubqueryExpression>().SubqueryMutable()->node);
+		}
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { visit_expression(child); });
+	};
+	visit_node = [&](QueryNode &current) {
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(
+		    current,
+		    [&](unique_ptr<ParsedExpression> &child) {
+			    if (child) {
+				    visit_expression(*child);
+			    }
+		    },
+		    [&](TableRef &ref) {
+			    if (ref.type != TableReferenceType::BASE_TABLE) {
+				    return;
+			    }
+			    auto &base = ref.Cast<BaseTableRef>();
+			    auto &name = base.GetQualifiedName();
+			    if (!name.Catalog().empty() || !name.Schema().empty() || ctes.count(name.Name().GetIdentifierName())) {
+				    return;
+			    }
+			    Identifier table = name.Name();
+			    base.SetQualifiedName(Identifier(), resolve(table), table);
+		    });
+	};
+	visit_node(node);
+	if (node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		auto &insert = node.Cast<InsertQueryNode>();
+		auto &name = insert.qualified_name;
+		if (name.Catalog().empty() && name.Schema().empty()) {
+			Identifier table = name.Name();
+			insert.SetQualifiedName(Identifier(), resolve(table), table);
 		}
 	}
 }
@@ -2429,6 +2492,7 @@ bool FabricatorCatalog::SupportsPushdown(const QueryNode &node) {
 
 unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
 	Identifier default_schema(GetDefaultSchema().value_or(Identifier("dbo")));
+	QualifyBareNames(context, *this, *node, default_schema);
 	string reason;
 	const bool is_insert = node->type == QueryNodeType::INSERT_QUERY_NODE;
 	const bool is_merge = node->type == QueryNodeType::MERGE_QUERY_NODE;

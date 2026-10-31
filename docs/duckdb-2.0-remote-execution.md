@@ -566,8 +566,8 @@ originals. Gaps are fine if they decline; wrong answers are not.
 - **The pipeline** (probe level 5): bind a copy → `RecursiveDependentJoinPlanner` + `DecorrelateIndependent` →
   `ResolveOperatorTypes` + `ColumnBindingResolver` (to_substrait needs positional references — the first run
   failed on `BOUND_COLUMN_REF` without it) → `to_substrait` in strict mode. No optimizer.
-- ⚠ **A name resolved only through `USE db.dbo` is not pushed at all** — DuckDB's remote optimizer acts on
-  catalog-qualified names; `RemoteExecute` was never called.
+- ⚠ **A name resolved only through `USE db.dbo` was not pushed at all** — DuckDB's remote optimizer checks a bare
+  name as `<catalog>.main.<name>`; `RemoteExecute` was never called. Fixed in §4.22.
 - **Measured, the 58 spike queries through this path and mssql-adbc against SQL Server**: 30 identical, 3 same
   values with BIGINT for HUGEINT, 4 overflow errors (`sum` declared i64), 1 both error, 5 declined by the
   producer (strict mode: `%`, `//`, `min` on strings, an expression GROUP BY; and the window), 2 refused by the
@@ -1720,6 +1720,36 @@ an `EXCEPT ALL` differential both ways over nvarchar and UTF-8 varchar, and pinn
 with T-SQL's "Invalid length parameter" as the answer), the optional filter kept (the routing row).
 `verify_merge_pushdown_mssql` and `verify_moved_rows_mssql` used `||` as their "no translation" control; it is
 `reverse` now (counts unchanged, 90 / 126).
+
+### 4.22 Bare names through `USE` — PUSHED (2026-10-31)
+
+MEASURED first: under `USE rp.dbo` a bare SELECT was pushed — by the subtree pass, which works on the BOUND plan —
+but every DML statement stayed local (INSERT … SELECT streamed the rows, a DELETE with a subquery took the rowid
+path), because the subtree pass never takes a statement that writes and DuckDB's optimizer never offered it.
+
+- **The cause is DuckDB's** (`RemotePushdownOptimizer::Rewrite(BaseTableRef)`, case 2): a bare name is checked as
+  `<catalog>.main.<name>` — `DEFAULT_SCHEMA`, not the search path's schema — and this catalog has no `main`.
+  duckdb-postgres answers it in `LookupSchema` (`c045f6c`, the commit adopting the optimizer): `main` resolves to
+  the database's default schema unless a real one exists. Ours does the same now (`FabricatorCatalog::LookupSchema`,
+  only for a provider declaring a default schema, i.e. SQL Server). Upstream candidate:
+  [duckdb-upstream-issues.md](duckdb-upstream-issues.md) §14.
+- **⚠ The same fix would have opened a WRONG ANSWER on our side, so it came first:** `RemoteExecute` qualified a bare
+  name with the catalog's DEFAULT schema — pushed or declined. After `USE rp.sales` with the same table name in `dbo`,
+  that reads `dbo.t` where DuckDB reads `sales.t` (measured with the mutant: dbo's sums). `QualifyBareNames` gives
+  each bare name the first search-path schema of this catalog that holds it (the binder's rule) before anything else.
+- **Limit, DuckDB's:** the optimizer's check still looks in `main` = the default schema, so a table that exists only
+  in another schema stays local when named bare. Safe; it is pushed when named `schema.table`.
+- **Found on the way, a pre-existing defect, FIXED:** `fabricator_refresh_cache` only ever ADDED schemas — a schema
+  dropped out of band stayed listed and resolvable until the next ATTACH (measured: `duckdb_schemas()` kept it). A
+  stale empty `main` then kept the alias from applying. `RefreshCache` retires a root an earlier discovery reported
+  and this one does not; a schema created in the session that discovery cannot see (an empty one on an object store)
+  stays.
+
+Gate: `verify_remote_select_mssql` §19 (644 -> 687): `rp.main` = dbo; bare INSERT … SELECT and DELETE with a subquery
+pushed under `USE rp.dbo`; under `USE rp.rs_use_s` the same names hold other rows and the pushed SELECT / INSERT /
+UPDATE reach those; a real `main` wins; a dropped `main` leaves at the refresh. Guide S15 (185 -> 195). Four mutants
+killed: no search-path qualification (the rs_use_s sums), no alias (the `rp.main` row), the alias over a real `main`
+(its row), no retirement (run with a stale `main` on the server: the alias row).
 
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 

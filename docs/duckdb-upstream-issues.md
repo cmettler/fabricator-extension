@@ -1053,6 +1053,20 @@ SELECT count(*) FROM a.eu.other;              -- 1
   asked of the schema entry. ⚠ `PRAGMA disable_optimizer` disables it. Gate `verify_delta_nested_schemas` §12,
   mutant killed at :465.
 
+## 14. The remote pushdown optimizer checks a bare table name in `main`, not in the search path's schema — 2.0
+
+Found 2026-10-31 (docs/duckdb-2.0-remote-execution.md §4.22). NOT filed. A missed pushdown, never a wrong answer.
+
+- `RemotePushdownOptimizer::Rewrite(BaseTableRef)`, case 2 (no catalog in the name): after deciding the single
+  remote catalog of the search path, it confirms the table with `LookupEntry(remote_catalog, table, schema_path)`,
+  which qualifies an empty schema path with `DEFAULT_SCHEMA` (`main`). The search path's schema for that catalog
+  (`USE db.dbo` ⇒ `dbo`) is not consulted — although `EntryExistsInLocalCatalog`, two lines above, does use the
+  search-path schema for local catalogs.
+- So a remote catalog without a `main` schema never gets a bare-name statement. duckdb-postgres works around it by
+  answering `main` with its default schema (`PostgresCatalog::LookupSchema`, `c045f6c`); we do the same now.
+- Even with that alias the check looks in the DEFAULT schema: after `USE db.sales`, a table only in `sales` is never
+  pushed. The fix is to look it up in `GetSchemasForCatalog(remote_catalog)` from the search path.
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the

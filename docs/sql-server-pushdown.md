@@ -316,6 +316,22 @@ SELECT count(*) FROM mssql.dbo.pg_sales_eu WHERE CAST(loaded AS DATE) = DATE '20
 A negative count (`left(note, -1)`, all but the last character in DuckDB) stays local: T-SQL refuses it.
 `ltrim` / `rtrim` need SQL Server 2022 or later to be pushed.
 
+**S15 — names through `USE`.** After `USE mssql.dbo` (or `USE mssql`) the bare names are pushed like qualified ones —
+DML too, which stayed in DuckDB until 2026-10-31. A bare name takes the schema `USE` / `search_path` gives it, as in
+DuckDB; `mssql.main` is the database's default schema (`dbo`) unless a schema called `main` exists:
+
+```sql
+USE mssql.dbo;
+SELECT region, sum(amount) FROM pg_sales GROUP BY region ORDER BY region;
+-- EXPLAIN: Fabricator Query.   EU 40.00 / US 25.00
+DELETE FROM pg_sales_eu WHERE id IN (SELECT id FROM pg_sales WHERE region = 'US');
+-- EXPLAIN: Fabricator Remote Dml
+USE memory;
+```
+
+One limit, DuckDB's: the check whether a bare name is a table of the catalog looks in `main`, i.e. the default
+schema — a table only in another schema stays in DuckDB when named bare (it is pushed when named `schema.table`).
+
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
 an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or

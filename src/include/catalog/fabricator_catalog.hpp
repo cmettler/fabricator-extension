@@ -259,6 +259,9 @@ private:
 	bool superset_filter_pushdown_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> schemas_;
+	//! The schema roots the last discovery reported (LoadCatalog / RefreshCache): a refresh retires one of these
+	//! that is no longer reported. Guarded by schema_lock_.
+	case_insensitive_set_t discovered_roots_;
 
 	//! Finds — creating each missing level — the schema entry at `path`, outermost element first, and
 	//! returns the LEAF. A one-element path is the flat case and touches only `schemas_`; deeper levels

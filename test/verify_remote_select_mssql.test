@@ -1927,3 +1927,133 @@ SELECT count(*) FROM db.dbo.rs_str WHERE CAST(ts AS DATE) = DATE '2024-01-01';
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_str');
+
+# ═══ §19  Bare names through USE (docs/duckdb-2.0-remote-execution.md §4.22) ═════════════════════════════════════
+# DuckDB's remote pushdown optimizer checks a bare table name as <catalog>.main.<name> — and this catalog has no
+# `main`, so nothing named through `USE db.dbo` was ever pushed (SELECTs were, by the subtree pass, which works on the
+# bound plan; DML never). `main` now answers with the default schema when no real schema of that name exists, and a
+# pushed node's bare names take the schema the session's search path finds them in — NOT the default schema: after
+# `USE rp.rs_use_s` the same name in dbo holds other rows, and reading those would be a wrong answer.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_use; DROP TABLE IF EXISTS dbo.rs_use2; IF SCHEMA_ID(''rs_use_s'') IS NOT NULL BEGIN DROP TABLE IF EXISTS rs_use_s.rs_use; DROP TABLE IF EXISTS rs_use_s.rs_use2; END; IF SCHEMA_ID(''main'') IS NOT NULL BEGIN DROP TABLE IF EXISTS main.rs_use; EXEC(''DROP SCHEMA main''); END;');
+
+statement ok
+SELECT fabricator_exec('db', 'IF SCHEMA_ID(''rs_use_s'') IS NULL EXEC(''CREATE SCHEMA rs_use_s'')');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_use (id INT PRIMARY KEY, g INT, v INT); INSERT INTO dbo.rs_use SELECT value, value % 3, value FROM GENERATE_SERIES(1, 100); CREATE TABLE rs_use_s.rs_use (id INT PRIMARY KEY, g INT, v INT); INSERT INTO rs_use_s.rs_use SELECT value, value % 2, value * 1000 FROM GENERATE_SERIES(1, 10); CREATE TABLE dbo.rs_use2 (id INT PRIMARY KEY, g INT, s BIGINT); CREATE TABLE rs_use_s.rs_use2 (id INT PRIMARY KEY, g INT, s BIGINT);');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+# `main` is the default schema here
+query I
+SELECT count(*) FROM rp.main.rs_use;
+----
+100
+
+statement ok
+USE rp.dbo;
+
+# DML naming its tables bare runs on the server now
+query II
+EXPLAIN INSERT INTO rs_use2 SELECT g, g, sum(v) FROM rs_use GROUP BY g;
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+INSERT INTO rs_use2 SELECT g, g, sum(v) FROM rs_use GROUP BY g;
+----
+3
+
+query II
+EXPLAIN DELETE FROM rs_use2 WHERE g IN (SELECT g FROM rs_use WHERE v > 98);
+----
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
+
+query I
+DELETE FROM rs_use2 WHERE g IN (SELECT g FROM rs_use WHERE v > 98);
+----
+2
+
+query III
+SELECT * FROM rs_use2 ORDER BY id;
+----
+2	2	1650
+
+# another schema of the catalog: the same names hold other rows there, and the bare names must reach THOSE
+statement ok
+USE rp.rs_use_s;
+
+query II
+EXPLAIN SELECT g, sum(v) FROM rs_use GROUP BY g ORDER BY g;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+SELECT g, sum(v) FROM rs_use GROUP BY g ORDER BY g;
+----
+0	30000
+1	25000
+
+query I
+INSERT INTO rs_use2 SELECT g, g, sum(v) FROM rs_use GROUP BY g;
+----
+2
+
+query I
+UPDATE rs_use2 SET s = s + 1 WHERE id IN (SELECT g FROM rs_use WHERE v = 1000);
+----
+1
+
+query III
+SELECT * FROM rp.rs_use_s.rs_use2 ORDER BY id;
+----
+0	0	30000
+1	1	25001
+
+# dbo's copy is untouched
+query III
+SELECT * FROM rp.dbo.rs_use2 ORDER BY id;
+----
+2	2	1650
+
+statement ok
+USE memory;
+
+# a real schema called main wins over the alias
+statement ok
+SELECT fabricator_exec('db', 'IF SCHEMA_ID(''main'') IS NULL EXEC(''CREATE SCHEMA main''); CREATE TABLE main.rs_use (id INT PRIMARY KEY); INSERT INTO main.rs_use VALUES (1), (2);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+query I
+SELECT count(*) FROM rp.main.rs_use;
+----
+2
+
+# dropped out of band, the schema leaves the catalog at the refresh (it stayed listed and resolvable until the next
+# ATTACH before 2026-10-31), and `main` is the default schema again
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE main.rs_use; DROP SCHEMA main;', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'rp' AND schema_name = 'main';
+----
+0
+
+query I
+SELECT count(*) FROM rp.main.rs_use;
+----
+100
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_use; DROP TABLE dbo.rs_use2; DROP TABLE rs_use_s.rs_use; DROP TABLE rs_use_s.rs_use2; DROP SCHEMA rs_use_s;', refresh_cache := true);

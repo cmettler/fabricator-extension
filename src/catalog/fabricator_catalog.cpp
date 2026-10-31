@@ -6,6 +6,7 @@
 //                         fabricator — catalog (impl)
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp" // 2.0: DUCKDB_LOG_* macros live here
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_partition_util.hpp"
@@ -233,9 +234,15 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	// return only matches), so register everything discovered.
 	for (auto &schema_path : DiscoverSchemaPaths(handle_)) {
 		EnsureSchemaPathLocked(schema_path);
+		if (!schema_path.empty()) {
+			discovered_roots_.insert(schema_path.front());
+		}
 	}
 	for (auto &table : DiscoverTables(handle_)) {
 		EnsureSchemaPathLocked(table.schema_path).AddTable(table.table_name, table.table_type);
+		if (!table.schema_path.empty()) {
+			discovered_roots_.insert(table.schema_path.front());
+		}
 	}
 	RegisterDeclarationsLocked();
 }
@@ -273,12 +280,33 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 	}
 	// schema_filter / table_filter are applied provider-side now (DiscoverSchemas/DiscoverTables already
 	// return only matches), so register everything discovered.
+	case_insensitive_set_t live_roots;
 	for (auto &schema_path : DiscoverSchemaPaths(handle_)) {
 		EnsureSchemaPathLocked(schema_path);
+		if (!schema_path.empty()) {
+			live_roots.insert(schema_path.front());
+		}
 	}
 	for (auto &table : DiscoverTables(handle_)) {
 		EnsureSchemaPathLocked(table.schema_path).AddTable(table.table_name, table.table_type);
+		if (!table.schema_path.empty()) {
+			live_roots.insert(table.schema_path.front());
+		}
 	}
+	// A schema an earlier discovery reported and this one does not was dropped out of band: retired, like every
+	// eviction (a binder may still hold it). Until 2026-10-31 a refresh only ever ADDED schemas, so a dropped one
+	// stayed listed and resolvable until the next ATTACH — and a stale empty `main` kept LookupSchema's alias from
+	// applying. Only a PREVIOUSLY DISCOVERED one: a schema created in this session that discovery cannot see (an
+	// empty one on an object store has no files) stays.
+	for (auto it = schemas_.begin(); it != schemas_.end();) {
+		if (live_roots.count(it->first) || !discovered_roots_.count(it->first)) {
+			++it;
+			continue;
+		}
+		retired_schemas_.push_back(std::move(it->second));
+		it = schemas_.erase(it);
+	}
+	discovered_roots_ = std::move(live_roots);
 	RegisterDeclarationsLocked();
 }
 
@@ -306,6 +334,25 @@ optional_ptr<SchemaCatalogEntry> FabricatorCatalog::LookupSchema(CatalogTransact
 		                                 return it == schemas_.end() ? nullptr
 		                                                             : optional_ptr<CatalogEntry>(it->second.get());
 	                                 });
+	if (!resolved && !default_schema_.empty() && !StringUtil::CIEquals(default_schema_, DEFAULT_SCHEMA)) {
+		// DuckDB's default schema name `main`, where the provider's own default is another schema (SQL Server:
+		// the login's, `dbo` in practice), is answered with that schema — as duckdb-postgres does. DuckDB's remote
+		// pushdown optimizer checks a bare table name as <catalog>.main.<name> (Rewrite(BaseTableRef), case 2),
+		// so without this a statement naming tables through `USE db.dbo` was never pushed. A real schema called
+		// main wins: it was looked up first.
+		auto &path = schema_lookup.GetQualifiedName().Path();
+		idx_t first = path.size() > 1 ? 1 : 0;
+		if (path.size() == first + 1 && StringUtil::CIEquals(path[first].GetIdentifierName(), DEFAULT_SCHEMA)) {
+			resolved = LookupSchemaPath(transaction,
+			                            EntryLookupInfo(schema_lookup, QualifiedName(Identifier(default_schema_))),
+			                            OnEntryNotFound::RETURN_NULL,
+			                            [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
+				                            auto it = schemas_.find(root.GetEntryName());
+				                            return it == schemas_.end() ? nullptr
+				                                                        : optional_ptr<CatalogEntry>(it->second.get());
+			                            });
+		}
+	}
 	if (resolved) {
 		return resolved;
 	}

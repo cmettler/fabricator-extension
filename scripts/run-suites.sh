@@ -1564,7 +1564,9 @@ case "$TIER" in
         # 2026-10-31: 6548 -> 6617: ||, trim, left / right and a date cast of a timestamp are pushed —
         # verify_remote_select_mssql 593 -> 644 (§18), verify_pushdown_guide_mssql 167 -> 185 (S14); tier measured
         # 6401 with merge_pushdown (90) and moved_rows (126) failing on their old `||` decline controls, 6617 after
-        : "${MIN_ASSERTIONS:=6617}"
+        # 2026-10-31: 6617 -> 6670: bare names through USE are pushed — verify_remote_select_mssql 644 -> 687 (§19),
+        #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
+        : "${MIN_ASSERTIONS:=6670}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

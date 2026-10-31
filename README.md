@@ -306,7 +306,9 @@ on SQL Server 2019+ and Azure SQL, not on Fabric Warehouse / Synapse. A `SELECT`
 ONE T-SQL statement, so only its result leaves the server; `EXPLAIN` shows `Fabricator Query` instead of
 `Fabricator Scan`. DuckDB binds the query itself, the plan travels as [Substrait](https://substrait.io) and is
 translated to T-SQL; the result keeps DuckDB's types and column names, and an `ORDER BY` is applied again
-locally. Whenever any part cannot be translated EXACTLY, the whole statement runs locally as before. Pushed:
+locally. Whenever any part cannot be translated EXACTLY, the whole statement runs locally as before. Names may be
+qualified or bare through `USE mssql.dbo` (a bare name takes the schema `USE` gives it; one that exists only outside
+the default schema stays local — a DuckDB limit). Pushed:
 
 - joins of the catalog's tables (`INNER`, `LEFT`, `RIGHT`, `FULL`, and `IN` / `EXISTS` subqueries), `UNION ALL`,
   `EXCEPT ALL`, `INTERSECT ALL`;
@@ -599,7 +601,11 @@ SELECT current_schema();               -- dbo
 
 > **The default schema is the login's, as SQL Server sees it** (`SCHEMA_NAME()`, read at ATTACH; `dbo` when the
 > server reports none). It is what `mssql.t`, `USE mssql` and an unqualified `CREATE TABLE mssql.t` use, and
-> `fabricator_server_info(catalog)` shows it as `default_schema`. Delta and DAX catalogs keep DuckDB's `main`.
+> `fabricator_server_info(catalog)` shows it as `default_schema`. `mssql.main` is that schema too, unless the
+> database has a schema called `main`. Delta and DAX catalogs keep DuckDB's `main`.
+>
+> `fabricator_refresh_cache(catalog)` also drops schemas that were dropped on the server (it only added new ones
+> before 2026-10-31).
 
 > **Objects the server cannot describe are skipped, not fatal.** The commonest case is an **invalid view**
 > on SQL Server — one whose underlying table or column has been dropped or renamed. Such an object is left
