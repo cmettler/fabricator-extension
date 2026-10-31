@@ -4588,7 +4588,11 @@ principal wins even if `PROVIDER` says something else:
 > `CALL enable_logging(level := 'debug', storage := 'memory')`). Single-writer use is unaffected, and a
 > read-only attach needs nothing — this is only about concurrent writers.
 
-> ### ⚠ A LOCAL path on **Windows** is single-writer only
+> ### ⚠ A LOCAL path on **Windows** is single-writer only — on the 1.5 line
+>
+> **On the DuckDB 2.0 line this is fixed** (DuckDB 2.0's exclusive create holds on Windows, and the commit file is
+> written under a temporary name and moved into place, so a concurrent reader never sees it half-written). What
+> follows describes 1.5.x builds.
 >
 > Delta's commit needs a put-if-absent, and on Windows the local filesystem does not provide one through
 > DuckDB — exclusive-create **succeeds on a file that already exists**, and a rename **overwrites** its

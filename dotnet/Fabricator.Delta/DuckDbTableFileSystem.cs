@@ -412,6 +412,16 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         {
             return new ValueTask<bool>(false); // target exists => commit conflict
         }
+        if (OperatingSystem.IsWindows() && !_root.Contains("://"))
+        {
+            bool won = TryPublishLocalWindows(dst, data.Span);
+            if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+            {
+                Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "local publish {Path} -> {Outcome}", path,
+                    won ? "won" : "LOST (exists)");
+            }
+            return new ValueTask<bool>(won);
+        }
         if (!HostFs.TryOpenWriteExclusive(Opener, dst, out nint target))
         {
             return new ValueTask<bool>(false); // target exists => commit conflict
@@ -431,6 +441,52 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             HostFs.CloseWrite(target);
         }
         return new ValueTask<bool>(true);
+    }
+
+    /// <summary>
+    /// The commit on a local WINDOWS root: the whole file is written under a temporary name and then moved onto the
+    /// commit name WITHOUT replacing (MoveFileEx without MOVEFILE_REPLACE_EXISTING — atomic, and it fails when the
+    /// target exists). False = the target exists, the commit-conflict signal.
+    /// </summary>
+    /// <remarks>
+    /// Create-then-write publishes the name BEFORE the content, and a concurrent writer re-reading the log sees an
+    /// empty or half-written commit — or, on Windows, cannot open it at all ("being used by another process", what
+    /// failed verify_ducklake_delta_sync in CI). MEASURED 2026-10-31 on DuckDB 2.0, whose EXCLUSIVE_CREATE does hold
+    /// now: 8 processes × (an INSERT + 5 UPDATEs of their own rows) on one local table lost whole INSERTs and UPDATEs
+    /// with no error (300 of 400 rows, v 1200 of 2000), because a snapshot missing a commit is what the next
+    /// checkpoint records. ⚠ Windows only: on POSIX .NET's no-replace move is a link(), which a FUSE mount (Fabric's
+    /// /lakehouse/default) does not support — it falls back to check-then-rename there, a race; the O_EXCL create
+    /// below is the measured-safe primitive on that mount.
+    /// </remarks>
+    private static bool TryPublishLocalWindows(string path, ReadOnlySpan<byte> data)
+    {
+        string temp = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!,
+            "." + System.IO.Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            using (var file = new System.IO.FileStream(temp, System.IO.FileMode.CreateNew, System.IO.FileAccess.Write,
+                       System.IO.FileShare.None))
+            {
+                file.Write(data);
+                file.Flush(flushToDisk: true);
+            }
+            try
+            {
+                System.IO.File.Move(temp, path, overwrite: false);
+                return true;
+            }
+            catch (System.IO.IOException) when (System.IO.File.Exists(path))
+            {
+                return false; // another writer published this version first
+            }
+        }
+        finally
+        {
+            if (System.IO.File.Exists(temp))
+            {
+                System.IO.File.Delete(temp);
+            }
+        }
     }
 
     public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
