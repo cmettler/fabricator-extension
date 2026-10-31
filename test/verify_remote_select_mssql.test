@@ -2057,3 +2057,124 @@ SELECT count(*) FROM rp.main.rs_use;
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_use; DROP TABLE dbo.rs_use2; DROP TABLE rs_use_s.rs_use; DROP TABLE rs_use_s.rs_use2; DROP SCHEMA rs_use_s;', refresh_cache := true);
+
+# ═══ §20  Correlated scalar subqueries: the single join (docs/duckdb-2.0-remote-execution.md §4.23) ═══════════════
+# DuckDB decorrelates `(SELECT … WHERE i.k = o.k)` into a SINGLE join — at most one right row per left row, an error
+# for more — and that stayed local. It is ONE read of the right side per left row now: an OUTER APPLY of its first
+# matching row and how many matched, with T-SQL's own error 512 for more than one. Outer rows without a match (NULL;
+# count 0), NULL outer keys (the decorrelation joins back with IS NOT DISTINCT FROM), keys with many matches.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_so; DROP TABLE IF EXISTS dbo.rs_si; CREATE TABLE dbo.rs_so (id INT PRIMARY KEY, k INT NULL); CREATE TABLE dbo.rs_si (id INT PRIMARY KEY, k INT NULL, v INT NULL); INSERT INTO dbo.rs_so SELECT value, CASE WHEN value % 17 = 0 THEN NULL ELSE value % 25 END FROM GENERATE_SERIES(1, 200); INSERT INTO dbo.rs_si SELECT value, CASE WHEN value % 31 = 0 THEN NULL ELSE value % 20 END, CASE WHEN value % 7 = 0 THEN NULL ELSE value END FROM GENERATE_SERIES(1, 300);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+# routing: the lookup runs as one statement, the count's part on the server; a top-1 per key keeps its single join in
+# DuckDB (see below)
+query II
+EXPLAIN SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.id = o.id * 2) FROM rp.dbo.rs_so o;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.k = o.k ORDER BY i.v DESC NULLS LAST, i.id LIMIT 1) FROM rp.dbo.rs_so o;
+----
+physical_plan	<REGEX>:.*Join Type: SINGLE.*
+
+query II
+EXPLAIN SELECT o.id, (SELECT count(*) FROM rp.dbo.rs_si i WHERE i.k = o.k) FROM rp.dbo.rs_so o;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# the differential, both ways
+query I
+SELECT count(*) FROM (
+ (SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.id = o.id * 2) AS lookup,
+         (SELECT i.v FROM rp.dbo.rs_si i WHERE i.k = o.k ORDER BY i.v DESC NULLS LAST, i.id LIMIT 1) AS top1,
+         (SELECT count(*) FROM rp.dbo.rs_si i WHERE i.k = o.k) AS n
+  FROM rp.dbo.rs_so o)
+ EXCEPT ALL
+ (SELECT o.id, (SELECT i.v FROM db.dbo.rs_si i WHERE i.id = o.id * 2),
+         (SELECT i.v FROM db.dbo.rs_si i WHERE i.k = o.k ORDER BY i.v DESC NULLS LAST, i.id LIMIT 1),
+         (SELECT count(*) FROM db.dbo.rs_si i WHERE i.k = o.k)
+  FROM db.dbo.rs_so o));
+----
+0
+
+query I
+SELECT count(*) FROM (
+ (SELECT o.id, (SELECT i.v FROM db.dbo.rs_si i WHERE i.id = o.id * 2) AS lookup,
+         (SELECT i.v FROM db.dbo.rs_si i WHERE i.k = o.k ORDER BY i.v DESC NULLS LAST, i.id LIMIT 1) AS top1,
+         (SELECT count(*) FROM db.dbo.rs_si i WHERE i.k = o.k) AS n
+  FROM db.dbo.rs_so o)
+ EXCEPT ALL
+ (SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.id = o.id * 2),
+         (SELECT i.v FROM rp.dbo.rs_si i WHERE i.k = o.k ORDER BY i.v DESC NULLS LAST, i.id LIMIT 1),
+         (SELECT count(*) FROM rp.dbo.rs_si i WHERE i.k = o.k)
+  FROM rp.dbo.rs_so o));
+----
+0
+
+# pinned (values from the local path): no match is NULL for a value and 0 for a count, a NULL outer key matches
+# nothing
+query IIII
+SELECT count(*) FILTER (WHERE lookup IS NULL), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE k IS NULL AND n = 0), sum(n)
+FROM (SELECT o.id, o.k, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.id = o.id * 2) AS lookup,
+             (SELECT count(*) FROM rp.dbo.rs_si i WHERE i.k = o.k) AS n FROM rp.dbo.rs_so o);
+----
+71	50	11	2182
+
+# a top-1 per key is NOT sent as the single join: it decorrelates into ROW_NUMBER over the whole right table, which
+# SQL Server ranks again for every outer row (measured 1457 s against 0.33 s locally at 20k x 1M rows)
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+statement ok
+SELECT count(m) FROM (SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.k = o.k ORDER BY i.v DESC NULLS LAST, i.id LIMIT 1) AS m FROM rp.dbo.rs_so o);
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%ranks or limits rows stays local%') > 0, count(*) FILTER (WHERE message LIKE 'remote%OUTER APPLY%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+true	0
+
+statement ok
+CALL disable_logging();
+
+# in a WHERE
+query II
+SELECT count(*), sum(o.id) FROM rp.dbo.rs_so o WHERE (SELECT i.v FROM rp.dbo.rs_si i WHERE i.id = o.id) > 100;
+----
+86	12943
+
+# more than one matching row is an error on both paths, also when nothing reads the value
+statement error
+SELECT count(*) FROM (SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.k = o.k) AS m FROM rp.dbo.rs_so o);
+----
+<REGEX>:.*(more than 1 value|More than one row).*
+
+statement error
+SELECT count(*) FROM (SELECT o.id, (SELECT i.v FROM db.dbo.rs_si i WHERE i.k = o.k) AS m FROM db.dbo.rs_so o);
+----
+More than one row returned by a subquery
+
+# with DuckDB's setting off any one of the rows is taken, as locally
+statement ok
+SET scalar_subquery_error_on_multiple_rows = false;
+
+query II
+SELECT count(*), count(m) FROM (SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.k = o.k AND i.v IS NOT NULL) AS m FROM rp.dbo.rs_so o);
+----
+200	150
+
+query II
+SELECT count(*), count(m) FROM (SELECT o.id, (SELECT i.v FROM db.dbo.rs_si i WHERE i.k = o.k AND i.v IS NOT NULL) AS m FROM db.dbo.rs_so o);
+----
+200	150
+
+statement ok
+RESET scalar_subquery_error_on_multiple_rows;
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_so; DROP TABLE dbo.rs_si;', refresh_cache := true);

@@ -1566,7 +1566,9 @@ case "$TIER" in
         # 6401 with merge_pushdown (90) and moved_rows (126) failing on their old `||` decline controls, 6617 after
         # 2026-10-31: 6617 -> 6670: bare names through USE are pushed — verify_remote_select_mssql 644 -> 687 (§19),
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
-        : "${MIN_ASSERTIONS:=6670}"
+        # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
+        #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
+        : "${MIN_ASSERTIONS:=6714}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

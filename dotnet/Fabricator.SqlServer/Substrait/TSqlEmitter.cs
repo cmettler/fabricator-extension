@@ -78,6 +78,12 @@ internal sealed class TSqlEmitter
     public bool SupportsTrimCharacters { get; init; } = true;
 
     /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A single join takes any one of several matching rows instead of failing
+    /// (DuckDB's scalar_subquery_error_on_multiple_rows = false; the plan says so).
+    /// </summary>
+    public bool SingleJoinAnyRow { get; init; }
+
+    /// <summary>
     /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A function of the attached catalog (its schema path and name) as the T-SQL
     /// name to call it by, e.g. <c>[dbo].[f]</c> — or null when it does not run on the server (a function the provider
     /// implements itself). Unset: every catalog function is refused.
@@ -1015,8 +1021,9 @@ internal sealed class TSqlEmitter
             case F.JoinType_RightMark:
                 return EmitMarkJoin(rel);
             case F.JoinType_LeftSingle:
+                return EmitSingleJoin(rel);
             case F.JoinType_RightSingle:
-                throw SubstraitTranslationException.Unsupported("Single joins are not supported.");
+                throw SubstraitTranslationException.Unsupported("Right single joins are not supported.");
             default:
                 throw SubstraitTranslationException.MalformedPlan($"Join type {rel.Type} is not valid.");
         }
@@ -1066,6 +1073,68 @@ internal sealed class TSqlEmitter
         }
         return block;
     }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A left single join — a correlated scalar subquery after DuckDB decorrelated it:
+    /// the left rows, each with the ONE right row the condition matches (NULLs for none), and an error for more than
+    /// one unless <see cref="SingleJoinAnyRow"/>. ONE read of the right side per left row: an OUTER APPLY of its first
+    /// matching row and how many matched. A scalar subquery per right column would read it once per column, and
+    /// T-SQL drops an unread one with its error — DuckDB raises it all the same (measured). The error is T-SQL's own
+    /// (512): a subquery in the CASE branch that returns two rows, evaluated only when the branch is taken.
+    /// </summary>
+    private SelectBlock EmitSingleJoin(JoinRel rel)
+    {
+        if (RanksOrLimits(rel.Right))
+        {
+            // MEASURED: a top-1 per key (`ORDER BY … LIMIT 1` in the subquery) decorrelates into ROW_NUMBER() OVER
+            // (PARTITION BY key) over the WHOLE right table, and SQL Server ranks it again for every left row — with
+            // `=` as with IS NOT DISTINCT FROM. 1457 s pushed against 0.33 s in DuckDB (20k outer rows, 1M inner).
+            throw SubstraitTranslationException.Unsupported(
+                "a correlated subquery that ranks or limits rows stays local (SQL Server would rank the whole table per row).");
+        }
+        var left = EmitRel(rel.Left);
+        var right = EmitRel(rel.Right);
+        PrepareExistsSides(ref left, ref right, leftOuter: true);
+        if (rel.Expression != null && !IsTrue(rel.Expression))
+        {
+            right.Where.Add(Predicate(rel.Expression, left.Columns.Concat(right.Columns).ToList()));
+        }
+        var names = UniqueNames(right.Columns.Select(c => c.Name));
+        var items = SelectList(right, names);
+        string matches = UniqueName("_n", names);
+        items.Add(("COUNT_BIG(*) OVER ()", matches));
+        right.Top = "1";
+        string alias = NewAlias();
+        left.From = left.From + "\nOUTER APPLY " + TSql.Parenthesize(Render(right, items, keepOrder: false)) + " AS " + alias;
+        left.FromIsJoin = true;
+        left.Columns = left.Columns
+            .Concat(names.Select((n, i) => ColumnOf(alias, n, right.Columns[i].Type.WithNullable(true))))
+            .ToList();
+        if (!SingleJoinAnyRow)
+        {
+            string count = alias + "." + TSql.Identifier(matches);
+            left.Where.Add($"(CASE WHEN {count} > 1 THEN (SELECT {count} FROM (VALUES (1), (2)) AS [_v]([x])) ELSE 0 END = 0)");
+        }
+        if (rel.PostJoinFilter != null)
+        {
+            left.Where.Add(Predicate(rel.PostJoinFilter, left.Columns));
+        }
+        return left;
+    }
+
+    /// <summary>Whether a relation ranks or limits its rows (a window, a fetch, a top-n) anywhere below it.</summary>
+    private static bool RanksOrLimits(Rel rel) => rel switch
+    {
+        WindowRel or FetchRel or TopNRel => true,
+        FilterRel f => RanksOrLimits(f.Input),
+        ProjectRel p => RanksOrLimits(p.Input),
+        SortRel s => RanksOrLimits(s.Input),
+        AggregateRel a => RanksOrLimits(a.Input),
+        JoinRel j => RanksOrLimits(j.Left) || RanksOrLimits(j.Right),
+        CrossRel c => RanksOrLimits(c.Left) || RanksOrLimits(c.Right),
+        SetRel s => s.Inputs.Any(RanksOrLimits),
+        _ => false,
+    };
 
     /// <summary>Prepares a block to be one side of a join, wrapping it when it can't be joined as it stands.</summary>
     private SelectBlock JoinInput(SelectBlock block, bool nullSupplying, bool keepWhere)

@@ -241,6 +241,20 @@ physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
 statement ok
 USE memory;
 
+# S16: a correlated scalar subquery is pushed (OUTER APPLY of the first match and the match count)
+query II
+EXPLAIN SELECT s.id, (SELECT r.name FROM mssql.dbo.pg_regions r WHERE r.region = s.region) AS name, (SELECT count(*) FROM mssql.dbo.pg_sales x WHERE x.region = s.region) AS same_region FROM mssql.dbo.pg_sales s ORDER BY s.id;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query III
+SELECT s.id, (SELECT r.name FROM mssql.dbo.pg_regions r WHERE r.region = s.region) AS name, (SELECT count(*) FROM mssql.dbo.pg_sales x WHERE x.region = s.region) AS same_region FROM mssql.dbo.pg_sales s ORDER BY s.id;
+----
+1	Europe	2
+2	Americas	2
+3	Europe	2
+4	Americas	2
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok

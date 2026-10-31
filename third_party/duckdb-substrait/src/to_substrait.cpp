@@ -21,6 +21,7 @@
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp" // [FABRICATOR-PATCH: OURS-BY-DESIGN] optional filters
+#include "duckdb/main/settings.hpp" // [FABRICATOR-PATCH: OURS-BY-DESIGN] single joins
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -1706,6 +1707,11 @@ substrait::Rel *DuckDBToSubstrait::TransformComparisonJoin(LogicalOperator &dop)
 		break;
 	case JoinType::SINGLE:
 		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SINGLE);
+		// [FABRICATOR-PATCH: OURS-BY-DESIGN] what a second matching row does is a session setting DuckDB reads when the
+		// join RUNS (join_hashtable.cpp): an error by default, any one of the rows when it is off — the consumer is told
+		if (!Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context)) {
+			AddPlanOptimization("fabricator.single_join_any_row");
+		}
 		break;
 	case JoinType::SEMI:
 		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SEMI);

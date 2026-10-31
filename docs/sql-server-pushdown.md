@@ -257,9 +257,8 @@ measured: 28 of 300 000 rows lost their subquery result over 8 runs. So such a q
 holds a connection), inside a SERIALIZABLE / SNAPSHOT transaction — and stays in DuckDB otherwise
 (`… reads the same rows more than once …` in the log).
 
-Not pushed (yet): a correlated **scalar** subquery (`SELECT (SELECT max(…) FROM … WHERE … > t.k) FROM t`). Its
-decorrelation keeps a single join — at most one row per outer row — which has no exact T-SQL form. A correlated
-subquery whose OUTER side is local data stays as before: its remote part is sent uncorrelated.
+A correlated **scalar** subquery is pushed too since 2026-10-31 (S16). A correlated subquery whose OUTER side is local
+data stays as before: its remote part is sent uncorrelated.
 
 **S10 — pushed: a table-valued function with constant arguments.** It is called by its schema and name inside the
 server query, like a table:
@@ -331,6 +330,20 @@ USE memory;
 
 One limit, DuckDB's: the check whether a bare name is a table of the catalog looks in `main`, i.e. the default
 schema — a table only in another schema stays in DuckDB when named bare (it is pushed when named `schema.table`).
+
+**S16 — pushed: a correlated scalar subquery.** A lookup or a count per row: DuckDB plans it as a join that allows at
+most one matching row per outer row; the server gets it as an `OUTER APPLY` of the first matching row and how many
+matched — one read per outer row — and more than one match is an error there as in DuckDB (SQL Server's error 512):
+
+```sql
+SELECT s.id, (SELECT r.name FROM mssql.dbo.pg_regions r WHERE r.region = s.region) AS name,
+       (SELECT count(*) FROM mssql.dbo.pg_sales x WHERE x.region = s.region) AS same_region
+FROM mssql.dbo.pg_sales s ORDER BY s.id;
+-- EXPLAIN: Fabricator Query.   1 Europe 2 / 2 Americas 2 / 3 Europe 2 / 4 Americas 2
+```
+
+A top-1 per row (`(SELECT … ORDER BY … LIMIT 1)`) keeps that join in DuckDB: it becomes a ranking over the whole
+table, which SQL Server would compute again for every outer row.
 
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where

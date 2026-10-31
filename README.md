@@ -351,7 +351,9 @@ called once per batch. A function the provider implements itself (C#, a plugin) 
 `LATERAL (… LIMIT n)` per row, or another correlation DuckDB turns into a CTE and joins, goes as one statement too,
 with the CTE inlined for the server — only where the database reads one statement consistently
 (`READ_COMMITTED_SNAPSHOT`, snapshot isolation allowed, or a SERIALIZABLE / SNAPSHOT transaction), since the server
-reads that CTE once per reference. A correlated scalar subquery stays local (its single join has no T-SQL form). A **table-valued function** with constant arguments (`mssql.dbo.tvf('EU')`) is
+reads that CTE once per reference. A correlated scalar subquery is pushed as an `OUTER APPLY` of the first matching
+row and the match count (more than one match is an error, as in DuckDB); a top-1 per row (`… ORDER BY … LIMIT 1`)
+stays local, since SQL Server would rank the whole table per row. A **table-valued function** with constant arguments (`mssql.dbo.tvf('EU')`) is
 called by name inside such a query, joined with the catalog's tables; called per row of a table of the catalog
 (`FROM mssql.dbo.t, mssql.dbo.tvf(t.a)`) it becomes a `CROSS APPLY` in the same statement. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
 condition down). `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.

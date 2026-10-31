@@ -108,7 +108,8 @@ public static class SqlServerSubstrait
         // IGNORE NULLS, DATETRUNC and LTRIM / RTRIM with characters arrived together, with SQL Server 2022
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes)
         {
-            SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, SupportsTrimCharacters = ignoreNulls, CatalogFunctions = catalogFunctions,
+            SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, SupportsTrimCharacters = ignoreNulls,
+            SingleJoinAnyRow = decoder.PlanOptimizations.Contains("fabricator.single_join_any_row"), CatalogFunctions = catalogFunctions,
             CatalogTableFunctions = catalogTableFunctions, ColumnByteLengths = columnByteLengths
         };
         if (root.Input is WriteRel writeRel)

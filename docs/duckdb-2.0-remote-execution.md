@@ -1380,8 +1380,8 @@ decline was "local: CTE".
   build inlined a reference from a definition ABOVE the replaced subtree — RETRACTED by §4.16: DuckDB still read that
   definition itself, so the server's copy was a second read of the same rows in another statement. `SinkCtes` now moves
   the CTE down to the smallest subtree holding all its references instead, and a subtree must define every CTE it reads.
-- Pushed: LATERAL with inequality + LIMIT, WITH … AS MATERIALIZED (its definition). Local: a correlated SCALAR
-  subquery — its decorrelation keeps a SINGLE join, which T-SQL has no exact form for (before §4.16 only the part
+- Pushed: LATERAL with inequality + LIMIT, WITH … AS MATERIALIZED (its definition). Local (pushed since §4.23): a
+  correlated SCALAR subquery — its decorrelation keeps a SINGLE join, which T-SQL has no exact form for (before §4.16 only the part
   beside it was pushed, reading the outer rows twice); a correlated EXISTS with an OR (to_substrait fails to bind a
   column — declines safely).
 - Gates: `verify_subtree_pushdown_mssql` P13–P15 (167, each with its differential), guide S9. Mutant "a CTE reference is
@@ -1750,6 +1750,35 @@ pushed under `USE rp.dbo`; under `USE rp.rs_use_s` the same names hold other row
 UPDATE reach those; a real `main` wins; a dropped `main` leaves at the refresh. Guide S15 (185 -> 195). Four mutants
 killed: no search-path qualification (the rs_use_s sums), no alias (the `rp.main` row), the alias over a real `main`
 (its row), no retirement (run with a stale `main` on the server: the alias row).
+
+### 4.23 Correlated scalar subqueries: the single join — PUSHED (2026-10-31)
+
+DuckDB decorrelates `(SELECT … WHERE i.k = o.k)` into a SINGLE join: a left join that allows at most one right row
+per left row and raises an error for more (`scalar_subquery_error_on_multiple_rows`, read when the join RUNS). The
+emitter refused it, so a lookup per row, a count per row and a top-1 per row all stayed local.
+
+- **One read per left row:** `OUTER APPLY (SELECT TOP (1) <right columns>, COUNT_BIG(*) OVER () AS _n FROM <right>
+  WHERE <condition>) AS s`, and in the WHERE `CASE WHEN s._n > 1 THEN (SELECT s._n FROM (VALUES (1), (2)) …) ELSE 0
+  END = 0` — T-SQL's own error 512, from a subquery in a CASE branch, which SQL Server evaluates only when the branch
+  is taken (documented; measured: no error for unique keys, 512 for several). A scalar subquery per right column was
+  rejected: one read per column (the §4.16 repeated-read class), and T-SQL DROPS an unread scalar subquery together
+  with its error — MEASURED, while DuckDB raises it even when nothing reads the value (with the optimizer off too).
+- **The setting off** (any one row): the producer marks the plan `fabricator.single_join_any_row`; the consumer keeps
+  `TOP (1)` and drops the check — as DuckDB, which then returns a random row.
+- **⚠⚠ A TOP-1 PER KEY IS NOT PUSHED, MEASURED:** `(… ORDER BY v DESC LIMIT 1)` decorrelates into `ROW_NUMBER() OVER
+  (PARTITION BY k)` over the WHOLE right table, joined back on the key — and SQL Server ranks that table again for
+  every left row: **1457 s pushed against 0.33 s in DuckDB** (20k outer rows, 1M inner with an index on k), with `=`
+  in place of IS NOT DISTINCT FROM still over 300 s. A single join whose right side ranks or limits (`RanksOrLimits`:
+  a WindowRel, FetchRel or TopNRel below it) declines; at scale the subtree pass then pushes the ranking alone (0.17 s).
+- Measured (20k x 1M): count per key 1.27 s local → 0.50 s pushed, lookup by key 0.76 → 0.15 s.
+
+Gate: `verify_remote_select_mssql` §20 (687 -> 717): routing; an `EXCEPT ALL` differential both ways over a lookup
+(with misses), a top-1 and a count per key (NULL outer keys, keys without matches); pinned counts taken from the local
+path; a scalar subquery in a WHERE; the multi-row error on both paths even with the value unread; the setting off.
+Guide S16 (`verify_pushdown_guide_mssql` 195 -> 209). `verify_subtree_pushdown_mssql`'s N5 — which pinned this very
+case as local — is P19 now (pushed, its differential unchanged; 210). Five mutants killed: no error check (the error row), no
+`TOP (1)` (the setting-off row: 1923 rows instead of 200), the condition dropped (the differential, error 512), the
+producer never marking the setting (its row), the ranking guard removed (the top-1 routing row).
 
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 

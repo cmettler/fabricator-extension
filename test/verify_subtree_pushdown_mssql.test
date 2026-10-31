@@ -168,6 +168,12 @@ EXPLAIN SELECT b.id, f.id AS fid FROM rp.dbo.st_big b LEFT JOIN LATERAL rp.dbo.s
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
+# P19: a correlated SCALAR subquery (a count with an inequality): its single join goes to the server as an OUTER APPLY of the first match and the match count (docs/duckdb-2.0-remote-execution.md §4.23)
+query II
+EXPLAIN SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
 # N1: a scan with a filter only: the table scan pushes that already
 query II
 EXPLAIN SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region);
@@ -195,12 +201,6 @@ physical_plan	<!REGEX>:.*Fabricator Query.*
 # N6: a TVF called per row of LOCAL data: the lateral session sends chunks of arguments, not one query
 query II
 EXPLAIN SELECT l.w, f.id FROM loc l, rp.dbo.st_tvf(l.w * 10 + 50) f;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-# N5: a correlated SCALAR subquery: its decorrelation keeps a single join (at most one row per outer row), which has no exact T-SQL form; pushing the part beside it would read the outer rows twice
-query II
-EXPLAIN SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region);
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -389,6 +389,17 @@ SELECT count(*) FROM (SELECT b.id, f.id AS fid FROM lb b LEFT JOIN LATERAL st_tv
 ----
 309
 
+# P19
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region));
+----
+32
+
 # N1
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region))));
@@ -443,17 +454,6 @@ query I
 SELECT count(*) FROM (SELECT l.w, f.id FROM loc l, st_tvf_local(l.w * 10 + 50) f);
 ----
 2840
-
-# N5
-query I
-SELECT (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region)) EXCEPT ALL (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM rp.dbo.st_big b WHERE b.v > t.v AND b.region = t.region) c FROM rp.dbo.st_big t WHERE t.id <= 40) r USING (region))));
-----
-0
-
-query I
-SELECT count(*) FROM (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT count(*) FROM lb b WHERE b.v > t.v AND b.region = t.region) c FROM lb t WHERE t.id <= 40) r USING (region));
-----
-32
 
 # N3
 query I
