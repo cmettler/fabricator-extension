@@ -1780,6 +1780,26 @@ case as local — is P19 now (pushed, its differential unchanged; 210). Five mut
 `TOP (1)` (the setting-off row: 1923 rows instead of 200), the condition dropped (the differential, error 512), the
 producer never marking the setting (its row), the ranking guard removed (the top-1 routing row).
 
+**Inversion pass, 2026-10-31 — a key that is not a plain column: FIXED.** The measurements above all had an index on
+the inner key. Without one, on a plain column, SQL Server builds an index spool once (20k x 1M: 1.97 s pushed vs
+1.15 s local; on a clustered columnstore the same, 1.95 vs 1.06; a nonclustered index on the key makes it a seek,
+0.99 vs 1.12 — answering the user's question whether the table's storage changes the rule: it does not). With an
+EXPRESSION as the key (`WHERE i.k2 + i.id = o.k + o.k`) DuckDB cannot reduce the correlation to a column: the right
+side arrives as the inner table JOINED with the outer keys on that expression inside the apply, and SQL Server
+evaluates it again for every outer row — 2k x 100k: 45 s pushed vs 0.27 s local, 20k x 1M did not finish in 10 min.
+`EmitSingleJoin` now declines unless the single join's own condition has an equality between a bare right column
+and an expression of the left alone (`HasSeekableKey`, checked BEFORE the right block is wrapped — wrapping makes
+every column bare) AND every join below the right side has an equality between a table column (followed through
+projections and grouping keys; `FromTable`) and an expression of its other side (`JoinsSeekable`). A join without
+a condition counts as a product of its sides — the count per key arrives as one (a LEFT join with no condition) and
+must stay pushed (0.70 s vs 1.31 s local; the lookup by key 0.24 vs 0.71 s). Unknown shapes decline (`Width` -1).
+⚠ The first two versions of the rule were wrong in opposite directions and only the suites showed it: "decline any
+join below the right side" also declined the lookup by key (a join with the outer keys on `i.id = o.id * 2`, where
+`i.id` CAN seek), and the conditionless LEFT join of the count looked like an unseekable join until a diagnostic
+printed its condition. Gate: `verify_remote_select_mssql` §20 (717 -> 722, the expression key: differential + the
+decline in `Fabricator.Remote` with no OUTER APPLY; mutant without `JoinsSeekable` killed there), guide S16 (209 ->
+219).
+
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
 **As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.

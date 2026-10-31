@@ -255,6 +255,21 @@ SELECT s.id, (SELECT r.name FROM mssql.dbo.pg_regions r WHERE r.region = s.regio
 3	Europe	2
 4	Americas	2
 
+# S16: a subquery matching on an EXPRESSION instead of a column keeps its join in DuckDB (SQL Server would evaluate
+# it again for every outer row)
+query II
+EXPLAIN SELECT s.id, (SELECT x.region FROM mssql.dbo.pg_sales x WHERE x.id + x.id = s.id * 2) FROM mssql.dbo.pg_sales s;
+----
+physical_plan	<REGEX>:.*Join Type: SINGLE.*
+
+query II
+SELECT s.id, (SELECT x.region FROM mssql.dbo.pg_sales x WHERE x.id + x.id = s.id * 2) FROM mssql.dbo.pg_sales s ORDER BY s.id;
+----
+1	EU
+2	US
+3	EU
+4	US
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok

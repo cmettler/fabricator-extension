@@ -1570,7 +1570,7 @@ case "$TIER" in
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
         # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
         #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
-        : "${MIN_ASSERTIONS:=6714}"
+        : "${MIN_ASSERTIONS:=6729}"   # 2026-10-31: +15, a single join on an expression key stays local (remote_select +5, guide +10)
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

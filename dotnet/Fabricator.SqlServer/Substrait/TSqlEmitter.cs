@@ -1094,8 +1094,17 @@ internal sealed class TSqlEmitter
         }
         var left = EmitRel(rel.Left);
         var right = EmitRel(rel.Right);
+        if (rel.Expression == null || !JoinsSeekable(rel.Right) || !HasSeekableKey(rel.Expression, left.Columns.Count, right))
+        {
+            // MEASURED: keyed on a plain column of the right table SQL Server builds an index spool once (20k outer
+            // rows, 1M inner, no index: 1.8 s pushed, 1.1 s local). A correlation DuckDB cannot reduce to such a key
+            // (an expression) arrives as the right table JOINED with the outer keys inside the apply, which SQL Server
+            // evaluates again for every left row (2k x 100k: 45 s pushed, 0.27 s local).
+            throw SubstraitTranslationException.Unsupported(
+                "a correlated subquery that does not match on a plain column stays local (SQL Server would evaluate it once per row).");
+        }
         PrepareExistsSides(ref left, ref right, leftOuter: true);
-        if (rel.Expression != null && !IsTrue(rel.Expression))
+        if (!IsTrue(rel.Expression))
         {
             right.Where.Add(Predicate(rel.Expression, left.Columns.Concat(right.Columns).ToList()));
         }
@@ -1120,6 +1129,192 @@ internal sealed class TSqlEmitter
             left.Where.Add(Predicate(rel.PostJoinFilter, left.Columns));
         }
         return left;
+    }
+
+    /// <summary>
+    /// Whether a join condition holds an equality (a conjunct of it) between a plain column of the right side, as the
+    /// right block projects it before any wrapping, and an expression of the left side alone: the key SQL Server can
+    /// seek or spool the right side on.
+    /// </summary>
+    private static bool HasSeekableKey(Expr condition, int leftCount, SelectBlock right)
+    {
+        if (condition is not ScalarFunctionExpr f)
+        {
+            return false;
+        }
+        if (f.Function.Name == "and")
+        {
+            return f.Args.Any(a => a.Value != null && HasSeekableKey(a.Value, leftCount, right));
+        }
+        if (f.Function.Name is not ("equal" or "is_not_distinct_from") || f.Args.Count != 2)
+        {
+            return false;
+        }
+        bool RightColumn(Expr? e) => e is FieldRefExpr { StepsOut: 0 } r && r.Index >= leftCount
+                                     && r.Index - leftCount < right.Columns.Count && right.Columns[r.Index - leftCount].IsBare;
+        var a0 = f.Args[0].Value;
+        var a1 = f.Args[1].Value;
+        return (RightColumn(a0) && Within(a1, 0, leftCount)) || (RightColumn(a1) && Within(a0, 0, leftCount));
+    }
+
+    /// <summary>
+    /// Whether an expression reads only input fields in [<paramref name="from"/>, <paramref name="to"/>) (unknown
+    /// shapes: no).
+    /// </summary>
+    private static bool Within(Expr? expr, int from, int to) => expr switch
+    {
+        LiteralExpr => true,
+        FieldRefExpr { StepsOut: 0 } r => r.Index >= from && r.Index < to,
+        CastExpr c => Within(c.Input, from, to),
+        ScalarFunctionExpr f => f.Args.All(a => a.Value == null || Within(a.Value, from, to)),
+        _ => false,
+    };
+
+    /// <summary>
+    /// Whether every join below a relation can seek: its condition holds an equality between a column that is a
+    /// table column (followed through projections and grouping keys) on one side and an expression of the other side
+    /// alone.
+    /// </summary>
+    private static bool JoinsSeekable(Rel rel) => rel switch
+    {
+        JoinRel j => SeekableJoin(j) && JoinsSeekable(j.Left) && JoinsSeekable(j.Right),
+        CrossRel c => JoinsSeekable(c.Left) && JoinsSeekable(c.Right),
+        FilterRel f => JoinsSeekable(f.Input),
+        ProjectRel p => JoinsSeekable(p.Input),
+        SortRel s => JoinsSeekable(s.Input),
+        AggregateRel a => JoinsSeekable(a.Input),
+        WindowRel w => JoinsSeekable(w.Input),
+        FetchRel f => JoinsSeekable(f.Input),
+        TopNRel t => JoinsSeekable(t.Input),
+        SetRel s => s.Inputs.All(JoinsSeekable),
+        _ => true,
+    };
+
+    private static bool SeekableJoin(JoinRel j)
+    {
+        if (j.Expression == null || IsTrue(j.Expression))
+        {
+            return true; // a product of its two sides, each checked on its own
+        }
+        int lw = Width(j.Left), rw = Width(j.Right);
+        return lw >= 0 && rw >= 0 && ColumnKey(j.Expression, j, lw, rw);
+    }
+
+    private static bool ColumnKey(Expr condition, JoinRel j, int lw, int rw)
+    {
+        if (condition is not ScalarFunctionExpr f)
+        {
+            return false;
+        }
+        if (f.Function.Name == "and")
+        {
+            return f.Args.Any(a => a.Value != null && ColumnKey(a.Value, j, lw, rw));
+        }
+        if (f.Function.Name is not ("equal" or "is_not_distinct_from") || f.Args.Count != 2)
+        {
+            return false;
+        }
+        bool Column(Expr? e, bool leftSide) => e is FieldRefExpr { StepsOut: 0 } r && (leftSide
+            ? r.Index < lw && FromTable(j.Left, r.Index)
+            : r.Index >= lw && r.Index < lw + rw && FromTable(j.Right, r.Index - lw));
+        bool Other(Expr? e, bool leftSide) => leftSide ? Within(e, 0, lw) : Within(e, lw, lw + rw);
+        var a0 = f.Args[0].Value;
+        var a1 = f.Args[1].Value;
+        return (Column(a0, true) && Other(a1, false)) || (Column(a0, false) && Other(a1, true))
+               || (Column(a1, true) && Other(a0, false)) || (Column(a1, false) && Other(a0, true));
+    }
+
+    /// <summary>Whether output field <paramref name="index"/> of a relation is a column of a table it reads.</summary>
+    private static bool FromTable(Rel rel, int index)
+    {
+        if (rel.Emit != null)
+        {
+            if (index < 0 || index >= rel.Emit.Count)
+            {
+                return false;
+            }
+            index = rel.Emit[index];
+        }
+        switch (rel)
+        {
+            case ReadRel r:
+                return r.VirtualRows == null && r.TableFunctionArgs == null && r.TableNames.Count > 0;
+            case FilterRel f:
+                return FromTable(f.Input, index);
+            case SortRel s:
+                return FromTable(s.Input, index);
+            case FetchRel f:
+                return FromTable(f.Input, index);
+            case TopNRel t:
+                return FromTable(t.Input, index);
+            case ProjectRel p:
+            {
+                int w = Width(p.Input);
+                if (w < 0)
+                {
+                    return false;
+                }
+                return index < w
+                    ? FromTable(p.Input, index)
+                    : index - w < p.Expressions.Count && p.Expressions[index - w] is FieldRefExpr { StepsOut: 0 } r
+                      && FromTable(p.Input, r.Index);
+            }
+            case JoinRel { Type: F.JoinType_Inner or F.JoinType_Left or F.JoinType_Right or F.JoinType_Outer } j:
+            {
+                int lw = Width(j.Left);
+                return lw >= 0 && (index < lw ? FromTable(j.Left, index) : FromTable(j.Right, index - lw));
+            }
+            case AggregateRel a when a.GroupingSets.Count <= 1:
+                // a grouping key that is a table column (DuckDB's decorrelation groups the right table by its key)
+                return index < a.GroupingExpressions.Count && a.GroupingExpressions[index] is FieldRefExpr { StepsOut: 0 } g
+                       && FromTable(a.Input, g.Index);
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>A relation's output width (after its emit mapping), or -1 when this does not know it.</summary>
+    private static int Width(Rel rel) => rel.Emit?.Count ?? RawWidth(rel);
+
+    /// <summary>A relation's width before its emit mapping, or -1 when this does not know it.</summary>
+    private static int RawWidth(Rel rel)
+    {
+        switch (rel)
+        {
+            case ReadRel r:
+                return r.Projection?.Count ?? r.ColumnNames.Count;
+            case FilterRel f:
+                return Width(f.Input);
+            case SortRel s:
+                return Width(s.Input);
+            case FetchRel f:
+                return Width(f.Input);
+            case TopNRel t:
+                return Width(t.Input);
+            case ProjectRel p:
+            {
+                int w = Width(p.Input);
+                return w < 0 ? -1 : w + p.Expressions.Count;
+            }
+            case AggregateRel a when a.GroupingSets.Count <= 1:
+                return a.GroupingExpressions.Count + a.Measures.Count;
+            case WindowRel w:
+            {
+                int iw = Width(w.Input);
+                return iw < 0 ? -1 : iw + w.Functions.Count;
+            }
+            case JoinRel { Type: F.JoinType_Inner or F.JoinType_Left or F.JoinType_Right or F.JoinType_Outer
+                or F.JoinType_LeftSingle } j:
+                return Sum(Width(j.Left), Width(j.Right));
+            case CrossRel c:
+                return Sum(Width(c.Left), Width(c.Right));
+            case SetRel s when s.Inputs.Count > 0:
+                return Width(s.Inputs[0]);
+            default:
+                return -1;
+        }
+
+        static int Sum(int a, int b) => a < 0 || b < 0 ? -1 : a + b;
     }
 
     /// <summary>Whether a relation ranks or limits its rows (a window, a fetch, a top-n) anywhere below it.</summary>

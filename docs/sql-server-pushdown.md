@@ -345,6 +345,12 @@ FROM mssql.dbo.pg_sales s ORDER BY s.id;
 A top-1 per row (`(SELECT … ORDER BY … LIMIT 1)`) keeps that join in DuckDB: it becomes a ranking over the whole
 table, which SQL Server would compute again for every outer row.
 
+So does a subquery that matches on an EXPRESSION rather than a column (`WHERE x.id + x.id = s.id * 2`): DuckDB
+can only join it with the outer keys inside the subquery, and SQL Server evaluates that again for every outer row
+(measured 45 s against 0.27 s at 2 000 × 100 000 rows). A plain column needs no index: SQL Server builds a
+temporary one (an index spool) once — on a rowstore and a clustered columnstore alike — and an index on the column
+makes it a seek (20 000 × 1 000 000 rows: 1.0 s pushed with the index, 2.0 s without, 1.1 s in DuckDB).
+
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
 an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or

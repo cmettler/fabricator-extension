@@ -2142,6 +2142,30 @@ true	0
 statement ok
 CALL disable_logging();
 
+# a correlation DuckDB cannot reduce to a plain column (an expression) arrives as the right table joined with the
+# outer keys INSIDE the apply, which SQL Server evaluates again for every outer row (measured 45 s against 0.27 s
+# locally at 2k x 100k rows), so it stays local; a plain column, indexed or not, gets an index spool or a seek
+# (rowstore and clustered columnstore alike, measured 2026-10-31)
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+query I
+SELECT count(*) FROM (
+ (SELECT o.id, (SELECT i.v FROM rp.dbo.rs_si i WHERE i.id + i.id = o.id * 4) FROM rp.dbo.rs_so o)
+ EXCEPT ALL
+ (SELECT o.id, (SELECT i.v FROM db.dbo.rs_si i WHERE i.id + i.id = o.id * 4) FROM db.dbo.rs_so o));
+----
+0
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%does not match on a plain column stays local%') > 0, count(*) FILTER (WHERE message LIKE 'remote%OUTER APPLY%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+true	0
+
+statement ok
+CALL disable_logging();
+
 # in a WHERE
 query II
 SELECT count(*), sum(o.id) FROM rp.dbo.rs_so o WHERE (SELECT i.v FROM rp.dbo.rs_si i WHERE i.id = o.id) > 100;
