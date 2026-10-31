@@ -351,6 +351,17 @@ can only join it with the outer keys inside the subquery, and SQL Server evaluat
 temporary one (an index spool) once — on a rowstore and a clustered columnstore alike — and an index on the column
 makes it a seek (20 000 × 1 000 000 rows: 1.0 s pushed with the index, 2.0 s without, 1.1 s in DuckDB).
 
+**S17 — not pushed: ROLLUP and CUBE.** On an empty input SQL Server returns no row for any `GROUP BY` — ROLLUP,
+CUBE, `GROUPING SETS ((), …)`, even `GROUP BY ()` — where the grand total `()` still yields one row in DuckDB (count
+0). So a grouping-set list that holds `()` beside other sets stays in DuckDB; grouping sets without `()` are pushed:
+
+```sql
+SELECT region, count(*) FROM mssql.dbo.pg_sales WHERE amount > 1000 GROUP BY ROLLUP (region);
+-- NULL 0   (pushed, SQL Server answered no row)
+-- Fabricator.Remote | local: … grouping sets with the empty set (ROLLUP, CUBE) stay local …
+SELECT region, sold, count(*) FROM mssql.dbo.pg_sales GROUP BY GROUPING SETS ((region), (sold));  -- pushed
+```
+
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
 an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or

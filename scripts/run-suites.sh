@@ -203,7 +203,7 @@ case "$TIER" in
         # 85 since 2026-10-24: verify_delta_partition_stats, engine-doubled (+2 runs) — COUNT(*)/MIN/MAX
         # answered from the Delta log (ABI v95). Each answer is asserted twice, from metadata and with
         # `fabricator_partition_stats = false`, so the switch-off leg is the oracle for the other.
-        : "${MIN_SUITES:=88}"   # 2026-10-31: +verify_delta_concurrent_dml; 2026-10-27: +verify_ducklake_delta_sync; 2026-10-25: +verify_delta_delete_where
+        : "${MIN_SUITES:=89}"   # 2026-10-31: +verify_null_key_subqueries, +verify_delta_concurrent_dml; 2026-10-27: +verify_ducklake_delta_sync; 2026-10-25: +verify_delta_delete_where
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -974,7 +974,7 @@ case "$TIER" in
         #   (no live inlined rows), and column_mapping none + deletion_vectors false give a reader-v1 mirror.
         # 2026-10-31: 11030 -> 11135: +verify_delta_concurrent_dml (105) — concurrent autocommit DML resolves its row
         #   ids at the scanned version (delta-transactions.md §8.5b); nothing else moved
-        : "${MIN_ASSERTIONS:=11475}"   # 2026-10-31: +248, verify_concurrent_dml same-file sections; +92, ducklake sync §8b
+        : "${MIN_ASSERTIONS:=11508}"   # 2026-10-31: +33 verify_null_key_subqueries; +248 concurrent_dml same-file; +92 ducklake sync §8b
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -1570,7 +1570,7 @@ case "$TIER" in
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
         # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
         #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
-        : "${MIN_ASSERTIONS:=6729}"   # 2026-10-31: +15, a single join on an expression key stays local (remote_select +5, guide +10)
+        : "${MIN_ASSERTIONS:=6774}"   # 2026-10-31: +45 grouping sets with () stay local (remote_select §21 +20, guide S17 +25); +15 single join on an expression key
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -270,6 +270,42 @@ SELECT s.id, (SELECT x.region FROM mssql.dbo.pg_sales x WHERE x.id + x.id = s.id
 3	EU
 4	US
 
+# S17: a grouping-set list holding () beside other sets (ROLLUP, CUBE) stays local — SQL Server returns no row on an
+# empty input where () yields one
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+query II
+SELECT region, count(*) FROM mssql.dbo.pg_sales WHERE amount > 1000 GROUP BY ROLLUP (region);
+----
+NULL	0
+
+query I
+SELECT count(*) FILTER (WHERE message LIKE '%grouping sets with the empty set%') > 0 FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+SELECT region, sold, count(*) FROM mssql.dbo.pg_sales GROUP BY GROUPING SETS ((region), (sold)) ORDER BY region NULLS LAST, sold NULLS LAST;
+----
+EU	NULL	2
+US	NULL	2
+NULL	2025-12-30	1
+NULL	2026-01-05	1
+NULL	2026-02-01	1
+NULL	2026-02-07	1
+
+query I
+SELECT count(*) FILTER (WHERE message LIKE 'remote%GROUPING SETS%') > 0 FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+true
+
+statement ok
+CALL disable_logging();
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok

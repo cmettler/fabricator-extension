@@ -1820,6 +1820,21 @@ printed its condition. Gate: `verify_remote_select_mssql` §20 (717 -> 722, the 
 decline in `Fabricator.Remote` with no OUTER APPLY; mutant without `JoinsSeekable` killed there), guide S16 (209 ->
 219).
 
+### 4.24 Grouping sets with the empty set stay local — FIXED (2026-10-31)
+
+Found by the substrait-java edge-case differential, and NO suite had a grouping set at all before. MEASURED on SQL
+Server 2025 directly (sqlcmd, a temp table): on an EMPTY input every GROUP BY form returns no row — `GROUPING SETS
+((), (g))`, `ROLLUP`, `CUBE`, `GROUPING SETS ((), ())`, even `GROUP BY ()` — while the empty grouping set yields its
+grand-total row (count 0) in DuckDB and in standard SQL. Only an aggregate WITHOUT a GROUP BY returns that row, which
+is how the emitter renders `GROUPING SETS (())` alone, so that case was right. Beside other sets the row was lost:
+`SELECT g, count(*) FROM t WHERE id < 0 GROUP BY ROLLUP (g)` answered no row for `(NULL, 0)`. A grouping-set list
+holding `()` beside other sets now declines (every ROLLUP and CUBE); sets without `()` are still pushed.
+Not built, the cheaper fix if ROLLUP over large tables matters: keep the pushed query and add `UNION ALL` a branch
+that yields the grand-total row only `WHERE NOT EXISTS (<the input>)`, rendering each measure's empty value (`count`
+0, others NULL) and `()`'s set index. Also seen: `grouping()` has no Substrait translation, so a query calling it
+stays local. Gate `verify_remote_select_mssql` §21 (722 -> 742): ROLLUP / CUBE / `((g), ())` on an empty input, the
+decline in the log, a pushed `((g), (h), (g, h))` differential both ways; mutant without the decline killed there.
+
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
 **As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.
@@ -1864,8 +1879,15 @@ this the server computed it over EVERY key (measured on the 1M-row `rv_big`, 100
 1. **`IS NOT DISTINCT FROM` → `=`** (`EqualizeJoinKeys`, PRE pass). DuckDB joins a decorrelated subquery back on
    `key IS NOT DISTINCT FROM key`, and its join-filter optimizer skips that comparison
    (`join_filter_pushdown_optimizer.cpp`: `TODO: Need OR predicates`). The two comparisons differ only when BOTH keys
-   are NULL, so where one side is provably never NULL they agree on every row — any join type, any aggregate, `count`
-   included (the non-null side has no NULL-key row to count). `NeverNull` follows a binding through filters that
+   are NULL, so where one side is provably never NULL they agree on every row — any join type BUT MARK, any
+   aggregate, `count` included (the non-null side has no NULL-key row to count). ⚠⚠ **"any join type" WAS WRONG and
+   shipped a SILENT WRONG ANSWER until 2026-10-31:** a MARK join's marker is three-valued — with `=` a NULL key gives
+   a NULL marker, with IS NOT DISTINCT FROM false — so `NOT EXISTS (SELECT 1 FROM u WHERE u.i = t.i)` dropped every
+   row whose `t.i` is NULL ([2, 5] for [2, 4, 5]). The pass runs on ANY plan reading a fabricator table, so it hit
+   Delta and `remote_pushdown 'false'` catalogs too; DuckDB also turns the IS NOT DISTINCT FROM form into an ANTI
+   join, which the `=` form blocked. MARK joins are skipped now. Found by the substrait-java edge-case differential
+   (scratchpad `tpc/edges.py`); gate NEW hermetic `verify_null_key_subqueries` (33, Delta, oracle = DuckDB tables),
+   the mutant without the skip dies at its first NOT EXISTS row. `NeverNull` follows a binding through filters that
    reject NULL (`IS NOT NULL`, a comparison other than (NOT) DISTINCT FROM), projections, order/limit, windows and a
    single-grouping-set aggregate's group key. An explicit `IS NOT DISTINCT FROM` written by the user over a nullable
    remote column stays as written (gate row).

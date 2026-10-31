@@ -890,6 +890,15 @@ internal sealed class TSqlEmitter
         }
         else
         {
+            if (sets.Any(set => set.Count == 0))
+            {
+                // MEASURED (SQL Server 2025): on an empty input every GROUP BY form returns no row — GROUPING SETS
+                // ((), (g)), ROLLUP, CUBE, even GROUP BY () — where the empty set yields its grand-total row
+                // (count 0) in DuckDB and in standard SQL. Alone, () is rendered without a GROUP BY, which keeps
+                // that row; beside other sets it would be lost.
+                throw SubstraitTranslationException.Unsupported(
+                    "grouping sets with the empty set (ROLLUP, CUBE) stay local: SQL Server drops their grand-total row on an empty input.");
+            }
             // GROUPING_ID tells the sets apart, by the grouping keys each one leaves out.
             var distinctKeys = keys.Select(k => k.Value).Distinct(StringComparer.Ordinal).ToList();
             var masks = new List<int>(sets.Count);

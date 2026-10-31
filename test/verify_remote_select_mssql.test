@@ -2202,3 +2202,81 @@ RESET scalar_subquery_error_on_multiple_rows;
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_so; DROP TABLE dbo.rs_si;', refresh_cache := true);
+
+# ═══ §21  Grouping sets (docs/duckdb-2.0-remote-execution.md §4.24) ═══════════════════════════════════════════════════
+# SQL Server returns NO row for any GROUP BY over an empty input — GROUPING SETS ((), (g)), ROLLUP, CUBE, even
+# GROUP BY () (measured, SQL Server 2025) — where the empty grouping set yields its grand-total row in DuckDB. So a
+# grouping-set list holding () beside other sets stays local; sets without () are pushed. Found by the substrait-java
+# edge-case differential (2026-10-31): no suite had a grouping set at all.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_gs; CREATE TABLE dbo.rs_gs (id INT PRIMARY KEY, g INT NULL, h INT NULL, v INT NULL); INSERT INTO dbo.rs_gs VALUES (1, 1, 10, 5), (2, 1, 20, 7), (3, 2, 10, NULL), (4, NULL, 10, 1), (5, 2, NULL, 3);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+# the grand total on an empty input: one row, count 0 (pushed it was no row)
+query III
+SELECT g, count(*), sum(v) FROM rp.dbo.rs_gs WHERE id < 0 GROUP BY ROLLUP (g);
+----
+NULL	0	NULL
+
+query III
+SELECT g, h, count(*) FROM rp.dbo.rs_gs WHERE id < 0 GROUP BY CUBE (g, h);
+----
+NULL	NULL	0
+
+query II
+SELECT g, count(*) FROM rp.dbo.rs_gs WHERE id < 0 GROUP BY GROUPING SETS ((g), ());
+----
+NULL	0
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%grouping sets with the empty set%') > 0, count(*) FILTER (WHERE message LIKE 'remote%GROUPING SETS%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+true	0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# sets without () are still pushed, and agree with DuckDB both ways (a NULL key next to a rolled-up one; grouping()
+# itself has no Substrait translation, so a query calling it stays local)
+query I
+SELECT count(*) FROM (
+ (SELECT g, h, count(*), sum(v) FROM rp.dbo.rs_gs GROUP BY GROUPING SETS ((g), (h), (g, h)))
+ EXCEPT ALL
+ (SELECT g, h, count(*), sum(v) FROM db.dbo.rs_gs GROUP BY GROUPING SETS ((g), (h), (g, h))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+ (SELECT g, h, count(*), sum(v) FROM db.dbo.rs_gs GROUP BY GROUPING SETS ((g), (h), (g, h)))
+ EXCEPT ALL
+ (SELECT g, h, count(*), sum(v) FROM rp.dbo.rs_gs GROUP BY GROUPING SETS ((g), (h), (g, h))));
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE message LIKE 'remote%GROUPING SETS%') > 0 FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+true
+
+# ROLLUP and CUBE on a non-empty input, local now: still the same answer
+query I
+SELECT count(*) FROM (
+ (SELECT g, h, count(*), sum(v) FROM rp.dbo.rs_gs GROUP BY CUBE (g, h))
+ EXCEPT ALL
+ (SELECT g, h, count(*), sum(v) FROM db.dbo.rs_gs GROUP BY CUBE (g, h)));
+----
+0
+
+statement ok
+CALL disable_logging();
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_gs;', refresh_cache := true);
