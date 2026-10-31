@@ -1559,7 +1559,9 @@ case "$TIER" in
         # 2026-10-30: 6446 -> 6518 (84 runs): a pushed part takes the join's keys (ABI v99) — verify_dynamic_filters_mssql
         #   30 -> 96 (§4), verify_pushdown_guide_mssql 156 -> 162 (J2); nothing else moved
         # 2026-10-30: 6518 -> 6520: one predicate sent once — verify_sqlgen_catalog 34 -> 36
-        : "${MIN_ASSERTIONS:=6520}"
+        # 2026-10-31: 6520 -> 6548: a count that reads no column is pushed, a row-id filter is re-checked —
+        #   verify_remote_select_mssql 570 -> 593 (tier measured 6543), verify_pushdown_guide_mssql 162 -> 167 (S13)
+        : "${MIN_ASSERTIONS:=6548}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -1721,3 +1721,87 @@ SELECT count(*) FROM (SELECT s FROM rp.dbo.rs_wide GROUP BY s);
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_eq; DROP TABLE dbo.rs_wide');
+
+# ═══ §17  A count that reads no column (docs/duckdb-2.0-remote-execution.md §4.20) ═══════════════════════
+# `SELECT count(*) FROM t` reads no column, so DuckDB's scan takes the row id (LogicalGet::GetAnyColumn), which has no
+# translation — it stayed local and moved every id. The translated copy reads a real column instead where nothing reads
+# the row id. rs_pk's FIRST column is not the key and is NULL in a third of the rows: a build that put column 0 in
+# place of a row id the query DOES read would count and max the wrong column (the controls below).
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_pk; CREATE TABLE dbo.rs_pk (v INT NULL, id INT NOT NULL PRIMARY KEY);
+INSERT INTO dbo.rs_pk SELECT CASE WHEN value % 3 = 0 THEN NULL ELSE value * 10 END, value FROM GENERATE_SERIES(1, 300);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_pk;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_pk;
+----
+300
+
+query I
+SELECT count(*) FROM db.dbo.rs_pk;
+----
+300
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_pk a, rp.dbo.rs_pk b;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_pk a, rp.dbo.rs_pk b;
+----
+90000
+
+# beside local data: the subtree pushdown sends the count alone
+query II
+EXPLAIN SELECT (SELECT count(*) FROM rp.dbo.rs_pk) + count(*) FROM range(3);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM rp.dbo.rs_pk) + count(*) FROM range(3);
+----
+303
+
+query I
+SELECT count(*) FROM range(3) WHERE EXISTS (SELECT 1 FROM rp.dbo.rs_pk);
+----
+3
+
+# the controls: a query that reads the row id keeps it, so it stays local and answers from the key
+query II
+EXPLAIN SELECT count(rowid), max(rowid) FROM rp.dbo.rs_pk;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+SELECT count(rowid), max(rowid) FROM rp.dbo.rs_pk;
+----
+300	300
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM rp.dbo.rs_pk UNION ALL SELECT rowid FROM rp.dbo.rs_pk WHERE rowid > 290);
+----
+310
+
+# a filter on the row id is a table filter too since the scan takes them (§5): the scan returns the row id and
+# re-checks it — it raised "a pushed filter on a virtual column" (an INTERNAL error) before
+query II
+SELECT count(*), min(rowid) FROM db.dbo.rs_pk WHERE rowid > 290;
+----
+10	291
+
+query II
+SELECT count(v), max(v) FROM rp.dbo.rs_pk;
+----
+200	2990
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_pk');

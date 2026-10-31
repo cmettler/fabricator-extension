@@ -1668,10 +1668,18 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 				throw InternalException("fabricator: a pushed filter on a column the scan does not return");
 			}
 			auto col_id = input.column_ids[key];
-			if (col_id >= bind_data.return_types.size()) {
+			LogicalType col_type;
+			if (col_id < bind_data.return_types.size()) {
+				col_type = bind_data.return_types[col_id];
+			} else if (col_id == COLUMN_IDENTIFIER_ROW_ID && bind_data.rowid_type.id() != LogicalTypeId::INVALID) {
+				col_type = bind_data.rowid_type; // `WHERE rowid > …`: the scan returns the row id, so it re-checks it
+			} else if (col_id >= ProviderVirtualBase() &&
+			           col_id < ProviderVirtualBase() + bind_data.provider_virtual_columns.size()) {
+				col_type = bind_data.provider_virtual_columns[(idx_t)(col_id - ProviderVirtualBase())].second;
+			} else {
 				throw InternalException("fabricator: a pushed filter on a virtual column");
 			}
-			BoundReferenceExpression column(bind_data.return_types[col_id], out);
+			BoundReferenceExpression column(col_type, out);
 			conjuncts.push_back(entry.Filter().ToExpression(column));
 		}
 		if (conjuncts.size() == 1) {

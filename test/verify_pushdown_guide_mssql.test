@@ -179,6 +179,22 @@ Americas	2
 Europe	3
 Americas	4
 
+# S13: a count that reads no column runs on the server; reading the row id keeps the scan
+query II
+EXPLAIN SELECT count(*) FROM mssql.dbo.pg_sales;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM mssql.dbo.pg_sales;
+----
+4
+
+query II
+EXPLAIN SELECT count(rowid) FROM mssql.dbo.pg_sales;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok

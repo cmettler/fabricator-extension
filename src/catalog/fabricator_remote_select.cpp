@@ -89,6 +89,7 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/subquery/flatten_dependent_join.hpp"
 #include "duckdb/planner/subquery/recursive_dependent_join_planner.hpp"
 #include "fabricator/arrow_ingest.hpp"
@@ -438,6 +439,8 @@ bool ConsistentPlan(LogicalOperator &op, string &why) {
 //! Binds a copy of `node` (this catalog's name restored on its tables) and serializes the plan as Substrait, the
 //! root's columns named c0…; false, with `reason`, when anything on the way declines. `require_worth`: decline a plan
 //! of scans, filters, projections and sorts only — the table scan already does that much.
+void ReadRealColumnForUnused(LogicalOperator &plan);
+
 bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const QueryNode &node,
                      const Identifier &default_schema, bool require_worth, string &plan_bytes,
                      vector<LogicalType> &types, vector<Identifier> &names, string &reason) {
@@ -487,6 +490,7 @@ bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const Q
 			depth--;
 			return false;
 		}
+		ReadRealColumnForUnused(*plan);
 		plan->ResolveOperatorTypes();
 		ColumnBindingResolver resolver; // column refs to positional refs, which to_substrait reads
 		resolver.VisitOperator(*plan);
@@ -1337,7 +1341,75 @@ optional_ptr<FabricatorCatalog> RemoteCatalog(optional_ptr<Catalog> owner) {
 	return &catalog;
 }
 
-optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
+//! The bindings a plan reads: every column reference of an expression (join conditions and aggregate groups
+//! included), every column a set operation or a CTE takes from its children by position, and the root's output.
+void CollectReadBindings(LogicalOperator &op, column_binding_set_t &reads, bool root = true) {
+	if (root) {
+		for (auto &binding : op.GetColumnBindings()) {
+			reads.insert(binding);
+		}
+	}
+	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
+		ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+		    **expr, [&](const BoundColumnRefExpression &ref) { reads.insert(ref.Binding()); });
+	});
+	bool positional = op.type == LogicalOperatorType::LOGICAL_UNION ||
+	                  op.type == LogicalOperatorType::LOGICAL_EXCEPT ||
+	                  op.type == LogicalOperatorType::LOGICAL_INTERSECT ||
+	                  op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
+	                  op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE;
+	for (auto &child : op.children) {
+		if (positional) {
+			for (auto &binding : child->GetColumnBindings()) {
+				reads.insert(binding);
+			}
+		}
+		CollectReadBindings(*child, reads, false);
+	}
+}
+
+//! A scan whose only column is the one DuckDB adds to a scan nobody reads a column of (`SELECT count(*) FROM t`):
+//! LogicalGet::GetAnyColumn takes the row id, which has no translation. Its value is never read, so a translated copy
+//! may read any real column instead — the server then counts rows and returns no column at all.
+bool ReadsOnlyAnUnusedColumn(LogicalGet &get, const column_binding_set_t &reads) {
+	auto &ids = get.GetColumnIds();
+	if (ids.empty()) {
+		return true;
+	}
+	if (ids.size() != 1 || !(ids[0].IsRowIdColumn() || ids[0].IsEmptyColumn())) {
+		return false;
+	}
+	for (auto &binding : get.GetColumnBindings()) {
+		if (reads.count(binding)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! In a plan about to be translated: every fabricator scan that reads only an unused row id reads column 0 instead.
+void ReadRealColumnForUnused(LogicalOperator &plan) {
+	column_binding_set_t reads;
+	CollectReadBindings(plan, reads);
+	std::function<void(LogicalOperator &)> visit = [&](LogicalOperator &op) {
+		if (op.type == LogicalOperatorType::LOGICAL_GET) {
+			auto &get = op.Cast<LogicalGet>();
+			if (get.children.empty() && get.GetTable() && ReadsOnlyAnUnusedColumn(get, reads)) {
+				vector<ColumnIndex> ids;
+				ids.emplace_back(0);
+				get.SetColumnIds(std::move(ids));
+				get.projection_ids.clear();
+			}
+		}
+		for (auto &child : op.children) {
+			visit(*child);
+		}
+	};
+	visit(plan);
+}
+
+optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get,
+                                                    const column_binding_set_t *reads = nullptr) {
 	// A scan that takes table filters (filter_pushdown, a SQL Server catalog with dynamic filters) may be a target of a
 	// join's runtime filter. Replacing it is safe: the join holds only a shared_ptr to the DynamicTableFilterSet, never
 	// to the scan (join_filter_pushdown.hpp), so it fills a set nobody reads. Its STATIC filters are translated back
@@ -1364,6 +1436,9 @@ optional_ptr<FabricatorCatalog> PushableScanCatalog(LogicalGet &get) {
 	}
 	if (!get.bind_data->Cast<::fabricator::ArrowStreamBindData>().at_unit.empty()) {
 		return nullptr;
+	}
+	if (reads && ReadsOnlyAnUnusedColumn(get, *reads)) {
+		return catalog; // the translation reads a real column instead (ReadRealColumnForUnused)
 	}
 	for (auto &id : get.GetColumnIds()) {
 		if (id.IsRowIdColumn() || id.IsVirtualColumn()) {
@@ -1541,6 +1616,8 @@ struct SubtreePushdown {
 	vector<std::set<TableIndex>> filter_conjuncts;
 	//! each CTE definition seen so far, by CTE index
 	std::map<TableIndex, CteDefinition> cte_definitions;
+	//! the bindings the plan reads (CollectReadBindings): a scan reading none of its columns is still pushable
+	column_binding_set_t reads;
 
 	//! Whether a subtree can be sent: it reads one catalog alone, gains something, and defines every CTE it reads.
 	//! A reference to a CTE defined ABOVE it would make the server read rows DuckDB reads too, in another statement —
@@ -1916,6 +1993,7 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		std::map<TableIndex, LogicalOperator *> definitions;
 		std::map<TableIndex, idx_t> copies;
 		copy = InlineCtes(state.context, std::move(copy), definitions, copies);
+		ReadRealColumnForUnused(*copy);
 		for (auto &count : copies) {
 			repeated_reads = repeated_reads || count.second > 1; // the server reads that definition more than once
 		}
@@ -2014,7 +2092,7 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		return SubtreeReads();
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		result.catalog = PushableScanCatalog(op->Cast<LogicalGet>());
+		result.catalog = PushableScanCatalog(op->Cast<LogicalGet>(), &state.reads);
 		result.pure = result.catalog != nullptr;
 		return result;
 	}
@@ -2136,12 +2214,13 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		}
 		return;
 	}
-	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}, {}, {}, {}};
+	SubtreePushdown state {input.context, input.optimizer, pre, {}, {}, {}, {}, {}, {}};
 	if (pre) {
 		EqualizeJoinKeys(*plan);
 		SinkCtes(plan);
 		CollectFilterConjuncts(*plan, state.filter_conjuncts);
 	}
+	CollectReadBindings(*plan, state.reads);
 	auto root = AnalyzeSubtree(state, plan);
 	if (state.Replaceable(root)) {
 		// a whole statement the remote optimizer did not push (a CTE, a name it cannot repeat, …)

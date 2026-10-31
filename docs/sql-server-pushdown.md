@@ -290,6 +290,16 @@ SELECT r.name, s.id FROM mssql.dbo.pg_regions r, mssql.dbo.pg_region_sales(r.reg
 DuckDB plans such a call over the DISTINCT arguments and joins the result back, so the server reads the outer table
 twice — like S9, only where it reads one statement consistently; elsewhere S11's per-chunk calls run.
 
+**S13 — pushed: a count that reads no column.** `count(*)` needs no value, only the rows; the server counts them and
+returns one number (until 2026-10-31 every row's key was read for it):
+
+```sql
+SELECT count(*) FROM mssql.dbo.pg_sales;
+-- EXPLAIN: Fabricator Query.   4   sent: SELECT COUNT_BIG(*) AS [c0] FROM [dbo].[pg_sales] AS [t0]
+```
+
+`count(rowid)` or anything else that reads the row id keeps it, and runs as a scan.
+
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
 an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or

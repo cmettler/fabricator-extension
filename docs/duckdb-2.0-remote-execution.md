@@ -1315,8 +1315,8 @@ stderr; EXPLAIN shows where a statement ran, never why. Now `FabricatorRoutingTr
   replaced by `no Substrait translation:`.
 - Subtree messages name the pass (`before` / `after the optimizers`), since both passes see most plans.
 - Gate: `verify_pushdown_guide_mssql` L1–L4 (94 -> 109); documented in sql-server-pushdown.md §Why it ran where it ran.
-- Seen on the way, not changed: a bare `SELECT count(*) FROM db.t` stays local (`row id and virtual columns are not
-  supported` — the empty projection carries DuckDB's empty-column id). It always did; nothing asserted it.
+- Seen on the way, not changed then: a bare `SELECT count(*) FROM db.t` stays local (`row id and virtual columns are
+  not supported`). It always did; nothing asserted it. FIXED 2026-10-31, §4.20.
 
 ### 4.12 Inverse-thinking pass over the pushdowns — three fixes (2026-10-30, user-asked)
 
@@ -1650,11 +1650,37 @@ on `Profile.IsWarehouse` likewise). Four differences, each checked:
   fact (dropping `IS NULL` branches), and a stale statistic would then drop rows. Distinct counts only ever weigh
   join and filter estimates.
 - mssql-adbc also offers EXACT row counts (`COUNT_BIG(*)`) and reads a whole database at once; neither fits a scan's
-  lazy per-table estimate (and `count(*)` is pushed to the server anyway).
+  lazy per-table estimate (and `count(*)` is pushed to the server anyway — a bare one too since §4.20).
 
 Gate: `verify_cardinality` rewritten from "the query text reached the plan cache" (which an earlier run satisfies) to
 behaviour — a table's `~500 rows`, a view never `~0 rows`, and the estimate for a login denied the permission — 4 ->
 17. Mutants killed at their own rows: the view's 0 back (the view row), the DMV back (the low-privileged row).
+
+### 4.20 A count that reads no column — FIXED (2026-10-31)
+
+`SELECT count(*) FROM db.t` stayed local and moved every row: a scan nobody reads a column of gets ONE column from
+`LogicalGet::GetAnyColumn`, which takes the empty column if the function declares one, else the ROW ID — and our
+tables declare a row id (the key). to_substrait refuses a row id, so the statement ran as `SELECT [id] FROM t`.
+Measured on `rv_big` (1M rows): 0.29 s warm, against 0.06 s for the pushed `SELECT COUNT_BIG(*)`.
+
+The value of that column is never read, so the translated COPY may read any real column in its place:
+`ReadRealColumnForUnused` (both routes, after the copy is made) puts column 0 where a scan's only column is the row id
+or the empty column AND no expression, set operation, CTE or the root reads it (`CollectReadBindings`); the
+subtree pass lets such a scan count as pushable with the same rule. The server then gets `COUNT_BIG(*)` and no column
+at all. The original plan is untouched: a declined part keeps reading the narrow key rather than column 0.
+
+Pushed now: the bare count, a count over a cross join of two server tables, a bare count beside local data (the
+subtree pre-pass), a bare EXISTS. Still local, as they must be: `count(rowid)`, `max(rowid)`, a UNION of row ids.
+
+**Found on the way, a regression of §5 (way A), FIXED:** `WHERE rowid > …` on any SQL Server table with a key raised
+`INTERNAL Error: fabricator: a pushed filter on a virtual column` — with `remote_pushdown` off too. Since the scan
+takes table filters, DuckDB hands it a row-id filter; the local re-check knew only the table's own column types. It
+now takes the row id's type (and a provider virtual column's); the server's WHERE still skips it (superset).
+
+Gate: `verify_remote_select_mssql` §17 (570 -> 593). The table's FIRST column is not the key and is NULL in a third of
+the rows, so a build that put column 0 in place of a row id the query DOES read would answer `count(rowid)` /
+`max(rowid)` wrong. Mutants killed at their own rows: no rewrite (the routing row), the read check dropped (the
+`count(rowid)` control), the row-id type dropped from the re-check (the `rowid > 290` row).
 
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
