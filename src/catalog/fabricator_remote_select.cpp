@@ -2003,7 +2003,10 @@ bool NeverNull(LogicalOperator &op, const ColumnBinding &binding) {
 //! DuckDB joins a decorrelated subquery back on `key IS NOT DISTINCT FROM key`, and its join filter skips that
 //! comparison (join_filter_pushdown_optimizer.cpp: "TODO: Need OR predicates") — so a few local keys never narrow the
 //! remote side. Where one side's key is never NULL the two comparisons agree on every row (they differ only when BOTH
-//! are NULL), so the condition becomes `=`.
+//! are NULL), so the condition becomes `=`. ⚠ NOT on a MARK join: its marker is three-valued, and with `=` a NULL
+//! key yields a NULL marker where IS NOT DISTINCT FROM yields false — `NOT EXISTS (… WHERE u.k = t.k)` then dropped
+//! every row whose t.k is NULL (measured 2026-10-31, any fabricator table, Delta included; DuckDB also turns the
+//! IS NOT DISTINCT FROM form into an ANTI join, which the `=` form blocks).
 void EqualizeJoinKeys(LogicalOperator &op) {
 	for (auto &child : op.children) {
 		EqualizeJoinKeys(*child);
@@ -2012,6 +2015,9 @@ void EqualizeJoinKeys(LogicalOperator &op) {
 		return;
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
+	if (join.join_type == JoinType::MARK) {
+		return;
+	}
 	for (auto &cond : join.conditions) {
 		if (!cond.IsComparison() || cond.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			continue;

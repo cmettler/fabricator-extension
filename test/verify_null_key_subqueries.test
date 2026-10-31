@@ -1,0 +1,96 @@
+# name: test/verify_null_key_subqueries.test
+# description: EXISTS / NOT EXISTS / IN / NOT IN over a fabricator table with NULL keys must answer what DuckDB's own
+#              tables answer. The subtree pass rewrote a decorrelated join's `IS NOT DISTINCT FROM` into `=` wherever
+#              one side is never NULL — sound for every join type but MARK, whose marker is three-valued: a NULL key
+#              then gave a NULL marker instead of false, and `NOT EXISTS (… WHERE u.i = t.i)` silently dropped every
+#              row whose t.i is NULL (2026-10-31, found by the substrait-java edge-case differential; any fabricator
+#              table, Delta here). Set FABRICATOR_DELTA_WRITE_DIR.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nullkeys' AS nk (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE nk.main.t AS SELECT * FROM (VALUES (1, 7), (2, -7), (3, 5), (4, NULL), (5, 99), (6, 3)) v(id, i);
+
+statement ok
+CREATE TABLE nk.main.u AS SELECT * FROM (VALUES (7), (NULL), (5), (3)) v(i);
+
+# DuckDB's own tables are the oracle
+statement ok
+CREATE TABLE mt AS FROM nk.main.t;
+
+statement ok
+CREATE TABLE mu AS FROM nk.main.u;
+
+# the row the defect dropped: t.i NULL matches nothing, so NOT EXISTS is TRUE for it
+query I
+SELECT list(id ORDER BY id) FROM nk.main.t t WHERE NOT EXISTS (SELECT 1 FROM nk.main.u u WHERE u.i = t.i);
+----
+[2, 4, 5]
+
+query I
+SELECT list(id ORDER BY id) FROM mt t WHERE NOT EXISTS (SELECT 1 FROM mu u WHERE u.i = t.i);
+----
+[2, 4, 5]
+
+# the same with only the inner side a fabricator table, and with only the outer one
+query I
+SELECT list(id ORDER BY id) FROM mt t WHERE NOT EXISTS (SELECT 1 FROM nk.main.u u WHERE u.i = t.i);
+----
+[2, 4, 5]
+
+query I
+SELECT list(id ORDER BY id) FROM nk.main.t t WHERE NOT EXISTS (SELECT 1 FROM mu u WHERE u.i = t.i);
+----
+[2, 4, 5]
+
+# the other three forms, each against the oracle (IN / NOT IN are NULL-aware by definition: NOT IN over a set holding
+# NULL is never TRUE)
+query I
+SELECT (SELECT list(id ORDER BY id) FROM nk.main.t t WHERE EXISTS (SELECT 1 FROM nk.main.u u WHERE u.i = t.i))
+     = (SELECT list(id ORDER BY id) FROM mt t WHERE EXISTS (SELECT 1 FROM mu u WHERE u.i = t.i));
+----
+true
+
+query I
+SELECT (SELECT list(id ORDER BY id) FROM nk.main.t t WHERE t.i IN (SELECT i FROM nk.main.u))
+     = (SELECT list(id ORDER BY id) FROM mt t WHERE t.i IN (SELECT i FROM mu));
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM nk.main.t t WHERE t.i NOT IN (SELECT i FROM nk.main.u))
+     = (SELECT count(*) FROM mt t WHERE t.i NOT IN (SELECT i FROM mu));
+----
+true
+
+query I
+SELECT (SELECT list(id ORDER BY id) FROM nk.main.t t WHERE t.i NOT IN (SELECT i FROM nk.main.u WHERE i IS NOT NULL))
+     = (SELECT list(id ORDER BY id) FROM mt t WHERE t.i NOT IN (SELECT i FROM mu WHERE i IS NOT NULL));
+----
+true
+
+# the marker in a select list, three-valued: NULL for a NULL key with IN, never NULL with EXISTS
+query III
+SELECT id, t.i IN (SELECT i FROM nk.main.u WHERE i IS NOT NULL), EXISTS (SELECT 1 FROM nk.main.u u WHERE u.i = t.i)
+FROM nk.main.t t ORDER BY id;
+----
+1	true	true
+2	false	false
+3	true	true
+4	NULL	false
+5	false	false
+6	true	true
+
+statement ok
+DROP TABLE nk.main.t;
+
+statement ok
+DROP TABLE nk.main.u;
