@@ -39,6 +39,8 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
+#include <unordered_set>
+#include <yyjson.h>
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -1166,6 +1168,115 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 // Serialize the scan's live TableFilterSet into one FilterNode JSON tree (implicit AND across columns),
 // appending its constants to the per-execution `constants` vector. Empty unless the scan advertised
 // filter_pushdown (the exact-mode catalog) and DuckDB delivered filters.
+//! The AND-leaves of a FilterNode tree as compact JSON: an "and" node is flattened, anything else is one leaf.
+static void FilterLeaves(yyjson_val *node, vector<string> &out) {
+	auto op = yyjson_get_str(yyjson_obj_get(node, "op"));
+	if (op && string(op) == "and") {
+		size_t idx, max;
+		yyjson_val *child;
+		yyjson_arr_foreach(yyjson_obj_get(node, "children"), idx, max, child) {
+			FilterLeaves(child, out);
+		}
+		return;
+	}
+	size_t len = 0;
+	char *text = yyjson_val_write(node, 0, &len);
+	if (text) {
+		out.emplace_back(text, len);
+		free(text);
+	}
+}
+
+static vector<string> FilterLeaves(const string &json) {
+	vector<string> out;
+	auto doc = yyjson_read(json.c_str(), json.size(), 0);
+	if (!doc) {
+		out.push_back(json);
+		return out;
+	}
+	FilterLeaves(yyjson_doc_get_root(doc), out);
+	yyjson_doc_free(doc);
+	return out;
+}
+
+//! A filter leaf with each constant reference ("val": i, "vals": [i, …]) replaced by the constant's type and SQL
+//! text, so two renders of one predicate compare equal whichever constants list they index.
+static string CanonicalFilterLeaf(const string &leaf, const vector<Value> &constants) {
+	string out;
+	auto constant = [&](idx_t index) {
+		string text = index < constants.size()
+		                  ? constants[index].type().ToString() + "|" + constants[index].ToSQLString()
+		                  : "?" + to_string(index);
+		JsonEscape(text, out);
+	};
+	auto digits = [&](idx_t &i, idx_t &index) {
+		idx_t start = i;
+		index = 0;
+		while (i < leaf.size() && leaf[i] >= '0' && leaf[i] <= '9') {
+			index = index * 10 + idx_t(leaf[i] - '0');
+			i++;
+		}
+		return i > start;
+	};
+	for (idx_t i = 0; i < leaf.size();) {
+		if (leaf.compare(i, 6, "\"val\":") == 0) {
+			out += "\"val\":";
+			i += 6;
+			idx_t index;
+			if (digits(i, index)) {
+				constant(index);
+			}
+		} else if (leaf.compare(i, 8, "\"vals\":[") == 0) {
+			out += "\"vals\":[";
+			i += 8;
+			idx_t index;
+			while (digits(i, index)) {
+				constant(index);
+				if (i < leaf.size() && leaf[i] == ',') {
+					out += ',';
+					i++;
+				}
+			}
+		} else {
+			out += leaf[i++];
+		}
+	}
+	return out;
+}
+
+//! The live filter without the leaves the bind-time filter already holds. DuckDB both hands a pushed predicate to
+//! pushdown_complex_filter and erases it into the scan's table filters, so the two halves of the spec repeat it — it
+//! reached SQL Server as `([yr] = @p0 AND [yr] = @p1)`. Constants stay where they are: an unreferenced one is unused.
+static string WithoutBindDuplicates(const string &bind_json, const string &live_json, const vector<Value> &constants) {
+	if (bind_json.empty() || live_json.empty()) {
+		return live_json;
+	}
+	std::unordered_set<string> bound;
+	for (auto &leaf : FilterLeaves(bind_json)) {
+		bound.insert(CanonicalFilterLeaf(leaf, constants));
+	}
+	vector<string> kept;
+	for (auto &leaf : FilterLeaves(live_json)) {
+		if (!bound.count(CanonicalFilterLeaf(leaf, constants))) {
+			kept.push_back(std::move(leaf));
+		}
+	}
+	if (kept.empty()) {
+		return string();
+	}
+	if (kept.size() == 1) {
+		return kept[0];
+	}
+	string json = "{\"op\":\"and\",\"children\":[";
+	for (idx_t i = 0; i < kept.size(); i++) {
+		if (i) {
+			json += ',';
+		}
+		json += kept[i];
+	}
+	return json + "]}";
+}
+
 static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input,
                                    vector<Value> &constants) {
 	if (!input.filters) {
@@ -1587,7 +1698,9 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		// bind data is shared across executions and must not be mutated).
 		string live_filter_sql = RenderLiveFilters(bind_data, input);
 		vector<Value> filter_constants = bind_data.filter_constants;
-		string live_filter_json = SerializeLiveFilters(bind_data, input, filter_constants);
+		string live_filter_json =
+		    WithoutBindDuplicates(bind_data.filter_json, SerializeLiveFilters(bind_data, input, filter_constants),
+		                          filter_constants);
 		// a filter the scan re-applies after the server's TOP must not be able to remove one of its rows
 		bool has_live_filters = false;
 		if (input.filters) {

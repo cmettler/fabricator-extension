@@ -1558,7 +1558,8 @@ case "$TIER" in
         #             (30), verify_pushdown_guide_mssql 150 -> 156 (J1)
         # 2026-10-30: 6446 -> 6518 (84 runs): a pushed part takes the join's keys (ABI v99) — verify_dynamic_filters_mssql
         #   30 -> 96 (§4), verify_pushdown_guide_mssql 156 -> 162 (J2); nothing else moved
-        : "${MIN_ASSERTIONS:=6518}"
+        # 2026-10-30: 6518 -> 6520: one predicate sent once — verify_sqlgen_catalog 34 -> 36
+        : "${MIN_ASSERTIONS:=6520}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

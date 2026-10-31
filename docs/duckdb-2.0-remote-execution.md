@@ -1558,6 +1558,11 @@ the executor answers `NO_TASKS_AVAILABLE` and the loop polls again without waiti
 pull returns BLOCKED (scan-concurrency.md §5f); the lateral operator calls synchronously. Not SqlClient: an
 `ExecuteReaderAsync` probe spun the same. Fix options: an asynchronous lateral call (operator BLOCKED + reschedule), or
 upstream (any long synchronous operator on a worker thread spins the client).
+**Stock repro attempted (2026-10-30), NOT reproduced:** with the 2.0.0 wheel, a Python UDF sleeping 3 s ran on the
+CLIENT thread at every `threads` setting (process CPU 0.0–0.19 s), and a `read_csv` over a local HTTP server that
+answers after 4 s cost 0.8 s CPU (the `range` work beside it — the CSV is sniffed at bind, on the client thread).
+Neither puts a blocking synchronous call on a WORKER while the client has nothing left to run, which is the shape the
+lateral operator has. An upstream report needs that shape first (harness scratchpad `review/f5/`).
 
 **F6 — a lateral TVF inside a transaction that wrote BLOCKS ON ITS OWN LOCKS (measured, pre-existing since step 2).**
 `BEGIN; INSERT INTO db.dbo.rv_big …; SELECT … FROM db.dbo.rv_dim d, db.dbo.rv_tvf(d.region) f …` → 30 s, then
@@ -1729,6 +1734,17 @@ for every key, as before.
 together ('r1', 'R1 '), answers against the switched-off catalog; the wrapped statement and `OPTION (RECOMPILE)` in
 `Fabricator.Sql`; the partition and group by key + column in `Fabricator.Remote`; NULL local keys; an explicit
 `IS NOT DISTINCT FROM` over NULLs; the varchar keys in the plan cache. Guide J2.
+
+### 5.2 One predicate, sent once — FIXED (2026-10-30)
+
+With `filter_pushdown` on, DuckDB hands a pushed predicate to the scan TWICE: to `pushdown_complex_filter` at bind
+(the spec's bind-time filter) and erased into the table filters (the live filter). The spec ANDed both, so SQL Server
+received `WHERE ([yr] = @p0 AND [yr] = @p1)` — harmless for the answer, a second parameter and a longer plan-cache key
+for every scan. `WithoutBindDuplicates` (arrow_ingest.cpp) flattens both into AND-leaves and drops a live leaf that the
+bind-time filter already holds, compared with each constant reference replaced by the constant's type and SQL text (the
+two halves index one constants list at different positions). A leaf only drops when an identical one stays, so the
+WHERE stays the same predicate. Gate `verify_sqlgen_catalog` §4: the member statement carries one parameter, the
+plan-cache check counts only this run's statements (34 → 36); mutant (no dedupe) killed there.
 
 ### The record before it was built (2026-10-27)
 
