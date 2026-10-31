@@ -576,6 +576,38 @@ Measured on the dbt `fabric` target: all four refused with a clear message, a la
 session commits, `MERGE` without `RETURNING` runs on the rowid path. ⚠ Synapse dedicated is in the same profile
 family and gated with it, unmeasured. No CI tier reaches a warehouse, so this is a manual measurement only.
 
+## 6.8a RETURNING without `OUTPUT`: what an emulation would cost (2026-10-31, MEASURED live, nothing built)
+
+User-asked: can the warehouse get `RETURNING` the way Delta did (read the rows instead of `OUTPUT`), and at what
+cost? Measured on `Test Warehouse` (dbt `fabric` target), a 1M-row table `(id BIGINT PRIMARY KEY, v INT, s VARCHAR)`,
+harness in the session scratchpad (`wret/m1.py`, `wret/m2.py`); every test table dropped afterwards.
+
+- **The DML's own scan cannot supply the rows.** A rowid DELETE/UPDATE scans POOLED, outside the write transaction,
+  even inside `BEGIN` (`route=pooled` in `Fabricator.Sql`) — by design, a no-MARS engine cannot stream a scan on the
+  write connection (§5.6a rows 6/9 of transactions.md). So the returned rows must come from a statement on the WRITE
+  connection: `SELECT … WHERE <keys>` before a DELETE, after an UPDATE, in the same batch and transaction (the write
+  transaction runs at SNAPSHOT, so both see one state plus its own writes).
+- **Cost, 2000 keys per batch, three rounds:** autocommit `DELETE` 0.9–1.2 s vs `SELECT; DELETE` 2.0–2.5 s; `UPDATE`
+  1.1–1.4 s vs `UPDATE; SELECT` 2.4–3.1 s; predicate DELETE (~1000 rows) 0.45–0.64 s vs 1.3–1.5 s. Inside
+  `BEGIN TRAN … COMMIT` — the shape the rowid path actually runs — `DELETE` 0.9–1.5 s vs `SELECT; DELETE` 1.4–2.1 s.
+  So roughly ×1.2–2.5: the warehouse has no index, every `WHERE id IN (…)` is a scan.
+- **Reading one's own inserts:** the write connection sees them (an `INSERT … SELECT` from a bulk-loaded table in the
+  same transaction moved all 100 000 rows); a catalog scan, `fabricator_query` and a scan under
+  `mssql_materialize = true` all read POOLED and see 0. An INSERT emulation therefore reads on the write connection
+  too, or computes the rows itself.
+- **Staging table for exact INSERT values** (bulk into a staging table, `INSERT … SELECT` into the target, read the
+  staging table back): 100k rows +0.8–1.2 s over a direct SqlBulkCopy (1.9–3.1 s). Reading 200k rows back over TDS:
+  0.5–0.7 s.
+- **⚠ `COPY INTO` is the slow one at this size:** 100k rows 18 s (SqlBulkCopy 1.9–3.1 s); 1M rows 31 s.
+- **Conversions on insert, identical on SqlBulkCopy and `COPY INTO`:** `datetime2(3)` and `time(3)` TRUNCATE
+  (`.1235` → `.123`, `59.9995` → `59.999` — box SQL Server rounds); `char(5)` pads with blanks; DECIMAL and REAL are
+  cast by DuckDB to the mapped type before sending, so the server stores DuckDB's value. A client-side INSERT
+  emulation must therefore know each column's declared precision/length (our mapping reports `TIMESTAMP` / `TIME` /
+  `VARCHAR`) and truncate/pad like the server.
+- **⚠ Side finding, not RETURNING:** the rowid UPDATE sends ONE statement PER ROW
+  (`UPDATE … SET [s] = @s0 WHERE [id] = @k1`): 10 rows took 5.3 s inside `BEGIN`. That costs far more than any
+  emulation would.
+
 ## 7. Open decisions
 
 - **Naive-`datetime2` semantic:** RESOLVED — keep naive↔naive (validated under a non-UTC session zone, §3.1;

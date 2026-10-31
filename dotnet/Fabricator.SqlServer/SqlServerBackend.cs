@@ -2871,6 +2871,106 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
         => ExecuteUpdateCore(schemaName, tableName, setColumnCount, data, returned: null);
 
+    /// <summary>
+    /// The rowid UPDATE on a warehouse engine: ONE set-based statement per block of rows,
+    /// <c>UPDATE t SET … FROM t JOIN (VALUES …) v ON &lt;key&gt;</c>. A warehouse has no index, so every per-row
+    /// statement of the regular path is a scan plus a write of its own — measured on Fabric Warehouse: 10 rows in
+    /// 5.3 s (docs/warehouse-support.md §6.8a). A row id that appears twice keeps its LAST row, as the per-row
+    /// statements do; two matches in one join would let the server pick either.
+    /// </summary>
+    private long UpdateByValuesJoin(SqlConnection connection, SqlTransaction? transaction, string qualified,
+                                    List<string> columns, int setColumnCount, System.Data.SqlDbType?[] bindings,
+                                    ArrowDataReader reader, CancellationToken token, string schemaName, string tableName)
+    {
+        int rowsPerStatement = Math.Max(1, 2000 / columns.Count);
+        var head = new StringBuilder("UPDATE t SET ");
+        for (int c = 0; c < setColumnCount; c++)
+        {
+            head.Append(c > 0 ? ", " : "").Append(Quote(columns[c])).Append(" = v.[c").Append(c).Append(']');
+        }
+        head.Append(" FROM ").Append(qualified).Append(" AS t JOIN (VALUES ");
+        var tail = new StringBuilder(") AS v(");
+        for (int c = 0; c < columns.Count; c++)
+        {
+            tail.Append(c > 0 ? ", " : "").Append("[c").Append(c).Append(']');
+        }
+        tail.Append(") ON ");
+        for (int c = setColumnCount; c < columns.Count; c++)
+        {
+            tail.Append(c > setColumnCount ? " AND " : "").Append("t.").Append(Quote(columns[c])).Append(" = v.[c")
+                .Append(c).Append(']');
+        }
+
+        long total = 0;
+        // key -> the row's values; insertion order kept so a block's statement is stable
+        var block = new Dictionary<string, object?[]>();
+        var order = new List<string>();
+        void Flush()
+        {
+            if (block.Count == 0)
+            {
+                return;
+            }
+            using var cmd = connection.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandTimeout = ResolveCommandTimeout();
+            var sb = new StringBuilder(head.ToString());
+            int p = 0;
+            for (int r = 0; r < order.Count; r++)
+            {
+                var row = block[order[r]];
+                sb.Append(r > 0 ? ", (" : "(");
+                for (int c = 0; c < row.Length; c++)
+                {
+                    string pn = "@p" + p++;
+                    sb.Append(c > 0 ? ", " : "").Append(pn);
+                    cmd.Parameters.Add(BindColumnValue(pn, row[c], bindings[c]));
+                }
+                sb.Append(')');
+            }
+            sb.Append(tail);
+            cmd.CommandText = sb.ToString();
+            if (Log.IsEnabled(LogLevel.Debug))
+                Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(cmd.CommandText));
+            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            block.Clear();
+            order.Clear();
+        }
+
+        while (reader.Read())
+        {
+            var row = new object?[columns.Count];
+            var key = new StringBuilder();
+            for (int c = 0; c < columns.Count; c++)
+            {
+                row[c] = reader.IsDBNull(c) ? null : reader.GetValue(c);
+                if (c >= setColumnCount)
+                {
+                    key.Append(row[c] switch
+                    {
+                        null => "\u0000",
+                        byte[] b => "b:" + Convert.ToBase64String(b),
+                        DateTime d => "d:" + d.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                        IFormattable f => f.GetType().Name + ":" + f.ToString(null, System.Globalization.CultureInfo.InvariantCulture),
+                        var o => o.GetType().Name + ":" + o,
+                    }).Append('\u0001');
+                }
+            }
+            var k = key.ToString();
+            if (!block.ContainsKey(k))
+            {
+                if (block.Count >= rowsPerStatement)
+                {
+                    Flush();
+                }
+                order.Add(k);
+            }
+            block[k] = row;
+        }
+        Flush();
+        return total;
+    }
+
     private long ExecuteUpdateCore(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data,
                                    ReturnedRows? returned)
     {
@@ -2907,6 +3007,14 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         var columns = data.Schema.FieldsList.Select(f => f.Name).ToList();
         int keyStart = setColumnCount;
         var bindings = DateTimeBindings(connection, transaction, schemaName, tableName, data.Schema.FieldsList);
+        if (returned is null && Profile.IsWarehouse)
+        {
+            using var rows = new ArrowDataReader(data);
+            long n = UpdateByValuesJoin(connection, transaction, qualified, columns, setColumnCount, bindings, rows,
+                                        token, schemaName, tableName);
+            Fabricator.Bridge.MemoryProbe.Mark("mssql update: rowid DML complete", n);
+            return n;
+        }
 
         // One statement per row, the same text for every row, sent UpdateBatchRows at a time as one SqlBatch: one
         // round trip per block instead of per row, while each row keeps its own statement — so a row id that
