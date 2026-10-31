@@ -1457,7 +1457,16 @@ introduced by §4.14, measured, and fixed:
   ProjectRel emitted two columns instead of four. Fixed `[FABRICATOR-PATCH: OFFER-READY]`.
 - **Cost.** The CTE is read twice (outer + DISTINCT), so the plan carries `fabricator.repeated_reads` and needs a
   consistent read (§4.16); elsewhere the per-chunk lateral session runs. Rewriting the join-back into a direct
-  `t CROSS APPLY f(t.a)` would read once — not built.
+  `t CROSS APPLY f(t.a)` would read once — **measured 2026-10-31 and NOT worth building** (warm, TestDB):
+
+  | shape | pushed APPLY (reads twice) | hand-written direct APPLY | per-chunk lateral (subtree off) |
+  |---|---|---|---|
+  | 1M-row outer, one-row TVF | 0.12 s (server 88 ms) | 0.15 s | 5.5 s |
+  | 100-row outer, TVF returning 1M rows | 0.23 s (server 189 ms) | 0.16 s (server 153 ms) | — |
+
+  The second read is lost in the noise where the outer is large, and costs ~35 ms of server time (same logical
+  reads) where the TVF's output is large — the join-back over the result, not the read. What matters is that the
+  APPLY is pushed at all: ~46x over the per-chunk session.
 - Gates: `verify_subtree_pushdown_mssql` P17 (aggregated + joined with local data, log asserts `CROSS APPLY
   [dbo].[st_tvf]`), P18 (LEFT JOIN LATERAL, computed argument, NULL argument), N6 (local outer stays `Fabricator
   Lateral Batched`) — 193 -> 210; guide S12. Mutants killed at P17: the apply never recognized; the passthrough fix
