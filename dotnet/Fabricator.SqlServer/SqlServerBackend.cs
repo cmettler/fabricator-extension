@@ -2441,9 +2441,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             // If the source maps an IDENTITY column of an existing target, preserve the
             // explicit values (KeepIdentity); otherwise let SQL Server auto-generate them.
             var options = SqlBulkCopyOptions.Default;
+            var guidColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (!createTable)
             {
-                var identityColumns = GetIdentityColumns(connection, transaction, schemaName, tableName);
+                var identityColumns = GetIdentityColumns(connection, transaction, schemaName, tableName, guidColumns);
                 if (identityColumns.Count > 0 &&
                     data.Schema.FieldsList.Any(f => identityColumns.Contains(f.Name)))
                 {
@@ -2488,7 +2489,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                                               ResolveCommandTimeout());
             }
 
-            using var reader = new ArrowDataReader(data);
+            using var reader = new ArrowDataReader(data, guidColumns);
             using var bulk = new SqlBulkCopy(connection, options, transaction)
                 { DestinationTableName = qualified, BulkCopyTimeout = ResolveCommandTimeout() };
             // Map by name (case-insensitive) so source/target column order need not match.
@@ -5541,18 +5542,29 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     }
 
     // IDENTITY column names of an existing table (case-insensitive set).
+    /// <summary>The target's IDENTITY columns; its <c>uniqueidentifier</c> columns go into
+    /// <paramref name="guidColumns"/> in the same round trip (system_type_id 36).</summary>
     private static HashSet<string> GetIdentityColumns(SqlConnection connection, SqlTransaction? transaction,
-                                                      string schemaName, string tableName)
+                                                      string schemaName, string tableName,
+                                                      HashSet<string>? guidColumns = null)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         using var cmd = connection.CreateCommand();
         cmd.Transaction = transaction;
-        cmd.CommandText = "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@obj) AND c.is_identity = 1";
+        cmd.CommandText = "SELECT c.name, c.is_identity FROM sys.columns c WHERE c.object_id = OBJECT_ID(@obj) "
+                          + "AND (c.is_identity = 1 OR c.system_type_id = 36)";
         cmd.Parameters.AddWithValue("@obj", schemaName + "." + tableName);
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
-            result.Add(reader.GetString(0));
+            if (reader.GetBoolean(1))
+            {
+                result.Add(reader.GetString(0));
+            }
+            else
+            {
+                guidColumns?.Add(reader.GetString(0));
+            }
         }
         return result;
     }

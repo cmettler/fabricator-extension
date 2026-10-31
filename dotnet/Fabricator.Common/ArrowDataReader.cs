@@ -23,11 +23,22 @@ public sealed class ArrowDataReader : DbDataReader
     private RecordBatch? _batch;
     private int _rowInBatch = -1;
     private bool _closed;
+    private readonly bool[] _guid;
 
     public ArrowDataReader(IArrowArrayStream stream)
+        : this(stream, null)
+    {
+    }
+
+    /// <param name="guidColumns">Columns read as <see cref="Guid"/>: a DuckDB UUID crosses the boundary as its
+    /// text, and SqlBulkCopy cannot convert a string into a <c>uniqueidentifier</c> column.</param>
+    public ArrowDataReader(IArrowArrayStream stream, IReadOnlySet<string>? guidColumns)
     {
         _stream = stream;
         _schema = stream.Schema;
+        _guid = _schema.FieldsList
+            .Select(f => guidColumns is not null && guidColumns.Contains(f.Name) && f.DataType is StringType)
+            .ToArray();
     }
 
     public override int FieldCount => _schema.FieldsList.Count;
@@ -38,7 +49,8 @@ public sealed class ArrowDataReader : DbDataReader
 
     public override string GetName(int ordinal) => _schema.FieldsList[ordinal].Name;
     public override Type GetFieldType(int ordinal) =>
-        VariantClrValue.IsVariantField(_schema.FieldsList[ordinal])
+        _guid[ordinal] ? typeof(Guid)
+        : VariantClrValue.IsVariantField(_schema.FieldsList[ordinal])
             ? typeof(object)
             : ClrType(_schema.FieldsList[ordinal].DataType);
     public override string GetDataTypeName(int ordinal) => _schema.FieldsList[ordinal].DataType.Name;
@@ -88,6 +100,14 @@ public sealed class ArrowDataReader : DbDataReader
     {
         var array = _batch!.Column(ordinal);
         var field = _schema.FieldsList[ordinal];
+        if (_guid[ordinal])
+        {
+            if (array.IsNull(_rowInBatch))
+            {
+                return DBNull.Value;
+            }
+            return Guid.Parse(((StringArray)array).GetString(_rowInBatch)!);
+        }
         if (VariantClrValue.IsVariantField(field))
         {
             // A DuckDB VARIANT into a sql_variant column: each value as the CLR type whose sql_variant base

@@ -1570,7 +1570,7 @@ case "$TIER" in
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
         # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
         #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
-        : "${MIN_ASSERTIONS:=137113}"   # 2026-10-31: +130310 TPC-H / TPC-DS (every value counts) and the edge cases; +29 IN / NOT IN; +45 grouping sets; +15 single join
+        : "${MIN_ASSERTIONS:=137121}"   # 2026-10-31: +8 granular_types UUID insert; +130310 TPC-H / TPC-DS (every value counts) and the edge cases; +29 IN / NOT IN; +45 grouping sets; +15 single join
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

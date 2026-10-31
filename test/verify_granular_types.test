@@ -92,6 +92,25 @@ SELECT CAST(TIMESTAMP_NS '2024-01-02 12:34:56.1234565' AS TIMESTAMP)::VARCHAR,
 statement ok
 DETACH gtlake;
 
+# INSERT into a uniqueidentifier column. A DuckDB UUID crosses the boundary as its text, and SqlBulkCopy cannot
+# convert a string into a uniqueidentifier ("The given value ... of type String ... cannot be converted"): every
+# such INSERT failed, a UUID literal and a plain string alike. The bulk path reads those columns as Guid now.
+statement ok
+INSERT INTO db.dbo.gt (id, g) VALUES (2, UUID '0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c11'), (3, '0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c12'), (4, NULL);
+
+query IT
+SELECT id, g FROM db.dbo.gt WHERE id >= 2 ORDER BY id;
+----
+2	0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c11
+3	0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c12
+4	NULL
+
+# the server holds the same GUIDs (not some other byte order)
+query T
+SELECT * FROM fabricator_query('db', 'SELECT LOWER(CONVERT(varchar(36), g)) FROM dbo.gt WHERE id = 2');
+----
+0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c11
+
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.gt');
 
