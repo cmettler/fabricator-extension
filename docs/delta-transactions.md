@@ -882,7 +882,7 @@ tier — is unaffected either way.
 
 #### 8.5b Local Windows on DuckDB 2.0, and the DML row-id bug the measurement found — FIXED (2026-10-31)
 
-Started from a red Windows CI run: `verify_ducklake_delta_sync:419` (the §8 race of 6 concurrent syncs) failed
+Started from a red Windows CI run on the 2.0 line (a race of 6 concurrent DuckLake-to-Delta syncs, a 2.0-only suite) failed
 intermittently since it landed (2026-10-27) with *"Cannot open file …00000000000000000001.json: The process cannot
 access the file because it is being used by another process"*.
 
