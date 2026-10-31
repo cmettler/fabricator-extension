@@ -971,12 +971,13 @@ internal static class DeltaReader
     /// threaded (CTAS zstd, rewrite snappy). See the write-options entry in CLAUDE.md.</param>
     public static long DeleteByRowIds(nint opener, string path, IReadOnlyCollection<long> rowIds,
                                       CancellationToken ct, bool nativeWrite = false, bool nativeRead = false,
-                                      DeltaWriteSpec? spec = null)
-        => DeleteByRowIdsAsync(opener, path, rowIds, ct, nativeWrite, nativeRead, spec).GetAwaiter().GetResult();
+                                      DeltaWriteSpec? spec = null, long? atVersion = null)
+        => DeleteByRowIdsAsync(opener, path, rowIds, ct, nativeWrite, nativeRead, spec, atVersion)
+            .GetAwaiter().GetResult();
 
     private static async Task<long> DeleteByRowIdsAsync(nint opener, string path, IReadOnlyCollection<long> rowIds,
                                       CancellationToken ct, bool nativeWrite, bool nativeRead,
-                                      DeltaWriteSpec? spec = null)
+                                      DeltaWriteSpec? spec = null, long? atVersion = null)
     {
         // Cancel a long copy-on-write/DV rewrite (OneLake/S3) on query interrupt — the opener is fresh (the
         // modify operator's Finalize set it via FabricatorSetActiveTxn). See docs/cancellation.md.
@@ -1002,7 +1003,8 @@ internal static class DeltaReader
         try
         {
             long deleted = (await table.DeleteRowsAsync(
-                    SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "copy-on-write DELETE"),
+                    await PinnedSelectionAsync(table, atVersion, rowIds, "copy-on-write DELETE", token)
+                        .ConfigureAwait(false),
                     RowDeleteMode.CopyOnWrite, cancellationToken: token)
                 .ConfigureAwait(false)).RowsDeleted;
             DmlLog.LogInformation("delta delete-rewrite {Path}: deleted={Deleted} writer={Writer}",
@@ -1389,11 +1391,12 @@ internal static class DeltaReader
     /// <summary>DELETE via deletion vectors (no file rewrite) — for tables with deletion vectors enabled.
     /// <paramref name="rowIds"/> are ABSOLUTE transient rowids. Returns rows deleted.</summary>
     public static long DeleteByRowIdsViaVectors(nint opener, string path, IReadOnlyCollection<long> rowIds,
-                                                CancellationToken ct, bool rowLevelRetry = false)
-        => DeleteByRowIdsViaVectorsAsync(opener, path, rowIds, ct, rowLevelRetry).GetAwaiter().GetResult();
+                                                CancellationToken ct, bool rowLevelRetry = false, long? atVersion = null)
+        => DeleteByRowIdsViaVectorsAsync(opener, path, rowIds, ct, rowLevelRetry, atVersion).GetAwaiter().GetResult();
 
     private static async Task<long> DeleteByRowIdsViaVectorsAsync(nint opener, string path,
-                                                IReadOnlyCollection<long> rowIds, CancellationToken ct, bool rowLevelRetry)
+                                                IReadOnlyCollection<long> rowIds, CancellationToken ct, bool rowLevelRetry,
+                                                long? atVersion)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
@@ -1402,7 +1405,8 @@ internal static class DeltaReader
         try
         {
             long deleted = (await table.DeleteRowsAsync(
-                    SelectionFromRowIds(table, table.CurrentSnapshot, rowIds, "deletion-vector DELETE"),
+                    await PinnedSelectionAsync(table, atVersion, rowIds, "deletion-vector DELETE", token)
+                        .ConfigureAwait(false),
                     RowDeleteMode.DeletionVector, rowLevelRetry, token)
                 .ConfigureAwait(false)).RowsDeleted;
             // The no-boxing DML floor, and therefore the control to compare an UPDATE against: this path
@@ -2865,8 +2869,8 @@ internal static class DeltaReader
     /// was threaded.</param>
     public static void UpdateByRowIds(nint opener, string path, RecordBatch updates, CancellationToken ct,
         bool nativeWrite = false, bool nativeRead = false, bool catalogSerializable = false,
-        DeltaWriteSpec? spec = null)
-        => UpdateByRowIdsAsync(opener, path, updates, ct, nativeWrite, nativeRead, catalogSerializable, spec)
+        DeltaWriteSpec? spec = null, long? atVersion = null)
+        => UpdateByRowIdsAsync(opener, path, updates, ct, nativeWrite, nativeRead, catalogSerializable, spec, atVersion)
             .GetAwaiter().GetResult();
 
     /// <summary>
@@ -2884,7 +2888,7 @@ internal static class DeltaReader
 
     private static async Task UpdateByRowIdsAsync(nint opener, string path, RecordBatch updates,
         CancellationToken ct, bool nativeWrite, bool nativeRead, bool catalogSerializable,
-        DeltaWriteSpec? spec = null)
+        DeltaWriteSpec? spec = null, long? atVersion = null)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
@@ -2920,7 +2924,7 @@ internal static class DeltaReader
             bool serializable = EffectiveSerializable(cfg, catalogSerializable);
             if (mor)
             {
-                await MergeOnReadUpdateAsync(table, updates, serializable, token).ConfigureAwait(false);
+                await MergeOnReadUpdateAsync(table, updates, serializable, atVersion, token).ConfigureAwait(false);
             }
             else
             {
@@ -2930,8 +2934,9 @@ internal static class DeltaReader
                 // of this method, because DuckDB's own rowid is a single BIGINT.
                 // VARIANT: the re-key passes the SET value columns through unchanged, so it works in either
                 // dialect — but what it RETURNS goes to engineered-wood, hence canonical.
+                var pinned = await PinnedSnapshotAsync(table, atVersion, token).ConfigureAwait(false);
                 await table.UpdateRowsAsync(
-                        VariantTransport.ToCanonical(ReKeyUpdatesOntoMetadata(table, updates)),
+                        VariantTransport.ToCanonical(ReKeyUpdatesOntoMetadata(table, pinned, updates)),
                         cancellationToken: token)
                     .ConfigureAwait(false);
             }
@@ -2963,7 +2968,8 @@ internal static class DeltaReader
     /// decoded on THIS side because it exists to satisfy DuckDB, whose <c>rowid</c> is a single BIGINT; it is not
     /// something a Delta library should have to know about.
     /// </remarks>
-    private static RecordBatch ReKeyUpdatesOntoMetadata(DeltaTable table, RecordBatch updates)
+    private static RecordBatch ReKeyUpdatesOntoMetadata(
+        DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot pinned, RecordBatch updates)
     {
         int ridIdx = -1;
         for (int c = 0; c < updates.ColumnCount; c++)
@@ -2976,7 +2982,8 @@ internal static class DeltaReader
                 $"copy-on-write UPDATE: updates batch has no '{DeltaCatalog.RowIdColumn}' column.");
         }
 
-        var snapshot = table.CurrentSnapshot;
+        // the ordinals name files of the snapshot the statement scanned (see PinnedSnapshotAsync)
+        var snapshot = pinned;
         var pathByOrdinal = new Dictionary<int, string>(snapshot.ActiveFiles.Count);
         foreach (var planned in table.PlanFiles(snapshot: snapshot))
         {
@@ -2984,6 +2991,7 @@ internal static class DeltaReader
         }
 
         long posMask = (1L << TransientRowAddress.PositionBits) - 1;
+        var touched = new HashSet<string>(System.StringComparer.Ordinal);
         var pathB = new StringArray.Builder();
         var idxB = new Int64Array.Builder();
         for (int i = 0; i < updates.Length; i++)
@@ -2999,7 +3007,9 @@ internal static class DeltaReader
             }
             pathB.Append(filePath);
             idxB.Append(rid & posMask);
+            touched.Add(filePath);
         }
+        EnsureUnchangedSince(table, pinned, touched, "copy-on-write UPDATE");
 
         // The two LOCATOR columns, flat and dot-named — EW's `_metadata.*` convention, shared with the
         // identity pair ReadAllWithRowTrackingAsync owns. We fill only the locator: EW resolves each row's own
@@ -3041,6 +3051,83 @@ internal static class DeltaReader
     /// transaction's own pending files — those are in no committed snapshot by construction, and the caller
     /// rejects or reroutes them itself right after. Every DML path leaves this false: there an unresolvable
     /// ordinal means a delete or update silently going missing.</param>
+    /// <summary>
+    /// The snapshot a statement's row ids were captured against: its pinned version, else the current one.
+    /// </summary>
+    /// <remarks>
+    /// A row id names a file by its ORDINAL in the scanned snapshot. The DML paths open the table again, at the
+    /// LATEST version — and a concurrent commit in between (another writer's append, its UPDATE's post-image)
+    /// shifts the ordinals, so resolving them there names OTHER files. MEASURED 2026-10-31: 8 processes each
+    /// updating only its own rows of one local table — an `UPDATE … WHERE w = 8` changed writer 6's rows, every
+    /// statement exiting 0, 7 of 40 updates lost or applied twice. The read-back (ReadRowsByRowIdsAsync) already
+    /// resolved at the pin; these four paths did not.
+    /// </remarks>
+    private static async ValueTask<EngineeredWood.DeltaLake.Snapshot.Snapshot> PinnedSnapshotAsync(
+        DeltaTable table, long? atVersion, CancellationToken token)
+        => atVersion is { } v && v != table.CurrentSnapshot.Version
+            ? await table.GetSnapshotAtVersionAsync(v, token).ConfigureAwait(false)
+            : table.CurrentSnapshot;
+
+    /// <summary>
+    /// The selection of a DML statement's row ids, resolved against the snapshot they were captured in, and only
+    /// while every file it names is unchanged since then (<see cref="EnsureUnchangedSince"/>).
+    /// </summary>
+    private static async ValueTask<RowSelection> PinnedSelectionAsync(
+        DeltaTable table, long? atVersion, IReadOnlyCollection<long> rowIds, string op, CancellationToken token)
+    {
+        var pinned = await PinnedSnapshotAsync(table, atVersion, token).ConfigureAwait(false);
+        var selection = SelectionFromRowIds(table, pinned, rowIds, op);
+        EnsureUnchangedSince(table, pinned, selection.Paths, op);
+        return selection;
+    }
+
+    /// <summary>
+    /// Every file a selection names must still be active NOW with the deletion vector it had in the pinned
+    /// snapshot — its positions then still name the same, still-live rows. Otherwise a concurrent writer changed
+    /// it after the statement scanned: the statement is refused as a concurrent modification (retry it), never
+    /// applied to rows it did not read. Commits after this point are the commit's own validation to judge.
+    /// </summary>
+    private static void EnsureUnchangedSince(
+        DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot pinned, IEnumerable<string> paths, string op)
+    {
+        var now = table.CurrentSnapshot;
+        if (ReferenceEquals(pinned, now))
+        {
+            return;
+        }
+        // ActiveFiles is keyed by the reconciliation key (path + deletion vector), so a file is found by its PATH
+        var wanted = new HashSet<string>(paths, System.StringComparer.Ordinal);
+        var then = ActiveByPath(pinned, wanted);
+        var current = ActiveByPath(now, wanted);
+        foreach (var path in wanted)
+        {
+            if (!then.TryGetValue(path, out var before) || !current.TryGetValue(path, out var after)
+                || !Equals(before.DeletionVector, after.DeletionVector))
+            {
+                DmlLog.LogInformation(
+                    "delta {Op}: {Path} changed between the scanned v{Pinned} and v{Now} (dv {Then} -> {Current})",
+                    op, path, pinned.Version, now.Version,
+                    then.TryGetValue(path, out var b) ? b.DeletionVector?.UniqueId ?? "-" : "(absent)",
+                    current.TryGetValue(path, out var c) ? c.DeletionVector?.UniqueId ?? "-" : "(removed)");
+                throw ConcurrentModification(op);
+            }
+        }
+    }
+
+    private static Dictionary<string, EngineeredWood.DeltaLake.Actions.AddFile> ActiveByPath(
+        EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot, HashSet<string> paths)
+    {
+        var byPath = new Dictionary<string, EngineeredWood.DeltaLake.Actions.AddFile>(paths.Count, System.StringComparer.Ordinal);
+        foreach (var add in snapshot.ActiveFiles.Values)
+        {
+            if (paths.Contains(add.Path))
+            {
+                byPath[add.Path] = add;
+            }
+        }
+        return byPath;
+    }
+
     private static RowSelection SelectionFromRowIds(
         DeltaTable table, EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
         IReadOnlyCollection<long> rowIds, string op, bool skipUnresolvable = false)
@@ -3113,7 +3200,7 @@ internal static class DeltaReader
     /// batching and deletion-vector filtering each break positional correspondence.</para>
     /// </remarks>
     private static async Task MergeOnReadUpdateAsync(
-        DeltaTable table, RecordBatch updates, bool serializable, CancellationToken token)
+        DeltaTable table, RecordBatch updates, bool serializable, long? atVersion, CancellationToken token)
     {
         int ridIdx = -1;
         for (int c = 0; c < updates.ColumnCount; c++)
@@ -3149,7 +3236,11 @@ internal static class DeltaReader
         // The rows to mask — and the SAME object the transaction stages below, so the positions the read
         // resolved and the positions the commit validates cannot drift apart.
         MemoryProbe.Mark("delta update mor: rowid map built", updRowByRid.Count);
-        var selection = SelectionFromRowIds(table, snapshot, updRowByRid.Keys, "merge-on-read UPDATE");
+        // The ordinals name files of the version the statement scanned; the read-back below resolves the same
+        // rows' addresses, so it reads there too — the files are unchanged since (EnsureUnchangedSince).
+        var pinned = await PinnedSnapshotAsync(table, atVersion, token).ConfigureAwait(false);
+        var selection = SelectionFromRowIds(table, pinned, updRowByRid.Keys, "merge-on-read UPDATE");
+        EnsureUnchangedSince(table, pinned, selection.Paths, "merge-on-read UPDATE");
 
         var setCols = new Dictionary<string, IArrowArray>(System.StringComparer.Ordinal);
         for (int c = 0; c < updates.ColumnCount; c++)
@@ -3285,7 +3376,7 @@ internal static class DeltaReader
         // the rowids and source tracking do not accumulate across the statement either.
         var ridsPerBatch = new List<long[]>();
         var srcTracking = materialize ? new List<(long?[] Ids, long?[] Versions)>() : null;
-        await foreach (var batch in ReadSelectedRowsAsync(table, snapshot, selection,
+        await foreach (var batch in ReadSelectedRowsAsync(table, pinned, selection,
                            sourceTrackingOut: srcTracking, rowIdsOut: ridsPerBatch, ct: token)
                            .ConfigureAwait(false))
         {

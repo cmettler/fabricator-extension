@@ -1,0 +1,72 @@
+# name: test/verify_delta_concurrent_dml.test
+# description: Autocommit UPDATE and DELETE on one Delta table from several threads at once. A row id names a file by
+#              its ORDINAL in the version the statement scanned, and the DML opens the table again at the latest —
+#              where a concurrent writer's commit has shifted the ordinals. Resolved there, an `UPDATE … WHERE w = 8`
+#              changed ANOTHER writer's rows, every statement succeeding (MEASURED 2026-10-31 with 8 processes:
+#              7 of 40 updates lost or applied twice, whole inserts' rows deleted). The row ids now resolve at the
+#              statement's pinned version (DeltaReader.PinnedSnapshotAsync). Each thread touches only its own rows,
+#              in its own files, so every statement succeeds and every row ends at an exact count.
+#              Set FABRICATOR_DELTA_WRITE_DIR.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/concurrent_dml' AS cd (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE cd.main.t (w INTEGER, r INTEGER, v INTEGER);
+
+# one file per writer
+loop w 0 8
+
+statement ok
+INSERT INTO cd.main.t SELECT ${w}, range, 0 FROM range(50);
+
+endloop
+
+# merge-on-read UPDATEs (deletion vectors are the default), each thread on its own rows only
+concurrentloop w 0 8
+
+loop i 0 6
+
+statement ok
+UPDATE cd.main.t SET v = v + 1 WHERE w = ${w};
+
+endloop
+
+endloop
+
+query IIII
+SELECT count(*), count(DISTINCT w), min(v), max(v) FROM cd.main.t;
+----
+400	8	6	6
+
+query I
+SELECT count(*) FROM (SELECT w FROM cd.main.t GROUP BY w HAVING count(*) <> 50 OR min(v) <> 6 OR max(v) <> 6);
+----
+0
+
+# DELETEs the same way: each thread removes its own rows, a few at a time
+concurrentloop w 0 8
+
+loop i 0 5
+
+statement ok
+DELETE FROM cd.main.t WHERE w = ${w} AND r >= 40 - ${i} * 10 AND r < 50 - ${i} * 10;
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) FROM cd.main.t;
+----
+0
+
+statement ok
+DROP TABLE cd.main.t;

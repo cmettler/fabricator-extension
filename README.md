@@ -4279,37 +4279,34 @@ principal wins even if `PROVIDER` says something else:
 > `CALL enable_logging(level := 'debug', storage := 'memory')`). Single-writer use is unaffected, and a
 > read-only attach needs nothing — this is only about concurrent writers.
 
-> ### ⚠ A LOCAL path on **Windows** is single-writer only
+> ### Concurrent writers on a local **Windows** path
 >
-> Delta's commit needs a put-if-absent, and on Windows the local filesystem does not provide one through
-> DuckDB — exclusive-create **succeeds on a file that already exists**, and a rename **overwrites** its
-> target. Two processes committing the same version therefore both "succeed" and the later one wins:
+> Delta's commit needs a put-if-absent, and on Windows DuckDB 1.5's local filesystem does not provide one —
+> exclusive-create **succeeds on a file that already exists**, and a rename **overwrites** its target. Earlier
+> builds committed through those primitives, so two processes committing the same version both "succeeded"
+> and the later one won (measured: 6 processes × 3 `INSERT`s × 50 rows landed **400 of 900 rows**, every
+> process exiting successfully), and a concurrent reader could see a half-written commit file.
+>
+> **The commit no longer uses them.** On a local Windows root the commit file is written under a temporary
+> name and moved into place without replacing an existing one, which Windows does atomically. The same test
+> now lands **900 of 900 rows**, and a lost race is reported as an ordinary conflict and retried. Concurrent
+> autocommit `UPDATE`/`DELETE` on one table also resolve their rows against the version they scanned (before,
+> a statement could change another writer's rows and still succeed).
+>
+> `fabricator_fs_write_probe` still reports DuckDB's own primitive, so on Windows it keeps saying "no
+> put-if-absent guard" — that row describes DuckDB's filesystem, not the commit path:
 >
 > ```sql
-> -- Check any root before writing to it from more than one process. Use a directory that ALREADY EXISTS
-> -- and read the whole table, top to bottom -- see the caveat below.
 > SELECT * FROM fabricator_fs_write_probe('D:/existing/dir');
 > --  create_directory                | true  | directory exists/created
 > --  write_create                    | true  | wrote 16 bytes (WRITE|FILE_CREATE)
 > --  exclusive_create_existing_fails | false | ... NO put-if-absent guard (unsafe for commits)
 > ```
 >
-> Measured: 6 concurrent processes × 3 `INSERT`s × 50 rows against one local table landed **400 of 900
-> rows** — 500 lost, one process's rows missing entirely, **and every process exited successfully**. A
-> concurrent reader can also observe a *half-written* commit file, which surfaces as a JSON parse error
-> (`'w' is an invalid start of a value`) rather than as a conflict.
->
 > **⚠ Read the probe's earlier rows before trusting its verdict.** Point it at a path whose parent does
 > not exist and `exclusive_create_existing_fails` reports **`true` — "put-if-absent works"** — because the
-> exclusive open threw for a *missing directory* rather than for an existing file. The rows above it give it
-> away (`write_create` = `false`, "The system cannot find the path specified"), but the verdict cell on its
-> own reads as SAFE on a run where nothing was tested. Confirm `create_directory` and `write_create` are
-> both `true` first.
->
-> This is a property of the storage, not of your SQL: **single-writer use is completely unaffected**, and
-> everything the test suite covers runs this way. For concurrent writers use OneLake/`abfss://` or
-> `s3://` with a named secret (above), or a POSIX filesystem — Linux/macOS local paths get a real `O_EXCL`
-> and are multi-process safe.
+> exclusive open threw for a *missing directory* rather than for an existing file. Confirm
+> `create_directory` and `write_create` are both `true` first.
 
 > ### ⚠ A table with CHECK constraints is INSERT-only here
 >

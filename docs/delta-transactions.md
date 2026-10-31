@@ -489,7 +489,7 @@ depends on the filesystem:
 | Storage | Commit guard | Verdict |
 |---|---|---|
 | Local POSIX | `O_EXCL` exclusive create | multi-process safe (validated: 4 processes × 200 rows → 800/800) |
-| **Local WINDOWS (`D:\…`, DuckDB's `LocalFileSystem`)** | **NONE THAT HOLDS** — `fabricator_fs_write_probe` reports `EXCLUSIVE_CREATE` **SUCCEEDING on an existing file** ("NO put-if-absent guard") *and* `MoveFile` **overwriting** its target, so neither primitive is conditional | **MEASURED 2026-08-03 (§8.5): 6 writers × 3 INSERTs × 50 rows ⇒ 400 of 900 rows landed, 500 SILENTLY LOST, every writer exited 0.** Single-writer only |
+| **Local WINDOWS (`D:\…`, DuckDB's `LocalFileSystem`)** | **Since 2026-10-31, on BOTH lines: the commit is written to a temporary name and MOVED onto the version without replacing** (`DuckDbTableFileSystem.TryPublishLocalWindows`) — on 1.5 this is the ONLY guard, since DuckDB 1.5 still drops `EXCLUSIVE_CREATE` on Windows; DuckDB 2.0 maps it to `CREATE_NEW` as well (§8.5b) | **MEASURED 2026-10-31 on 1.5.6: 6 processes × 3 INSERTs: 900/900 rows (350/900 without it); 8 processes × (1 INSERT + 5 UPDATEs): 400/400 rows, v 2000/2000** — after the row-id fix of §8.5b. Before: 400 of 900 rows (§8.5) |
 | OneLake / abfss (`onelake://`) | ADLS conditional create (`If-None-Match: *`) | multi-process safe for DATA (no lost writes measured), but a losing writer can surface an ERROR instead of retrying — see §8.1 |
 | Plain ADLS Gen2 `abfss://` **with an azure `SECRET` NAMED** | the SAME ADLS conditional create — a credentialed abfss root now takes the direct-SDK filesystem, which is what OneLake always took | **MEASURED 2026-08-02 (§8.4): 6 writers × 8 commits ⇒ 48/48, zero losses, commit versions fully interleaved across writers so contention was real** |
 | Plain ADLS Gen2 `abfss://` with **no named secret** | **none that holds** — duckdb-azure's `ExclusiveCreate` is a client-side existence CHECK, so it races | **MEASURED 2026-08-02 (§8.4): 41 of 48 landed, six of the seven losses SILENT.** Single-writer only; RENAME/DROP also unavailable |
@@ -879,6 +879,55 @@ Windows as safe as local POSIX **with no change on our side** — `HostFsOpenWri
 platform-specific conditional create in our own filesystem) is therefore deliberately NOT attempted: it
 would duplicate a fix that belongs one layer down. Single-writer behaviour — every suite in the hermetic
 tier — is unaffected either way.
+
+#### 8.5b Local Windows on DuckDB 2.0, and the DML row-id bug the measurement found — FIXED (2026-10-31)
+
+Started from a red Windows CI run: `verify_ducklake_delta_sync:419` (the §8 race of 6 concurrent syncs) failed
+intermittently since it landed (2026-10-27) with *"Cannot open file …00000000000000000001.json: The process cannot
+access the file because it is being used by another process"*.
+
+- **DuckDB 2.0 fixed §8.5's root cause**: `local_file_system.cpp` maps `ExclusiveCreate()` to `CREATE_NEW` on Windows
+  now. `fabricator_fs_write_probe` (with an existing parent, §8.5a) reports `exclusive_create_existing_fails = true`;
+  6 processes × 5 INSERTs: 1500/1500 rows.
+- **What was left on Windows: the commit is created, THEN written** — a concurrent reader opening it in between gets
+  the sharing violation above (or an empty file). Fixed for local Windows roots only: the bytes go to
+  `.<name>.<guid>.tmp`, then `File.Move(tmp, commit, overwrite: false)` — MoveFileEx without
+  MOVEFILE_REPLACE_EXISTING, atomic and failing when the version exists. ⚠ NOT on POSIX: .NET's no-replace move is a
+  `link()` there, which a FUSE mount (Fabric's `/lakehouse/default`) does not support — it falls back to
+  check-then-rename, a race, while `O_EXCL` is the measured-safe primitive on that mount (§8.1). The create-then-write
+  window therefore still exists on POSIX; not measured there.
+- **⚠⚠ THE MEASUREMENT FOUND A SILENT WRONG-ROW BUG THAT HAS NOTHING TO DO WITH WINDOWS.** 8 processes × (1 INSERT +
+  5 UPDATEs of their OWN rows): 300 of 400 rows, v 1200 of 2000, every statement exit 0. Per process: an UPDATE that
+  "succeeded" without a visible change, one applied twice, values going DOWN. Ruled out by measurement, in this order:
+  checkpoints (`delta.checkpointInterval = 1000` — still lost), the version checksum (`.crc` carries no file list),
+  versions won twice (each won exactly once). The log showed it: commit 15, `UPDATE … WHERE w = 8`, changed
+  **writer 6's** file.
+  - **Cause:** a DML row id names a file by its ORDINAL in the snapshot the statement scanned (TransientRowAddress).
+    The four autocommit DML paths (`DeleteByRowIds`, `DeleteByRowIdsViaVectors`, merge-on-read and copy-on-write
+    `UpdateByRowIds`) open the table again at the LATEST version and resolved the ordinals there — a concurrent
+    writer's commit in between shifts them onto OTHER files. The buffered read-back already resolved at the pin
+    (its comment describes exactly this); these four did not. Not Windows-specific: any multi-writer root.
+  - **Fix:** the catalog passes the statement's pinned version (`TryTxn(txn)?.Peek(path)?.PinnedVersion`); the
+    ordinals resolve against that snapshot (`PinnedSnapshotAsync`), the merge-on-read read-back reads there too, and
+    every selected file must be unchanged since — same path, same deletion vector (`EnsureUnchangedSince`) — else
+    the statement is refused as a concurrent modification ("Retry the statement"), never applied to rows it did not
+    read. ⚠ `Snapshot.ActiveFiles` is keyed by the RECONCILIATION key (path + deletion vector), so the check finds files
+    by `AddFile.Path`; the first version looked up by path and refused every second DELETE on a file with a vector.
+  - Attribution by A/B: with the row-id fix and WITHOUT the atomic publish, nothing is lost silently (v = 50 × the
+    successful updates) but a statement sometimes fails loudly with the sharing violation — so the silent losses were
+    the row-id bug, the loud failures the publish.
+- **On the 1.5 line (backported 2026-10-31), measured against a control on 1.5.6.** DuckDB 1.5 still drops
+  `EXCLUSIVE_CREATE` on Windows, so there the move-without-replace is the only put-if-absent. Three builds, same
+  harness: WITHOUT both fixes 350/900 INSERT rows (11 of 12 processes exit 0) and the suite fails loudly at its
+  first UPDATE (a half-written commit); WITH the publish alone 900/900 INSERT rows but the UPDATE race ends at
+  v 1500/2000, every process exit 0 — the row-id bug, isolated and silent in the shipped line; WITH both 900/900 and
+  v 2000/2000, three runs, and `verify_delta_concurrent_dml` green 3/3.
+- Gate: NEW hermetic `verify_delta_concurrent_dml` (105): 8 `concurrentloop` threads, each updating (merge-on-read,
+  6×) and then deleting (deletion vectors, 5×) only its own rows, exact counts after. The mutant "no pinned version"
+  fails 5 of 5 runs (four loud, one silent `min(v)` mismatch). Not gated: the unchanged-file refusal (needs a commit
+  between a statement's scan and its DML open on the SAME file — sqllogictest cannot interleave inside a statement).
+- Not fixed, recorded: `AllSelectedFilesRowTracked` looks files up by path in the same reconciliation-keyed map, so a
+  file with a deletion vector counts as untracked — it then takes the read-back route for row ids (correct, slower).
 
 #### 8.5a ⚠ `fabricator_fs_write_probe` HAS A FALSE-POSITIVE MODE — FOUND, **NOT FIXED** (2026-08-03)
 

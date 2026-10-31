@@ -196,7 +196,7 @@ case "$TIER" in
         # table actually compile to" cannot be answered by reading the rules, and being a RELATION it can
         # be reviewed, diffed between two versions, or stored beside the decision it produced. It covers
         # OUTPUT cells, which the strict audit does not.
-        : "${MIN_SUITES:=82}"
+        : "${MIN_SUITES:=83}"   # 2026-10-31: +verify_delta_concurrent_dml (backport)
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -893,7 +893,7 @@ case "$TIER" in
         #   pin that 1.5.6 rounds a truncated string max up), verify_delta_batched_read +18 and
         #   verify_delta_clustered_optimize +13 per engine leg (Spark-named materialized row ids),
         #   verify_delta_subplan_dedup +41 (a catalog scan survives a plan copy; an inlined CTE was an INTERNAL Error).
-        : "${MIN_ASSERTIONS:=10142}"
+        : "${MIN_ASSERTIONS:=10247}"   # 2026-10-31: +105, verify_delta_concurrent_dml (backport)
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
