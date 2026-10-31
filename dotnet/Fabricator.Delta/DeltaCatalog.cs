@@ -5291,9 +5291,12 @@ public sealed class DeltaCatalog : IProviderCatalog
         // made the difference visible.
         var tableConfig = DeltaReader.GetTableProperties(opener, path);
         bool dvMode = DeltaReader.IsDeletionVectorsEnabled(tableConfig);
-        _log.LogInformation("delta delete {Schema}.{Table}: rows={Rows} mode={Mode} native_write={Native}",
+        // The row ids name files by their ordinal in the version the statement SCANNED, and the paths below open
+        // the latest: the pin is what they resolve against (DeltaReader.PinnedSnapshotAsync).
+        long? scanned = TryTxn(AmbientTransaction.Current)?.Peek(path)?.PinnedVersion;
+        _log.LogInformation("delta delete {Schema}.{Table}: rows={Rows} mode={Mode} native_write={Native} scanned=v{Scanned}",
             schemaName, tableName, ids.Count, dvMode ? "deletion-vector" : "copy-on-write",
-            !dvMode && _nativeWrite);
+            !dvMode && _nativeWrite, scanned?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "?");
         // rowLevelRetry: Databricks-style ROW-LEVEL CONCURRENCY (write_serializable only) — a concurrent
         // DV swap of the same file re-unions instead of conflicting when the touched rows are disjoint.
         //
@@ -5305,9 +5308,6 @@ public sealed class DeltaCatalog : IProviderCatalog
         // to serialize, so this is "only a resilience knob" — is true about the isolation semantics and beside
         // the point about the contract: once a table has DECLARED Serializable, no local option should weaken
         // it. Costs one property read per autocommit DELETE, on the DV path only.
-        // The row ids name files by their ordinal in the version the statement SCANNED, and the paths below open
-        // the latest: the pin is what they resolve against (DeltaReader.PinnedSnapshotAsync).
-        long? scanned = TryTxn(AmbientTransaction.Current)?.Peek(path)?.PinnedVersion;
         return dvMode
             ? DeltaReader.DeleteByRowIdsViaVectors(opener, path, ids, default,
                                                    rowLevelRetry: !EffectiveSerializable(tableConfig),
@@ -5694,13 +5694,15 @@ public sealed class DeltaCatalog : IProviderCatalog
         // The catalog's ATTACH default only — the TABLE's own delta.isolationLevel outranks it, resolved inside
         // from the configuration the update path already reads (no extra _delta_log LIST).
         MemoryProbe.Mark("delta update: arrow batch rebuilt", updates.Count);
+        long? scanned = TryTxn(AmbientTransaction.Current)?.Peek(path)?.PinnedVersion;
         DeltaReader.UpdateByRowIds(opener, path, updatesBatch, default, _nativeWrite, _nativeRead,
                                    catalogSerializable: _serializable,
                                    spec: ResolveWriteSpec(null, null, path),
-                                   atVersion: TryTxn(AmbientTransaction.Current)?.Peek(path)?.PinnedVersion);
+                                   atVersion: scanned);
 
-        _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native}",
-            schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite);
+        _log.LogInformation("delta update {Schema}.{Table}: rows={Rows} set_cols={SetCols} native_write={Native} scanned=v{Scanned}",
+            schemaName, tableName, updates.Count, setColNames.Count, _nativeWrite,
+            scanned?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "?");
         return updates.Count; // each distinct rowid is one updated row
     }
 
