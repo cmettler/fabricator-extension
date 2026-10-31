@@ -1561,7 +1561,10 @@ case "$TIER" in
         # 2026-10-30: 6518 -> 6520: one predicate sent once — verify_sqlgen_catalog 34 -> 36
         # 2026-10-31: 6520 -> 6548: a count that reads no column is pushed, a row-id filter is re-checked —
         #   verify_remote_select_mssql 570 -> 593 (tier measured 6543), verify_pushdown_guide_mssql 162 -> 167 (S13)
-        : "${MIN_ASSERTIONS:=6548}"
+        # 2026-10-31: 6548 -> 6617: ||, trim, left / right and a date cast of a timestamp are pushed —
+        # verify_remote_select_mssql 593 -> 644 (§18), verify_pushdown_guide_mssql 167 -> 185 (S14); tier measured
+        # 6401 with merge_pushdown (90) and moved_rows (126) failing on their old `||` decline controls, 6617 after
+        : "${MIN_ASSERTIONS:=6617}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

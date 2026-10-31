@@ -195,6 +195,29 @@ EXPLAIN SELECT count(rowid) FROM mssql.dbo.pg_sales;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
+# S14: ||, trim, left / right and a date cast of a timestamp are pushed; a negative count stays local
+query II
+EXPLAIN SELECT id, region || '-' || note AS label, trim(note) AS t, left(note, 3) AS l FROM mssql.dbo.pg_sales ORDER BY id LIMIT 3;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query IIII
+SELECT id, region || '-' || note AS label, trim(note) AS t, left(note, 3) AS l FROM mssql.dbo.pg_sales ORDER BY id LIMIT 3;
+----
+1	EU-first	first	fir
+2	NULL	NULL	NULL
+3	EU-Größe	Größe	Grö
+
+query II
+EXPLAIN SELECT count(*) FROM mssql.dbo.pg_sales_eu WHERE CAST(loaded AS DATE) = DATE '2026-01-05';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT id, left(note, -1) FROM mssql.dbo.pg_sales ORDER BY id LIMIT 3;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok

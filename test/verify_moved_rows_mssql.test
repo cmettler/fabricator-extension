@@ -262,14 +262,14 @@ WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE amount > 5.5 RETURNING id, s,
 ----
 2
 
-# M7 || is not in the Substrait producer: declines, runs locally
+# M7 reverse has no exact T-SQL (SQL Server reverses UTF-16 code units): declines, runs locally
 query II
-EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE s || '' = 'b ' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+EXPLAIN WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE reverse(s) = ' b' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
 ----
 physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
 
 query I
-WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE s || '' = 'b ' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
+WITH moved AS (DELETE FROM db.dbo.mvr_src_on WHERE reverse(s) = ' b' RETURNING *) INSERT INTO db.dbo.mvr_dst_on SELECT * FROM moved;
 ----
 1
 
@@ -313,7 +313,7 @@ WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE amount > 5.5 RETURNING id, s
 2
 
 query I
-WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE s || '' = 'b ' RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
+WITH moved AS (DELETE FROM db.dbo.mvr_src_off WHERE reverse(s) = ' b' RETURNING *) INSERT INTO db.dbo.mvr_dst_off SELECT * FROM moved;
 ----
 1
 
@@ -344,7 +344,7 @@ statement ok
 WITH moved AS (DELETE FROM loc_src WHERE amount > 5.5 RETURNING id, s, n, amount) INSERT INTO loc_dst (amount, n, s, id) SELECT amount, n, s, id FROM moved;
 
 statement ok
-WITH moved AS (DELETE FROM loc_src WHERE s || '' = 'b ' RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
+WITH moved AS (DELETE FROM loc_src WHERE reverse(s) = ' b' RETURNING *) INSERT INTO loc_dst SELECT * FROM moved;
 
 statement ok
 WITH moved AS (DELETE FROM loc_src WHERE id = 11 RETURNING id, s) INSERT INTO loc_arch SELECT * FROM moved;

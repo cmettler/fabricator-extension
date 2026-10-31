@@ -300,6 +300,22 @@ SELECT count(*) FROM mssql.dbo.pg_sales;
 
 `count(rowid)` or anything else that reads the row id keeps it, and runs as a scan.
 
+**S14 — pushed: `||`, `trim`, `left` / `right`, a date cast of a timestamp.** These stayed in DuckDB until
+2026-10-31. Each is translated to give DuckDB's answer: `||` returns NULL for a NULL operand (T-SQL `+`, where
+`concat()` skips it), a `trim` without characters removes every Unicode space separator — NBSP and the ideographic
+space too, never a tab — and `left` / `right` count code points:
+
+```sql
+SELECT id, region || '-' || note AS label, trim(note) AS t, left(note, 3) AS l
+FROM mssql.dbo.pg_sales ORDER BY id LIMIT 3;
+-- EXPLAIN: Fabricator Query.   1 EU-first first fir / 2 NULL NULL NULL / 3 EU-Größe Größe Grö
+SELECT count(*) FROM mssql.dbo.pg_sales_eu WHERE CAST(loaded AS DATE) = DATE '2026-01-05';
+-- EXPLAIN: Fabricator Query.   sent: … WHERE (CAST([t0].[loaded] AS date) = CAST('2026-01-05' AS date))
+```
+
+A negative count (`left(note, -1)`, all but the last character in DuckDB) stays local: T-SQL refuses it.
+`ltrim` / `rtrim` need SQL Server 2022 or later to be pushed.
+
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
 an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or

@@ -105,10 +105,10 @@ public static class SqlServerSubstrait
             throw SubstraitTranslationException.Unsupported(
                 "the query reads the same rows more than once, and one statement would not read them consistently here " +
                 "(neither READ_COMMITTED_SNAPSHOT nor ALLOW_SNAPSHOT_ISOLATION, or a transaction holds a connection)");
-        // IGNORE NULLS and DATETRUNC arrived together, with SQL Server 2022
+        // IGNORE NULLS, DATETRUNC and LTRIM / RTRIM with characters arrived together, with SQL Server 2022
         var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation, columnSqlTypes: columnSqlTypes)
         {
-            SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, CatalogFunctions = catalogFunctions,
+            SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, SupportsTrimCharacters = ignoreNulls, CatalogFunctions = catalogFunctions,
             CatalogTableFunctions = catalogTableFunctions, ColumnByteLengths = columnByteLengths
         };
         if (root.Input is WriteRel writeRel)

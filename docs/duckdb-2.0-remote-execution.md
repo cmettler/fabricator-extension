@@ -1087,7 +1087,7 @@ and runs it through `fabricator_remote_dml` (`EXPLAIN`: `FABRICATOR_REMOTE_DML`)
   storage. Triggers and NULL handling need no decline here — the rowid path is itself a T-SQL DELETE / UPDATE.
 - **Switch:** `fabricator_dml_pushdown = false` declines INSERT and DML alike (it is the gate's reference oracle);
   `remote_pushdown 'false'` on the ATTACH keeps the shortcut.
-- ⚠ `||` is not in the Substrait producer, so a SET with string concatenation stays local.
+- ⚠ `||` was not in the Substrait producer, so a SET with string concatenation stayed local — pushed since §4.21.
 
 Gate NEW `verify_remote_dml_mssql` (87, service): routing, then a THREE-WAY differential — `on` (pushed), `off`
 (the switch, i.e. the rowid path) and `loc` (a DuckDB table) — over adversarial data (case, trailing spaces, NULLs,
@@ -1138,7 +1138,7 @@ same SQL Server catalog, runs as `DELETE [t0] OUTPUT DELETED.[c…] INTO dst ([d
 - Gate: routing (pushed; type change, trigger, FK, CHECK, self-move, RETURNING expression, filtering SELECT, switch
   all local; a standalone DELETE … RETURNING returns its rows; COPY to a file; another database refused with nothing
   deleted), then the three-way differential (`on` / `off` / DuckDB tables) over eight moves: a range, an exact
-  string against `'b '`, NULLs, `IN (subquery)`, `NOT IN` over a NULL, reordered named columns, a declined `||`
+  string against `'b '`, NULLs, `IN (subquery)`, `NOT IN` over a NULL, reordered named columns, a declined `||` (a declined `reverse` since §4.21)
   predicate, and a target with other column names. Transactions: ROLLBACK undoes both halves, COMMIT keeps them.
   Five mutants killed at their own rows: DELETED named by the insert's columns (M8), no OUTPUT INTO decline (FK
   row), no type check (the type-change row), the shape never recognised (routing), the CTE not marked (the first
@@ -1225,7 +1225,7 @@ rest. No ABI change. Gate NEW `verify_merge_pushdown_mssql` (90, service).
   Fix: `SupportsPushdown(ParsedExpression)` vetoes a FUNCTION / WINDOW call that names this catalog, so such a
   statement is never pushed and stays exactly as written. Gate `verify_remote_select_mssql` §5b (512 -> 518), over a
   table and over a derived table; mutant (no veto) killed at its EXPLAIN row.
-- Gate: routing (pushed; RETURNING, a `||` condition, THEN ERROR, UPDATE without SET, a trigger target, the switch,
+- Gate: routing (pushed; RETURNING, a `||` condition (`reverse` since §4.21), THEN ERROR, UPDATE without SET, a trigger target, the switch,
   a constant source all local — the declined ones also EXECUTE, which proves the subquery decline path for MERGE);
   duplicate matches (UPDATE and DELETE refused, no-op matches fine); an IDENTITY-keyed table without a PK; the
   three-way differential over six steps (upsert; three WHEN MATCHED with first-true-wins; NOT MATCHED BY SOURCE with
@@ -1681,6 +1681,45 @@ Gate: `verify_remote_select_mssql` §17 (570 -> 593). The table's FIRST column i
 the rows, so a build that put column 0 in place of a row id the query DOES read would answer `count(rowid)` /
 `max(rowid)` wrong. Mutants killed at their own rows: no rewrite (the routing row), the read check dropped (the
 `count(rowid)` control), the row-id type dropped from the re-check (the `rowid > 290` row).
+
+### 4.21 `||`, trim, left / right, a date cast of a timestamp — PUSHED (2026-10-31)
+
+An inventory of 42 common expressions in a pushed `WHERE` (scratchpad `inv/`) found most of them pushed already. Four
+stayed local for reasons of ours, not of T-SQL:
+
+- **`||`** had no Substrait name ("Could not find function `||`"). It is Substrait's `concat` with
+  `null_handling = ACCEPT_NULLS` now (a NULL operand gives NULL — T-SQL `+`), and DuckDB's `concat()` asks for
+  `IGNORE_NULLS` (T-SQL `CONCAT`) instead of taking the emitter's first variant by luck. Only for a VARCHAR result:
+  a BLOB or a LIST `||` still declines.
+- **One-argument `trim` / `ltrim` / `rtrim`** had no Substrait signature (Substrait's take the characters to remove).
+  DuckDB's remove every Unicode space separator — MEASURED over every code point: exactly the 17 of category Zs
+  (U+0020, U+00A0, U+1680, U+2000–U+200A, U+202F, U+205F, U+3000) — so the producer passes those 17. MEASURED on the
+  server over every BMP code point of a UTF-8 varchar: `TRIM(<the 17> FROM s)`, `LTRIM(s, <the 17>)` and
+  `RTRIM(…)` remove exactly those 17. `LTRIM` / `RTRIM` with characters need SQL Server 2022 (they work at
+  compatibility level 150 there), so they decline below it, like `DATETRUNC`.
+- **`left` / `right`** — DuckDB binds the count as BIGINT; narrowed to i32 like `substring`. The emitter wrote a bare
+  `LEFT(s, n)`, unreachable until now: it uses the code-point collation now (as `SUBSTRING` does) and requires a
+  constant count of at least 0 — a negative one keeps all but that many in DuckDB and errors in T-SQL.
+- **`CAST(ts AS DATE) = …`** — a §5 side effect. Since a SQL Server scan takes table filters, the FilterPushdown pass
+  in `BindToSubstrait` (and the subtree pass) hands the copied scan DuckDB's OPTIONAL range filter derived from the
+  cast (`optional: ts >= … AND optional: ts <= …`), whose internal function has no translation, so the whole statement
+  declined. `TransformGet` drops an optional filter (`WithoutOptionalFilters`) as a whole condition or as a conjunct
+  of an AND: it only prunes, and the predicate it was derived from stays in the plan. Anywhere else it still
+  declines. A dynamic (join) filter still declines too — dropping it would lose the pruning it brings.
+
+Still local after the inventory, and left so: `ILIKE` (no exact case-insensitive T-SQL — the reason `lower()` is the
+one accepted divergence), `TRY_CAST` (declined on purpose), `sign()` (returns TINYINT, and T-SQL's tinyint is
+unsigned), `concat_ws`, `strftime`, `hash`, `epoch`. `GREATEST` / `LEAST` are SQL Server 2022 functions pushed without a
+version check (pre-existing; this box cannot test an older server).
+
+Gate: `verify_remote_select_mssql` §18 (593 -> 644): strings written BY DuckDB through the extension (NBSP, the
+ideographic and the hair space, a tab, a zero-width space, a supplementary character, a combining mark, NULL, ''),
+an `EXCEPT ALL` differential both ways over nvarchar and UTF-8 varchar, and pinned rows per change. Guide S14
+(`verify_pushdown_guide_mssql` 167 -> 185). Five mutants killed: `||` with concat's NULL handling, trim given only
+`' '`, `LEFT` without the code-point collation (all three at the differential), a negative count pushed (its own row,
+with T-SQL's "Invalid length parameter" as the answer), the optional filter kept (the routing row).
+`verify_merge_pushdown_mssql` and `verify_moved_rows_mssql` used `||` as their "no translation" control; it is
+`reverse` now (counts unchanged, 90 / 126).
 
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 

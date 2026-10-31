@@ -20,6 +20,7 @@
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp" // [FABRICATOR-PATCH: OURS-BY-DESIGN] optional filters
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -718,6 +719,14 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 		auto enum_arg = sfun->add_arguments();
 		*enum_arg->mutable_enum_() = subfield;
 	}
+	// [FABRICATOR-PATCH: OFFER-READY] string concatenation says what a NULL argument does: DuckDB's concat() skips
+	// it, its `||` operator returns NULL. Both are Substrait's concat, told apart by null_handling.
+	if ((function_name == "concat" || function_name == "||") && dfun.GetReturnType().id() == LogicalTypeId::VARCHAR) {
+		auto null_handling = sfun->add_options();
+		null_handling->set_name("null_handling");
+		null_handling->add_preference(function_name == "concat" ? "IGNORE_NULLS" : "ACCEPT_NULLS");
+		function_name = "concat";
+	}
 	// Substrait only defines substring/substr over i32 offsets and lengths, but DuckDB binds
 	// those arguments as i64 (BIGINT). Emit them cast to i32 so the call resolves to the
 	// standard substring signature instead of an unknown native function.
@@ -725,6 +734,8 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 	// range. Revisit and emit the wider arguments directly if an i64 substring signature is
 	// ever added to the Substrait function definitions.
 	bool is_substring = function_name == "substring" || function_name == "substr";
+	// [FABRICATOR-PATCH: OFFER-READY] left / right take their count as i32 as well
+	is_substring = is_substring || function_name == "left" || function_name == "right";
 	vector<substrait::Type> args_types;
 	for (idx_t arg_idx = 0; arg_idx < dfun.GetChildren().size(); arg_idx++) {
 		auto &darg = dfun.GetChildren()[arg_idx];
@@ -739,6 +750,22 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 			TransformExpr(*darg, *sarg->mutable_value(), col_offset);
 			args_types.emplace_back(DuckToSubstraitType(darg->GetReturnType()));
 		}
+	}
+	// [FABRICATOR-PATCH: OFFER-READY] DuckDB's one-argument trim / ltrim / rtrim remove every Unicode space separator
+	// (category Zs — measured, these 17); Substrait's remove the characters they are given
+	if ((function_name == "trim" || function_name == "ltrim" || function_name == "rtrim") &&
+	    dfun.GetChildren().size() == 1) {
+		static const char *space_separators = " "
+		                                      "\xC2\xA0" // U+00A0
+		                                      "\xE1\x9A\x80" // U+1680
+		                                      "\xE2\x80\x80\xE2\x80\x81\xE2\x80\x82\xE2\x80\x83" // U+2000-U+2003
+		                                      "\xE2\x80\x84\xE2\x80\x85\xE2\x80\x86\xE2\x80\x87" // U+2004-U+2007
+		                                      "\xE2\x80\x88\xE2\x80\x89\xE2\x80\x8A" // U+2008-U+200A
+		                                      "\xE2\x80\xAF" // U+202F
+		                                      "\xE2\x81\x9F" // U+205F
+		                                      "\xE3\x80\x80"; // U+3000
+		TransformConstant(Value(space_separators), *sfun->add_arguments()->mutable_value());
+		args_types.emplace_back(DuckToSubstraitType(LogicalType::VARCHAR));
 	}
 	sfun->set_function_reference(RegisterFunction(RemapFunctionName(function_name), args_types));
 
@@ -2514,11 +2541,43 @@ void DuckDBToSubstrait::AddPlanOptimization(const string &type_url) {
 	plan.mutable_advanced_extensions()->add_optimization()->set_type_url(type_url);
 }
 
+//! [FABRICATOR-PATCH: OURS-BY-DESIGN] An optional filter — the range DuckDB derives from `CAST(ts AS DATE) = …`, a
+//! TopN's boundary — only prunes: the predicate it comes from stays in the plan. Dropped as a whole condition or as a
+//! conjunct of an AND; anywhere else (under an OR, as an argument) it stays and declines the plan. nullptr when nothing
+//! is left.
+static unique_ptr<Expression> WithoutOptionalFilters(unique_ptr<Expression> expr) {
+	auto optional = [](const Expression &e) {
+		return e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+		       e.Cast<BoundFunctionExpression>().Function().GetName() == OptionalFilterScalarFun::NAME;
+	};
+	if (optional(*expr)) {
+		return nullptr;
+	}
+	if (expr->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		auto &conjunction = expr->Cast<BoundConjunctionExpression>();
+		vector<unique_ptr<Expression>> kept;
+		for (auto &child : conjunction.GetChildrenMutable()) {
+			auto rest = WithoutOptionalFilters(std::move(child));
+			if (rest) {
+				kept.push_back(std::move(rest));
+			}
+		}
+		if (kept.empty()) {
+			return nullptr;
+		}
+		if (kept.size() == 1) {
+			return std::move(kept[0]);
+		}
+		conjunction.GetChildrenMutable() = std::move(kept);
+	}
+	return expr;
+}
+
 //! [FABRICATOR-PATCH: OURS-BY-DESIGN] A scan that takes table filters (filter_pushdown) carries its WHERE as TABLE
 //! FILTERS once DuckDB's filter pushdown ran — the plan holds no LogicalFilter for them any more. They become a
 //! FilterRel over the read again, each through TableFilter::ToExpression. A runtime filter of a join (an internal
 //! table-filter function) has no translation and declines the plan, as does a filter on a column the read does not
-//! return.
+//! return. An OPTIONAL filter is dropped instead (WithoutOptionalFilters).
 substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 	auto &dget = dop.Cast<LogicalGet>();
 	if (!dget.children.empty() || !dget.table_filters.HasFilters()) {
@@ -2546,7 +2605,13 @@ substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 			throw NotImplementedException("to_substrait: a table filter on a virtual or extracted column");
 		}
 		BoundReferenceExpression reference(dget.returned_types[column.GetPrimaryIndex()], position);
-		conditions.push_back(entry.Filter().ToExpression(reference));
+		auto condition = WithoutOptionalFilters(entry.Filter().ToExpression(reference));
+		if (condition) {
+			conditions.push_back(std::move(condition));
+		}
+	}
+	if (conditions.empty()) {
+		return TransformGetRead(dop);
 	}
 	auto filter = make_uniq<substrait::Rel>();
 	filter->mutable_filter()->set_allocated_input(TransformGetRead(dop));

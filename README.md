@@ -320,13 +320,16 @@ locally. Whenever any part cannot be translated EXACTLY, the whole statement run
   month / week (ISO, Monday) / day / hour / minute / second (SQL Server 2022+), `date_diff` from year down to
   microsecond, `last_day`, `make_date` (a year past 9999 is an error on the server, an answer in DuckDB);
 - strings, compared, grouped and sorted exactly as DuckDB does (case-, accent- and trailing-space-sensitive, code
-  point order) whatever the column's collation — an equality keeps an index seek usable; `concat`, `replace`,
-  `trim`, `lpad`/`rpad`, `length`, `substring`, `strpos` (counted in code points), `LIKE` without `_`,
-  `starts_with` / `contains` / `ends_with`, `lower` / `upper` (see below).
+  point order) whatever the column's collation — an equality keeps an index seek usable; `concat`, `||` (NULL for a
+  NULL operand), `replace`, `trim` (without characters: every Unicode space separator, as DuckDB), `ltrim` / `rtrim`
+  (SQL Server 2022+), `lpad`/`rpad`, `length`, `substring`, `left` / `right` (a count of at least 0), `strpos`
+  (counted in code points), `LIKE` without `_`, `starts_with` / `contains` / `ends_with`, `lower` / `upper` (see
+  below); a date cast of a timestamp (`CAST(ts AS DATE) = …`).
 
 Runs locally (each measured to answer differently on SQL Server, or not expressible): a plain scan of one table
 (the table scan already pushes its filter and projection), `reverse`,
-regular expressions, `LIKE` patterns with `_`, `substring` with a negative or non-constant start, comparing or
+regular expressions, `LIKE` patterns with `_`, `ILIKE`, `substring` with a negative or non-constant start, `left` /
+`right` with a negative count, comparing or
 grouping binary values (SQL Server ignores trailing zero bytes), a float divided by a value that may be zero,
 decimal arithmetic past precision 38 (SQL Server would round), float → string casts, `any_value`, `GROUPS` /
 `RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions with no T-SQL rendering (`date_sub`,

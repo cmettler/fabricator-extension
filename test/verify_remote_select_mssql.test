@@ -1805,3 +1805,125 @@ SELECT count(v), max(v) FROM rp.dbo.rs_pk;
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_pk');
+
+# ═══ §18  Concatenation, trim, left / right, a date cast of a timestamp (docs/duckdb-2.0-remote-execution.md §4.21) ═
+# All four stayed local before: `||` had no Substrait name, one-argument trim / ltrim / rtrim and left / right had no
+# signature (DuckDB binds the count as BIGINT), and `CAST(ts AS DATE) = …` carried DuckDB's OPTIONAL range filter
+# into the translated copy, whose internal function has no translation. The strings are written BY DuckDB through
+# the extension, so the server holds exactly what DuckDB would: NBSP and the ideographic space (trimmed — DuckDB's
+# trim removes every Unicode space separator), a tab and a zero-width space (NOT trimmed), a supplementary
+# character (left / right count code points), a combining mark, NULL and ''. `s` is nvarchar, `v` UTF-8 varchar.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_str;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_str (k INT NOT NULL PRIMARY KEY, s NVARCHAR(40) NULL, v VARCHAR(40) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL, t NVARCHAR(10) NULL, ts DATETIME2 NULL)');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+statement ok
+INSERT INTO db.dbo.rs_str (k, s, t, ts) VALUES
+ (1, 'abc', NULL, TIMESTAMP '2024-01-01 10:00'), (2, NULL, 'x', TIMESTAMP '2024-01-01 23:59:59'),
+ (3, '', '', TIMESTAMP '2024-01-02 00:00'), (4, '  pad  ', 'x', TIMESTAMP '2023-12-31 23:59:59'),
+ (5, chr(160) || 'nb' || chr(160), 'x', NULL), (6, chr(12288) || 'id' || chr(12288), 'x', TIMESTAMP '2024-01-01 00:00'),
+ (7, chr(9) || 'tab' || chr(9), 'x', NULL), (8, chr(119070) || 'g' || chr(119070), 'x', NULL),
+ (9, 'e' || chr(769) || 'x', 'x', NULL), (10, chr(8203) || 'zw' || chr(8203), 'x', NULL),
+ (11, chr(8202) || 'h' || chr(8202), 'x', NULL), (12, 'ABC', NULL, NULL);
+
+statement ok
+UPDATE db.dbo.rs_str SET v = s;
+
+# routing: each of them is pushed now
+query II
+EXPLAIN SELECT k, s || t, trim(v), ltrim(s), rtrim(v), left(s, 1), right(v, 2) FROM rp.dbo.rs_str ORDER BY k LIMIT 100;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_str WHERE CAST(ts AS DATE) = DATE '2024-01-01';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# the differential, both ways: `db` evaluates every expression in DuckDB
+query I
+SELECT count(*) FROM (
+ (SELECT k, s || t, v || t, s || '|', concat(s, t), trim(s), ltrim(s), rtrim(s), trim(v), ltrim(v), rtrim(v), trim(s, chr(160) || 'a'), left(s, 0), left(s, 1), left(v, 2), right(s, 1), right(v, 2), left(v, 100) FROM rp.dbo.rs_str ORDER BY k LIMIT 100)
+ EXCEPT ALL
+ (SELECT k, s || t, v || t, s || '|', concat(s, t), trim(s), ltrim(s), rtrim(s), trim(v), ltrim(v), rtrim(v), trim(s, chr(160) || 'a'), left(s, 0), left(s, 1), left(v, 2), right(s, 1), right(v, 2), left(v, 100) FROM db.dbo.rs_str ORDER BY k LIMIT 100));
+----
+0
+
+query I
+SELECT count(*) FROM (
+ (SELECT k, s || t, v || t, s || '|', concat(s, t), trim(s), ltrim(s), rtrim(s), trim(v), ltrim(v), rtrim(v), trim(s, chr(160) || 'a'), left(s, 0), left(s, 1), left(v, 2), right(s, 1), right(v, 2), left(v, 100) FROM db.dbo.rs_str ORDER BY k LIMIT 100)
+ EXCEPT ALL
+ (SELECT k, s || t, v || t, s || '|', concat(s, t), trim(s), ltrim(s), rtrim(s), trim(v), ltrim(v), rtrim(v), trim(s, chr(160) || 'a'), left(s, 0), left(s, 1), left(v, 2), right(s, 1), right(v, 2), left(v, 100) FROM rp.dbo.rs_str ORDER BY k LIMIT 100));
+----
+0
+
+# the cases each change is about, pinned: `||` returns NULL for a NULL operand where concat() skips it
+query III
+SELECT k, s || t IS NULL, concat(s, t) FROM rp.dbo.rs_str WHERE k IN (1, 2, 12) ORDER BY k LIMIT 10;
+----
+1	true	abc
+2	true	x
+12	true	ABC
+
+# trim removes NBSP, the ideographic space and the hair space, never a tab or a zero-width space
+query II
+SELECT k, length(trim(v)) FROM rp.dbo.rs_str WHERE k IN (4, 5, 6, 7, 10, 11) ORDER BY k LIMIT 10;
+----
+4	3
+5	2
+6	2
+7	5
+10	4
+11	1
+
+query II
+SELECT k, length(ltrim(s)) - length(rtrim(s)) FROM rp.dbo.rs_str WHERE k IN (5, 6, 7) ORDER BY k LIMIT 10;
+----
+5	0
+6	0
+7	0
+
+# left / right count code points: the supplementary character is one, and so is a combining mark
+query III
+SELECT k, left(v, 1) = chr(119070), right(s, 2) = 'g' || chr(119070) FROM rp.dbo.rs_str WHERE k = 8 ORDER BY k LIMIT 10;
+----
+8	true	true
+
+query II
+SELECT k, strlen(left(v, 2)) FROM rp.dbo.rs_str WHERE k = 9 ORDER BY k LIMIT 10;
+----
+9	3
+
+# a negative count keeps all but that many in DuckDB and errors in T-SQL: it stays local
+query II
+EXPLAIN SELECT k, left(s, -1) FROM rp.dbo.rs_str ORDER BY k LIMIT 100;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+SELECT k, left(s, -1) FROM rp.dbo.rs_str WHERE k = 1 ORDER BY k LIMIT 10;
+----
+1	ab
+
+# the optional range DuckDB derives from the date cast is dropped; the cast itself goes to the server
+query I
+SELECT count(*) FROM rp.dbo.rs_str WHERE CAST(ts AS DATE) = DATE '2024-01-01';
+----
+3
+
+query I
+SELECT count(*) FROM db.dbo.rs_str WHERE CAST(ts AS DATE) = DATE '2024-01-01';
+----
+3
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_str');

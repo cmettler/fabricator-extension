@@ -74,6 +74,9 @@ internal sealed class TSqlEmitter
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The server has DATETRUNC (SQL Server 2022+).</summary>
     public bool SupportsDateTrunc { get; init; } = true;
 
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] LTRIM / RTRIM take the characters to remove (SQL Server 2022+).</summary>
+    public bool SupportsTrimCharacters { get; init; } = true;
+
     /// <summary>
     /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A function of the attached catalog (its schema path and name) as the T-SQL
     /// name to call it by, e.g. <c>[dbo].[f]</c> — or null when it does not run on the server (a function the provider

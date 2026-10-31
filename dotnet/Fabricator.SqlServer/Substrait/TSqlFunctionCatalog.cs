@@ -1026,16 +1026,20 @@ internal static class TSqlFunctionCatalog
             c => $"CAST(LEN(({c.V(0)}) COLLATE {TSqlEmitter.CodePointCollation} + N'.') - 1 AS bigint)", V("str"));
         Scalar(StringUrn, "octet_length", "DATALENGTH", "FUNCTION", Long, c => $"CAST(DATALENGTH({Utf8(c)}) AS bigint)", V("str"));
         Scalar(StringUrn, "bit_length", "DATALENGTH", "FUNCTION", Long, c => $"(CAST(DATALENGTH({Utf8(c)}) AS bigint) * 8)", V("str"));
-        Scalar(StringUrn, "ltrim", "LTRIM", "FUNCTION", Str, c => $"LTRIM({c.V(0)}, {TrimCharacters(c)})", V("str_str"));
-        Scalar(StringUrn, "rtrim", "RTRIM", "FUNCTION", Str, c => $"RTRIM({c.V(0)}, {TrimCharacters(c)})", V("str_str"));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] LTRIM / RTRIM take their characters from SQL Server 2022 on
+        Scalar(StringUrn, "ltrim", "LTRIM", "FUNCTION", Str, c => $"LTRIM({c.V(0)}, {OneSidedTrimCharacters(c)})", V("str_str"));
+        Scalar(StringUrn, "rtrim", "RTRIM", "FUNCTION", Str, c => $"RTRIM({c.V(0)}, {OneSidedTrimCharacters(c)})", V("str_str"));
         Scalar(StringUrn, "trim", "TRIM", "FUNCTION", Str, c => $"TRIM({TrimCharacters(c)} FROM {c.V(0)})", V("str_str"));
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] lpad / rpad as DuckDB defines them (measured): the fill repeats from its
         // start, a longer input is cut to the length from the RIGHT end, positions are code points. Length and fill
         // must be constants (length >= 0, fill non-empty — DuckDB fails on an empty one).
         Scalar(StringUrn, "lpad", "LPAD", "FUNCTION", Str, c => Pad(c, left: true), V("str_i32_str"));
         Scalar(StringUrn, "rpad", "RPAD", "FUNCTION", Str, c => Pad(c, left: false), V("str_i32_str"));
-        Scalar(StringUrn, "left", "LEFT", "FUNCTION", Str, c => $"LEFT({c.V(0)}, {c.V(1)})", V("str_i32"));
-        Scalar(StringUrn, "right", "RIGHT", "FUNCTION", Str, c => $"RIGHT({c.V(0)}, {c.V(1)})", V("str_i32"));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] LEFT / RIGHT count code points as SUBSTRING does (the code-point
+        // collation); a negative count keeps all but that many in DuckDB and errors in T-SQL, so it must be a
+        // constant >= 0
+        Scalar(StringUrn, "left", "LEFT", "FUNCTION", Str, c => LeftOrRight(c, "LEFT"), V("str_i32"));
+        Scalar(StringUrn, "right", "RIGHT", "FUNCTION", Str, c => LeftOrRight(c, "RIGHT"), V("str_i32"));
         var regexDefaults = new[] { ("multiline", "MULTILINE_DISABLED"), ("dotall", "DOTALL_DISABLED") };
         TSqlFunctionVariant RegexVariant(string[] impls, (string, string) caseOption) => new(impls, regexDefaults.Append(caseOption).ToArray());
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] regular expressions decline: measured, REGEXP_REPLACE replaces every match where DuckDB's
@@ -1311,6 +1315,14 @@ internal static class TSqlFunctionCatalog
     /// <summary>The characters to trim, which T-SQL refuses as nvarchar(max) (error 536).</summary>
     private static string TrimCharacters(TSqlCall c)
         => c.StringLiteral(1) is { Length: <= 4000 } ? c.V(1) : c.Emitter.Collate($"CAST({c.V(1)} AS nvarchar(4000))");
+
+    private static string OneSidedTrimCharacters(TSqlCall c)
+        => c.Emitter.SupportsTrimCharacters ? TrimCharacters(c) : throw c.Unsupported("LTRIM and RTRIM take characters from SQL Server 2022 on.");
+
+    private static string LeftOrRight(TSqlCall c, string function)
+        => !IsNonNegativeConstant(c, 1)
+            ? throw c.Unsupported("the count must be a constant of at least 0; DuckDB keeps all but that many for a negative one.")
+            : c.Emitter.Collate($"{function}(({c.V(0)}) COLLATE {TSqlEmitter.CodePointCollation}, {c.V(1)})");
 
     /// <summary>The string as UTF-8 bytes (varchar in a UTF-8 collation).</summary>
     private static string Utf8(TSqlCall c) => $"CAST(({c.V(0)}) COLLATE {TSqlEmitter.BinaryCollation} AS varchar(max))";

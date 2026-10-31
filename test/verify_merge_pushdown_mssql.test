@@ -67,9 +67,9 @@ EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id
 ----
 physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
 
-# || is not in the Substrait producer: the MERGE declines and runs locally — inside a subquery, which must work
+# reverse has no exact T-SQL (UTF-16 code units): the MERGE declines and runs locally — inside a subquery, which must work
 query II
-EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED AND src.s || '' = 'x' THEN UPDATE SET v = src.v;
+EXPLAIN MERGE INTO db.dbo.mgp_r AS t USING db.dbo.mgp_rs AS src ON t.id = src.id WHEN MATCHED AND reverse(src.s) = 'x' THEN UPDATE SET v = src.v;
 ----
 physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
 
