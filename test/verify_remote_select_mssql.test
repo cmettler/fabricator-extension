@@ -2280,3 +2280,76 @@ CALL disable_logging();
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_gs;', refresh_cache := true);
+
+# ═══ §22  IN / NOT IN subqueries as a WHERE condition (docs/duckdb-2.0-remote-execution.md §4.25) ════════════════════
+# A mark join's marker is three-valued, rendered `CASE WHEN EXISTS (match) THEN 1 WHEN EXISTS (unknown) THEN NULL ELSE
+# 0 END`, and that CASE kept SQL Server from planning a semi join: TPC-H q20 (SF1, no indexes) did not finish in 300 s,
+# q16 took 43 s. A WHERE keeps only TRUE, so a conjunct that is the marker renders the match's EXISTS, and `NOT marker`
+# (FALSE: no match and no unknown) renders T-SQL's NOT IN, three-valued alike, for one non-string equality. 7.6 s and
+# 3.8 s. The marker as a VALUE keeps its three-valued CASE.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_mo; DROP TABLE IF EXISTS dbo.rs_mi; DROP TABLE IF EXISTS dbo.rs_mn; CREATE TABLE dbo.rs_mo (id INT PRIMARY KEY, k INT NULL); CREATE TABLE dbo.rs_mi (k INT NULL, ok BIT NOT NULL); CREATE TABLE dbo.rs_mn (k INT NULL); INSERT INTO dbo.rs_mo VALUES (1, 1), (2, 2), (3, NULL), (4, 4), (5, 5); INSERT INTO dbo.rs_mi VALUES (1, 1), (2, 0), (5, 1), (NULL, 1); INSERT INTO dbo.rs_mn VALUES (1), (5);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+# IN: the outer NULL key matches nothing (ids 1 and 5)
+query II
+SELECT count(*), sum(id * id) FROM rp.dbo.rs_mo o WHERE o.k IN (SELECT k FROM rp.dbo.rs_mi WHERE ok) AND o.id > 0;
+----
+2	26
+
+# NOT IN over a set holding NULL is never TRUE
+query I
+SELECT count(*) FROM rp.dbo.rs_mo o WHERE o.k NOT IN (SELECT k FROM rp.dbo.rs_mi) AND o.id > 0;
+----
+0
+
+# NOT IN over a set without NULL: TRUE except for a match and for the outer NULL key (ids 2 and 4)
+query II
+SELECT count(*), sum(id * id) FROM rp.dbo.rs_mo o WHERE o.k NOT IN (SELECT k FROM rp.dbo.rs_mn) AND o.id > 0;
+----
+2	20
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE 'remote%NOT IN (SELECT%'), count(*) FILTER (WHERE message LIKE 'remote%CASE WHEN EXISTS%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+2	0
+
+# the marker as a value stays three-valued: NULL for the NULL key and for a non-match against a set holding NULL
+query III
+SELECT id, k IN (SELECT k FROM rp.dbo.rs_mi), k NOT IN (SELECT k FROM rp.dbo.rs_mn) FROM rp.dbo.rs_mo ORDER BY id LIMIT 10;
+----
+1	true	false
+2	true	true
+3	NULL	NULL
+4	NULL	true
+5	true	false
+
+# both ways against DuckDB, the forms together
+query I
+SELECT count(*) FROM (
+ (SELECT id FROM rp.dbo.rs_mo o WHERE (o.k IN (SELECT k FROM rp.dbo.rs_mi WHERE ok) OR o.id = 3) AND o.k NOT IN (SELECT k FROM rp.dbo.rs_mn WHERE k > 1))
+ EXCEPT ALL
+ (SELECT id FROM db.dbo.rs_mo o WHERE (o.k IN (SELECT k FROM db.dbo.rs_mi WHERE ok) OR o.id = 3) AND o.k NOT IN (SELECT k FROM db.dbo.rs_mn WHERE k > 1)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+ (SELECT id FROM db.dbo.rs_mo o WHERE (o.k IN (SELECT k FROM db.dbo.rs_mi WHERE ok) OR o.id = 3) AND o.k NOT IN (SELECT k FROM db.dbo.rs_mn WHERE k > 1))
+ EXCEPT ALL
+ (SELECT id FROM rp.dbo.rs_mo o WHERE (o.k IN (SELECT k FROM rp.dbo.rs_mi WHERE ok) OR o.id = 3) AND o.k NOT IN (SELECT k FROM rp.dbo.rs_mn WHERE k > 1)));
+----
+0
+
+statement ok
+CALL disable_logging();
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_mo; DROP TABLE dbo.rs_mi; DROP TABLE dbo.rs_mn;', refresh_cache := true);

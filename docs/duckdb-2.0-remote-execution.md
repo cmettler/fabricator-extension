@@ -1835,6 +1835,25 @@ that yields the grand-total row only `WHERE NOT EXISTS (<the input>)`, rendering
 stays local. Gate `verify_remote_select_mssql` §21 (722 -> 742): ROLLUP / CUBE / `((g), ())` on an empty input, the
 decline in the log, a pushed `((g), (h), (g, h))` differential both ways; mutant without the decline killed there.
 
+### 4.25 IN / NOT IN as a WHERE condition: the semi join SQL Server can plan — FIXED (2026-10-31)
+
+Found by the TPC-H harness (scratchpad `tpc/harness.py`) at SF1 with every table on SQL Server, loaded by CTAS — so
+heaps without any index: q20 did not finish in 300 s and q16 took 43 s, where DuckDB answers in 0.03 / 0.08 s and the
+SAME query hand-written in T-SQL on the SAME tables in 0.28 s. The cause is the mark join's rendering. Its marker is
+three-valued, `CASE WHEN EXISTS (match) THEN 1 WHEN EXISTS (… CASE WHEN a = b THEN 1 WHEN NOT a = b THEN 0 END IS
+NULL) THEN NULL ELSE 0 END`, and MEASURED in isolation (q20's `ps_partkey IN (SELECT p_partkey … LIKE 'forest%')`):
+a bare `IN` 67 ms; `CASE WHEN x IN (…) THEN 1 WHEN x NOT IN (…) THEN 0 END = 1` and our form both > 120 s — the CASE
+itself keeps SQL Server from planning a semi join, and without an index every outer row scans the inner table.
+A WHERE keeps only TRUE, so a conjunct that IS the marker renders the match's EXISTS (`SqlColumn.TrueWhen`), and
+`NOT marker` — FALSE, i.e. no match AND no unknown — renders `o NOT IN (SELECT i …)` for one non-string equality
+(`FalseWhen`; T-SQL's NOT IN is three-valued exactly like the marker; strings excluded because IN compares under the
+column's collation), else `NOT match AND NOT unknown`. The marker as a VALUE keeps its CASE. Measured after: q20
+7.6 s (186 rows, the published answer), q16 3.8 s (18314). Gate `verify_remote_select_mssql` §22 (742 -> 771): IN,
+NOT IN over a set with and without NULL, the outer NULL key, the marker as a value, a combined differential both
+ways, the route (`NOT IN (SELECT` sent, no `CASE WHEN EXISTS`); mutants without the conjunct forms (the route row)
+and with `NOT marker` as NOT EXISTS alone (the NULL-set row) killed. Remaining gap to hand-written T-SQL (q20 7.6 s
+vs 0.28 s): the string prefix `LIKE 'forest%'` is a range on the binary ORDER key, computed per row.
+
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
 **As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.

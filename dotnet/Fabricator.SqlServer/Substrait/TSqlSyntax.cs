@@ -102,9 +102,20 @@ internal sealed class SqlColumn
     /// </summary>
     public string? Unsupported { get; }
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A condition that holds exactly when this boolean column is TRUE — simpler
+    /// than <see cref="SqlExpr.Predicate"/>, but two-valued, so only for a WHERE conjunct that is the column itself
+    /// (FALSE and NULL are dropped alike there). A mark join's marker carries its EXISTS: the three-valued CASE
+    /// around it keeps SQL Server from planning a semi join.
+    /// </summary>
+    public string? TrueWhen { get; init; }
+
+    /// <summary>As <see cref="TrueWhen"/>, for the column being FALSE (a WHERE conjunct `NOT column`).</summary>
+    public string? FalseWhen { get; init; }
+
     public SqlColumn WithType(SType type) => new(Name, Expr.IsPredicate
         ? new SqlExpr(null, Expr.Predicate, type, Expr.Props)
-        : SqlExpr.Of(Expr.Value, type, Expr.Props), IsBare, Raw, Unsupported);
+        : SqlExpr.Of(Expr.Value, type, Expr.Props), IsBare, Raw, Unsupported) { TrueWhen = TrueWhen, FalseWhen = FalseWhen };
 }
 
 /// <summary>An ORDER BY item: an expression and a direction.</summary>

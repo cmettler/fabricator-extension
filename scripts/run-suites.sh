@@ -1570,7 +1570,7 @@ case "$TIER" in
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
         # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
         #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
-        : "${MIN_ASSERTIONS:=6774}"   # 2026-10-31: +45 grouping sets with () stay local (remote_select §21 +20, guide S17 +25); +15 single join on an expression key
+        : "${MIN_ASSERTIONS:=6803}"   # 2026-10-31: +29 IN / NOT IN as a WHERE condition (remote_select §22); +45 grouping sets; +15 single join
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -608,8 +608,69 @@ internal sealed class TSqlEmitter
         {
             block = Wrap(block, keepOrder: true);
         }
-        block.Where.Add(Predicate(rel.Condition, block.Columns));
+        block.Where.Add(FilterPredicate(rel.Condition, block.Columns));
         return block;
+    }
+
+    /// <summary>
+    /// A WHERE condition: as <see cref="Predicate"/>, except that a conjunct which is a boolean column carrying
+    /// <see cref="SqlColumn.TrueWhen"/> renders that (a WHERE keeps only TRUE). MEASURED on TPC-H q20 (SF1, no
+    /// indexes): `CASE WHEN EXISTS … THEN 1 WHEN EXISTS … THEN NULL ELSE 0 END = 1` did not finish in 300 s, the bare
+    /// EXISTS is a semi join (67 ms for the IN alone).
+    /// </summary>
+    private string FilterPredicate(Expr condition, IReadOnlyList<SqlColumn> scope)
+    {
+        if (condition is ScalarFunctionExpr { Function.Name: "and" } conjunction && conjunction.Args.Count > 0
+            && conjunction.Args.All(a => a.Value != null))
+        {
+            return "(" + string.Join(" AND ", conjunction.Args.Select(a => FilterPredicate(a.Value!, scope))) + ")";
+        }
+        if (condition is FieldRefExpr { StepsOut: 0 } field && field.Index >= 0 && field.Index < scope.Count
+            && scope[field.Index].TrueWhen is { } trueWhen)
+        {
+            return "(" + trueWhen + ")";
+        }
+        if (condition is ScalarFunctionExpr { Function.Name: "not" } negation && negation.Args.Count == 1
+            && negation.Args[0].Value is FieldRefExpr { StepsOut: 0 } negated && negated.Index >= 0 && negated.Index < scope.Count
+            && scope[negated.Index].FalseWhen is { } falseWhen)
+        {
+            return "(" + falseWhen + ")";
+        }
+        return Predicate(condition, scope);
+    }
+
+    /// <summary>
+    /// `outer NOT IN (SELECT inner FROM …)` for a mark join on ONE equality of non-string operands, one reading only
+    /// the outer side and the other only the inner; null otherwise.
+    /// </summary>
+    private string? NotIn(SelectBlock inner, Expr condition, int leftCount, IReadOnlyList<SqlColumn> scope, bool leftOuter)
+    {
+        if (condition is not ScalarFunctionExpr { Function.Name: "equal" } eq || eq.Args.Count != 2
+            || eq.Args[0].Value is not { } a || eq.Args[1].Value is not { } b)
+        {
+            return null;
+        }
+        int total = scope.Count;
+        var (outerFrom, outerTo, innerFrom, innerTo) = leftOuter ? (0, leftCount, leftCount, total) : (leftCount, total, 0, leftCount);
+        Expr? o = Within(a, outerFrom, outerTo) && Within(b, innerFrom, innerTo) ? a
+            : Within(b, outerFrom, outerTo) && Within(a, innerFrom, innerTo) ? b : null;
+        if (o == null)
+        {
+            return null;
+        }
+        var i = ReferenceEquals(o, a) ? b : a;
+        var os = Render(o, scope);
+        var ins = Render(i, scope);
+        if (!os.Type.IsKnown || !ins.Type.IsKnown || os.Type.IsStringLike || ins.Type.IsStringLike || os.Type.Kind != ins.Type.Kind)
+        {
+            return null;
+        }
+        string sql = $"{os.Value} NOT IN (SELECT {ins.Value} FROM {inner.From}";
+        if (inner.Where.Count > 0)
+        {
+            sql += " WHERE " + string.Join(" AND ", inner.Where);
+        }
+        return sql + ")";
     }
 
     private SelectBlock EmitProject(ProjectRel rel)
@@ -1388,18 +1449,27 @@ internal sealed class TSqlEmitter
         // for some row, else false.
         string matched = Exists(inner, rel.Expression, scope, null);
         string mark;
+        string notMatched;
         if (rel.Expression == null || IsTrue(rel.Expression))
         {
             mark = $"CASE WHEN {matched} THEN CAST(1 AS bit) ELSE CAST(0 AS bit) END";
+            notMatched = $"NOT {matched}";
         }
         else
         {
             string unknown = Exists(inner, rel.Expression, scope, c => $"CASE WHEN {c} THEN 1 WHEN NOT {c} THEN 0 END IS NULL");
             mark = $"CASE WHEN {matched} THEN CAST(1 AS bit) WHEN {unknown} THEN NULL ELSE CAST(0 AS bit) END";
+            // FALSE = no match and no unknown. For one non-string equality that is T-SQL's own NOT IN, three-valued
+            // alike, which SQL Server plans as an anti semi join (strings: IN would compare under the collation)
+            notMatched = NotIn(inner, rel.Expression, left.Columns.Count, scope, leftOuter) ?? $"NOT {matched} AND NOT {unknown}";
         }
         outer.Columns = outer.Columns.Concat(new[]
         {
-            new SqlColumn(NewName("_mark"), SqlExpr.Of(mark, SType.Bool, SqlProps.Column | SqlProps.Subquery), isBare: false),
+            new SqlColumn(NewName("_mark"), SqlExpr.Of(mark, SType.Bool, SqlProps.Column | SqlProps.Subquery), isBare: false)
+            {
+                TrueWhen = matched,
+                FalseWhen = notMatched,
+            },
         }).ToList();
         if (rel.PostJoinFilter != null)
         {
