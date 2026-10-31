@@ -68,5 +68,58 @@ SELECT count(*) FROM cd.main.t;
 ----
 0
 
+# ONE FILE, every thread deleting its own rows of it: the statements change the SAME file's deletion vector.
+# Requiring the vector unchanged since the scan (the first version of the fix) refused them — "Retry the
+# statement", 3 of 3 runs. A deletion-vector DELETE now commits as a transaction based on the scanned version, and
+# engineered-wood reconciles a concurrent delete of OTHER rows of the file row by row.
+statement ok
+CREATE TABLE cd.main.s AS SELECT range % 8 AS w, range AS r FROM range(8000);
+
+concurrentloop w 0 8
+
+loop i 0 10
+
+statement ok
+DELETE FROM cd.main.s WHERE w = ${w} AND r % 10 = ${i};
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) FROM cd.main.s;
+----
+0
+
+# the same, while every thread also INSERTS (a new file each time): the inserts shift the file ordinals between a
+# DELETE's scan and its commit, so the transaction must resolve the row ids at the scanned version, not the latest
+statement ok
+CREATE TABLE cd.main.u AS SELECT range % 8 AS w, range AS r FROM range(8000);
+
+concurrentloop w 0 8
+
+loop i 0 10
+
+statement ok
+INSERT INTO cd.main.u VALUES (100 + ${w}, ${i});
+
+statement ok
+DELETE FROM cd.main.u WHERE w = ${w} AND r % 10 = ${i};
+
+endloop
+
+endloop
+
+query III
+SELECT count(*), min(w), count(DISTINCT w) FROM cd.main.u;
+----
+80	100	8
+
+statement ok
+DROP TABLE cd.main.u;
+
+statement ok
+DROP TABLE cd.main.s;
+
 statement ok
 DROP TABLE cd.main.t;

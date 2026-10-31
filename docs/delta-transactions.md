@@ -916,7 +916,20 @@ access the file because it is being used by another process"*.
   - Attribution by A/B: with the row-id fix and WITHOUT the atomic publish, nothing is lost silently (v = 50 × the
     successful updates) but a statement sometimes fails loudly with the sharing violation — so the silent losses were
     the row-id bug, the loud failures the publish.
-- Gate: NEW hermetic `verify_delta_concurrent_dml` (105): 8 `concurrentloop` threads, each updating (merge-on-read,
+- **⚠ The first version of the fix COST AVAILABILITY, found by the inversion pass the same day.** `EnsureUnchangedSince`
+  required every selected file's deletion vector to be unchanged since the scan, so two concurrent deletes of
+  DIFFERENT rows of ONE file — which row-level concurrency had re-unioned — were refused "Retry the statement"
+  (8 threads × 10 deletes, own rows of one file: 3 of 3 runs). Under `write_serializable` and without change data
+  the deletion-vector DELETE now commits as an engineered-wood transaction BASED ON THE PINNED SNAPSHOT
+  (`StartTransaction(pinned)` + `StageRowDeletesAsync`): the commit judges every commit since the scan — other rows
+  of a file reconcile, the same rows conflict. `serializable` and CDF tables keep `DeleteRowsAsync` + the strict
+  check (CDF: staging writes no delete change files). Merge-on-read UPDATE was left strict: concurrent UPDATEs of
+  one file never overlapped here, in-process or across 8 processes × 6 statements (0 conflicts with the strict
+  check), so a relaxation there would be unmeasured. ⚠ Its transaction is based on the snapshot it OPENED, not on
+  the pin — safe only because the strict check covers the gap; drop the check and it must move to the pin.
+- Gate: NEW hermetic `verify_delta_concurrent_dml` (105; 353 since the same-file sections — one file with
+  concurrent deletes, and the same with concurrent inserts shifting the ordinals, where a mutant resolving at the
+  latest version ends with a wrong count 5 of 5 runs, every statement succeeding): 8 `concurrentloop` threads, each updating (merge-on-read,
   6×) and then deleting (deletion vectors, 5×) only its own rows, exact counts after. The mutant "no pinned version"
   fails 5 of 5 runs (four loud, one silent `min(v)` mismatch). Not gated: the unchanged-file refusal (needs a commit
   between a statement's scan and its DML open on the SAME file — sqllogictest cannot interleave inside a statement).

@@ -974,7 +974,7 @@ case "$TIER" in
         #   (no live inlined rows), and column_mapping none + deletion_vectors false give a reader-v1 mirror.
         # 2026-10-31: 11030 -> 11135: +verify_delta_concurrent_dml (105) — concurrent autocommit DML resolves its row
         #   ids at the scanned version (delta-transactions.md §8.5b); nothing else moved
-        : "${MIN_ASSERTIONS:=11227}"   # 2026-10-31: +92, verify_ducklake_delta_sync §8b (sync race over 76 snapshots)
+        : "${MIN_ASSERTIONS:=11475}"   # 2026-10-31: +248, verify_concurrent_dml same-file sections; +92, ducklake sync §8b
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

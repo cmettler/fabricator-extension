@@ -1407,11 +1407,30 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token).ConfigureAwait(false);
         try
         {
-            long deleted = (await table.DeleteRowsAsync(
-                    await PinnedSelectionAsync(table, atVersion, rowIds, "deletion-vector DELETE", token)
-                        .ConfigureAwait(false),
-                    RowDeleteMode.DeletionVector, rowLevelRetry, token)
-                .ConfigureAwait(false)).RowsDeleted;
+            long deleted;
+            var cfg = table.CurrentSnapshot.Metadata.Configuration;
+            if (rowLevelRetry && !EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(cfg))
+            {
+                // A transaction BASED ON THE PINNED SNAPSHOT: the addresses come from there, and the commit judges
+                // every commit since — a concurrent delete of OTHER rows of the same file reconciles row by row, one
+                // of the same rows conflicts. Requiring the file's vector unchanged since the scan instead refused
+                // every such DELETE (8 threads, own rows of one file: refused in 3 of 3 runs).
+                // ⚠ Not with change data: DeleteRowsAsync writes the delete change files, staging does not.
+                var pinned = await PinnedSnapshotAsync(table, atVersion, token).ConfigureAwait(false);
+                var selection = SelectionFromRowIds(table, pinned, rowIds, "deletion-vector DELETE");
+                await using var txn = table.StartTransaction(pinned);
+                txn.Operation = "DELETE";
+                deleted = await txn.StageRowDeletesAsync(selection, token).ConfigureAwait(false);
+                await txn.CommitAsync(token).ConfigureAwait(false);
+            }
+            else
+            {
+                deleted = (await table.DeleteRowsAsync(
+                        await PinnedSelectionAsync(table, atVersion, rowIds, "deletion-vector DELETE", token)
+                            .ConfigureAwait(false),
+                        RowDeleteMode.DeletionVector, rowLevelRetry, token)
+                    .ConfigureAwait(false)).RowsDeleted;
+            }
             // The no-boxing DML floor, and therefore the control to compare an UPDATE against: this path
             // carries ROWIDS ONLY across the seam. Measured 204 MB for 1M rows where the equivalent
             // one-column UPDATE took 454 MB.
