@@ -429,22 +429,22 @@ Measured over 1M server rows and 3 local keys: a Top-3 per key 0.27 s → 0.044 
 exact form only). With a NULL among the local keys of a scalar subquery DuckDB builds no key list (only a range), so
 that query is computed for every key — the answer is the same.
 
-**J3 — many keys: raise DuckDB's threshold, the keys go as one JSON parameter.** DuckDB hands the scan an `IN`
-list of the build side's keys only up to `dynamic_or_filter_threshold` (default 50); with more keys it keeps a range
-or a filter of its own the server cannot use, and the server table comes back nearly whole. Raised, the keys reach
-SQL Server — above 50 integer keys as ONE parameter read with `OPENJSON` (no 2100-parameter limit):
+**J3 — many keys reach the server too.** DuckDB hands the scan an `IN` list of the build side's keys only up to
+`dynamic_or_filter_threshold` (default 50); above that a bitmap of its own, which the scan reads back as keys. On box
+SQL Server more than 50 integer keys go into a table variable filled from one JSON parameter, and the statement is
+recompiled so the optimizer sees how many keys there are — several lists on one scan stay exact:
 
 ```sql
-SET dynamic_or_filter_threshold = 20000;
 SELECT count(*) FROM picked p JOIN mssql.dbo.pg_clicks c USING (id);   -- picked: 60 local ids
--- Fabricator.Sql: SELECT [id], … FROM [dbo].[pg_clicks] WHERE [id] IN (SELECT [v] FROM OPENJSON(@p0) WITH ([v] int '$'))
+-- Fabricator.Sql: SET NOCOUNT ON; DECLARE @k0 TABLE ([v] int PRIMARY KEY); INSERT @k0 SELECT DISTINCT [v]
+--   FROM OPENJSON(@p0) WITH ([v] int '$'); SELECT [id], … FROM [dbo].[pg_clicks] WHERE … [id] IN (SELECT [v] FROM @k0)
+--   OPTION (RECOMPILE)
 ```
 
-The setting is DuckDB's and applies to local joins too: TPC-H SF1 all local took 0.74 s at 50, 0.80 s at 20 000 and
-1.71 s at 100 000 (summed over the 22 queries). With lineitem on SQL Server and the other tables local it took q17
-from 9.5 s to 0.12 s (204 keys), q8 from 8.4 s to 1.35 s, q9 from 10.2 s to 2.6 s (100 000: its partsupp side has
-42 000 keys). Keys that are not integers go as one parameter each, up to 2 000; a longer list is left out of the
-`WHERE` (DuckDB still filters).
+Keys without a gap go as their range. Fabric Warehouse has neither table variables nor RECOMPILE: there the shortest
+list goes as `OPENJSON` and any other as its range. With lineitem on SQL Server and the other TPC-H tables local (SF1,
+columnstore, DuckDB's default threshold): q8 7.3 → 1.55 s, q17 8.9 → 0.12 s, q21 11.1 → 6.4 s. Keys that are not
+integers go as one parameter each, up to 2 000; a longer list is left out of the `WHERE` (DuckDB still filters).
 
 Not as a part: a statement that WRITES a table of the catalog (its reads stay with the write on the catalog's own
 connection), a part calling a function the provider implements itself (scalar or table) or a function of another

@@ -32,15 +32,108 @@ internal sealed class FilterWhereBuilder
     /// this is refused here rather than by the server.</summary>
     internal const int MaxListParameters = 2000;
 
-    public FilterWhereBuilder(IReadOnlyList<object?> values, bool openJson = false)
+    private readonly bool _superset;
+    private readonly bool _tableVariables;
+    private bool _planned;
+    private FilterNode? _jsonList;
+    private readonly HashSet<FilterNode> _redundantLists = new(ReferenceEqualityComparer.Instance);
+
+    /// <param name="values">The filter constants, by index.</param>
+    /// <param name="openJson">The server has OPENJSON (compatibility level 130+, or a warehouse).</param>
+    /// <param name="superset">A SCAN's WHERE, which may admit more rows than asked (the host re-applies every filter):
+    /// then at most ONE long key list goes as JSON and any other as its range. A DELETE / UPDATE predicate passes false
+    /// and stays exact.</param>
+    /// <param name="tableVariables">Box SQL Server: every long key list goes into a table variable declared before the
+    /// statement (<see cref="Prelude"/>), and the statement takes OPTION (RECOMPILE) — then the optimizer knows each
+    /// list's row count and every list stays exact (docs/duckdb-2.0-remote-execution.md §5.5). A warehouse has neither
+    /// table variables nor RECOMPILE.</param>
+    public FilterWhereBuilder(IReadOnlyList<object?> values, bool openJson = false, bool superset = false,
+                              bool tableVariables = false)
     {
         _values = values;
         _openJson = openJson;
+        _superset = superset;
+        _tableVariables = tableVariables && openJson;
     }
 
     public List<SqlParameter> Parameters { get; } = new();
 
-    public string Build(FilterNode node) => node.Op switch
+    /// <summary>Statements to run before the one that uses <see cref="Build"/>'s WHERE: the table variables of the long
+    /// key lists, filled from their JSON parameters. Empty when there are none.</summary>
+    public List<string> Prelude { get; } = new();
+
+    public string Build(FilterNode node)
+    {
+        if (!_planned)
+        {
+            // ⚠ ONE JSON list per statement: SQL Server estimates every OPENJSON at 50 rows, and with two of them as
+            // semi joins it chose a plan that did not finish — MEASURED on lineitem (6M rows, clustered columnstore):
+            // 91 179 order keys alone 2.2 s, 1 451 part keys alone 0.08 s, both together > 60 s (1.2 s under OPTION
+            // (HASH JOIN), which would also forbid the index seeks a short list wants). The shortest list goes, the
+            // others as their range (docs/duckdb-2.0-remote-execution.md §5.5).
+            _planned = true;
+            _jsonList = _superset && !_tableVariables ? ShortestJsonList(node) : null;
+            if (_superset)
+            {
+                MarkRedundantLists(node);
+            }
+        }
+        return BuildNode(node);
+    }
+
+    private FilterNode? ShortestJsonList(FilterNode node)
+    {
+        FilterNode? best = null;
+        void Visit(FilterNode n)
+        {
+            if (n.Op == "in" && IsJsonList(n) && (best is null || n.Vals!.Count < best.Vals!.Count))
+            {
+                best = n;
+            }
+            foreach (var child in n.Children ?? (IEnumerable<FilterNode>)Array.Empty<FilterNode>())
+            {
+                Visit(child);
+            }
+        }
+        Visit(node);
+        return best;
+    }
+
+    /// <summary>A scan can be handed two long lists for ONE column — a join's IN list under a raised
+    /// dynamic_or_filter_threshold and its prefix-range filter read back as keys — which the server would join twice.
+    /// Under a top-level AND only the shortest stays; the others are dropped (the WHERE is a superset anyway).</summary>
+    private void MarkRedundantLists(FilterNode root)
+    {
+        var conjuncts = new List<FilterNode>();
+        void Collect(FilterNode n)
+        {
+            if (n.Op == "and")
+            {
+                foreach (var child in n.Children ?? new List<FilterNode>())
+                {
+                    Collect(child);
+                }
+            }
+            else
+            {
+                conjuncts.Add(n);
+            }
+        }
+        Collect(root);
+        foreach (var group in conjuncts.Where(n => n.Op == "in" && IsJsonList(n))
+                                       .GroupBy(n => n.Col ?? "", StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (var extra in group.OrderBy(n => n.Vals!.Count).Skip(1))
+            {
+                _redundantLists.Add(extra);
+            }
+        }
+    }
+
+    private bool IsJsonList(FilterNode node)
+        => node.Vals is { } idxs && idxs.Count > JsonListThreshold && _openJson && JsonIntegerType(idxs) is not null;
+
+    private string BuildNode(FilterNode node) => node.Op switch
     {
         "and" => Conjunction(node, " AND "),
         "or" => Conjunction(node, " OR "),
@@ -78,16 +171,21 @@ internal sealed class FilterWhereBuilder
     private string Conjunction(FilterNode node, string sep)
     {
         var children = node.Children ?? throw new InvalidOperationException("conjunction without children");
-        var sb = new StringBuilder("(");
-        for (int i = 0; i < children.Count; i++)
+        var parts = new List<string>();
+        foreach (var child in children)
         {
-            if (i > 0)
+            string part = Build(child);
+            if (sep == " AND " && part == "(1 = 1)")
             {
-                sb.Append(sep);
+                continue; // a dropped redundant list
             }
-            sb.Append(Build(children[i]));
+            parts.Add(part);
         }
-        return sb.Append(')').ToString();
+        if (parts.Count == 0)
+        {
+            return "(1 = 1)";
+        }
+        return "(" + string.Join(sep, parts) + ")";
     }
 
     private string Compare(FilterNode node)
@@ -111,27 +209,66 @@ internal sealed class FilterWhereBuilder
     private string In(FilterNode node)
     {
         var idxs = node.Vals ?? throw new InvalidOperationException("in without vals");
+        if (_redundantLists.Contains(node))
+        {
+            return "(1 = 1)"; // a shorter list on the same column is in the same AND
+        }
+        if (_tableVariables && IsJsonList(node) && JsonIntegerType(idxs) is { } tvType)
+        {
+            // MEASURED on lineitem (6M rows, columnstore), two lists 91 179 + 1 451 keys: two OPENJSON semi joins did not
+            // finish in 60 s (each estimated at 50 rows, with or without RECOMPILE); as table variables under RECOMPILE
+            // 0.75 s and exactly the 2 603 rows; a #temp table with its statistics 1.0 s, one list 0.60 vs 0.43 s.
+            var json = JsonParameter(idxs);
+            string table = "@k" + Prelude.Count;
+            Prelude.Add($"DECLARE {table} TABLE ([v] {tvType} PRIMARY KEY); INSERT {table} SELECT DISTINCT [v] FROM " +
+                        $"OPENJSON({json}) WITH ([v] {tvType} '$');");
+            return $"{Col(node)} IN (SELECT [v] FROM {table})";
+        }
+        if (_superset && IsJsonList(node) && !ReferenceEquals(node, _jsonList))
+        {
+            // another long list in the same statement: its range (a superset; the host re-applies the list)
+            int lo = idxs[0], hi = idxs[0];
+            foreach (var i in idxs)
+            {
+                long v = Convert.ToInt64(_values[i], System.Globalization.CultureInfo.InvariantCulture);
+                if (v < Convert.ToInt64(_values[lo], System.Globalization.CultureInfo.InvariantCulture)) lo = i;
+                if (v > Convert.ToInt64(_values[hi], System.Globalization.CultureInfo.InvariantCulture)) hi = i;
+            }
+            return $"({Col(node)} >= {Param(lo)} AND {Col(node)} <= {Param(hi)})";
+        }
         if (idxs.Count > JsonListThreshold && _openJson && JsonIntegerType(idxs) is { } sqlType)
         {
             // A long key list (a hash join's keys under a raised dynamic_or_filter_threshold) as one JSON parameter:
             // no 2100-parameter cap, one plan for any list length, and MEASURED as fast as the parameter list or
             // faster — 411 keys over 6M rows 0.17 s vs 0.22 s, 10 664 keys 0.46 s where the range alone took 7.8 s.
             // Integers only: their JSON form is exact, and the type matches the column's.
-            var name = "@p" + Parameters.Count;
-            var json = new StringBuilder("[");
-            for (int i = 0; i < idxs.Count; i++)
-            {
-                json.Append(i == 0 ? "" : ",").Append(Convert.ToString(_values[idxs[i]], System.Globalization.CultureInfo.InvariantCulture));
-            }
-            json.Append(']');
-            Parameters.Add(new SqlParameter(name, System.Data.SqlDbType.NVarChar, -1) { Value = json.ToString() });
-            return $"{Col(node)} IN (SELECT [v] FROM OPENJSON({name}) WITH ([v] {sqlType} '$'))";
+            return $"{Col(node)} IN (SELECT [v] FROM OPENJSON({JsonParameter(idxs)}) WITH ([v] {sqlType} '$'))";
         }
         if (idxs.Count > MaxListParameters)
         {
+            if (_superset)
+            {
+                // a scan: leave out this list alone, not the whole WHERE (TRUE in its place only widens — the tree has no
+                // NOT); the host re-applies it
+                return "(1 = 1)";
+            }
             throw new NotSupportedException($"fabricator: an IN list of {idxs.Count} values exceeds the parameter limit");
         }
         return $"{Col(node)} IN ({string.Join(", ", idxs.Select(i => Param(i, equality: true)))})";
+    }
+
+    /// <summary>The list's values as one nvarchar(max) parameter holding a JSON array; returns its name.</summary>
+    private string JsonParameter(IReadOnlyList<int> idxs)
+    {
+        var name = "@p" + Parameters.Count;
+        var json = new StringBuilder("[");
+        for (int i = 0; i < idxs.Count; i++)
+        {
+            json.Append(i == 0 ? "" : ",").Append(Convert.ToString(_values[idxs[i]], System.Globalization.CultureInfo.InvariantCulture));
+        }
+        json.Append(']');
+        Parameters.Add(new SqlParameter(name, System.Data.SqlDbType.NVarChar, -1) { Value = json.ToString() });
+        return name;
     }
 
     /// <summary>The T-SQL type of an IN list whose values are all integers of one CLR type, else null.</summary>

@@ -61,6 +61,11 @@ internal static class HostSettings
     /// docs/duckdb-2.0-remote-execution.md §4.29.</summary>
     public const string PushdownBoundaryName = "fabricator_pushdown_boundary";
 
+    /// <summary>Read a hash join's prefix-range filter back as the build side's keys, so a SQL Server scan joined with
+    /// more than 50 local keys gets them as a list (docs/duckdb-2.0-remote-execution.md §5.5). The structure is
+    /// DuckDB's own: off is the way out should it ever answer wrongly, and the reference the gate compares against.</summary>
+    public const string JoinKeyListsName = "fabricator_join_key_lists";
+
     /// <summary>Answer an ungrouped <c>COUNT(*)</c> / <c>MIN</c> / <c>MAX</c> from the provider's per-file
     /// metadata instead of scanning — ABI v95. Off, the scan always runs, which is the reference oracle the
     /// differential gate compares against.</summary>
@@ -110,6 +115,13 @@ internal static class HostSettings
                          "catalog alone as its own server query and the rest of the statement in DuckDB; 'none' " +
                          "pushes as much as translates. Empty (default): the catalog's ATTACH option " +
                          "pushdown_boundary decides."),
+        new ProviderSetting(
+            JoinKeyListsName,
+            ProviderSettingType.Bool,
+            Default: true,
+            Description: "Read a hash join's key filter (a bitmap DuckDB builds above dynamic_or_filter_threshold) back " +
+                         "as the keys and send them to a SQL Server scan. On by default; off, such a scan gets only " +
+                         "what DuckDB itself can express, which is also the reference oracle."),
         new ProviderSetting(
             PartitionStatsName,
             ProviderSettingType.Bool,

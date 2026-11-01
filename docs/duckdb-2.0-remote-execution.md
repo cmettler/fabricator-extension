@@ -2130,6 +2130,9 @@ Kept on the old paths: a key or SET column of a type JSON does not carry exactly
 rowversion …) and an engine without OPENJSON (compatibility level < 130).
 MEASURED live: OPENJSON with a typed WITH, `COLLATE`, decimal and datetime2 from text, and UPDATE / DELETE through a
 join on a two-part key all work on Fabric Warehouse and the Lakehouse SQL endpoint (compatibility level 160).
+The built path, live on Fabric Warehouse (scripts/fabric_returning_check.py ALL OK, plus a probe with a key of int,
+varchar `COLLATE Latin1_General_100_BIN2_UTF8` and datetime2(6)): rowid UPDATE of 1 500 rows 1.6 s, DELETE of 600
+1.5 s, UPDATE / DELETE … RETURNING the same count, sum and hash as on a local copy, the table identical afterwards.
 
 Gate: NEW service suite `verify_rowid_json_mssql` (67): a ten-part key of int, datetime2(7), legacy datetime,
 decimal, a CI varchar, a BIN2 nvarchar, uniqueidentifier, date, time(7) and datetimeoffset(7) — UPDATE and DELETE
@@ -2139,6 +2142,60 @@ the same statements on the local copy (count, sum and a hash of every column), a
 DuckDB does, and a trigger table (OUTPUT INTO). Mutants: no COLLATE (killed at the declaration row), legacy datetime
 with 7 digits (killed at the first UPDATE: conversion error), a row-id key to the second (killed at the microsecond
 keys). The last-row-wins mutant SURVIVES, as argued above.
+
+
+### 5.5 A join's keys without raising the threshold, and several lists on one scan — BUILT (2026-11-01)
+
+§5.3 left the keys behind `dynamic_or_filter_threshold`: with more build rows than that DuckDB hands the probe scan a
+PREFIX-RANGE filter — a bitmap over [min, max], one bit per value when the span is small (`SMALL_EXACT_PRF_BITS`),
+coarser buckets otherwise — which has no SQL form and was dropped, so the server got nothing. Its public interface
+answers `LookupRange` and `LookupKeys`, so `arrow_ingest.cpp` (`ReadPrefixRangeKeys`, integral keys) reads it back:
+its bounds by binary search with `LookupRange`, then every value between them in vectors through `LookupKeys`. A
+coarse bucket admits values the build side does not hold — a superset, removed by the re-applied filters and the join.
+Up to 100 000 keys and a span of 2^24 they become an IN list; past that, or when every value of the range is a key,
+the range `[c] >= lo AND [c] <= hi` (which before also did not reach the server). Only for a provider that re-applies
+what it is sent (`reapply_filters`, SQL Server): the structured channel also feeds Delta's file pruning, where a list
+of tens of thousands per file is a cost, not a win.
+
+That made SEVERAL long lists on one scan common, and the first build exposed what that does on SQL Server: q8 sent
+`l_orderkey IN (OPENJSON…) AND l_partkey IN (OPENJSON…) AND l_suppkey IN (OPENJSON…)` and did not finish — MEASURED on
+lineitem (6M rows, columnstore): 91 179 order keys alone 2.2 s, 1 451 part keys alone 0.08 s, both > 60 s, with or
+without OPTION (RECOMPILE) (OPENJSON is always estimated at 50 rows), 1.2 s under OPTION (HASH JOIN). User-proposed,
+then measured (two lists → one list):
+
+| keys go … | box SQL Server | rows back |
+|---|---|---|
+| as table variables + OPTION (RECOMPILE), one batch | **0.75 s** (one list 0.43 / 1.06 s) | 2 603, exact |
+| SELECT … INTO #temp, automatic statistics | 1.00 s (0.60 / 1.64 s) | 2 603 |
+| #temp + UPDATE STATISTICS + RECOMPILE | 1.31 s | 2 603 |
+| the shortest as OPENJSON, the others as their range | ~1.2 s | 43 693 |
+
+So on box every list goes into a table variable (`FilterWhereBuilder.Prelude`: `DECLARE @k0 TABLE ([v] bigint PRIMARY
+KEY); INSERT @k0 SELECT DISTINCT [v] FROM OPENJSON(@p0) …; SELECT … WHERE [c] IN (SELECT [v] FROM @k0) … OPTION
+(RECOMPILE)`), and every list stays exact. Fabric Warehouse and the Lakehouse SQL endpoint REFUSE both ("TYPE 'table'
+is not supported", "Query hint … is not allowed"); `#temp` works there (also inside BEGIN … COMMIT, also as CTAS) but
+cost 2–5 s per table at SF 0.01 where two OPENJSON lists took 0.15 s. There the shortest list goes as OPENJSON and any
+other as its range. MEASURED at SF1 on Fabric Warehouse (lineitem 6M rows, the same two lists): the full pull
+9.1 s; one list 0.29 s (parts) / 1.32 s (91k orders); BOTH as OPENJSON 0.76 s and exact — Fabric's optimizer does not
+have box's problem; the rule (parts as OPENJSON, orders as their range) 0.30 s with 43 692 rows; two SELECT … INTO
+#temp 5.9 s, one 4.6 s. So the rule stays on a warehouse, and #temp does not pay there. Two lists for ONE column (DuckDB's
+IN list under a raised threshold and its prefix-range filter read back) keep only the shorter. A DELETE / UPDATE
+predicate (§2.4) is untouched: it must stay exact, so it never trades a list for a range.
+
+TPC-H SF1, lineitem / orders / partsupp on box (columnstore), DuckDB's default threshold: q8 7.3 → 1.55 s, q17 8.9 →
+0.12 s, q21 11.1 → 6.4 s (its EXISTS / NOT EXISTS scans get no keys). q9 unchanged at ~10 s: lineitem's part keys come
+from a coarse bitmap with more candidates than the cap, so only ranges go — the join order (lineitem joined with a
+local table first) is what would help there.
+
+The switch is `SET fabricator_join_key_lists = false` (default true): the reading back rests on DuckDB's own structure
+and its no-false-negative contract — the same one DuckDB's pruning relies on — so off is the way out should DuckDB ever
+get it wrong; a change of the interface itself breaks the build. In a scan a list that cannot be sent (non-integer,
+more than 2 000 values) now leaves out only itself — TRUE in its place, which only widens since the filter tree has no
+NOT — where it used to cost the whole WHERE.
+
+Gates: `verify_dynamic_filters_mssql` §5 (119 -> 136: the table variable at a raised threshold and at the default, the
+switch off with the same answer and no list, two lists on one scan, a gapless list as its range, the string list left
+out), guide J3. Mutants: no table variables, no same-column dedupe, no reading back (C++) — each killed at its row.
 
 ### The record before it was built (2026-10-27)
 

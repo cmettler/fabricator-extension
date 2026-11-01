@@ -298,11 +298,10 @@ while the query runs, so `EXPLAIN` does not show it; the statement logged under 
 for a pushed part of a statement: a Top-N or a scalar subquery per row of a local table is computed on the server for
 those rows' keys only (`… ) AS [q] WHERE [c1] IN (…)`). An ASCII key is sent as `varchar`, so an index on a `varchar`
 column is sought. `ATTACH … (TYPE fabricator, dynamic_filters 'false')` turns it off for a catalog.
-⚠ DuckDB passes the keys as a list only up to its own `dynamic_or_filter_threshold` (default **50**); above that the
-server gets a range or nothing. For joins of many local keys with a large server table raise it, e.g. `SET
-dynamic_or_filter_threshold = 20000` — integer keys then go as one JSON parameter (`OPENJSON`, no 2100-parameter
-limit). It applies to local joins too and costs them a little (TPC-H SF1 all local: +8% at 20 000, ×2.3 at 100 000);
-see docs/sql-server-pushdown.md J3.
+Many keys reach the server too: DuckDB passes a list only up to its `dynamic_or_filter_threshold` (default 50) and a
+bitmap of its own above it, which the scan reads back as keys. On box SQL Server more than 50 integer keys go into a
+table variable filled from one JSON parameter and the statement is recompiled; on Fabric Warehouse the shortest list
+goes as `OPENJSON` and any other as its range. Keys without a gap go as their range. See docs/sql-server-pushdown.md J3.
 
 **`remote_pushdown` (on by default since 2026-10-27; `'false'` opts out, any other value is refused).** The
 environment variable `FABRICATOR_REMOTE_PUSHDOWN=false` changes the default for every ATTACH that does not name the
@@ -4241,6 +4240,7 @@ Settings the extension itself owns rather than a provider, so they exist even wh
 | `fabricator_allow_plugin_install` | **Active** | Whether `fabricator_install_plugin()` (see [Function Reference](#function-reference)) may write plugin assemblies into a plugin root. **Default `false`**: an installed plugin is loaded into this process and runs with the extension's privileges, so it is opt-in rather than something a SQL statement can arrange on its own. Session-scoped like every other setting, so `RESET` closes it again |
 | `fabricator_partition_stats` | **Active** | Answer an ungrouped `COUNT(*)` / `MIN` / `MAX` from table metadata instead of scanning — on Delta, the log's per-file counts and statistics (see [Delta Lake provider](#delta-lake-provider)). **Default `true`**; `false` always scans, which is also the reference the metadata answer is tested against |
 | `fabricator_subtree_pushdown` | **Active** | Under `remote_pushdown`, run each part of a statement that reads one catalog alone — a subquery or CTE over its tables beside local data — as one query on the server (see [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md), S5). **Default `true`**; `false` runs such parts locally, which is also the reference the pushdown is tested against |
+| `fabricator_join_key_lists` | **Active** | Read a hash join's key filter — the bitmap DuckDB builds when the local side has more rows than `dynamic_or_filter_threshold` — back as the keys and send them to a SQL Server scan (a table variable on box, `OPENJSON` on Fabric; see docs/sql-server-pushdown.md J3). **Default `true`**; `false` sends such a scan only what DuckDB itself expresses (its range, or nothing), which is also the reference the feature is tested against |
 | `fabricator_pushdown_boundary` | **Active** | Where the pushdown to a `remote_pushdown` catalog stops: `'cte'` sends each CTE that reads one catalog alone to the server as its own query and runs the statement around it in DuckDB, streaming; `'none'` pushes as much as translates. **Default empty**: each catalog's ATTACH option `pushdown_boundary` (`'none'` or `'cte'`, default `'none'`) decides. Any other value is refused. See *Stopping at a CTE* under [Connection Configuration](#connection-configuration) and docs/sql-server-pushdown.md S19 |
 | `fabricator_dml_pushdown` | **Active** | Run a DELETE or UPDATE whose whole WHERE (and SET) translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)) — and, under `remote_pushdown`, an `INSERT … SELECT` reading the same catalog. **Default `true`**; `false` sends every DELETE and UPDATE down the row-id path and every INSERT through the regular bulk insert, which are also the reference the shortcut is tested against |
 

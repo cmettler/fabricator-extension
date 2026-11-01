@@ -242,9 +242,11 @@ SELECT n > 0 FROM fabricator_query('rp', 'SELECT COUNT(*) AS n FROM sys.dm_exec_
 ----
 true
 
-# ═══ §5  A long key list goes as ONE JSON parameter (docs/duckdb-2.0-remote-execution.md §5.3) ══════════════
-# DuckDB hands a scan an IN list of the join's keys only up to dynamic_or_filter_threshold (default 50), a range above.
-# Raised, more than 50 integer keys go as OPENJSON(@p) — no 2100-parameter cap, one plan for any length.
+# ═══ §5  A join's keys reach the server however many there are (docs/duckdb-2.0-remote-execution.md §5.3, §5.5) ════
+# DuckDB hands a scan an IN list of the join's keys only up to dynamic_or_filter_threshold (default 50); above it a
+# prefix-range bitmap, whose keys the scan reads back. On box SQL Server a list of more than 50 integer keys goes into a
+# table variable filled from one JSON parameter, and the statement is recompiled, so the optimizer sees each list's row
+# count — every list stays exact, however many there are.
 
 statement ok
 CREATE TABLE ids AS SELECT 7 * range::INT AS id FROM range(1, 301);
@@ -260,12 +262,12 @@ SELECT count(*), sum(b.v) FROM ids k JOIN sc.dbo.df_big b ON b.id = k.id;
 ----
 300	14850
 
-query II
-SELECT count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big]%WHERE [id] IN (SELECT [v] FROM OPENJSON(@p0) WITH ([v] int ''$''))%'),
-       count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big]%' AND message LIKE '%params=1 %')
-FROM duckdb_logs WHERE type = 'Fabricator.Sql';
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql'
+  AND message LIKE '%DECLARE @k0 TABLE ([v] int PRIMARY KEY); INSERT @k0 SELECT DISTINCT [v] FROM OPENJSON(@p0) WITH ([v] int ''$'');%FROM [dbo].[df_big] WHERE %[id] IN (SELECT [v] FROM @k0)%OPTION (RECOMPILE)%'
+  AND message NOT LIKE '%@k1%';
 ----
-1	1
+1
 
 query II
 SELECT count(*), sum(b.v) FROM ids k JOIN off.dbo.df_big b ON b.id = k.id;
@@ -275,8 +277,7 @@ SELECT count(*), sum(b.v) FROM ids k JOIN off.dbo.df_big b ON b.id = k.id;
 statement ok
 CALL truncate_duckdb_logs();
 
-# at DuckDB's default no key list reaches the server (DuckDB keeps a prefix-range filter of its own for these keys,
-# which has no T-SQL form)
+# at DuckDB's default the keys come from its prefix-range filter — the same list
 statement ok
 RESET dynamic_or_filter_threshold;
 
@@ -285,11 +286,71 @@ SELECT count(*), sum(b.v) FROM ids k JOIN sc.dbo.df_big b ON b.id = k.id;
 ----
 300	14850
 
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE '%FROM [dbo].[df_big] WHERE %[id] IN (SELECT [v] FROM @k0)%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# the switch: off, the scan gets only what DuckDB itself expresses — no list, the same answer
+statement ok
+SET fabricator_join_key_lists = false;
+
 query II
-SELECT count(*) FILTER (WHERE message LIKE '%OPENJSON%'), count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big]%WHERE [id] IN (%')
+SELECT count(*), sum(b.v) FROM ids k JOIN sc.dbo.df_big b ON b.id = k.id;
+----
+300	14850
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND (message LIKE '%DECLARE @k%' OR message LIKE '%OPENJSON%');
+----
+0
+
+statement ok
+RESET fabricator_join_key_lists;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# two lists on one scan: two table variables (two OPENJSON semi joins measured > 60 s on 6M rows)
+statement ok
+CREATE TABLE vs AS SELECT range::INT AS v FROM range(0, 100) WHERE range % 3 <> 2;
+
+query II
+SELECT count(*), sum(b.v) FROM ids k JOIN sc.dbo.df_big b ON b.id = k.id JOIN vs ON vs.v = b.v;
+----
+201	9900
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE '%DECLARE @k0 TABLE%DECLARE @k1 TABLE%FROM [dbo].[df_big]%IN (SELECT [v] FROM @k0)%IN (SELECT [v] FROM @k1)%';
+----
+1
+
+query II
+SELECT count(*), sum(b.v) FROM ids k JOIN off.dbo.df_big b ON b.id = k.id JOIN vs ON vs.v = b.v;
+----
+201	9900
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# keys without a gap are their range: no list
+statement ok
+CREATE TABLE dense AS SELECT range::INT AS id FROM range(100, 400);
+
+query II
+SELECT count(*), sum(b.v) FROM dense k JOIN sc.dbo.df_big b ON b.id = k.id;
+----
+300	14850
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%DECLARE%' OR message LIKE '%OPENJSON%'),
+       count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big] WHERE ([id] >= @p0 AND [id] <= @p1)%')
 FROM duckdb_logs WHERE type = 'Fabricator.Sql';
 ----
-0	0
+0	1
 
 statement ok
 CALL truncate_duckdb_logs();

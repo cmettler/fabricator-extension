@@ -417,12 +417,9 @@ SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND contains(mess
 statement ok
 CALL truncate_duckdb_logs();
 
-# J3: a long key list (DuckDB's dynamic_or_filter_threshold raised) goes as one JSON parameter
+# J3: more than 50 keys reach the server too: DuckDB's prefix-range filter read back as keys, sent in a table variable
 statement ok
 CREATE TABLE picked AS SELECT 3 * range::INT AS id FROM range(1, 61);
-
-statement ok
-SET dynamic_or_filter_threshold = 1000;
 
 query II
 SELECT count(*), max(c.region) FROM picked p JOIN mssql.dbo.pg_clicks c USING (id);
@@ -430,12 +427,11 @@ SELECT count(*), max(c.region) FROM picked p JOIN mssql.dbo.pg_clicks c USING (i
 60	EU
 
 query I
-SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND contains(message, 'WHERE [id] IN (SELECT [v] FROM OPENJSON(@p0) WITH ([v] int ''$''))');
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql'
+  AND contains(message, 'DECLARE @k0 TABLE ([v] int PRIMARY KEY)') AND contains(message, '[id] IN (SELECT [v] FROM @k0)')
+  AND contains(message, 'OPTION (RECOMPILE)');
 ----
 1
-
-statement ok
-RESET dynamic_or_filter_threshold;
 
 statement ok
 CALL truncate_duckdb_logs();

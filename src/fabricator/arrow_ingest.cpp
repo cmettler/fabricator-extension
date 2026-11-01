@@ -46,6 +46,7 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/function/scalar/struct_functions.hpp" // struct_extract / struct_extract_at names
+#include "duckdb/function/scalar/tablefilter_functions.hpp" // the prefix-range filter's name
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -842,6 +843,103 @@ static bool LiveExprSubject(const Expression &e, const LogicalType &type, vector
 	return true;
 }
 
+// ---- A hash join's prefix-range filter as the build side's keys ---------------------------------------------
+// Whether the live filters being serialized go to a provider that renders them as a SUPERSET and re-applies them
+// (ArrowStreamBindData::reapply_filters — SQL Server): only then is a hash join's prefix-range filter turned into a
+// key list. Set by SerializeLiveFilters for the duration of one call; the node serializers below take it from here
+// rather than through every signature.
+static thread_local bool g_expand_prefix_ranges = false;
+
+//! The values a hash join's prefix-range filter admits, as an IN list (docs/duckdb-2.0-remote-execution.md §5.5).
+//! DuckDB passes a probe-side scan the build side's keys as an IN list only up to dynamic_or_filter_threshold
+//! (default 50); above it a bitmap over [min, max] — exact when the span is small, one bit per value — that has no
+//! SQL form, so the server got nothing and returned the table nearly whole (TPC-H q17 9.5 s with lineitem remote). The
+//! bitmap answers `LookupRange` / `LookupKeys`, so its keys can be read back: its bounds by binary search, then every
+//! value in between in vectors. A bucket of a coarser bitmap admits values the build side does not have — a superset,
+//! which the scan's re-applied filters and the join remove. Integral keys only.
+//! Returns false when there is nothing to send; `keys` empty with true: too many keys, send `[lo, hi]` instead.
+static constexpr idx_t PREFIX_RANGE_MAX_KEYS = 100000;
+static constexpr int64_t PREFIX_RANGE_MAX_SPAN = int64_t(1) << 24;
+
+template <class T>
+static bool ReadPrefixRangeKeys(const PrefixRangeFilter &filter, const LogicalType &type, vector<Value> &keys,
+                                int64_t &lo, int64_t &hi) {
+	const int64_t domain_lo = static_cast<int64_t>(NumericLimits<T>::Minimum());
+	const int64_t domain_hi = static_cast<int64_t>(NumericLimits<T>::Maximum());
+	auto any = [&](int64_t a, int64_t b) {
+		return filter.LookupRange(Value::Numeric(type, a), Value::Numeric(type, b)) !=
+		       FilterPropagateResult::FILTER_ALWAYS_FALSE;
+	};
+	if (!any(domain_lo, domain_hi)) {
+		return false; // an empty build side
+	}
+	// the smallest value with a set bucket: the largest a with nothing in [domain_lo, a - 1]
+	int64_t a = domain_lo, b = domain_hi;
+	while (a < b) {
+		int64_t mid = a + static_cast<int64_t>((static_cast<uint64_t>(b) - static_cast<uint64_t>(a)) / 2);
+		if (any(domain_lo, mid)) {
+			b = mid;
+		} else {
+			a = mid + 1;
+		}
+	}
+	lo = a;
+	a = lo, b = domain_hi;
+	while (a < b) {
+		int64_t mid = a + static_cast<int64_t>((static_cast<uint64_t>(b) - static_cast<uint64_t>(a) + 1) / 2);
+		if (any(mid, domain_hi)) {
+			a = mid;
+		} else {
+			b = mid - 1;
+		}
+	}
+	hi = a;
+	if (static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) >= static_cast<uint64_t>(PREFIX_RANGE_MAX_SPAN)) {
+		return true; // too wide to read value by value: the range only
+	}
+	Vector candidates(type, STANDARD_VECTOR_SIZE);
+	SelectionVector found(STANDARD_VECTOR_SIZE);
+	auto data = FlatVector::GetDataMutable<T>(candidates);
+	for (int64_t start = lo; start <= hi;) {
+		idx_t count = 0;
+		for (; count < STANDARD_VECTOR_SIZE && start + static_cast<int64_t>(count) <= hi; count++) {
+			data[count] = static_cast<T>(start + static_cast<int64_t>(count));
+		}
+		idx_t hits = filter.LookupKeys(candidates, found, count);
+		if (keys.size() + hits > PREFIX_RANGE_MAX_KEYS) {
+			keys.clear();
+			return true; // too many keys for a list: the range only
+		}
+		for (idx_t i = 0; i < hits; i++) {
+			keys.push_back(Value::Numeric(type, static_cast<int64_t>(data[found.get_index(i)])));
+		}
+		if (start + static_cast<int64_t>(count) > hi) {
+			break;
+		}
+		start += static_cast<int64_t>(count);
+	}
+	return true;
+}
+
+static bool ReadPrefixRangeKeys(const PrefixRangeFunctionData &data, vector<Value> &keys, int64_t &lo, int64_t &hi) {
+	if (!data.filter || !data.filter->IsInitialized()) {
+		return false;
+	}
+	switch (data.key_type.id()) {
+	case LogicalTypeId::TINYINT:
+		return ReadPrefixRangeKeys<int8_t>(*data.filter, data.key_type, keys, lo, hi);
+	case LogicalTypeId::SMALLINT:
+		return ReadPrefixRangeKeys<int16_t>(*data.filter, data.key_type, keys, lo, hi);
+	case LogicalTypeId::INTEGER:
+		return ReadPrefixRangeKeys<int32_t>(*data.filter, data.key_type, keys, lo, hi);
+	case LogicalTypeId::BIGINT:
+		return ReadPrefixRangeKeys<int64_t>(*data.filter, data.key_type, keys, lo, hi);
+	default:
+		return false;
+	}
+}
+
+
 //! Serialize one EXPRESSION_FILTER expression node into a FilterNode JSON object. Same contract as
 //! LiveFilterNode: false = not convertible, which is skip-safe for the pruning consumer.
 static bool LiveExprNode(const Expression &e, vector<string> &path, const LogicalType &type,
@@ -855,6 +953,47 @@ static bool LiveExprNode(const Expression &e, vector<string> &path, const Logica
 		BoundReferenceExpression fallback(type, 0ULL);
 		const Expression &subject =
 		    wrapper.GetChildren().empty() ? static_cast<const Expression &>(fallback) : *wrapper.GetChildren()[0];
+		if (g_expand_prefix_ranges && wrapper.Function().GetName() == TableFilterPrefixRangeFun::Name &&
+		    wrapper.BindInfo()) {
+			// a hash join's keys as an IN list, or their range when there are too many (§5.5)
+			auto &data = wrapper.BindInfo()->Cast<PrefixRangeFunctionData>();
+			vector<Value> keys;
+			int64_t lo = 0, hi = 0;
+			LogicalType leaf;
+			const idx_t base = path.size();
+			if (data.key_type != type || !ReadPrefixRangeKeys(data, keys, lo, hi) ||
+			    !LiveExprSubject(subject, type, path, leaf)) {
+				path.resize(base);
+				return false;
+			}
+			if (!keys.empty() && static_cast<uint64_t>(keys.size()) == static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1) {
+				keys.clear(); // every value of the range: the range says as much, and costs no list
+			}
+			if (keys.empty()) {
+				const idx_t lo_idx = constants.size();
+				constants.push_back(Value::Numeric(type, lo));
+				constants.push_back(Value::Numeric(type, hi));
+				out += "{\"op\":\"and\",\"children\":[{\"op\":\"compare\",\"cmp\":\">=\",";
+				LiveJsonColumnRef(path, out);
+				out += ",\"val\":" + to_string(lo_idx) + "},{\"op\":\"compare\",\"cmp\":\"<=\",";
+				LiveJsonColumnRef(path, out);
+				out += ",\"val\":" + to_string(lo_idx + 1) + "}]}";
+			} else {
+				out += "{\"op\":\"in\",";
+				LiveJsonColumnRef(path, out);
+				out += ",\"vals\":[";
+				for (idx_t i = 0; i < keys.size(); i++) {
+					if (i) {
+						out += ',';
+					}
+					out += to_string(constants.size());
+					constants.push_back(std::move(keys[i]));
+				}
+				out += "]}";
+			}
+			path.resize(base);
+			return true;
+		}
 		auto recovered = RecoverFilterFunction(wrapper, subject);
 		if (!recovered) {
 			return false;
@@ -1278,10 +1417,20 @@ static string WithoutBindDuplicates(const string &bind_json, const string &live_
 }
 
 static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input,
-                                   vector<Value> &constants) {
+                                   vector<Value> &constants, bool join_key_lists) {
 	if (!input.filters) {
 		return string();
 	}
+	// a hash join's prefix-range filter becomes its keys only for a provider that re-applies what it is sent
+	struct ExpandScope {
+		explicit ExpandScope(bool on) : saved(g_expand_prefix_ranges) {
+			g_expand_prefix_ranges = on;
+		}
+		~ExpandScope() {
+			g_expand_prefix_ranges = saved;
+		}
+		bool saved;
+	} expand_scope(bind_data.reapply_filters && join_key_lists);
 	vector<string> parts;
 	for (auto entry : *input.filters) {
 		idx_t key = entry.GetIndex();
@@ -1706,9 +1855,14 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		// bind data is shared across executions and must not be mutated).
 		string live_filter_sql = RenderLiveFilters(bind_data, input);
 		vector<Value> filter_constants = bind_data.filter_constants;
-		string live_filter_json =
-		    WithoutBindDuplicates(bind_data.filter_json, SerializeLiveFilters(bind_data, input, filter_constants),
-		                          filter_constants);
+		// the switch for reading a hash join's prefix-range filter back as keys (§5.5): DuckDB's own structure, so
+		// the way out should DuckDB ever get it wrong
+		Value join_key_lists;
+		bool read_key_lists = !(context.TryGetCurrentSetting("fabricator_join_key_lists", join_key_lists) &&
+		                        !join_key_lists.IsNull() && !join_key_lists.GetValue<bool>());
+		string live_filter_json = WithoutBindDuplicates(
+		    bind_data.filter_json, SerializeLiveFilters(bind_data, input, filter_constants, read_key_lists),
+		    filter_constants);
 		// a filter the scan re-applies after the server's TOP must not be able to remove one of its rows
 		bool has_live_filters = false;
 		if (input.filters) {

@@ -4429,13 +4429,18 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             {
                 var values = ReadFilterValues(filterValues);
                 filterValues = null; // consumed + disposed by ReadFilterValues
-                var builder = new FilterWhereBuilder(values, Profile.SupportsOpenJson);
+                var builder = new FilterWhereBuilder(values, Profile.SupportsOpenJson, superset: true,
+                                                     tableVariables: !Profile.IsWarehouse);
                 var where = builder.Build(spec.Filter);
                 var allParams = new List<SqlParameter>(sourceParams);
                 allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint
                 bool drainF = spec.HasSink && SinkRequiresDrainedScan(spec.Sink!, touchKey, spec.SchemaOnly);
-                string option = recompileFiltered && optionClause.Length == 0 ? " OPTION (RECOMPILE)" : optionClause;
-                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{option}", allParams,
+                // long key lists in table variables: declared and filled first, and the statement recompiled so the
+                // optimizer sees their row counts (FilterWhereBuilder.Prelude)
+                string prelude = builder.Prelude.Count == 0 ? "" : "SET NOCOUNT ON; " + string.Join(" ", builder.Prelude) + " ";
+                string option = (recompileFiltered || prelude.Length > 0) && optionClause.Length == 0
+                    ? " OPTION (RECOMPILE)" : optionClause;
+                return ExecuteQuery($"{prelude}SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{option}", allParams,
                                     readYourWrites: false, materialize: drainF && ResolveMaterialize(),
                                     snapshotRead: drainF && !ResolveMaterialize());
             }
