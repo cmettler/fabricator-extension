@@ -2684,6 +2684,16 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         var keyColumns = keys.Schema.FieldsList.Select(f => f.Name).ToList();
+        // the keys as JSON blocks joined with the table (§5.4); RETURNING and keys of a type JSON does not carry exactly
+        // keep the OR terms below
+        if (returned is null && Profile.SupportsOpenJson &&
+            OpenJsonRows.Columns(connection, transaction, qualified, keys.Schema.FieldsList) is { } jsonKeys)
+        {
+            long deleted = DeleteByJson(connection, transaction, qualified, keyColumns, jsonKeys, keys, token,
+                                        schemaName, tableName);
+            Fabricator.Bridge.MemoryProbe.Mark("mssql delete: rowid DML complete", deleted);
+            return deleted;
+        }
         var keyBindings = DateTimeBindings(connection, transaction, schemaName, tableName, keys.Schema.FieldsList);
         // a warehouse has no OUTPUT: its RETURNING reads the rows back on this connection (ReadBackReturning)
         var shape = returned is null || Profile.IsWarehouse
@@ -2887,6 +2897,129 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// 500 on the round trips no longer count and the per-statement execution on the server does.</summary>
     private const int UpdateBatchRows = 500;
 
+    /// <summary>The rowid DELETE as <c>DELETE t FROM … AS t JOIN OPENJSON(@j) WITH (…) AS j ON &lt;key&gt;</c>, one
+    /// statement per <see cref="OpenJsonRows.BlockRows"/> keys (docs/duckdb-2.0-remote-execution.md §5.4). A key that
+    /// appears twice deletes its row once, as the OR terms do.</summary>
+    private long DeleteByJson(SqlConnection connection, SqlTransaction? transaction, string qualified,
+                              List<string> keyColumns, OpenJsonRows.Column[] jsonKeys, IArrowArrayStream keys,
+                              CancellationToken token, string schemaName, string tableName)
+    {
+        var sql = new StringBuilder("DELETE t FROM ").Append(qualified).Append(" AS t JOIN ")
+            .Append(OpenJsonRows.Source("@j", jsonKeys)).Append(" ON ");
+        for (int c = 0; c < keyColumns.Count; c++)
+        {
+            sql.Append(c > 0 ? " AND " : "").Append("t.").Append(Quote(keyColumns[c])).Append(" = j.[c").Append(c).Append(']');
+        }
+        string text = sql.ToString();
+        if (Log.IsEnabled(LogLevel.Debug))
+            Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(text));
+        using var reader = new ArrowDataReader(keys);
+        var rows = new List<object?[]>();
+        long total = 0;
+        void Flush()
+        {
+            if (rows.Count == 0)
+            {
+                return;
+            }
+            using var cmd = connection.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandTimeout = ResolveCommandTimeout();
+            cmd.CommandText = text;
+            cmd.Parameters.Add(OpenJsonRows.Parameter("@j", rows, jsonKeys));
+            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            rows.Clear();
+        }
+        while (reader.Read())
+        {
+            var row = new object?[keyColumns.Count];
+            for (int c = 0; c < keyColumns.Count; c++)
+            {
+                row[c] = reader.IsDBNull(c) ? null : reader.GetValue(c);
+            }
+            rows.Add(row);
+            if (rows.Count >= OpenJsonRows.BlockRows)
+            {
+                Flush();
+            }
+        }
+        Flush();
+        return total;
+    }
+
+    /// <summary>The rowid UPDATE as <c>UPDATE t SET … FROM … AS t JOIN OPENJSON(@j) WITH (…) AS j ON &lt;key&gt;</c>, one
+    /// statement per <see cref="OpenJsonRows.BlockRows"/> rows (docs/duckdb-2.0-remote-execution.md §5.4). A row id
+    /// that appears twice keeps its LAST row, as the per-row statements do: within a block the earlier one is dropped
+    /// (two matches in one join would let the server pick either), across blocks the later statement runs later.</summary>
+    private long UpdateByJson(SqlConnection connection, SqlTransaction? transaction, string qualified,
+                              List<string> columns, int setColumnCount, OpenJsonRows.Column[] jsonColumns,
+                              IArrowArrayStream data, CancellationToken token, string schemaName, string tableName)
+    {
+        var sql = new StringBuilder("UPDATE t SET ");
+        for (int c = 0; c < setColumnCount; c++)
+        {
+            sql.Append(c > 0 ? ", " : "").Append(Quote(columns[c])).Append(" = j.[c").Append(c).Append(']');
+        }
+        sql.Append(" FROM ").Append(qualified).Append(" AS t JOIN ").Append(OpenJsonRows.Source("@j", jsonColumns))
+           .Append(" ON ");
+        for (int c = setColumnCount; c < columns.Count; c++)
+        {
+            sql.Append(c > setColumnCount ? " AND " : "").Append("t.").Append(Quote(columns[c])).Append(" = j.[c")
+               .Append(c).Append(']');
+        }
+        string text = sql.ToString();
+        if (Log.IsEnabled(LogLevel.Debug))
+            Log.LogDebug("dml {Schema}.{Table}: {Sql}", schemaName, tableName, Trunc(text));
+        using var reader = new ArrowDataReader(data);
+        var rows = new List<object?[]>();
+        var byKey = new Dictionary<string, int>(StringComparer.Ordinal);
+        long total = 0;
+        void Flush()
+        {
+            if (rows.Count == 0)
+            {
+                return;
+            }
+            using var cmd = connection.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandTimeout = ResolveCommandTimeout();
+            cmd.CommandText = text;
+            cmd.Parameters.Add(OpenJsonRows.Parameter("@j", rows, jsonColumns));
+            total += cmd.ExecuteNonQueryAsync(token).GetAwaiter().GetResult();
+            rows.Clear();
+            byKey.Clear();
+        }
+        var key = new StringBuilder();
+        while (reader.Read())
+        {
+            var row = new object?[columns.Count];
+            key.Clear();
+            for (int c = 0; c < columns.Count; c++)
+            {
+                row[c] = reader.IsDBNull(c) ? null : reader.GetValue(c);
+                if (c >= setColumnCount)
+                {
+                    key.Append(row[c]?.GetType().Name).Append(':')
+                       .Append(Convert.ToString(row[c], System.Globalization.CultureInfo.InvariantCulture)).Append('\u0001');
+                }
+            }
+            string k = key.ToString();
+            if (byKey.TryGetValue(k, out int earlier))
+            {
+                rows[earlier] = row; // the last row of a row id wins
+                continue;
+            }
+            byKey[k] = rows.Count;
+            rows.Add(row);
+            if (rows.Count >= OpenJsonRows.BlockRows)
+            {
+                Flush();
+            }
+        }
+        Flush();
+        return total;
+    }
+
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
         => ExecuteUpdateCore(schemaName, tableName, setColumnCount, data, returned: null);
 
@@ -3065,6 +3198,16 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         var columns = data.Schema.FieldsList.Select(f => f.Name).ToList();
         int keyStart = setColumnCount;
+        // the rows as JSON blocks joined with the table (§5.4), on a warehouse too; RETURNING and columns of a type JSON
+        // does not carry exactly keep the paths below
+        if (returned is null && Profile.SupportsOpenJson &&
+            OpenJsonRows.Columns(connection, transaction, qualified, data.Schema.FieldsList) is { } jsonColumns)
+        {
+            long updated = UpdateByJson(connection, transaction, qualified, columns, setColumnCount, jsonColumns, data,
+                                        token, schemaName, tableName);
+            Fabricator.Bridge.MemoryProbe.Mark("mssql update: rowid DML complete", updated);
+            return updated;
+        }
         var bindings = DateTimeBindings(connection, transaction, schemaName, tableName, data.Schema.FieldsList);
         if (Profile.IsWarehouse)
         {

@@ -2092,6 +2092,42 @@ filters, nothing sent at the default, a 2 501-string list left out with ONE quer
 `verify_server_profile` (row 20 + the level), guide J3. Mutants: no JSON (killed at §5's first log row), no 2 000 cap
 (killed at the string list's query count).
 
+
+### 5.4 The rowid DELETE and UPDATE as JSON blocks — BUILT (2026-11-01)
+
+When a DELETE or UPDATE cannot go to the server as one statement (its WHERE reads local data, or does not translate
+exactly), DuckDB scans the row ids and the provider writes by them. That sent a DELETE as 500-key OR chains
+(`([k] = @p0) OR …`, `([a] = @p0 AND [b] = @p1) OR …` for a two-part key) and an UPDATE as one statement per row —
+batched in one round trip on box (`SqlBatch`), a VALUES join of 2 000 / column-count rows on a warehouse. MEASURED on
+100 000 of 200 000 rows (box):
+
+| table, key | DELETE before → JSON | UPDATE before → JSON |
+|---|---|---|
+| rowstore, `id INT` | 2.44 → 0.92 s | 3.73 → 1.03 s |
+| clustered columnstore, `id INT` (PK nonclustered) | 6.00 → 2.29 s | **344 → 2.18 s** |
+| rowstore, `(a INT, b VARCHAR)` | **49.7 → 1.33 s** | 5.29 → 1.12 s |
+
+Now `DeleteByJson` / `UpdateByJson` send `DELETE t FROM [s].[t] AS t JOIN OPENJSON(@j) WITH (…) AS j ON t.[k] = j.[c0] …`
+and `UPDATE t SET [v] = j.[c0] … FROM … JOIN OPENJSON(@j) WITH (…) AS j ON …`, 10 000 rows per statement (one
+statement of 100 000 measured the same). A multi-column row id is a join on every part — no IN list.
+`OpenJsonRows.Columns` declares each JSON column with its TABLE column's type from `sys.columns`, read on the
+statement's own connection (a table altered earlier in the transaction is described as it now is; deliberately NOT
+cached — a stale type would make a key silently match nothing): `decimal(p,s)`, `datetime2(s)`, a string with
+`COLLATE <its collation>` (OPENJSON takes it in the WITH clause). Values that a JSON number would round go as text;
+legacy `datetime` as `.fff` and `smalldatetime` without fractions, since they take no more from text — the server then
+rounds as for a bound parameter. A row id that appears twice in one block keeps its last row (a join would let the
+server pick either; DuckDB's own UPDATE with a double match is not determined either, so this is not observable).
+Kept on the old path: RETURNING (OUTPUT / the warehouse read-back), a key or SET column of a type JSON does not carry
+exactly (binary, sql_variant, xml, spatial, rowversion …), and an engine without OPENJSON (compatibility level < 130).
+MEASURED live: OPENJSON with a typed WITH, `COLLATE`, decimal and datetime2 from text, and UPDATE / DELETE through a
+join on a two-part key all work on Fabric Warehouse and the Lakehouse SQL endpoint (compatibility level 160).
+
+Gate: NEW service suite `verify_rowid_json_mssql` (36): a ten-part key of int, datetime2(7), legacy datetime,
+decimal, a CI varchar, a BIN2 nvarchar, uniqueidentifier, date, time(7) and datetimeoffset(7) — UPDATE and DELETE
+against a local copy, both ways; the declarations in the logged statement; a double match; 25 000 rows in several
+blocks; a varbinary key on the OR terms. Mutants: no COLLATE (killed at the declaration row), legacy datetime with 7
+digits (killed at the first UPDATE: conversion error). The last-row-wins mutant SURVIVES, as argued above.
+
 ### The record before it was built (2026-10-27)
 
 

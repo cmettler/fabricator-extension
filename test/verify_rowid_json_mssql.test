@@ -1,0 +1,159 @@
+# name: test/verify_rowid_json_mssql.test
+# description: The rowid DELETE and UPDATE send their rows as JSON blocks joined with the table
+#              (docs/duckdb-2.0-remote-execution.md §5.4): `DELETE t FROM … JOIN OPENJSON(@j) WITH (…)` and
+#              `UPDATE t SET … FROM … JOIN OPENJSON(@j) WITH (…)`, each JSON column declared with its table column's
+#              type and collation. Every key type that travels as JSON is checked against the same statements on a
+#              local copy; a varbinary key keeps the OR terms. Needs MSSQL_TESTDB_DSN.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'false');
+
+# the row-id path, not the one-statement shortcut
+statement ok
+SET fabricator_dml_pushdown = false;
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rj_k; DROP TABLE IF EXISTS dbo.rj_b;');
+
+# one row per key; every column a possible key part. ci: a case-insensitive collation, cs: a binary one, so 'a' and
+# 'A' are two keys only there. legacy datetime stores .127 as .1266667.
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rj_k (
+  i INT NOT NULL, dt2 DATETIME2(7) NOT NULL, dtl DATETIME NOT NULL, dec DECIMAL(18,6) NOT NULL,
+  ci VARCHAR(10) COLLATE Latin1_General_CI_AS NOT NULL, cs NVARCHAR(10) COLLATE Latin1_General_100_BIN2 NOT NULL,
+  u UNIQUEIDENTIFIER NOT NULL, d DATE NOT NULL, tm TIME(7) NOT NULL, dto DATETIMEOFFSET(7) NOT NULL, v INT NULL,
+  CONSTRAINT pk_rj_k PRIMARY KEY (i, dt2, dtl, dec, ci, cs, u, d, tm, dto));
+INSERT INTO dbo.rj_k SELECT value,
+  DATEADD(microsecond, value * 7, CAST(''2026-01-01 12:00:00.123456'' AS datetime2(7))),
+  DATEADD(millisecond, value * 3, CAST(''2026-01-01 12:00:00.127'' AS datetime)),
+  CAST(value AS DECIMAL(18,6)) / 7, CONCAT(''k'', value % 10), CASE WHEN value % 2 = 0 THEN N''a'' ELSE N''A'' END,
+  CAST(CONCAT(''00000000-0000-0000-0000-'', RIGHT(CONCAT(''000000000000'', value), 12)) AS uniqueidentifier),
+  DATEADD(day, value, ''2026-01-01''), DATEADD(microsecond, value, CAST(''10:00:00.000001'' AS time(7))),
+  DATEADD(second, value, CAST(''2026-01-01 12:00:00.5 +02:00'' AS datetimeoffset(7))), value % 100
+FROM GENERATE_SERIES(1, 3000);', refresh_cache := true);
+
+statement ok
+CREATE TABLE lk AS SELECT * FROM db.dbo.rj_k;
+
+statement ok
+CALL enable_logging(['Fabricator.Sql'], storage := 'memory', level := 'debug');
+
+# ═══ §1  UPDATE and DELETE on a ten-part key, against the local copy ═══════════════════════════════════════
+
+statement ok
+UPDATE db.dbo.rj_k SET v = v + 1000 WHERE i % 3 = 0;
+
+statement ok
+UPDATE lk SET v = v + 1000 WHERE i % 3 = 0;
+
+statement ok
+DELETE FROM db.dbo.rj_k WHERE i % 5 = 0;
+
+statement ok
+DELETE FROM lk WHERE i % 5 = 0;
+
+query II
+SELECT count(*), sum(v) FROM db.dbo.rj_k;
+----
+2400	920000
+
+query I
+SELECT count(*) FROM ((SELECT * FROM db.dbo.rj_k EXCEPT ALL SELECT * FROM lk) UNION ALL (SELECT * FROM lk EXCEPT ALL SELECT * FROM db.dbo.rj_k));
+----
+0
+
+# the rows went as JSON, one statement each (3000 rows < one block)
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%UPDATE t SET [v] = j.[c0] FROM [dbo].[rj_k] AS t JOIN OPENJSON(@j)%'),
+       count(*) FILTER (WHERE message LIKE '%DELETE t FROM [dbo].[rj_k] AS t JOIN OPENJSON(@j)%')
+FROM duckdb_logs WHERE type = 'Fabricator.Sql';
+----
+1	1
+
+# each JSON column is declared like its table column, a string with its collation
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql'
+  AND message LIKE '%[c2] datetime2(7) ''$[2]''%[c4] decimal(18,6) ''$[4]''%[c5] varchar(10) COLLATE Latin1_General_CI_AS ''$[5]''%[c6] nvarchar(10) COLLATE Latin1_General_100_BIN2 ''$[6]''%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# ═══ §2  A row id matched twice: one of its rows wins, the row is updated once ═══════════════════════════════
+
+statement ok
+CREATE TABLE src AS SELECT i, v FROM lk WHERE i <= 20 UNION ALL SELECT i, v + 1 FROM lk WHERE i <= 20;
+
+query I
+UPDATE db.dbo.rj_k SET v = s.v FROM src s WHERE rj_k.i = s.i;
+----
+16
+
+query I
+SELECT count(*) FROM db.dbo.rj_k k JOIN lk USING (i) WHERE k.i <= 20 AND k.v NOT IN (lk.v, lk.v + 1);
+----
+0
+
+# ═══ §3  Many rows: several blocks of 10 000 ═══════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rj_b (id INT PRIMARY KEY, v INT); INSERT INTO dbo.rj_b SELECT value, 0 FROM GENERATE_SERIES(1, 25000);', refresh_cache := true);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+UPDATE db.dbo.rj_b SET v = id WHERE id > 1;
+----
+24999
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE '%UPDATE t SET [v] = j.[c0] FROM [dbo].[rj_b]%';
+----
+1
+
+query II
+SELECT count(*), sum(v) FROM db.dbo.rj_b;
+----
+25000	312512499
+
+query I
+DELETE FROM db.dbo.rj_b WHERE id % 2 = 1;
+----
+12500
+
+query II
+SELECT count(*), sum(v) FROM db.dbo.rj_b;
+----
+12500	156262500
+
+# ═══ §4  A key JSON does not carry exactly (varbinary) keeps the OR terms ═══════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rj_b; CREATE TABLE dbo.rj_b (id VARBINARY(8) PRIMARY KEY, v INT); INSERT INTO dbo.rj_b SELECT CAST(value AS VARBINARY(8)), value FROM GENERATE_SERIES(1, 100);', refresh_cache := true);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+DELETE FROM db.dbo.rj_b WHERE v > 90;
+----
+10
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%OPENJSON%'), count(*) FILTER (WHERE message LIKE '%DELETE FROM [dbo].[rj_b] WHERE ([id] = @p0) OR%')
+FROM duckdb_logs WHERE type = 'Fabricator.Sql';
+----
+0	1
+
+statement ok
+CALL disable_logging();
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rj_k; DROP TABLE dbo.rj_b;');
