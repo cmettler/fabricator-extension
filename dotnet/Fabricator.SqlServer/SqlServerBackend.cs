@@ -107,6 +107,12 @@ public sealed class SqlServerBackend : IProvider
                      "default (see the column_default read-back: an expression default is not reported to " +
                      "DuckDB, so that spelling reaches us as an ordinary NULL). Overrides the per-catalog " +
                      "keep_nulls ATTACH option"),
+                Bool("mssql_result_set_caching",
+                     "fabricator: let Fabric Warehouse answer a scan from its result set cache (default true). " +
+                     "false adds OPTION (USE HINT ('DISABLE_RESULT_SET_CACHE')) to the queries the provider " +
+                     "generates, so repeated statements are executed again — for timing comparisons. No effect " +
+                     "elsewhere (box SQL Server has no such cache or hint). Overrides the per-catalog " +
+                     "result_set_caching ATTACH option"),
                 Str("mssql_default_table_type",
                     "fabricator: created-table storage — '' (rowstore, default) | 'clustered columnstore' " +
                     "(CCI, box/Azure SQL; Fabric/Synapse tables are columnstore already so it is a no-op there)"),
@@ -648,6 +654,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // ATTACH option `keep_nulls true|false` (default TRUE). See ResolveKeepNulls; a SET mssql_keep_nulls
     // overrides it per session, the same precedence as materialize and isolation_level.
     private readonly bool? _keepNulls;
+    // ATTACH option `result_set_caching true|false` (default TRUE). See ResolveResultSetCaching; a SET
+    // mssql_result_set_caching overrides it per session.
+    private readonly bool? _resultSetCaching;
     // ATTACH option `session_context '<json object>'` — a fixed tag for this catalog; a SET
     // mssql_session_context overrides it per session. Validated at ATTACH. See ResolveSessionContextText.
     private readonly string? _sessionContext;
@@ -806,6 +815,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         break;
                     case "keep_nulls":
                         _keepNulls = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
+                        break;
+                    case "result_set_caching":
+                        _resultSetCaching = ParseRemotePushdown(val, "result_set_caching");
                         break;
                     // Validated here so a malformed tag fails the ATTACH that names it, not the first query.
                     case "session_context":
@@ -1961,6 +1973,17 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// send and the server applies its own default. Both values of this flag give the identical result
     /// there, including for a column whose default is an expression.</para>
     /// </remarks>
+    /// <summary>Whether Fabric Warehouse may answer a scan from its result set cache. <c>SET
+    /// mssql_result_set_caching</c> wins if set, else this catalog's <c>result_set_caching</c> ATTACH option, else TRUE.
+    /// The cache is on by default on a Fabric Warehouse (MEASURED: <c>is_result_set_caching_on</c> = 1; an aggregate
+    /// over 6M rows 3.0 s, then 0.32 / 0.10 / 0.09 s repeated, 0.15 s each under the hint), and a session cannot turn it
+    /// off (<c>SET RESULT_SET_CACHING</c> is refused), so a scan's statement carries the hint instead.</summary>
+    internal bool ResolveResultSetCaching()
+    {
+        var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_result_set_caching");
+        return set ?? _resultSetCaching ?? true;
+    }
+
     internal bool ResolveKeepNulls()
     {
         var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_keep_nulls");
@@ -4097,6 +4120,20 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // the other). An object without partitions — a view — yields NULL, i.e. unknown:
     // a 0 told DuckDB a view over a million rows was EMPTY (est=0), which made it the
     // build side of a hash join.
+    /// <summary>The row count on a warehouse engine, where sys.partitions answers NULL and the partition-stats DMV does
+    /// not exist: COUNT_BIG(*), which Fabric answers from its metadata — MEASURED 0.09 s warm (up to 0.9 s on the first
+    /// call) for 180 and for 6 001 215 rows alike. Only for a user TABLE: a view's count would run the view. Written so it
+    /// cannot fail (an object dropped meanwhile reads as NULL): on a warehouse a failed statement aborts the
+    /// transaction (docs/warehouse-support.md §6.5). Without a count DuckDB planned TPC-DS q72 with a 1.2 billion row
+    /// join (24 s; 0.4 s with the counts) and q64 ran out of memory (docs/duckdb-2.0-remote-execution.md §5.6).</summary>
+    private static string WarehouseRowCountSql(string schema, string table)
+    {
+        string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
+        return "IF OBJECTPROPERTY(OBJECT_ID(" + objectLiteral + "), 'IsUserTable') = 1 " +
+               "SELECT CAST(COUNT_BIG(*) AS VARCHAR(32)) AS n FROM " + Quote(schema) + "." + Quote(table) +
+               " ELSE SELECT CAST(NULL AS VARCHAR(32)) AS n";
+    }
+
     private static string RowCountSql(string schema, string table)
     {
         string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
@@ -4381,6 +4418,15 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 source = $"{source} FOR SYSTEM_TIME AS OF @__at";
                 sourceParams = new List<SqlParameter>(sourceParams) { asOf };
             }
+        }
+
+        // Fabric's result set cache off for this scan (mssql_result_set_caching = false): one more hint in the same OPTION
+        if (Profile.IsFabricWarehouse && !ResolveResultSetCaching())
+        {
+            const string noCache = "USE HINT ('DISABLE_RESULT_SET_CACHE')";
+            optionClause = optionClause.Length == 0
+                ? $" OPTION ({noCache})"
+                : optionClause.Substring(0, optionClause.Length - 1) + ", " + noCache + ")";
         }
 
         // Projection: SELECT only the requested columns (absent/empty => SELECT *).

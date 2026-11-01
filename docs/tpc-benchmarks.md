@@ -65,9 +65,10 @@ At SF 0.01 a remote run measures round trips, not computation. Notes:
   on OneLake. Not investigated further.
 - **The lakehouse's SQL endpoint needed 153 s** after the Delta write before it showed every table with its full count
   (the harness polls; a stale-but-consistent snapshot reads like wrong data).
-- **TPC-DS on the warehouse: q64 (47 s all remote, 94 s with the dimensions remote) and q72 (30 s)** dominate. Not yet
-  analysed — the same method as q16 / q20 applies: the pushed T-SQL from the `Fabricator.Remote` log against the query
-  hand-written in T-SQL.
+- **TPC-DS on the warehouse: q64 (47 s all remote, 94 s with the dimensions remote) and q72 (30 s)** — FIXED
+  (2026-11-01, docs/duckdb-2.0-remote-execution.md §5.6): the scans reported no row count on a warehouse, so DuckDB
+  planned a 1.2 billion row join. With `COUNT_BIG(*)` (Fabric answers it from metadata in ~0.1 s): q64 1.65 s / 1.38 s,
+  q72 1.67 s / 0.8 s, every placement equal to the local answer.
 - The SF1 TPC-H run on box was stopped at q20 for the fixes; the placements are measured below.
 
 ### TPC-H SF1 on box, all placements (2026-11-01)

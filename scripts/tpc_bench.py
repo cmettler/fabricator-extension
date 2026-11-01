@@ -72,6 +72,10 @@ def connect(bench, sf, target):
         if target == "lakehouse-sql":
             dsn = re.sub(r"Database=[^;]*", "Database=LH", warehouse_dsn())
             con.execute(f"ATTACH '{dsn}' AS rp (TYPE fabricator, remote_pushdown 'true')")
+    if target in ("warehouse", "lakehouse-sql"):
+        # Fabric answers a repeated statement from its result set cache (on by default; the same scans recur across
+        # placements), so a later placement would look faster than it is — docs/duckdb-2.0-remote-execution.md §5.7
+        con.execute("SET mssql_result_set_caching = false")
     return con
 
 

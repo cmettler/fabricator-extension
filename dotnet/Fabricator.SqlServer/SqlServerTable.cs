@@ -440,16 +440,18 @@ SELECT s.name, o.name, c.name, dc.definition
         return names;
     }
 
-    /// <summary>Approximate row count from partition stats (a cheap metadata read, not COUNT(*)). NULL on a
-    /// warehouse engine — sys.dm_db_partition_stats is unsupported there, and on Fabric a failed best-effort
-    /// statement ABORTS an open transaction, so the probe must never be issued (the standing rule).</summary>
+    /// <summary>Approximate row count from partition stats (a cheap metadata read, not COUNT(*)). On a warehouse
+    /// engine, where neither sys.partitions nor the stats DMV answers, an exact COUNT_BIG(*) that Fabric serves from
+    /// metadata (<see cref="WarehouseRowCountSql"/>) — written so it cannot fail, since there a failed statement
+    /// ABORTS an open transaction (the standing rule).</summary>
     internal long? RowCountCore(string schemaName, string tableName)
     {
-        if (Profile.IsWarehouse)
+        if (Profile.IsWarehouse && !Profile.IsFabricWarehouse)
         {
-            return null;
+            return null; // Synapse dedicated: unmeasured, and it has neither the DMV nor (here) a counting path
         }
-        foreach (var row in ReadMetadataRows(RowCountSql(schemaName, tableName), 1))
+        string sql = Profile.IsFabricWarehouse ? WarehouseRowCountSql(schemaName, tableName) : RowCountSql(schemaName, tableName);
+        foreach (var row in ReadMetadataRows(sql, 1))
         {
             if (row[0] is { } text && long.TryParse(text, out long n))
             {

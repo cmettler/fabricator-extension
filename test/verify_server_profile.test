@@ -23,11 +23,18 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 # fabricator_server_info filters by NAME, so the COUNT is the only thing that can see it.
 # 19 since 2026-10-29: + default_schema, the login's SCHEMA_NAME() that the catalog reports as its DuckDB
 # default schema (verify_default_schema_mssql).
-# 20 since 2026-11-01: + compatibility_level, which gates OPENJSON for long key lists (verify_dynamic_filters_mssql §5).
+# 20 since 2026-11-01: + compatibility_level, which gates OPENJSON for long key lists (verify_dynamic_filters_mssql §5);
+# 21: + database_edition (DATABASEPROPERTYEX Edition: DataWarehouse / LakeWarehouse on Fabric), which tells Fabric by
+# NAME as well as by engine edition (docs/duckdb-2.0-remote-execution.md §5.6).
 query I
 SELECT count(*) FROM fabricator_server_info('db');
 ----
-20
+21
+
+query T
+SELECT value FROM fabricator_server_info('db') WHERE property = 'database_edition';
+----
+(none)
 
 query T
 SELECT value FROM fabricator_server_info('db') WHERE property = 'default_schema';

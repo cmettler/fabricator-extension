@@ -2197,6 +2197,59 @@ Gates: `verify_dynamic_filters_mssql` §5 (119 -> 136: the table variable at a r
 switch off with the same answer and no list, two lists on one scan, a gapless list as its range, the string list left
 out), guide J3. Mutants: no table variables, no same-column dedupe, no reading back (C++) — each killed at its row.
 
+
+### 5.6 Row counts on a warehouse — FIXED (2026-11-01)
+
+TPC-DS q72 and q64 at SF 0.01 on Fabric Warehouse took 25–30 s and 47 s (94 s with the dimensions remote; at the end q64
+ran OUT OF MEMORY) against 0.04 s locally. Not the server: a warehouse gets no whole-statement pushdown (`remote_select`
+is off there), every scan had finished after 4.4 s, and `EXPLAIN ANALYZE` showed DuckDB's own plan — a nested loop join
+of 94M rows and a hash join emitting 1.2 BILLION. The scans reported NO cardinality: `RowCountCore` returned NULL on a
+warehouse because `sys.dm_db_partition_stats` does not exist there (and a failing best-effort statement aborts a Fabric
+transaction). The same query on box with plain scans and row counts: q72 0.39 s, q64 0.92 s.
+
+MEASURED on Fabric: `sys.partitions` answers NULL, `dm_db_partition_stats` / `dm_db_stats_properties` are refused,
+`DBCC SHOW_STATISTICS … WITH STAT_HEADER` gives a row count only for `_WA_Sys` statistics, which exist only once a
+query has filtered on the column; `COUNT_BIG(*)` costs 0.09 s warm (up to 0.9 s on the first call) for 180 and for
+6 001 215 rows alike — Fabric answers it from metadata. So `WarehouseRowCountSql`: `IF OBJECTPROPERTY(OBJECT_ID(…),
+'IsUserTable') = 1 SELECT COUNT_BIG(*) … ELSE SELECT NULL` — exact, cannot fail (a dropped object reads NULL), and not
+for a view, whose count would run the view. NDV stays unreported on a warehouse.
+
+After: q72 1.67 s / 0.8 s (remote / dims-remote), q64 1.65 s / 1.38 s; `scripts/tpc_bench.py tpcds 0.01 --target
+warehouse --queries 64,72`: 10 of 10 runs equal to the local answers, none above 1.6 s. Gate: live only — no tier
+reaches a warehouse; the box path (`sys.partitions`) is unchanged. The first count of a table in a session
+cost 0.78–0.89 s on tables freshly loaded and never queried (no `_WA_Sys` statistics yet) — Fabric loads its file
+metadata once — and 0.09 s after; the provider counts each table once, at its first scan after ATTACH.
+
+⚠ WHICH ENGINE, told by NAME as well as by number (user-raised: an engine edition can be renumbered). MEASURED:
+box `EngineEdition` 3 / database edition NULL; Fabric Warehouse 11 / `DataWarehouse`; the Lakehouse SQL endpoint 11 /
+`LakeWarehouse` (`DATABASEPROPERTYEX(DB_NAME(), 'Edition')`; `SERVERPROPERTY('Edition')` says only "SQL Azure").
+`ServerProfile.IsFabricWarehouse` = engine edition 11, or the database edition `DataWarehouse` / `LakeWarehouse` on
+any engine edition but 6 — Synapse dedicated is reported to say `DataWarehouse` too and was never measured, so it gets
+neither the count nor the OPENJSON paths (it keeps no row count, parameter lists and the per-row DML). The count is
+for that family only: edition 12, the Fabric SQL database, is SQL-Server-like (real `sys.partitions`) and a count
+would scan there; it takes OPENJSON by its compatibility level like box. The name is a `fabricator_server_info` row,
+`database_edition`.
+
+
+### 5.7 Fabric's result set cache, and a switch for timing — BUILT (2026-11-01)
+
+User-raised: Fabric Warehouse caches result sets, which skews any timing comparison — a TPC run sends the same scans
+across placements. MEASURED on our warehouse: `sys.databases.is_result_set_caching_on` = 1; an aggregate over
+lineitem (6M rows) 3.0 s, then 0.32 / 0.10 / 0.09 s with the same text; with `OPTION (USE HINT
+('DISABLE_RESULT_SET_CACHE'))` 0.15 s every time (the data cache stays warm, the result cache is skipped). A session
+cannot turn the cache off (`SET RESULT_SET_CACHING` is "not a recognized SET option"); `ALTER DATABASE` could, for
+every user of the warehouse. The Lakehouse SQL endpoint accepts the hint too.
+
+`SET mssql_result_set_caching = false` (or the ATTACH option `result_set_caching 'false'`; a session value wins;
+default true) makes the provider append that hint to the scans it generates on Fabric — into the same OPTION as a
+`FOR TIMESTAMP AS OF` (`OPTION (FOR TIMESTAMP AS OF '…', USE HINT (…))`, measured to parse). Queries written through
+`fabricator_query` are not touched (an appended OPTION could clash with the caller's). No effect on box, which has
+neither cache nor hint. `scripts/tpc_bench.py` sets it for its warehouse and lakehouse-sql targets.
+
+Checked against the measurements before it: the COUNT_BIG(*) of §5.6 costs 0.09–0.10 s also with a new statement text
+every time, so it is metadata, not the cache; q64 / q72's gain was DuckDB's join order, the server having finished in
+~4 s before. Gate: live only (no tier reaches Fabric) — the hint seen in the logged scan on both Fabric targets.
+
 ### The record before it was built (2026-10-27)
 
 

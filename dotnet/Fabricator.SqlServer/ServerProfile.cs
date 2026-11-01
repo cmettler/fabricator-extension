@@ -51,12 +51,12 @@ internal sealed class ServerProfile
     public bool IsCaseSensitive { get; }
 
     /// <summary>True for Synapse (dedicated/serverless) + Fabric — the "warehouse" family.</summary>
-    public bool IsWarehouse => EngineEdition is EditionSynapseDedicated or EditionFabricOrSynapseServerless;
+    public bool IsWarehouse => EngineEdition == EditionSynapseDedicated || IsFabricWarehouse;
 
     /// <summary>RETURNING without an OUTPUT clause: the DELETE/UPDATE rows read back on the write connection, the
     /// INSERT rows computed with the server's own store conversions (measured on Fabric only — Synapse dedicated
     /// may round where Fabric truncates; docs/warehouse-support.md §6.8a).</summary>
-    public bool ReturnsByReadBack => EngineEdition == EditionFabricOrSynapseServerless;
+    public bool ReturnsByReadBack => IsFabricWarehouse;
 
     /// <summary>
     /// Change data capture exists on this engine — the whole <c>db.cdc.*</c> surface is gated on it.
@@ -121,7 +121,7 @@ internal sealed class ServerProfile
     /// Synapse dedicated keep the connection/server default (empty => Unspecified). Synapse dedicated is
     /// intentionally NOT snapshot here — its default is READ UNCOMMITTED and snapshot may be disabled.
     /// </summary>
-    public string DefaultWriteIsolation => EngineEdition == EditionFabricOrSynapseServerless ? "snapshot" : string.Empty;
+    public string DefaultWriteIsolation => IsFabricWarehouse ? "snapshot" : string.Empty;
 
     /// <summary>
     /// The login's default schema in this database (<c>SCHEMA_NAME()</c>) — where SQL Server itself resolves
@@ -134,14 +134,33 @@ internal sealed class ServerProfile
     /// <summary>The database's compatibility level; 0 when unknown.</summary>
     public int CompatibilityLevel { get; }
 
-    /// <summary><c>OPENJSON</c> — a warehouse engine, or a database at compatibility level 130 or higher (unknown counts
-    /// as yes: a scan that fails on it falls back to the unfiltered query).</summary>
-    public bool SupportsOpenJson => IsWarehouse || CompatibilityLevel == 0 || CompatibilityLevel >= 130;
+    /// <summary>The database's edition NAME (<c>DATABASEPROPERTYEX(DB_NAME(), 'Edition')</c>): <c>DataWarehouse</c> on
+    /// Fabric Warehouse, <c>LakeWarehouse</c> on the Lakehouse SQL endpoint (measured), NULL on box.</summary>
+    public string DatabaseEdition { get; }
+
+    /// <summary>Fabric Warehouse or the Lakehouse SQL endpoint. Told by the database edition NAME (DataWarehouse /
+    /// LakeWarehouse) as well as by engine edition 11, so a future renumbering of the engine edition does not lose it —
+    /// but never edition 6: Synapse dedicated is reported to say DataWarehouse too, and it was never measured. Its row
+    /// count is a COUNT_BIG(*) served from metadata; edition 12 (Fabric SQL database) is SQL-Server-like, with real
+    /// partition stats, where a count would scan.</summary>
+    public bool IsFabricWarehouse { get; }
+
+    /// <summary><c>OPENJSON</c> — Fabric Warehouse / the SQL endpoint (measured at compatibility level 160), or any
+    /// other non-warehouse engine at compatibility level 130 or higher (box, Azure SQL, Fabric SQL database; unknown
+    /// counts as yes: a scan that fails on it falls back to the unfiltered query). NOT Synapse dedicated: never
+    /// measured, and every path using it has a fallback.</summary>
+    public bool SupportsOpenJson => IsFabricWarehouse ||
+                                    (!IsWarehouse && (CompatibilityLevel == 0 || CompatibilityLevel >= 130));
 
     private ServerProfile(int engineEdition, int productMajorVersion, string? productVersion, string? collation,
-                          string? defaultSchema, int compatibilityLevel)
+                          string? defaultSchema, int compatibilityLevel, string? databaseEdition)
     {
         CompatibilityLevel = compatibilityLevel;
+        DatabaseEdition = databaseEdition ?? string.Empty;
+        IsFabricWarehouse = engineEdition == EditionFabricOrSynapseServerless ||
+                            (engineEdition != EditionSynapseDedicated &&
+                             (DatabaseEdition.Equals("DataWarehouse", StringComparison.OrdinalIgnoreCase) ||
+                              DatabaseEdition.Equals("LakeWarehouse", StringComparison.OrdinalIgnoreCase)));
         EngineEdition = engineEdition;
         ProductMajorVersion = productMajorVersion;
         ProductVersion = productVersion ?? string.Empty;
@@ -150,7 +169,7 @@ internal sealed class ServerProfile
 
         // Fabric Warehouse / Lakehouse SQL endpoint (the type-restricted family). Synapse dedicated
         // (6) keeps box-like types (nvarchar, datetimeoffset, datetime2(7)) but, like Fabric, lacks MARS.
-        bool fabric = engineEdition == EditionFabricOrSynapseServerless;
+        bool fabric = IsFabricWarehouse;
         SupportsMars = engineEdition is not (EditionSynapseDedicated or EditionFabricOrSynapseServerless);
         HasNVarchar = !fabric;
         HasDatetimeOffset = !fabric;
@@ -167,8 +186,10 @@ internal sealed class ServerProfile
 
     /// <summary>Construct from raw values (used by <see cref="Detect"/> and directly in tests).</summary>
     public static ServerProfile FromValues(int engineEdition, int productMajorVersion, string? productVersion,
-                                            string? collation, string? defaultSchema = null, int compatibilityLevel = 0)
-        => new(engineEdition, productMajorVersion, productVersion, collation, defaultSchema, compatibilityLevel);
+                                            string? collation, string? defaultSchema = null, int compatibilityLevel = 0,
+                                            string? databaseEdition = null)
+        => new(engineEdition, productMajorVersion, productVersion, collation, defaultSchema, compatibilityLevel,
+               databaseEdition);
 
     /// <summary>
     /// The profile as ordered (property, value) text rows — surfaced by the <c>fabricator_server_info(catalog)</c>
@@ -195,6 +216,7 @@ internal sealed class ServerProfile
         ("default_write_isolation", DefaultWriteIsolation.Length == 0 ? "(default)" : DefaultWriteIsolation),
         ("default_schema", DefaultSchema),
         ("compatibility_level", CompatibilityLevel.ToString()),
+        ("database_edition", DatabaseEdition.Length == 0 ? "(none)" : DatabaseEdition),
     };
 
     private static string Bool(bool value) => value ? "true" : "false";
@@ -214,7 +236,8 @@ internal sealed class ServerProfile
             "CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), " +
             "CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS nvarchar(128)), " +
             "SCHEMA_NAME(), " +
-            "(SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE database_id = DB_ID())";
+            "(SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE database_id = DB_ID()), " +
+            "CAST(DATABASEPROPERTYEX(DB_NAME(), 'Edition') AS nvarchar(128))";
         using var reader = cmd.ExecuteReader();
         if (!reader.Read())
         {
@@ -226,7 +249,9 @@ internal sealed class ServerProfile
         string collation = reader.IsDBNull(3) ? string.Empty : reader.GetString(3);
         string? defaultSchema = reader.IsDBNull(4) ? null : reader.GetString(4);
         int compatibilityLevel = reader.IsDBNull(5) ? 0 : reader.GetInt32(5);
-        return FromValues(engineEdition, productMajor, productVersion, collation, defaultSchema, compatibilityLevel);
+        string? databaseEdition = reader.IsDBNull(6) ? null : reader.GetString(6);
+        return FromValues(engineEdition, productMajor, productVersion, collation, defaultSchema, compatibilityLevel,
+                          databaseEdition);
     }
 
     // "16.0.4135.4" -> 16; 0 on anything unparseable.
