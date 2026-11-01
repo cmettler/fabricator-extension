@@ -2064,6 +2064,34 @@ two halves index one constants list at different positions). A leaf only drops w
 WHERE stays the same predicate. Gate `verify_sqlgen_catalog` §4: the member statement carries one parameter, the
 plan-cache check counts only this run's statements (34 → 36); mutant (no dedupe) killed there.
 
+
+### 5.3 A long key list: DuckDB's threshold, and one JSON parameter — BUILT (2026-11-01)
+
+The TPC-H outliers with lineitem on SQL Server and the other tables local (q8, q9, q17, q21) all fetched lineitem
+nearly whole: the hash join's build side is local, and DuckDB passes its keys as an `IN` list only up to
+`dynamic_or_filter_threshold` (default 50, `CanUseInFilter` in physical_hash_join.cpp, counting build ROWS); above it
+a range — or, when the span is small, an exact prefix-range filter of DuckDB's own, which has no T-SQL form and
+reaches the server as nothing at all. MEASURED with the setting raised: q17 9.5 → 0.12 s (204 keys), q21 11.8 → 8.3 s
+(411; its two EXISTS / NOT EXISTS scans get no keys), q8 8.4 → 1.35 s, q9 10.2 → 2.6 s at 100 000 (the partsupp side
+has 42 000 keys). Before this, more than ~2 100 keys failed on SQL Server's parameter cap and the scan fell back to
+an unfiltered query — two round trips, the first one failing.
+
+`FilterWhereBuilder.In` now sends more than 50 integer keys as ONE `nvarchar(max)` parameter,
+`[c] IN (SELECT [v] FROM OPENJSON(@p) WITH ([v] bigint '$'))` — MEASURED as fast as the parameter list or faster
+(411 keys over 6M rows 0.17 vs 0.22 s; 10 664 keys 0.46 s where the range alone took 7.8 s), one plan for any length.
+Integers only: their JSON form is exact and typed like the column. Other lists keep one parameter per value and are
+refused client-side past 2 000 (the WHERE is then left out; DuckDB filters). `OPENJSON` needs compatibility level
+130: `ServerProfile.CompatibilityLevel` (also a `fabricator_server_info` row) gates it; a warehouse has it.
+
+⚠ NOT changed: DuckDB's default. It is a DuckDB setting, applied to every hash join including purely local ones,
+and raising it costs them — TPC-H SF1 all local 0.74 s at 50, 0.80 s at 20 000, 1.71 s at 100 000. Documented for the
+user to raise (README, guide J3).
+
+Gates: `verify_dynamic_filters_mssql` §5 (96 -> 119: OPENJSON with one parameter, the same answer as without dynamic
+filters, nothing sent at the default, a 2 501-string list left out with ONE query and no failing one),
+`verify_server_profile` (row 20 + the level), guide J3. Mutants: no JSON (killed at §5's first log row), no 2 000 cap
+(killed at the string list's query count).
+
 ### The record before it was built (2026-10-27)
 
 

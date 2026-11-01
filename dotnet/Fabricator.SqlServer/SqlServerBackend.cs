@@ -2847,7 +2847,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             var qualified = Quote(schemaName) + "." + Quote(tableName);
             // ONE builder for the SET values and the predicate: they share the constant batch, and the builder
             // numbers its parameters itself, so the two cannot collide.
-            var builder = new FilterWhereBuilder(values);
+            var builder = new FilterWhereBuilder(values, Profile.SupportsOpenJson);
             var sql = new StringBuilder();
             if (set is null)
             {
@@ -4216,7 +4216,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             {
                 var values = ReadFilterValues(filterValues);
                 filterValues = null; // consumed + disposed by ReadFilterValues
-                var builder = new FilterWhereBuilder(values);
+                var builder = new FilterWhereBuilder(values, Profile.SupportsOpenJson);
                 var where = builder.Build(spec.Filter);
                 var allParams = new List<SqlParameter>(sourceParams);
                 allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint

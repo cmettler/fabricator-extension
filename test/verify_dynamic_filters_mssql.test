@@ -242,6 +242,80 @@ SELECT n > 0 FROM fabricator_query('rp', 'SELECT COUNT(*) AS n FROM sys.dm_exec_
 ----
 true
 
+# ═══ §5  A long key list goes as ONE JSON parameter (docs/duckdb-2.0-remote-execution.md §5.3) ══════════════
+# DuckDB hands a scan an IN list of the join's keys only up to dynamic_or_filter_threshold (default 50), a range above.
+# Raised, more than 50 integer keys go as OPENJSON(@p) — no 2100-parameter cap, one plan for any length.
+
+statement ok
+CREATE TABLE ids AS SELECT 7 * range::INT AS id FROM range(1, 301);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SET dynamic_or_filter_threshold = 5000;
+
+query II
+SELECT count(*), sum(b.v) FROM ids k JOIN sc.dbo.df_big b ON b.id = k.id;
+----
+300	14850
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big]%WHERE [id] IN (SELECT [v] FROM OPENJSON(@p0) WITH ([v] int ''$''))%'),
+       count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big]%' AND message LIKE '%params=1 %')
+FROM duckdb_logs WHERE type = 'Fabricator.Sql';
+----
+1	1
+
+query II
+SELECT count(*), sum(b.v) FROM ids k JOIN off.dbo.df_big b ON b.id = k.id;
+----
+300	14850
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# at DuckDB's default no key list reaches the server (DuckDB keeps a prefix-range filter of its own for these keys,
+# which has no T-SQL form)
+statement ok
+RESET dynamic_or_filter_threshold;
+
+query II
+SELECT count(*), sum(b.v) FROM ids k JOIN sc.dbo.df_big b ON b.id = k.id;
+----
+300	14850
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%OPENJSON%'), count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big]%WHERE [id] IN (%')
+FROM duckdb_logs WHERE type = 'Fabricator.Sql';
+----
+0	0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# a list that cannot go as JSON (strings) and would pass SQL Server's parameter cap is left out here — one
+# unfiltered query, not a failing one followed by a retry
+statement ok
+CREATE TABLE skeys AS SELECT 'k' || range AS region FROM range(1, 2501) UNION ALL SELECT 'r1';
+
+statement ok
+SET dynamic_or_filter_threshold = 5000;
+
+query II
+SELECT count(*), sum(b.v) FROM skeys k JOIN sc.dbo.df_big b ON b.region = k.region;
+----
+1000	50000
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%FROM [dbo].[df_big]%'), count(*) FILTER (WHERE message LIKE '%WHERE [region] IN (%')
+FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE 'query [%';
+----
+1	0
+
+statement ok
+RESET dynamic_or_filter_threshold;
+
 statement ok
 SELECT fabricator_exec('rp', 'DROP TABLE dbo.df_n');
 

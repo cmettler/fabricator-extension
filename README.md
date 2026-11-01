@@ -298,6 +298,11 @@ while the query runs, so `EXPLAIN` does not show it; the statement logged under 
 for a pushed part of a statement: a Top-N or a scalar subquery per row of a local table is computed on the server for
 those rows' keys only (`… ) AS [q] WHERE [c1] IN (…)`). An ASCII key is sent as `varchar`, so an index on a `varchar`
 column is sought. `ATTACH … (TYPE fabricator, dynamic_filters 'false')` turns it off for a catalog.
+⚠ DuckDB passes the keys as a list only up to its own `dynamic_or_filter_threshold` (default **50**); above that the
+server gets a range or nothing. For joins of many local keys with a large server table raise it, e.g. `SET
+dynamic_or_filter_threshold = 20000` — integer keys then go as one JSON parameter (`OPENJSON`, no 2100-parameter
+limit). It applies to local joins too and costs them a little (TPC-H SF1 all local: +8% at 20 000, ×2.3 at 100 000);
+see docs/sql-server-pushdown.md J3.
 
 **`remote_pushdown` (on by default since 2026-10-27; `'false'` opts out, any other value is refused).** The
 environment variable `FABRICATOR_REMOTE_PUSHDOWN=false` changes the default for every ATTACH that does not name the

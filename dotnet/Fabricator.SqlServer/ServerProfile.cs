@@ -131,9 +131,17 @@ internal sealed class ServerProfile
     /// </summary>
     public string DefaultSchema { get; }
 
+    /// <summary>The database's compatibility level; 0 when unknown.</summary>
+    public int CompatibilityLevel { get; }
+
+    /// <summary><c>OPENJSON</c> — a warehouse engine, or a database at compatibility level 130 or higher (unknown counts
+    /// as yes: a scan that fails on it falls back to the unfiltered query).</summary>
+    public bool SupportsOpenJson => IsWarehouse || CompatibilityLevel == 0 || CompatibilityLevel >= 130;
+
     private ServerProfile(int engineEdition, int productMajorVersion, string? productVersion, string? collation,
-                          string? defaultSchema)
+                          string? defaultSchema, int compatibilityLevel)
     {
+        CompatibilityLevel = compatibilityLevel;
         EngineEdition = engineEdition;
         ProductMajorVersion = productMajorVersion;
         ProductVersion = productVersion ?? string.Empty;
@@ -159,8 +167,8 @@ internal sealed class ServerProfile
 
     /// <summary>Construct from raw values (used by <see cref="Detect"/> and directly in tests).</summary>
     public static ServerProfile FromValues(int engineEdition, int productMajorVersion, string? productVersion,
-                                            string? collation, string? defaultSchema = null)
-        => new(engineEdition, productMajorVersion, productVersion, collation, defaultSchema);
+                                            string? collation, string? defaultSchema = null, int compatibilityLevel = 0)
+        => new(engineEdition, productMajorVersion, productVersion, collation, defaultSchema, compatibilityLevel);
 
     /// <summary>
     /// The profile as ordered (property, value) text rows — surfaced by the <c>fabricator_server_info(catalog)</c>
@@ -186,6 +194,7 @@ internal sealed class ServerProfile
         ("is_case_sensitive", Bool(IsCaseSensitive)),
         ("default_write_isolation", DefaultWriteIsolation.Length == 0 ? "(default)" : DefaultWriteIsolation),
         ("default_schema", DefaultSchema),
+        ("compatibility_level", CompatibilityLevel.ToString()),
     };
 
     private static string Bool(bool value) => value ? "true" : "false";
@@ -204,7 +213,8 @@ internal sealed class ServerProfile
             "CAST(SERVERPROPERTY('ProductMajorVersion') AS int), " +
             "CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), " +
             "CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS nvarchar(128)), " +
-            "SCHEMA_NAME()";
+            "SCHEMA_NAME(), " +
+            "(SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE database_id = DB_ID())";
         using var reader = cmd.ExecuteReader();
         if (!reader.Read())
         {
@@ -215,7 +225,8 @@ internal sealed class ServerProfile
         int productMajor = reader.IsDBNull(1) ? ParseLeadingInt(productVersion) : reader.GetInt32(1);
         string collation = reader.IsDBNull(3) ? string.Empty : reader.GetString(3);
         string? defaultSchema = reader.IsDBNull(4) ? null : reader.GetString(4);
-        return FromValues(engineEdition, productMajor, productVersion, collation, defaultSchema);
+        int compatibilityLevel = reader.IsDBNull(5) ? 0 : reader.GetInt32(5);
+        return FromValues(engineEdition, productMajor, productVersion, collation, defaultSchema, compatibilityLevel);
     }
 
     // "16.0.4135.4" -> 16; 0 on anything unparseable.

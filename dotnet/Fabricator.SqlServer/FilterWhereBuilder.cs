@@ -21,10 +21,21 @@ namespace Fabricator.SqlServer;
 internal sealed class FilterWhereBuilder
 {
     private readonly IReadOnlyList<object?> _values;
+    private readonly bool _openJson;
 
-    public FilterWhereBuilder(IReadOnlyList<object?> values)
+    /// <summary>More values than this go as ONE parameter, a JSON array read with <c>OPENJSON</c>; up to it, one
+    /// parameter each. 50 is DuckDB's default <c>dynamic_or_filter_threshold</c>, so a join's key list goes as before
+    /// unless the session raised it (docs/duckdb-2.0-remote-execution.md §5.3).</summary>
+    internal const int JsonListThreshold = 50;
+
+    /// <summary>SQL Server takes at most 2100 parameters per statement; a list that cannot go as JSON and would pass
+    /// this is refused here rather than by the server.</summary>
+    internal const int MaxListParameters = 2000;
+
+    public FilterWhereBuilder(IReadOnlyList<object?> values, bool openJson = false)
     {
         _values = values;
+        _openJson = openJson;
     }
 
     public List<SqlParameter> Parameters { get; } = new();
@@ -100,7 +111,50 @@ internal sealed class FilterWhereBuilder
     private string In(FilterNode node)
     {
         var idxs = node.Vals ?? throw new InvalidOperationException("in without vals");
+        if (idxs.Count > JsonListThreshold && _openJson && JsonIntegerType(idxs) is { } sqlType)
+        {
+            // A long key list (a hash join's keys under a raised dynamic_or_filter_threshold) as one JSON parameter:
+            // no 2100-parameter cap, one plan for any list length, and MEASURED as fast as the parameter list or
+            // faster — 411 keys over 6M rows 0.17 s vs 0.22 s, 10 664 keys 0.46 s where the range alone took 7.8 s.
+            // Integers only: their JSON form is exact, and the type matches the column's.
+            var name = "@p" + Parameters.Count;
+            var json = new StringBuilder("[");
+            for (int i = 0; i < idxs.Count; i++)
+            {
+                json.Append(i == 0 ? "" : ",").Append(Convert.ToString(_values[idxs[i]], System.Globalization.CultureInfo.InvariantCulture));
+            }
+            json.Append(']');
+            Parameters.Add(new SqlParameter(name, System.Data.SqlDbType.NVarChar, -1) { Value = json.ToString() });
+            return $"{Col(node)} IN (SELECT [v] FROM OPENJSON({name}) WITH ([v] {sqlType} '$'))";
+        }
+        if (idxs.Count > MaxListParameters)
+        {
+            throw new NotSupportedException($"fabricator: an IN list of {idxs.Count} values exceeds the parameter limit");
+        }
         return $"{Col(node)} IN ({string.Join(", ", idxs.Select(i => Param(i, equality: true)))})";
+    }
+
+    /// <summary>The T-SQL type of an IN list whose values are all integers of one CLR type, else null.</summary>
+    private string? JsonIntegerType(IReadOnlyList<int> idxs)
+    {
+        string? type = null;
+        foreach (var i in idxs)
+        {
+            string? t = _values[i] switch
+            {
+                long => "bigint",
+                int => "int",
+                short => "smallint",
+                byte => "tinyint",
+                _ => null,
+            };
+            if (t is null || (type is not null && t != type))
+            {
+                return null;
+            }
+            type = t;
+        }
+        return type;
     }
 
     private static string Col(FilterNode node)
