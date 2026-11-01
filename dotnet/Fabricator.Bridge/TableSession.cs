@@ -275,6 +275,16 @@ internal sealed class TableSession
     }
 }
 
+/// <summary>Answers for a schema catalog discovery did not return (ABI v100, capability <c>schema_by_name</c>): a
+/// discovery filter bounds enumeration, never access by name. Lives in the Bridge, like
+/// <see cref="IDeleteWhereShape"/>, so the plugin contract is unchanged.</summary>
+public interface ISchemaByName
+{
+    /// <summary>Whether the schema at <paramref name="path"/> exists and would be served. False for a schema the
+    /// provider never serves, whatever its filters.</summary>
+    bool SchemaExists(IReadOnlyList<string> path);
+}
+
 /// <summary>
 /// Narrows WHEN the host takes a binding's predicate DELETE (<see cref="ITableBinding.DeleteWhere"/>), for a
 /// provider whose predicate statement is not equivalent to the rowid path everywhere. Internal on purpose: the

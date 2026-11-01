@@ -76,6 +76,9 @@ struct FabricatorCapabilities {
 	bool bind_schema_cacheable = false;
 	//! DELETE / UPDATE / MERGE … RETURNING: the provider returns the rows a rowid DML changed (ABI v98).
 	bool dml_returning = false;
+	//! A discovery filter left schemas out, and the provider answers catalog_schema_exists (ABI v100) for a
+	//! schema a statement names: a filter bounds enumeration, never access by name.
+	bool schema_by_name = false;
 
 	//! The provider runs a whole SELECT pushed by DuckDB's remote optimizer (src/catalog/fabricator_remote_select.cpp).
 	//! Opt-in: SQL Server reports it only with the `remote_pushdown` ATTACH option.

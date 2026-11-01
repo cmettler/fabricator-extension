@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 99;
+        vtable->AbiVersion = 100;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -179,6 +179,7 @@ public static unsafe class Bootstrap
         vtable->RemoteTranslate = &RemoteTranslate;
         vtable->ExecuteModifyReturning = &ExecuteModifyReturning;
         vtable->ExecuteQueryFiltered = &ExecuteQueryFiltered;
+        vtable->CatalogSchemaExists = &CatalogSchemaExists;
         return FabricatorStatus.Ok;
     }
 
@@ -919,6 +920,29 @@ public static unsafe class Bootstrap
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             catalog.CreateSchema(ReadSchemaPath(schemaPath, schemaPathLen), ifNotExists != 0);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // ABI v100: a schema the discovery filter left out, named by a statement. A provider without ISchemaByName
+    // answers "no" — what the host concluded before this entry existed.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogSchemaExists(nint handle, byte** schemaPath, int schemaPathLen, int* exists, byte** err)
+    {
+        try
+        {
+            if (exists is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IProviderCatalog>(handle);
+            *exists = catalog is ISchemaByName byName && byName.SchemaExists(ReadSchemaPath(schemaPath, schemaPathLen))
+                ? 1 : 0;
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

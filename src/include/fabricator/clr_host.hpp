@@ -177,6 +177,9 @@ void CloseCatalog(FabricatorHandle handle);
 // `params` (nullable, ABI v88): the caller's parameter bag — see abi.h execute_query. The managed side
 // CONSUMES it, so a caller invoked more than once (a bind + a scan) must build a fresh one per call.
 //! A pushed query with its scan spec and filter constants (ABI v99); the provider may ignore them.
+//! Whether the schema at `schema_path` exists (ABI v100), for a name discovery did not return.
+bool CatalogSchemaExists(FabricatorHandle handle, const std::vector<std::string> &schema_path);
+
 void ExecuteQueryFiltered(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out,
                           ArrowArrayStream *params, const std::string &spec_json, ArrowArrayStream *filter_values);
 void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out,

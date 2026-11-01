@@ -102,6 +102,36 @@ FabricatorSchemaEntry *FabricatorCatalog::FindSchemaPathLocked(const vector<stri
 	return current;
 }
 
+FabricatorSchemaEntry *FabricatorCatalog::FindRootSchemaLocked(optional_ptr<ClientContext> context,
+                                                                const string &name) {
+	auto it = schemas_.find(name);
+	if (it != schemas_.end()) {
+		return it->second.get();
+	}
+	auto by_name = by_name_schemas_.find(name);
+	if (by_name != by_name_schemas_.end()) {
+		return by_name->second.get();
+	}
+	// A discovery filter bounds ENUMERATION, never access by name — the rule tables have followed since
+	// 2026-07-15. Only a provider that declared `schema_by_name` is asked (one with a filter set), so a catalog
+	// without a filter keeps its old answer at no cost. Without a context there is no transaction to run the
+	// question in; the answer is then the old one.
+	if (!schema_by_name_ || !context || name.empty() || absent_schemas_.count(name)) {
+		return nullptr;
+	}
+	FabricatorSetActiveTxn(handle_, *context);
+	if (!fabricator::CatalogSchemaExists(handle_, {name})) {
+		absent_schemas_.insert(name);
+		return nullptr;
+	}
+	CreateSchemaInfo info;
+	info.SetSchema(Identifier(name));
+	auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
+	auto *result = entry.get();
+	by_name_schemas_[name] = std::move(entry);
+	return result;
+}
+
 void FabricatorCatalog::RegisterDeclarationsLocked() {
 	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates), macros and views register
 	// onto the schema at their PATH (ABI v97) — but ONLY a schema already registered by discovery. The managed
@@ -205,6 +235,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		remote_select_ = caps.remote_select;
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
 		dml_returning_ = caps.dml_returning;
+		schema_by_name_ = caps.schema_by_name;
 		default_schema_ = caps.default_schema;
 		pushdown_boundary_ = caps.pushdown_boundary;
 	} catch (std::exception &ex) {
@@ -216,6 +247,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		remote_select_ = false;
 		bind_schema_cacheable_ = false;
 		dml_returning_ = false;
+		schema_by_name_ = false;
 		default_schema_.clear();
 		pushdown_boundary_.clear();
 		// ⚠ IT WARNS NOW, and the silence was the defect. This catch guards TWO unrelated things: a provider
@@ -309,6 +341,13 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 		it = schemas_.erase(it);
 	}
 	discovered_roots_ = std::move(live_roots);
+	// Found-by-name schemas are re-asked after a refresh, like tables found by name: retired (a binder may hold
+	// one), and the remembered absences go too — a schema created out of band since is real now.
+	for (auto &entry : by_name_schemas_) {
+		retired_schemas_.push_back(std::move(entry.second));
+	}
+	by_name_schemas_.clear();
+	absent_schemas_.clear();
 	RegisterDeclarationsLocked();
 }
 
@@ -332,9 +371,7 @@ optional_ptr<SchemaCatalogEntry> FabricatorCatalog::LookupSchema(CatalogTransact
 	// lookups never go past the root, which is why slices 1 and 2a stayed green while this was missing.
 	auto resolved = LookupSchemaPath(transaction, schema_lookup, OnEntryNotFound::RETURN_NULL,
 	                                 [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
-		                                 auto it = schemas_.find(root.GetEntryName());
-		                                 return it == schemas_.end() ? nullptr
-		                                                             : optional_ptr<CatalogEntry>(it->second.get());
+		                                 return FindRootSchemaLocked(transaction.context, root.GetEntryName());
 	                                 });
 	if (!resolved && !default_schema_.empty() && !StringUtil::CIEquals(default_schema_, DEFAULT_SCHEMA)) {
 		// DuckDB's default schema name `main`, where the provider's own default is another schema (SQL Server:
@@ -349,9 +386,7 @@ optional_ptr<SchemaCatalogEntry> FabricatorCatalog::LookupSchema(CatalogTransact
 			                            EntryLookupInfo(schema_lookup, QualifiedName(Identifier(default_schema_))),
 			                            OnEntryNotFound::RETURN_NULL,
 			                            [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
-				                            auto it = schemas_.find(root.GetEntryName());
-				                            return it == schemas_.end() ? nullptr
-				                                                        : optional_ptr<CatalogEntry>(it->second.get());
+				                            return FindRootSchemaLocked(transaction.context, root.GetEntryName());
 			                            });
 		}
 	}
@@ -501,6 +536,11 @@ void FabricatorCatalog::RetireSchemaPathLocked(const vector<string> &path) {
 		if (it != schemas_.end()) {
 			retired_schemas_.push_back(std::move(it->second));
 			schemas_.erase(it);
+		}
+		auto by_name = by_name_schemas_.find(path[0]);
+		if (by_name != by_name_schemas_.end()) {
+			retired_schemas_.push_back(std::move(by_name->second));
+			by_name_schemas_.erase(by_name);
 		}
 		return;
 	}

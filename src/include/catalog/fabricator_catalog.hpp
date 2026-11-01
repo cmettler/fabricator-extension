@@ -249,6 +249,8 @@ private:
 	//! Capability `dml_returning`: DELETE / UPDATE / MERGE … RETURNING. Refused at PLANNING otherwise, before any
 	//! action has written anything.
 	bool dml_returning_ = false;
+	//! Capability `schema_by_name`: a schema discovery did not return is asked for by name (ABI v100).
+	bool schema_by_name_ = false;
 	bool supports_nested_schemas_ = false;
 	//! The provider's default schema (capability `default_schema`); empty => DuckDB's `main`.
 	string default_schema_;
@@ -265,6 +267,13 @@ private:
 	bool superset_filter_pushdown_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> schemas_;
+	//! Schemas a discovery filter left out that a statement named and the provider confirmed (capability
+	//! `schema_by_name`). Resolvable, but NOT enumerated — the same rule as a table found by name, which is cached
+	//! but kept out of the table list. Cleared by RefreshCache. Guarded by schema_lock_.
+	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> by_name_schemas_;
+	//! Names the provider said do not exist, so DuckDB's binder — which asks every attached catalog about a
+	//! two-part name's first part — costs one round trip per name, not one per bind. Cleared by RefreshCache.
+	case_insensitive_set_t absent_schemas_;
 	//! The schema roots the last discovery reported (LoadCatalog / RefreshCache): a refresh retires one of these
 	//! that is no longer reported. Guarded by schema_lock_.
 	case_insensitive_set_t discovered_roots_;
@@ -285,6 +294,10 @@ private:
 	//! The schema entry at `path`, or null — creates NOTHING (a declaration must not resurrect a schema the
 	//! ATTACH schema_filter kept out). Requires schema_lock_.
 	FabricatorSchemaEntry *FindSchemaPathLocked(const vector<string> &path);
+	//! The top-level schema called `name`: discovered, else found by name before, else — with `schema_by_name` —
+	//! asked of the provider (catalog_schema_exists) and kept in by_name_schemas_. Null when absent.
+	//! Requires schema_lock_.
+	FabricatorSchemaEntry *FindRootSchemaLocked(optional_ptr<ClientContext> context, const string &name);
 	//! Registers the discovered functions, macros and views onto their schema paths. Requires schema_lock_.
 	void RegisterDeclarationsLocked();
 

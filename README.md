@@ -264,7 +264,9 @@ ATTACH 'Server=host,1433;Database=db;User Id=sa;Password=***;TrustServerCertific
 -- mssql:// URI (encrypt defaults on; ?encrypt=false to disable)
 ATTACH 'mssql://sa:***@host:1433/db' AS mssql (TYPE fabricator);
 
--- Restrict catalog discovery on large servers (case-insensitive regex, partial match)
+-- Restrict catalog discovery on large servers (case-insensitive regex, partial match). The filters bound what
+-- is LISTED (SHOW TABLES, duckdb_tables, information_schema), not what a statement may name: mssql.hr.employees
+-- still resolves although `hr` is filtered out. System schemas (sys, INFORMATION_SCHEMA, guest, db_*) never do.
 ATTACH 'Server=...;Database=...' AS mssql
   (TYPE fabricator, schema_filter '^(dbo|sales)$', table_filter '^fact_');
 

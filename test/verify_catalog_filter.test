@@ -100,5 +100,105 @@ SELECT * FROM dbsys.guest.gv_sysfilter;
 statement ok
 DETACH dbsys;
 
+# ── §4  A SCHEMA THE FILTER LEFT OUT IS STILL REACHABLE BY NAME
+#
+# A filter bounds ENUMERATION, never access by name — the rule tables have followed since 2026-07-15. Until
+# 2026-11-01 it stopped at the schema: a table in a schema schema_filter excluded was "schema not found"
+# even when the statement named it in full. Now the host asks the provider (ABI v100, catalog_schema_exists)
+# for a name discovery did not return; the schema resolves but stays out of every listing, like a table
+# found by name.
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF SCHEMA_ID(''sf_other'') IS NULL EXEC(''CREATE SCHEMA sf_other'')');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''sf_other.sf_t'') IS NOT NULL DROP TABLE sf_other.sf_t; CREATE TABLE sf_other.sf_t (id int, s nvarchar(10)); INSERT sf_other.sf_t VALUES (1, N''a''), (2, N''b'')');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''guest.gv_sysfilter'') IS NOT NULL DROP VIEW guest.gv_sysfilter');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'CREATE VIEW guest.gv_sysfilter AS SELECT 1 AS x');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dbsf (TYPE fabricator, schema_filter '^dbo$');
+
+# Enumeration is still bounded: the excluded schema and its table are not listed.
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dbsf' AND schema_name = 'sf_other';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dbsf' AND schema_name = 'sf_other';
+----
+0
+
+# ...but the table is reachable by its full name — read, and written.
+query IT
+SELECT id, s FROM dbsf.sf_other.sf_t ORDER BY id;
+----
+1	a
+2	b
+
+statement ok
+INSERT INTO dbsf.sf_other.sf_t VALUES (3, 'c');
+
+query I
+SELECT count(*) FROM dbsf.sf_other.sf_t;
+----
+3
+
+# Case does not matter, as everywhere else in the catalog.
+query I
+SELECT count(*) FROM dbsf.SF_OTHER.sf_t;
+----
+3
+
+# Reaching it by name does not put it into the listings either.
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dbsf' AND schema_name = 'sf_other';
+----
+0
+
+# A schema that does not exist is still not found — the question is asked, the answer is no.
+statement error
+SELECT * FROM dbsf.no_such_schema_sf.t;
+----
+schema "no_such_schema_sf" does not exist
+
+# A system schema stays unreachable with a filter set too: the provider never serves it, whatever the filter.
+statement error
+SELECT * FROM dbsf.guest.gv_sysfilter;
+----
+schema "guest" does not exist
+
+# After a refresh the schema is asked for again and still resolves.
+statement ok
+SELECT fabricator_refresh_cache('dbsf');
+
+query I
+SELECT count(*) FROM dbsf.sf_other.sf_t;
+----
+3
+
+# Without a filter nothing is asked: discovery already returns the schema.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dbnf (TYPE fabricator);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dbnf' AND schema_name = 'sf_other';
+----
+1
+
+statement ok
+DETACH dbnf;
+
+statement ok
+DETACH dbsf;
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP TABLE sf_other.sf_t; DROP SCHEMA sf_other');
+
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP VIEW guest.gv_sysfilter');

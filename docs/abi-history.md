@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v84
+# ABI history — prior versions v16–v100
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,20 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v100 (2026-11-01) — `catalog_schema_exists`: a schema a discovery filter left out, named by a statement
+
+ONE entry appended after `execute_query_filtered`: `(handle, schema_path, schema_path_len, *exists, err)`. A filter
+bounds ENUMERATION, never access by name — tables have followed that since 2026-07-15, schemas did not: with
+`schema_filter '^dbo$'`, `db.hr.t` was "schema not found". `FabricatorCatalog::LookupSchema` now asks the provider for
+a top-level name discovery did not return, keeps a confirmed one OUT of `schemas_` (resolvable, never listed, like a
+table found by name) and remembers a "no" — DuckDB's binder asks every attached catalog about a two-part name's first
+part, so without the memo each bind would cost a round trip. Both are forgotten by `RefreshCache`. Asked only when the
+capability doc says `schema_by_name` (SQL Server: a `schema_filter` is set), so a catalog without a filter is
+unchanged. The managed side is the Bridge interface `ISchemaByName` (built-in providers only, beside
+`IDeleteWhereShape`); a provider without it answers "no", which is the old behaviour. SQL Server refuses the system
+schemas discovery never serves (`ExcludedSchemas`) whatever the filter. Gate `verify_catalog_filter` §4 (16 → 40), two
+mutants (capability never declared; system schemas not excluded), each killed at its own row.
 
 ## v99 (2026-10-30) — `execute_query_filtered`: a pushed query under DuckDB's table filters
 

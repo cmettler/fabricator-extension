@@ -1233,6 +1233,15 @@ typedef struct FabricatorVTable {
 	int32_t (*execute_query_filtered)(FabricatorHandle handle, const char *sql, struct ArrowArrayStream *params,
 	                                  const char *spec_json, struct ArrowArrayStream *filter_values,
 	                                  struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// Does the schema at this path exist — ABI v100. Asked only for a name catalog discovery did not return, and
+	// only by a catalog whose capability doc declares `schema_by_name` (a discovery filter is set): a filter bounds
+	// ENUMERATION, never access by name, so a schema it left out must still resolve when a statement names it.
+	// *exists = 1 or 0. A provider must answer 0 for a schema it would refuse to serve (system schemas).
+	// -------------------------------------------------------------------------
+	int32_t (*catalog_schema_exists)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                                 int32_t *exists, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1469,7 +1478,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 99
+#define FABRICATOR_ABI_VERSION 100
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

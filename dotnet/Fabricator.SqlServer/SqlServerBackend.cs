@@ -424,7 +424,7 @@ public sealed class SqlServerBackend : IProvider
 /// <see cref="SqlConnection"/> (ADO.NET pools by connection string); the
 /// connection's lifetime is owned by the returned Arrow stream.
 /// </summary>
-public sealed partial class SqlServerCatalog : IProviderCatalog
+public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
 {
     // Traces every T-SQL statement the provider sends to SQL Server (the scan/filter/DML SQL, the connection
     // routing and affected-row counts) — off by default (FABRICATOR_LOG_LEVEL). This is the SQL-provider
@@ -3631,6 +3631,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
            $"\"dml_returning\":{(!Profile.IsWarehouse || Profile.ReturnsByReadBack ? "true" : "false")}," +
            $"\"default_schema\":{JsonSerializer.Serialize(Profile.DefaultSchema)}," +
            $"\"pushdown_boundary\":\"{_pushdownBoundary}\"," +
+           // schema_by_name: with a schema_filter set, a schema it left out is still reachable when a statement
+           // names it (ISchemaByName) — the filter bounds enumeration, never access by name. Without a filter
+           // discovery returns every schema there is, so the host need not ask.
+           $"\"schema_by_name\":{(_schemaFilter is not null ? "true" : "false")}," +
            $"\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
            $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";
 
@@ -4019,6 +4023,22 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { names.Build() }, n);
         return new InMemoryArrayStream(schema, new[] { batch });
+    }
+
+    /// <summary>A schema a statement names that discovery did not return (ABI v100): exists, and is not one of the
+    /// system schemas discovery never serves (<see cref="ExcludedSchemas"/>), whatever <c>schema_filter</c> says.
+    /// Compared case-insensitively, as the host looks names up.</summary>
+    public bool SchemaExists(IReadOnlyList<string> path)
+    {
+        if (path.Count != 1 || string.IsNullOrEmpty(path[0]))
+        {
+            return false;
+        }
+        var rows = ReadMetadataRows(
+            "SELECT s.name FROM sys.schemas s WHERE s.name NOT IN (" + ExcludedSchemas + ") " +
+            "AND UPPER(s.name) = UPPER(@name)", 1,
+            new[] { new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = path[0] } });
+        return rows.Count > 0;
     }
 
     // schema_filter + table_filter applied: a table is kept only if its schema matches schema_filter (or none

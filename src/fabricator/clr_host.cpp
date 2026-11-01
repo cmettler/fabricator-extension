@@ -1663,6 +1663,21 @@ void CreateSchema(FabricatorHandle handle, const std::vector<std::string> &schem
 	}
 }
 
+bool CatalogSchemaExists(FabricatorHandle handle, const std::vector<std::string> &schema_path) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.catalog_schema_exists) {
+		throw duckdb::IOException("Fabricator: bridge does not provide catalog_schema_exists");
+	}
+	char *err = nullptr;
+	int32_t exists = 0;
+	PathArgs path(schema_path);
+	int32_t rc = vt.catalog_schema_exists(handle, path.Data(), path.Len(), &exists, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: catalog_schema_exists failed");
+	}
+	return exists != 0;
+}
+
 void DropSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, bool if_exists) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.drop_schema) {

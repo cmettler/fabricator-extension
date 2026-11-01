@@ -353,6 +353,8 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, int, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteModifyReturning;
     // ABI v99: execute_query + a scan spec and its filter constants.
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteQueryFiltered;
+    // ABI v100: whether a schema discovery did not return exists (catalog_schema_exists).
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, int*, byte**, int> CatalogSchemaExists;
 }
 
 /// <summary>
