@@ -338,6 +338,20 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         cancellationToken.ThrowIfCancellationRequested();
         var resolved = Resolve(path);
         EnsureParentDir(resolved);
+        // A file is published only by CompleteAsync, and disposing it uncompleted abandons it (engineered-wood
+        // #501). On a local WINDOWS root that is engineered-wood's own LocalSequentialFile: written under a temporary
+        // name and moved onto the real one at completion, no-replace when overwrite is false — the same primitive our
+        // commit publish uses (TryPublishLocalWindows). The early existence check is the contract's "fails early";
+        // the move is the atomic one. NOT on POSIX: a no-replace move is a link() there, which a FUSE mount (Fabric's
+        // /lakehouse/default) does not have — O_EXCL at open is the measured-safe primitive on that mount.
+        if (OperatingSystem.IsWindows() && !_root.Contains("://"))
+        {
+            if (!overwrite && System.IO.File.Exists(resolved))
+            {
+                throw new System.IO.IOException($"DuckDbTableFileSystem: file already exists: {path}");
+            }
+            return new ValueTask<ISequentialFile>(new EngineeredWood.IO.Local.LocalSequentialFile(resolved, overwrite));
+        }
         nint file;
         if (overwrite)
         {
@@ -348,7 +362,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             // Contract: CreateAsync fails when the file exists and overwrite is false.
             throw new System.IO.IOException($"DuckDbTableFileSystem: file already exists: {path}");
         }
-        return new ValueTask<ISequentialFile>(new DuckDbSequentialFile(file));
+        return new ValueTask<ISequentialFile>(new DuckDbSequentialFile(file, Opener, resolved));
     }
 
     /// <summary>
@@ -422,7 +436,14 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             }
             return new ValueTask<bool>(won);
         }
-        if (!HostFs.TryOpenWriteExclusive(Opener, dst, out nint target))
+        bool created = HostFs.TryOpenWriteExclusive(Opener, dst, out nint target);
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            // The same line the Windows publish writes, so a race is countable on every platform.
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "exclusive publish {Path} -> {Outcome}", path,
+                created ? "won" : "LOST (exists)");
+        }
+        if (!created)
         {
             return new ValueTask<bool>(false); // target exists => commit conflict
         }
@@ -699,21 +720,40 @@ internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
 
 /// <summary>
 /// Sequential (append-only) write handle over a host <c>FileSystem</c> file (opened via fs_open_write). Writes
-/// are synchronous host calls in completed <see cref="ValueTask"/>s; the handle is flushed + closed on dispose.
-/// Azure DFS only accepts sequential writes, which is exactly this contract.
+/// are synchronous host calls in completed <see cref="ValueTask"/>s. Azure DFS only accepts sequential writes,
+/// which is exactly this contract.
 /// </summary>
+/// <remarks>
+/// <see cref="CompleteAsync"/> publishes by closing the handle, which is where an object store makes the object
+/// visible. Disposing without it ABANDONS the write (engineered-wood #501): the handle is closed and the file
+/// removed, so a write that failed part-way leaves nothing at the name. ⚠ The name is written directly, not a
+/// temporary one: on a local POSIX root a concurrent reader can see the file while it is being written (a reader
+/// falls back from an unreadable newest checkpoint, #500). Windows local roots take LocalSequentialFile instead.
+/// </remarks>
 internal sealed unsafe class DuckDbSequentialFile : ISequentialFile
 {
     private readonly nint _file;
+    private readonly nint _opener;
+    private readonly string _path;
     private long _position;
     private bool _closed;
+    private bool _completed;
 
-    public DuckDbSequentialFile(nint file) => _file = file;
+    public DuckDbSequentialFile(nint file, nint opener, string path)
+    {
+        _file = file;
+        _opener = opener;
+        _path = path;
+    }
 
     public long Position => _position;
 
     public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
+        if (_closed)
+        {
+            throw new InvalidOperationException("DuckDbSequentialFile: the file has already been completed");
+        }
         if (data.Length > 0)
         {
             using var pin = data.Pin();
@@ -727,12 +767,38 @@ internal sealed unsafe class DuckDbSequentialFile : ISequentialFile
     // already handed straight to the FileHandle, so this is a no-op until Dispose.
     public ValueTask FlushAsync(CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
 
+    public ValueTask CompleteAsync(CancellationToken cancellationToken = default)
+    {
+        if (_completed)
+        {
+            return ValueTask.CompletedTask;
+        }
+        if (_closed)
+        {
+            throw new InvalidOperationException("DuckDbSequentialFile: the write was abandoned");
+        }
+        _closed = true;
+        HostFs.CloseWrite(_file);
+        _completed = true;
+        return ValueTask.CompletedTask;
+    }
+
     public void Dispose()
     {
-        if (!_closed)
+        if (_closed)
         {
-            _closed = true;
-            HostFs.CloseWrite(_file);
+            return;
+        }
+        _closed = true;
+        HostFs.CloseWrite(_file);
+        // Abandoned: never completed, so whatever the close published must not stay at the name. Best effort — a
+        // failed removal leaves an unreferenced file for VACUUM, which is what an aborted write left before.
+        try
+        {
+            HostFs.Remove(_opener, _path);
+        }
+        catch (Exception)
+        {
         }
     }
 

@@ -117,6 +117,34 @@ internal static class DeltaReader
     public static long Checkpoint(nint opener, string path)
         => CheckpointAsync(opener, path).GetAwaiter().GetResult();
 
+    /// <summary>RESTORE TABLE (engineered-wood's <c>DeltaTable.RestoreAsync</c>): commits the state at
+    /// <paramref name="version"/>, or at the latest version committed at or before <paramref name="timestamp"/>.
+    /// Opens FRESH, like <see cref="Checkpoint"/>: the restore diffs against the table's current state, and a
+    /// commit landing meanwhile makes it fail (retry), so a cached snapshot would only make that likelier.</summary>
+    public static RestoreResult Restore(nint opener, string path, long? version, DateTime? timestamp,
+                                        bool ignoreMissingFiles)
+        => RestoreAsync(opener, path, version, timestamp, ignoreMissingFiles).GetAwaiter().GetResult();
+
+    private static async Task<RestoreResult> RestoreAsync(nint opener, string path, long? version,
+                                                          DateTime? timestamp, bool ignoreMissingFiles)
+    {
+        using var interrupt = new InterruptScope(opener, CancellationToken.None);
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), interrupt.Token).ConfigureAwait(false);
+        try
+        {
+            var options = new RestoreOptions { IgnoreMissingFiles = ignoreMissingFiles };
+            return version is { } v
+                ? await table.RestoreAsync(v, options, interrupt.Token).ConfigureAwait(false)
+                : await table.RestoreAsync(new DateTimeOffset(DateTime.SpecifyKind(timestamp!.Value, DateTimeKind.Utc)),
+                                           options, interrupt.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     private static async Task<long> CheckpointAsync(nint opener, string path)
     {
         var fs = TableFileSystems.Create(opener, path);
@@ -608,17 +636,29 @@ internal static class DeltaReader
             var dvReader = new DeletionVectorReader(fs);
             var files = new List<NativeScanFile>();
             int pruned = snap.ActiveFiles.Count - planned.Count;
-            // AnyUri is PRE-prune BY CONTRACT — it is what the schema probe falls back to when every file
-            // pruned away, exactly the case where `planned` is empty. So take it from the active set, not
-            // from the plan. Path-sorted minimum rather than first-enumerated to keep it deterministic
-            // (it is the same file the old hand-rolled sort picked), in one pass instead of a second sort.
-            string? minPath = null;
-            foreach (var add in snap.ActiveFiles.Values)
+            // AnyUri is the file the schema probe reads (ProbeSchema: a `LIMIT 0` that still opens the footer).
+            // A file THIS SCAN READS when there is one: the first planned file, so the probe costs no read of a
+            // file pruning excluded. Until 2026-11-01 it was always the path-smallest ACTIVE file, so a scan of
+            // partition c opened partition a's footer — one extra request per scan on remote storage, and a scan
+            // that failed outright when that excluded file was unreadable (measured: a rowid DELETE WHERE p = 'c'
+            // with p=a's file corrupt). Only when every file pruned away does it fall back to the active set,
+            // which is why it exists at all: the probe still needs SOME file to type the columns. Both choices
+            // are deterministic — `planned` is in ordinal (path) order, and the fallback is the path-smallest.
+            string? anyUri = null;
+            if (planned.Count > 0)
             {
-                if (minPath is null || string.CompareOrdinal(add.Path, minPath) < 0)
-                    minPath = add.Path;
+                anyUri = FileUri(root, planned[0].File.Path);
             }
-            string? anyUri = minPath is null ? null : FileUri(root, minPath);
+            else
+            {
+                string? minPath = null;
+                foreach (var add in snap.ActiveFiles.Values)
+                {
+                    if (minPath is null || string.CompareOrdinal(add.Path, minPath) < 0)
+                        minPath = add.Path;
+                }
+                anyUri = minPath is null ? null : FileUri(root, minPath);
+            }
             foreach (var (ordinal, add) in planned)
             {
                 var uri = FileUri(root, add.Path);
@@ -1493,7 +1533,7 @@ internal static class DeltaReader
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
         var fs = TableFileSystems.Create(opener, path);
-        var options = DeltaWriter.Options() with { DeleteTrustsStatistics = trustStatistics };
+        var options = DeltaWriter.Options() with { TrustStatisticsProofs = trustStatistics };
         var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
         try
         {
@@ -3659,8 +3699,12 @@ internal static class DeltaReader
         // ONE version: the deletion-vector mask, the post-image append and the CDF pair. Based on the PINNED
         // snapshot — the parameterless StartTransaction would make the commit's validation vacuous, since it
         // would ask what landed since the version it just read.
-        await txn.StageRowDeletesAsync(selection, token).ConfigureAwait(false);
-        await txn.StageDataFilesAsync(written, cancellationToken: token).ConfigureAwait(false);
+        // changeDataStagedByCaller: the update_preimage / update_postimage pairs above ARE this commit's change rows;
+        // left undeclared, engineered-wood (#530) would add a delete and an insert for the same rows.
+        await txn.StageRowDeletesAsync(selection, RowDeleteMode.DeletionVector, token, changeDataStagedByCaller: true)
+            .ConfigureAwait(false);
+        await txn.StageDataFilesAsync(written, changeDataStagedByCaller: true, cancellationToken: token)
+            .ConfigureAwait(false);
         await txn.CommitAsync(token).ConfigureAwait(false);
         MemoryProbe.Mark("delta update mor: committed", matched);
     }

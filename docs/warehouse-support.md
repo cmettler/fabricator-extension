@@ -641,6 +641,12 @@ capability `dml_returning` on; Synapse dedicated stays refused (it may round whe
   `--staging` — `COPY INTO`, incl. MERGE, the moved CTE, BEGIN … ROLLBACK / COMMIT and both refusals; exit code 1 on
   a failure. Three mutants killed (no conversion; DELETE reading after; UPDATE reading before). No CI tier reaches a
   warehouse, so run it after changing this path.
+- **And as a suite (2026-11-01):** `test/verify_returning_fabric.test` (122, manual tier — `require-env
+  FABRICATOR_FABRIC_WAREHOUSE_DSN`, a SqlClient connection string with its own Entra authentication, which no tier
+  provides). SqlBulkCopy path only. Each RETURNING is followed by a read of the stored rows pinned to the SAME values,
+  so the pair asserts returned = stored and pins what Fabric does to them, measured: DATETIME2(3) and TIME(3)
+  TRUNCATE (`.123456` → `.123`, `23:59:59.9995` → `.999`, `.0005` → `00:00:00`), and CHAR(5) pads by BYTES under the
+  UTF-8 collation (`'ä'` → `'ä'` + three spaces). MERGE's rows are compared sorted — the server gives no order.
 
 ## 7. Open decisions
 

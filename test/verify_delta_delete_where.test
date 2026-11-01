@@ -342,6 +342,39 @@ SELECT p, count(*) FROM lake.main.pc GROUP BY p ORDER BY p;
 ----
 b	10
 
+# ═══ §4b  The rowid path reads only the partitions its WHERE names ═══════════════════════════════════
+# The scan's schema probe used to open the path-smallest ACTIVE file — another partition's — so a rowid DELETE
+# of partition c read partition a's footer (one extra request per scan) and failed outright when that file was
+# unreadable. MEASURED before the fix: this DELETE failed with "too small to be a Parquet file".
+
+statement ok
+CREATE TABLE lake.main.pd (id INTEGER, p VARCHAR) PARTITIONED BY (p) WITH (column_mapping='none');
+
+statement ok
+INSERT INTO lake.main.pd SELECT i, ['a','b','c'][i % 3 + 1] FROM range(30) t(i);
+
+query I
+SELECT sum(fabricator_host_exec('COPY (SELECT ''garbage'' AS x) TO ''' || file || ''' (FORMAT csv)'))
+FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/dw/pd/p=a/*.parquet');
+----
+1
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM lake.main.pd WHERE p = 'c';
+----
+10
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query II
+SELECT p, count(*) FROM lake.main.pd WHERE p <> 'a' GROUP BY p ORDER BY p;
+----
+b	10
+
 # ═══ §5  A file whose statistics prove every row matches is removed WITHOUT READING it ════════════════
 
 statement ok

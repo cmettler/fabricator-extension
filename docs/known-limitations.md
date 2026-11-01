@@ -401,6 +401,11 @@ file-layout check.
 
 ## 3. Interop constraints that are permanent, not bugs
 
+- **DuckDB 2.0 needs Python 3.11 or newer, and a Fabric PYTHON notebook runs 3.10** (measured 2026-11-01:
+  `pip install duckdb==2.0.0` has no 3.10 wheel — 2.0.0 ships cp311 and cp312-abi3 Linux wheels). So the 2.0
+  line does not run in Fabric's default Python notebook kernel at all. The PySpark kernel works: Python 3.13, the
+  `cp312-abi3` wheel, the `/lakehouse/default` fuse mount present — measured with the 16-writer fuse race
+  (docs/delta-transactions.md, the Local POSIX row). The 1.5 line is unaffected.
 - **SQL Server's `DELTA` reader is protocol 1.0 only.** A table it must read has to be written
   `deletion_vectors false, column_mapping 'none'`. Column mapping ⇒ error 19725; a **materialized** deletion
   vector ⇒ 19726. ⚠ **A protocol bump alone is tolerated** — a DV-declared table with no DV written reads

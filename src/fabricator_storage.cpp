@@ -228,7 +228,14 @@ static unique_ptr<Catalog> FabricatorAttach(optional_ptr<StorageExtensionInfo> s
 		catalog->LoadCatalog(context); // discover schemas + tables (also validates the connection)
 		return std::move(catalog);
 	} catch (const std::exception &ex) {
-		throw IOException("MSSQL connection validation failed: %s", ex.what());
+		// The SQL Server wording stays for SQL Server — the compat corpus and users' scripts match it. Any other
+		// provider gets its own name: a Delta attach failing on a storage listing used to read "MSSQL connection
+		// validation failed", a connection error for a database that was never involved.
+		auto lowered = StringUtil::Lower(provider);
+		if (provider.empty() || lowered == "sqlserver" || lowered == "mssql") {
+			throw IOException("MSSQL connection validation failed: %s", ex.what());
+		}
+		throw IOException("Fabricator: ATTACH of a '%s' catalog failed: %s", provider, ex.what());
 	}
 }
 

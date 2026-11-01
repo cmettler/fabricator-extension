@@ -187,9 +187,9 @@ DETACH lake;
 # The delta.* functions replaced the C++-registered fabricator_delta_* fronts (metadata kinds 8-11/13-14,
 # deleted at ABI v70). Three properties pinned, each a distinct failure shape:
 #   (a) the schema is ADVERTISED — the host drops a declared function whose schema it did not register, so a
-#       regression in CatalogSchemaNames makes all seven functions vanish with NO error (measured for `fabric`:
+#       regression in CatalogSchemaNames makes all eight functions vanish with NO error (measured for `fabric`:
 #       the ATTACH succeeds and the call fails as "Table Function ... does not exist");
-#   (b) all seven functions are declared IN it, as table functions;
+#   (b) all eight functions are declared IN it, as table functions (restore joined them 2026-11-01);
 #   (c) DDL into it is REFUSED — a CREATE TABLE there would make a real delta/ folder that the NEXT attach
 #       discovers as a data schema, silently un-separating the namespace.
 
@@ -209,6 +209,7 @@ ORDER BY function_name;
 changes	table
 checkpoint	table
 get_transaction_version	table
+restore	table
 set_tblproperties	table
 set_transaction_version	table
 snapshots	table

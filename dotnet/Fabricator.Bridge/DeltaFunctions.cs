@@ -60,6 +60,21 @@ public static class DeltaFunctions
         new Field("version", Int64Type.Default, nullable: false),
     }, null);
 
+    /// <summary>The one row <c>delta.restore</c> returns: the version committed, the version restored, and the
+    /// six figures Spark's RESTORE TABLE reports (and records as the commit's operationMetrics).</summary>
+    public static readonly Schema RestoreSchema = new(new[]
+    {
+        new Field("version", Int64Type.Default, nullable: false),
+        new Field("restored_version", Int64Type.Default, nullable: false),
+        new Field("committed", BooleanType.Default, nullable: false),
+        new Field("table_size_after_restore", Int64Type.Default, nullable: false),
+        new Field("num_of_files_after_restore", Int64Type.Default, nullable: false),
+        new Field("num_removed_files", Int64Type.Default, nullable: false),
+        new Field("num_restored_files", Int64Type.Default, nullable: false),
+        new Field("removed_files_size", Int64Type.Default, nullable: false),
+        new Field("restored_files_size", Int64Type.Default, nullable: false),
+    }, null);
+
     /// <summary>One (app_id, version) batch against <see cref="AppTxnSchema"/>.</summary>
     public static RecordBatch AppTxnRow(string appId, long? version)
     {
@@ -255,6 +270,55 @@ public sealed class DeltaCheckpointFunction : ICatalogTableFunction
     }
 }
 
+/// <summary><c>cat.delta.restore('schema.table', version := n)</c> or <c>timestamp := ts</c> — RESTORE TABLE: commits the
+/// table's state at that version as a new version (engineered-wood's <c>DeltaTable.RestoreAsync</c>, Spark's
+/// semantics). Returns <see cref="DeltaFunctions.RestoreSchema"/>. Runs at EXECUTION, immediately (administrative,
+/// like OPTIMIZE/VACUUM — never part of a surrounding DuckDB transaction).</summary>
+/// <remarks>
+/// No data file is read or written: files active then but not now are re-added, files active now but not then are
+/// removed. Refused when VACUUM has deleted a file it would re-add, naming the files, unless
+/// <c>ignore_missing_files := true</c> (then the table names a file that is not there, and reading it fails — what
+/// Spark's and delta-rs's option of that name do). A timestamp restores the latest version committed at or before it.
+/// The restored version may have another schema, so the binding reports <c>SchemaMayChange</c> and the host
+/// rebuilds its metadata cache. ⚠ NOT <c>version_as_of</c>-style dual typing: version and timestamp are separate
+/// named parameters, as in <see cref="DeltaChangesFunction"/>.
+/// </remarks>
+public sealed class DeltaRestoreFunction : ICatalogTableFunction
+{
+    private readonly Func<string, long?, DateTime?, bool, IArrowArrayStream> _restore;
+
+    public DeltaRestoreFunction(Func<string, long?, DateTime?, bool, IArrowArrayStream> restore) => _restore = restore;
+
+    public SchemaPath SchemaPath => DeltaFunctions.SchemaName;
+    public string Name => "restore";
+
+    private static readonly TimestampType TsType = new(TimeUnit.Microsecond, (string?)null);
+
+    public Schema Parameters { get; } = new(new[]
+    {
+        Params.Positional("table", StringType.Default, nullable: false),
+        Params.Named("version", Int64Type.Default),
+        Params.Named("timestamp", TsType),
+        Params.Named("ignore_missing_files", BooleanType.Default),
+    }, null);
+
+    public ITableFunctionBinding Bind(RecordBatch args)
+    {
+        var table = FabricArgs.Str(args, 0)
+            ?? throw new ArgumentException("delta.restore: a table is required ('schema.table').");
+        long? version = FabricArgs.Int(args, 1);
+        DateTime? timestamp = FabricArgs.Ts(args, 2);
+        bool ignoreMissing = FabricArgs.Bool(args, 3) ?? false;
+        if ((version is null) == (timestamp is null))
+        {
+            throw new ArgumentException(
+                "delta.restore: give exactly one of version := <version> or timestamp := <timestamp>.");
+        }
+        return new StreamTableBinding(DeltaFunctions.RestoreSchema, () => _restore(table, version, timestamp, ignoreMissing),
+                                      schemaMayChange: true);
+    }
+}
+
 /// <summary><c>cat.delta.get_transaction_version('schema.table', 'app')</c> — the app's committed
 /// application-transaction high-water mark (the Delta <c>txn</c> action; NULL when never set).</summary>
 public sealed class DeltaGetTxnVersionFunction : ICatalogTableFunction
@@ -346,14 +410,21 @@ public sealed class DeltaSetTxnVersionFunction : ICatalogTableFunction
 internal sealed class StreamTableBinding : ITableFunctionBinding
 {
     private readonly Func<IArrowArrayStream> _open;
+    private readonly bool _schemaMayChange;
+    private bool _ran;
     private IArrowArrayStream? _peeked;
 
-    /// <summary>Fixed-schema, execution-deferred core (side effects allowed).</summary>
-    internal StreamTableBinding(Schema schema, Func<IArrowArrayStream> open)
+    /// <summary>Fixed-schema, execution-deferred core (side effects allowed). <paramref name="schemaMayChange"/>: the
+    /// core may change a table's schema, so once it ran the host rebuilds its metadata cache (ABI v81) — read when
+    /// <see cref="Execute"/> returns, which is why the core runs there and not in the drain.</summary>
+    internal StreamTableBinding(Schema schema, Func<IArrowArrayStream> open, bool schemaMayChange = false)
     {
         _open = open;
+        _schemaMayChange = schemaMayChange;
         OutputSchema = schema;
     }
+
+    public bool SchemaMayChange => _ran && _schemaMayChange;
 
     /// <summary>Schema peeked from a bind-time open (read-only cores).</summary>
     internal StreamTableBinding(Func<IArrowArrayStream> open)
@@ -372,6 +443,7 @@ internal sealed class StreamTableBinding : ITableFunctionBinding
     {
         scan.FilterValues?.Dispose();
         var stream = Interlocked.Exchange(ref _peeked, null) ?? _open();
+        _ran = true;
         return Drain(stream, ct);
     }
 

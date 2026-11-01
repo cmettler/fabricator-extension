@@ -338,9 +338,13 @@ builder drops unmappable ones on purpose), `IS NOT DISTINCT FROM v` is `=`, `IS 
 (*"too small to be a Parquet file"* — the control that the file really is unreadable), the shortcut deletes the
 partition / the statistics-proven file anyway, with the right count from the log.
 
-⚠ **An observation the proof surfaced, NOT fixed:** the rowid path's scan for `p = 'c'` read the file of partition
-`a`, i.e. the DELETE-shaped native scan did not prune partitions by its own filter. Worth a look on its own — it
-is a cost every rowid DELETE pays.
+**An observation the proof surfaced — FIXED 2026-11-01:** the rowid path's scan for `p = 'c'` read the file of
+partition `a`. Not the pruning — the file list was pruned (`scanned=1 pruned=2`) — but the scan's schema probe
+(`ProbeSchema`, a `LIMIT 0` that still opens the footer) read `NativeScanList.AnyUri`, which was always the
+path-smallest ACTIVE file. It is now the first PLANNED file, and the active set only when every file pruned away (its
+reason to exist). One footer read fewer per native scan of a partitioned or statistics-pruned table — on remote
+storage one request — and a scan no longer fails on an unreadable file it does not read. Gate
+`verify_delta_delete_where` §4b (106 -> 114), mutant (the old choice) killed there.
 
 ## 3. Scan-side 2.0 features worth adopting (mostly for Delta)
 
@@ -1791,6 +1795,22 @@ emitter refused it, so a lookup per row, a count per row and a top-1 per row all
   in place of IS NOT DISTINCT FROM still over 300 s. A single join whose right side ranks or limits (`RanksOrLimits`:
   a WindowRel, FetchRel or TopNRel below it) declines; at scale the subtree pass then pushes the ranking alone (0.17 s).
 - Measured (20k x 1M): count per key 1.27 s local → 0.50 s pushed, lookup by key 0.76 → 0.15 s.
+- **Top-1 per key as `OUTER APPLY (SELECT TOP (1) … WHERE i.k = o.k ORDER BY …)` — BUILT, MEASURED, NOT KEPT
+  (2026-11-01, user-asked).** The emitter recognized the decorrelated shape (a single join whose right side keeps rank 1
+  of one `row_number()` partitioned by exactly the join keys) and emitted the apply instead of the window; results were
+  identical to DuckDB's, NULL keys and keys without matches included (20k x 1M: 0 rows differ either way). Against the
+  path it would replace — the subtree pass pushes the ranking alone, DuckDB joins locally:
+
+  | case | ranking pushed alone (today) | `OUTER APPLY TOP (1)` |
+  |---|---|---|
+  | 20k outer rows, 1M inner, index on `k` only | 0.14 s | **2.4 s** (a key lookup per inner row of each key) |
+  | the same, index on `(k, v DESC, id)` | 0.125 s | 0.12 s |
+  | 100 outer rows, index on `k` only | 0.11 s | 0.02 s |
+
+  It wins only where the outer side is small, by milliseconds, and loses seconds wherever the inner index does not
+  cover the order — which the emitter cannot see, and the outer cardinality does not reach it in the plan. Not kept;
+  the attempt is in the session scratchpad (`TSqlEmitter.top1.cs`). Revisit only with a cardinality hint in the plan
+  AND index knowledge, and then as a choice, not a rewrite.
 
 Gate: `verify_remote_select_mssql` §20 (687 -> 717): routing; an `EXCEPT ALL` differential both ways over a lookup
 (with misses), a top-1 and a count per key (NULL outer keys, keys without matches); pinned counts taken from the local

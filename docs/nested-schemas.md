@@ -272,8 +272,16 @@ attached FLAT as the control proving the table exists.
   row can only pass if ONE `**` glob spans two levels against a real object store. Discovery, the
   depth-3 read, an INSERT and a DELETE at depth 2 all pass on BOTH engine legs, and the write is read
   back through a sub-root attached FLAT — the control that it landed where the path says.
-  ⚠ **AZURE is still unmeasured**: it is a third glob implementation, and no CI tier can reach a real
-  ADLS account (the `verify_delta_catalog_adls` suite is the manual/live-account tier).
+  **AZURE, MEASURED 2026-11-01 — it was BROKEN, twice over, and is fixed.** (1) duckdb-azure refuses `**`
+  anywhere but at the end of a pattern (*"abfss do not manage recursive lookup patterns … only pattern ending
+  by \*\* are allowed"*), so every nested ATTACH on an abfss root failed — OneLake included; the root is now
+  listed as `<root>/**` there and filtered for `_delta_log` entries. (2) It answers in another spelling of the
+  same location, `abfss://<host>/<filesystem>/<path>` for a root written `abfss://<filesystem>@<host>/<path>`,
+  so the relative-path comparison found NO table until both were brought to one form (`AzureHostFirst`).
+  `verify_delta_catalog_adls` §9 (manual/live-account tier, 55 -> 81 with the warning fix below): discovery,
+  the depth-3 read, the leaf refused, a depth-2 INSERT read back through a flat sub-root. The same run showed
+  that DuckDB 2.0 no longer bumps an abfss ATTACH without READ_ONLY to read-only, so it now warns like any
+  unguarded writable attach (§6 of that suite).
 - The plain-ADLS SDK fast path (`AdlsTableDiscovery`) is deliberately not used for nested roots: its walk
   is fixed at one or two levels. Nested ADLS pays the glob — correct, and slower.
 - Depth is capped at 16 levels and REFUSES rather than truncating; silently not discovering a table is

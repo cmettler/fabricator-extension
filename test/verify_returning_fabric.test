@@ -1,0 +1,180 @@
+# name: test/verify_returning_fabric.test
+# description: RETURNING on Fabric Warehouse, which has no T-SQL OUTPUT (docs/warehouse-support.md §6.8b). DELETE
+#              selects then deletes, UPDATE updates then selects, both in one batch on the write connection; INSERT
+#              computes its rows client-side from the column metadata (Fabric TRUNCATES datetime2/time precision,
+#              CHAR pads). Every RETURNING below is followed by a read of what the server stored, pinned to the SAME
+#              rows — so the pair asserts "returned = stored", which is the property, not just a shape.
+#              MANUAL TIER: needs a live Fabric Warehouse (FABRICATOR_FABRIC_WAREHOUSE_DSN, a SqlClient connection
+#              string with its own Entra authentication). Only the SqlBulkCopy insert path; the COPY INTO path needs
+#              a OneLake secret as well and stays in the session harness.
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_FABRIC_WAREHOUSE_DSN
+
+statement ok
+ATTACH '${FABRICATOR_FABRIC_WAREHOUSE_DSN}' AS wb (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('wb', 'DROP TABLE IF EXISTS dbo.wret_r; DROP TABLE IF EXISTS dbo.wret_a; DROP TABLE IF EXISTS dbo.wret_i; CREATE TABLE dbo.wret_r (id BIGINT NOT NULL, v INT, c CHAR(5), d3 DATETIME2(3), t3 TIME(3), dec DECIMAL(10,2), u UNIQUEIDENTIFIER, s VARCHAR(20)); ALTER TABLE dbo.wret_r ADD CONSTRAINT pk_wret_r PRIMARY KEY NONCLUSTERED (id) NOT ENFORCED');
+
+statement ok
+SELECT fabricator_refresh_cache('wb');
+
+# ---- 1. INSERT … RETURNING: what the server stores (precision truncated, CHAR padded) ----
+
+query ITTTTTTT
+WITH r AS (INSERT INTO wb.dbo.wret_r (id, v, c, d3, t3, dec, u, s) VALUES
+ (1, 10, 'ä', TIMESTAMP '2026-01-01 12:00:00.123456', TIME '12:00:00.9999', 1.235, '0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c11', 'x'),
+ (2, 20, 'abcde', TIMESTAMP '1969-12-31 23:59:59.9995', TIME '00:00:00.0005', -2.5, NULL, NULL),
+ (3, NULL, NULL, NULL, NULL, NULL, NULL, 'only s')
+ RETURNING *)
+SELECT id, v::VARCHAR, '[' || c || ']', d3::VARCHAR, t3::VARCHAR, dec::VARCHAR, u::VARCHAR, s FROM r ORDER BY id;
+----
+1	10	[ä   ]	2026-01-01 12:00:00.123	12:00:00.999	1.24	0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c11	x
+2	20	[abcde]	1969-12-31 23:59:59.999	00:00:00	-2.50	NULL	NULL
+3	NULL	NULL	NULL	NULL	NULL	NULL	only s
+
+query ITTTTTTT
+SELECT id, v::VARCHAR, '[' || c || ']', d3::VARCHAR, t3::VARCHAR, dec::VARCHAR, u::VARCHAR, s FROM wb.dbo.wret_r ORDER BY id;
+----
+1	10	[ä   ]	2026-01-01 12:00:00.123	12:00:00.999	1.24	0e7c0e5a-7f8b-4c4e-9a52-6a0d2f1b7c11	x
+2	20	[abcde]	1969-12-31 23:59:59.999	00:00:00	-2.50	NULL	NULL
+3	NULL	NULL	NULL	NULL	NULL	NULL	only s
+
+# omitted columns come back as the server's NULL
+query IT
+WITH r AS (INSERT INTO wb.dbo.wret_r (id, s) VALUES (4, 'omitted') RETURNING id, v::VARCHAR) SELECT * FROM r;
+----
+4	NULL
+
+# ---- 2. UPDATE … RETURNING: the post-image ----
+
+query ITTT
+WITH r AS (UPDATE wb.dbo.wret_r SET v = coalesce(v, 0) + 1, d3 = d3 + INTERVAL 1 SECOND, c = 'zz' WHERE id IN (1, 2, 4) RETURNING *)
+SELECT id, v::VARCHAR, '[' || c || ']', d3::VARCHAR FROM r ORDER BY id;
+----
+1	11	[zz   ]	2026-01-01 12:00:01.123
+2	21	[zz   ]	1970-01-01 00:00:00.999
+4	1	[zz   ]	NULL
+
+query ITTT
+SELECT id, v::VARCHAR, '[' || c || ']', d3::VARCHAR FROM wb.dbo.wret_r WHERE id IN (1, 2, 4) ORDER BY id;
+----
+1	11	[zz   ]	2026-01-01 12:00:01.123
+2	21	[zz   ]	1970-01-01 00:00:00.999
+4	1	[zz   ]	NULL
+
+# ---- 3. DELETE … RETURNING: the rows as they were ----
+
+query ITT
+WITH r AS (DELETE FROM wb.dbo.wret_r WHERE id IN (2, 3) RETURNING *) SELECT id, v::VARCHAR, s FROM r ORDER BY id;
+----
+2	21	NULL
+3	NULL	only s
+
+query I
+SELECT count(*) FROM wb.dbo.wret_r WHERE id IN (2, 3);
+----
+0
+
+# ---- 4. MERGE … RETURNING ----
+
+query TIIT rowsort
+MERGE INTO wb.dbo.wret_r AS t USING (VALUES (1, 100), (4, NULL), (9, 90)) AS src(id, v) ON t.id = src.id
+WHEN MATCHED AND src.v IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET v = src.v
+WHEN NOT MATCHED THEN INSERT (id, v, s) VALUES (src.id, src.v, 'm')
+RETURNING merge_action, id, v, s;
+----
+DELETE	4	1	omitted
+INSERT	9	90	m
+UPDATE	1	100	x
+
+# ---- 5. the moved CTE: deleted rows become another table's, one transaction ----
+
+statement ok
+SELECT fabricator_exec('wb', 'CREATE TABLE dbo.wret_a (id BIGINT, v INT, c CHAR(5), d3 DATETIME2(3), t3 TIME(3), dec DECIMAL(10,2), u UNIQUEIDENTIFIER, s VARCHAR(20))');
+
+statement ok
+SELECT fabricator_refresh_cache('wb');
+
+statement ok
+WITH m AS (DELETE FROM wb.dbo.wret_r WHERE id = 9 RETURNING *) INSERT INTO wb.dbo.wret_a SELECT * FROM m;
+
+query IIT
+SELECT id, v, s FROM wb.dbo.wret_a;
+----
+9	90	m
+
+query I
+SELECT count(*) FROM wb.dbo.wret_r WHERE id = 9;
+----
+0
+
+# ---- 6. inside BEGIN: ROLLBACK undoes, COMMIT keeps ----
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE wb.dbo.wret_r SET v = -1 WHERE id = 1 RETURNING *;
+
+statement ok
+INSERT INTO wb.dbo.wret_r (id, s) VALUES (50, 'tx') RETURNING *;
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, v FROM wb.dbo.wret_r WHERE id IN (1, 50) ORDER BY id;
+----
+1	100
+
+statement ok
+BEGIN;
+
+query IT
+INSERT INTO wb.dbo.wret_r (id, c, s) VALUES (51, 'ü', 'tx') RETURNING id, '[' || c || ']';
+----
+51	[ü   ]
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, '[' || c || ']' FROM wb.dbo.wret_r WHERE id = 51;
+----
+51	[ü   ]
+
+# ---- 7. refusals change nothing ----
+
+statement error
+UPDATE wb.dbo.wret_r SET id = 77 WHERE id = 1 RETURNING *;
+----
+key column
+
+query I
+SELECT count(*) FROM wb.dbo.wret_r WHERE id = 77;
+----
+0
+
+statement ok
+SELECT fabricator_exec('wb', 'CREATE TABLE dbo.wret_i (id BIGINT IDENTITY, s VARCHAR(10))');
+
+statement ok
+SELECT fabricator_refresh_cache('wb');
+
+statement error
+INSERT INTO wb.dbo.wret_i (s) VALUES ('a') RETURNING *;
+----
+IDENTITY
+
+query I
+SELECT count(*) FROM wb.dbo.wret_i;
+----
+0
+
+statement ok
+SELECT fabricator_exec('wb', 'DROP TABLE IF EXISTS dbo.wret_r; DROP TABLE IF EXISTS dbo.wret_a; DROP TABLE IF EXISTS dbo.wret_i');

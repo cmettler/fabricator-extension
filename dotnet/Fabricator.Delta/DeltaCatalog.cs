@@ -1553,6 +1553,31 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         });
     }
 
+    // cat.delta.restore('schema.table', version := n | timestamp := ts): RESTORE TABLE, as engineered-wood's
+    // DeltaTable.RestoreAsync does it (a new commit; no data file read or written). Immediate and administrative,
+    // like OPTIMIZE. The cached table entry is stale afterwards (other files, possibly another schema): the binding
+    // reports SchemaMayChange, and the per-transaction caches are dropped here like after a DDL.
+    private IArrowArrayStream RestoreCore(string tableRef, long? version, DateTime? timestamp, bool ignoreMissingFiles)
+    {
+        var path = ResolveTableRefPath(tableRef, "delta.restore");
+        var r = DeltaReader.Restore(Opener(), path, version, timestamp, ignoreMissingFiles);
+        _tableConfigCache.TryRemove(path, out _);
+        InvalidateReadCache();
+        _log.LogInformation("delta restore {Path}: v{Restored} -> v{Version} (committed={Committed}, +{Restored2} -{Removed} files)",
+            path, r.RestoredVersion, r.Version, r.Committed, r.NumRestoredFiles, r.NumRemovedFiles);
+        var s = DeltaFunctions.RestoreSchema;
+        IArrowArray I(long v) => new Int64Array.Builder().Append(v).Build();
+        var committed = new BooleanArray.Builder().Append(r.Committed).Build();
+        return new InMemoryArrayStream(s, new[]
+        {
+            new RecordBatch(s, new IArrowArray[]
+            {
+                I(r.Version), I(r.RestoredVersion), committed, I(r.TableSizeAfterRestore), I(r.NumOfFilesAfterRestore),
+                I(r.NumRemovedFiles), I(r.NumRestoredFiles), I(r.RemovedFilesSize), I(r.RestoredFilesSize),
+            }, 1),
+        });
+    }
+
     // Table-FEATURE properties: enabling these requires a protocol upgrade (reader/writer feature + supporting
     // metadata), so they can't be flipped by a plain metaData commit on an existing table — they're set at
     // CREATE via the ATTACH option. A set_tblproperties attempt on one is rejected with a clear pointer.
@@ -1933,13 +1958,24 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         }
         else
         {
-            var json = HostFs.Glob(Opener(), _root + "/**/_delta_log/*.json");
-            var rootPrefix = Normalize(_root) + "/";
+            // ⚠ duckdb-azure refuses `**` anywhere but at the END of a pattern (MEASURED 2026-11-01 on a plain
+            // ADLS Gen2 account: "abfss do not manage recursive lookup patterns … only pattern ending by ** are
+            // allowed"), which failed every nested ATTACH on Azure — OneLake included. There the whole tree is
+            // listed and the filter below keeps the _delta_log entries; S3 lists the whole prefix for a `**`
+            // pattern anyway (an object store matches client-side), so the cost is the same shape.
+            bool azure = _root.StartsWith("abfss://", System.StringComparison.OrdinalIgnoreCase)
+                         || _root.StartsWith("az://", System.StringComparison.OrdinalIgnoreCase)
+                         || _root.StartsWith("azure://", System.StringComparison.OrdinalIgnoreCase);
+            var json = HostFs.Glob(Opener(), _root + (azure ? "/**" : "/**/_delta_log/*.json"));
+            // ⚠ duckdb-azure answers in ANOTHER spelling of the same location — `abfss://<host>/<filesystem>/<path>`
+            // for a root written `abfss://<filesystem>@<host>/<path>` (measured) — so both are brought to the former
+            // before the prefix comparison, or no table is ever found.
+            var rootPrefix = AzureHostFirst(Normalize(_root)) + "/";
             var seen = new HashSet<string>(System.StringComparer.Ordinal);
             using var doc = JsonDocument.Parse(json);
             foreach (var el in doc.RootElement.EnumerateArray())
             {
-                var path = Normalize(el.GetProperty("path").GetString() ?? string.Empty);
+                var path = AzureHostFirst(Normalize(el.GetProperty("path").GetString() ?? string.Empty));
                 int marker = path.IndexOf("/_delta_log/", System.StringComparison.Ordinal);
                 if (marker < 0 || !path.StartsWith(rootPrefix, System.StringComparison.Ordinal))
                 {
@@ -1979,6 +2015,34 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             return c != 0 ? c : string.CompareOrdinal(x.Table, y.Table);
         });
         return found;
+    }
+
+    /// <summary><c>abfss://&lt;filesystem&gt;@&lt;host&gt;/&lt;path&gt;</c> as <c>abfss://&lt;host&gt;/&lt;filesystem&gt;/&lt;path&gt;</c>,
+    /// the spelling duckdb-azure's glob returns; any other path unchanged.</summary>
+    private static string AzureHostFirst(string path)
+    {
+        int scheme = path.IndexOf("://", System.StringComparison.Ordinal);
+        if (scheme < 0)
+        {
+            return path;
+        }
+        string prefix = path.Substring(0, scheme);
+        if (!prefix.Equals("abfss", System.StringComparison.OrdinalIgnoreCase)
+            && !prefix.Equals("az", System.StringComparison.OrdinalIgnoreCase)
+            && !prefix.Equals("azure", System.StringComparison.OrdinalIgnoreCase))
+        {
+            return path;
+        }
+        int start = scheme + 3;
+        int slash = path.IndexOf('/', start);
+        string authority = slash < 0 ? path.Substring(start) : path.Substring(start, slash - start);
+        int at = authority.IndexOf('@');
+        if (at <= 0)
+        {
+            return path;
+        }
+        string rest = slash < 0 ? string.Empty : path.Substring(slash);
+        return prefix + "://" + authority.Substring(at + 1) + "/" + authority.Substring(0, at) + rest;
     }
 
     private void WarnRootTable(string table) =>
@@ -4767,8 +4831,13 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     }
                     bornDeleted = RowSelection.ByPath(byPath);
                 }
+                // changeDataStagedByCaller: on a Change Data Feed table every buffered statement staged its own
+                // change rows at statement time (WriteCdcFilesAsync), so engineered-wood must not write them again
+                // at commit — since EW #530 it fills in any staged operation not declared covered, which would put
+                // each row in the feed TWICE.
                 await txn.StageDataFilesAsync(files, bornDeleted,
                         identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
+                        changeDataStagedByCaller: true,
                         cancellationToken: token)
                     .ConfigureAwait(false);
             }
@@ -4786,7 +4855,10 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                         pinnedSnap.Metadata.Configuration)
                     ? RowDeleteMode.DeletionVector
                     : RowDeleteMode.CopyOnWrite;
-                rowsDeleted += await txn.StageRowDeletesAsync(RowSelection.ByPath(deletes), deleteMode, token)
+                // Covered by our own change rows, like the appends above (and for copy-on-write this also keeps EW
+                // from writing a delete change file per rewritten file).
+                rowsDeleted += await txn.StageRowDeletesAsync(RowSelection.ByPath(deletes), deleteMode, token,
+                        changeDataStagedByCaller: true)
                     .ConfigureAwait(false);
             }
             // The buffered schema change (metaData + merged protocol upgrade) joins the SAME commit.
@@ -6297,6 +6369,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             new DeltaTblPropertiesFunction(TblPropertiesCore),
             new DeltaSetTblPropertiesFunction(SetTblPropertiesCore),
             new DeltaCheckpointFunction(CheckpointCore),
+            new DeltaRestoreFunction(RestoreCore),
             new DeltaGetTxnVersionFunction(GetTxnVersionCore),
             new DeltaSetTxnVersionFunction(SetTxnVersionCore),
         };

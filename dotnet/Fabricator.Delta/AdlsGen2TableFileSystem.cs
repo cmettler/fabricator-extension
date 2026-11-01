@@ -434,11 +434,19 @@ internal sealed class OneLakeRandomAccessFile : IRandomAccessFile
 
 /// <summary>Sequential (append-only) write handle over a OneLake file: buffers appends and flushes on dispose
 /// (Azure DFS needs an explicit Flush to commit appended data at the final length).</summary>
+/// <remarks>
+/// The appends are staged and become the file's content only at the flush <see cref="CompleteAsync"/> sends
+/// (engineered-wood #501: a file is published only at completion). Disposing without completing abandons the
+/// write and deletes the path. ⚠ The PATH exists from CreateAsync on, as an empty file: DFS creates it first, and
+/// the put-if-absent condition rides that create. A reader can therefore see a zero-byte file while it is being
+/// written — never a partial one.
+/// </remarks>
 internal sealed class OneLakeSequentialFile : ISequentialFile
 {
     private readonly DataLakeFileClient _file;
     private long _position;
     private bool _closed;
+    private bool _completed;
 
     public OneLakeSequentialFile(DataLakeFileClient file) => _file = file;
 
@@ -457,9 +465,31 @@ internal sealed class OneLakeSequentialFile : ISequentialFile
         _position += data.Length;
     }
 
-    public async ValueTask FlushAsync(CancellationToken cancellationToken = default)
+    // A DFS flush COMMITS the appended bytes, i.e. publishes them, which only CompleteAsync may do.
+    public ValueTask FlushAsync(CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
+
+    public async ValueTask CompleteAsync(CancellationToken cancellationToken = default)
     {
-        await _file.FlushAsync(_position, cancellationToken: cancellationToken).ConfigureAwait(false);
+        if (_completed)
+        {
+            return;
+        }
+        if (_closed)
+        {
+            throw new InvalidOperationException("OneLakeSequentialFile: the write was abandoned");
+        }
+        _closed = true;
+        try
+        {
+            await _file.FlushAsync(_position, new DataLakeFileFlushOptions { Close = true }, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            await AbandonAsync().ConfigureAwait(false);
+            throw;
+        }
+        _completed = true;
     }
 
     public async ValueTask DisposeAsync()
@@ -469,8 +499,19 @@ internal sealed class OneLakeSequentialFile : ISequentialFile
             return;
         }
         _closed = true;
-        // Commit the appended bytes at the final length.
-        await _file.FlushAsync(_position).ConfigureAwait(false);
+        await AbandonAsync().ConfigureAwait(false);
+    }
+
+    // Best effort, like the host filesystem's: a failed delete leaves an unreferenced file for VACUUM.
+    private async ValueTask AbandonAsync()
+    {
+        try
+        {
+            await _file.DeleteIfExistsAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+        }
     }
 
     public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();

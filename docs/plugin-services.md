@@ -1065,7 +1065,8 @@ which is what makes the usage proven rather than plausible.
 `ReadAllText` does not.
 
 ⚠ **A `.gitattributes` rule forcing LF looked necessary and is NOT — measured, so it was not added.** A
-stray `` in the version would corrupt the artifact footer, which is the kind of hazard `*.sh text eol=lf`
+stray `
+` in the version would corrupt the artifact footer, which is the kind of hazard `*.sh text eol=lf`
 exists for. But `file(STRINGS)` on a CRLF file returns `0.0.13` at **length 6** (checked with `cmake -P`),
 i.e. it strips the CR itself, and `.Trim()` covers the MSBuild side by construction. Adding a rule that
 protects against nothing would make `.gitattributes` claim a load-bearing entry it does not have.
@@ -1351,8 +1352,9 @@ be refused.
 would make one that forgot to override it unattachable — a silent removal rather than a loud one. Verified
 across the three out-of-tree plugins: all implement `OpenCatalog`, so all are correct with no edit.
 
-⚠ The C++ ATTACH wrapper still nests this in `MSSQL connection validation failed: {…}`. That envelope is a
-pre-existing wart; `HostsCatalog` fixed the message inside it, not the envelope.
+⚠ The C++ ATTACH wrapper nested this in `MSSQL connection validation failed: {…}` for EVERY provider until
+2026-11-01; since then only SQL Server keeps that wording (the compat corpus and users' scripts match it) and any
+other provider reads `Fabricator: ATTACH of a '<provider>' catalog failed: {…}` (`fabricator_storage.cpp`).
 
 ### 12.3 ⚠⚠ THE CLOSURE FIXTURE — because Fluid was the only proof, and it stopped being a plugin
 

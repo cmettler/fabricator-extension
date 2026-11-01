@@ -1,0 +1,195 @@
+# name: test/verify_delta_restore.test
+# description: cat.delta.restore('schema.table', version := n | timestamp := ts) — RESTORE TABLE through
+#              engineered-wood's DeltaTable.RestoreAsync (EW #567). A restore is a NEW commit that re-adds the
+#              files active at that version and removes the ones active now but not then; no data file is read or
+#              written, and it can itself be undone. The restored version may have another schema, so the
+#              function reports SchemaMayChange and the host rebuilds its metadata cache (§5).
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# v0 CREATE + v1 WRITE (the CTAS), v2 and v3 appends, v4 a delete, v5 an update.
+statement ok
+CREATE TABLE lake.main.r AS SELECT 1 AS id, 'a' AS s;
+
+statement ok
+INSERT INTO lake.main.r VALUES (2, 'b');
+
+statement ok
+INSERT INTO lake.main.r VALUES (3, 'c');
+
+statement ok
+DELETE FROM lake.main.r WHERE id = 1;
+
+statement ok
+UPDATE lake.main.r SET s = 'x' WHERE id = 2;
+
+query IT
+SELECT version, operation FROM lake.delta.snapshots('main.r') ORDER BY version;
+----
+0	CREATE TABLE
+1	WRITE
+2	WRITE
+3	WRITE
+4	DELETE
+5	UPDATE
+
+query IT
+SELECT id, s FROM lake.main.r ORDER BY id;
+----
+2	x
+3	c
+
+# ---- 1. restore to a version: a new commit (v6) holding v3's rows ----
+
+query IITT
+SELECT version, restored_version, committed::VARCHAR, (num_of_files_after_restore > 0)::VARCHAR
+FROM lake.delta.restore('main.r', version := 3);
+----
+6	3	true	true
+
+query IT
+SELECT id, s FROM lake.main.r ORDER BY id;
+----
+1	a
+2	b
+3	c
+
+# It is in the history as a RESTORE, and the versions it skipped are still there.
+query IT
+SELECT version, operation FROM lake.delta.snapshots('main.r') WHERE version >= 5 ORDER BY version;
+----
+5	UPDATE
+6	RESTORE
+
+query IT
+SELECT id, s FROM lake.main.r AT (VERSION => 5) ORDER BY id;
+----
+2	x
+3	c
+
+# ---- 2. a restore can be undone by another restore ----
+
+query II
+SELECT version, restored_version FROM lake.delta.restore('main.r', version := 5);
+----
+7	5
+
+query IT
+SELECT id, s FROM lake.main.r ORDER BY id;
+----
+2	x
+3	c
+
+# ---- 3. restoring to the current version commits nothing ----
+
+query IIT
+SELECT version, restored_version, committed::VARCHAR FROM lake.delta.restore('main.r', version := 7);
+----
+7	7	false
+
+query I
+SELECT max(version) FROM lake.delta.snapshots('main.r');
+----
+7
+
+# ---- 4. by timestamp: the latest version committed at or before it ----
+
+statement ok
+SET VARIABLE ts = (SELECT timestamp FROM lake.delta.snapshots('main.r') WHERE version = 1);
+
+statement ok
+SET VARIABLE expected = (SELECT max(version) FROM lake.delta.snapshots('main.r') WHERE timestamp <= getvariable('ts'));
+
+query T
+SELECT (restored_version = getvariable('expected'))::VARCHAR
+FROM lake.delta.restore('main.r', timestamp := getvariable('ts'));
+----
+true
+
+# The rows of that version (v1 holds only id 1; a later version committed in the same instant holds more).
+query I
+SELECT count(*) = (SELECT count(*) FROM lake.main.r AT (VERSION => getvariable('expected'))) FROM lake.main.r;
+----
+true
+
+# ---- 5. the schema comes back with the version (SchemaMayChange rebuilds the cached entry) ----
+
+statement ok
+CREATE TABLE lake.main.sc AS SELECT 1 AS id;
+
+statement ok
+ALTER TABLE lake.main.sc ADD COLUMN n INTEGER;
+
+statement ok
+INSERT INTO lake.main.sc VALUES (2, 20);
+
+query II
+SELECT id, n FROM lake.main.sc ORDER BY id;
+----
+1	NULL
+2	20
+
+query I
+SELECT restored_version FROM lake.delta.restore('main.sc', version := 1);
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'lake' AND table_name = 'sc';
+----
+1
+
+query I
+SELECT id FROM lake.main.sc ORDER BY id;
+----
+1
+
+# ---- 6. refusals ----
+
+statement error
+SELECT * FROM lake.delta.restore('main.r', version := 1, timestamp := TIMESTAMP '2020-01-01');
+----
+exactly one of
+
+statement error
+SELECT * FROM lake.delta.restore('main.r');
+----
+exactly one of
+
+statement error
+SELECT * FROM lake.delta.restore('main.r', version := 99);
+----
+
+# ---- 7. files VACUUM removed: refused by default, restored on request ----
+
+statement ok
+CREATE TABLE lake.main.v AS SELECT 1 AS id;
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.v AS SELECT 2 AS id;
+
+statement ok
+SELECT fabricator_exec('lake', 'VACUUM main.v RETAIN 0 HOURS');
+
+statement error
+SELECT * FROM lake.delta.restore('main.v', version := 1);
+----
+missing
+
+query T
+SELECT committed::VARCHAR FROM lake.delta.restore('main.v', version := 1, ignore_missing_files := true);
+----
+true
+
+# The table now names a file that is not there, and reading it fails — what the option means.
+statement error
+SELECT * FROM lake.main.v;
+----

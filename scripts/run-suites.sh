@@ -203,7 +203,7 @@ case "$TIER" in
         # 85 since 2026-10-24: verify_delta_partition_stats, engine-doubled (+2 runs) — COUNT(*)/MIN/MAX
         # answered from the Delta log (ABI v95). Each answer is asserted twice, from metadata and with
         # `fabricator_partition_stats = false`, so the switch-off leg is the oracle for the other.
-        : "${MIN_SUITES:=91}"   # 2026-10-31: +verify_delta_returning x2 engines; +verify_null_key_subqueries, +verify_delta_concurrent_dml; 2026-10-27: +verify_ducklake_delta_sync; 2026-10-25: +verify_delta_delete_where
+        : "${MIN_SUITES:=92}"   # 2026-11-01: +verify_delta_restore; 2026-10-31: +verify_delta_returning x2 engines; +verify_null_key_subqueries, +verify_delta_concurrent_dml; 2026-10-27: +verify_ducklake_delta_sync; 2026-10-25: +verify_delta_delete_where
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -974,7 +974,7 @@ case "$TIER" in
         #   (no live inlined rows), and column_mapping none + deletion_vectors false give a reader-v1 mirror.
         # 2026-10-31: 11030 -> 11135: +verify_delta_concurrent_dml (105) — concurrent autocommit DML resolves its row
         #   ids at the scanned version (delta-transactions.md §8.5b); nothing else moved
-        : "${MIN_ASSERTIONS:=11840}"   # 2026-10-31: +328 verify_delta_returning (164 x2), +4 merge_into §9 RETURNING; +33 verify_null_key_subqueries; +248 concurrent_dml same-file; +92 ducklake sync §8b
+        : "${MIN_ASSERTIONS:=11923}"   # 2026-11-01: +73 verify_delta_restore, +8 verify_delta_delete_where §4b (the schema probe reads a scanned file), +2 verify_delta_catalog_functions (restore listed); 2026-10-31: +328 verify_delta_returning (164 x2), +4 merge_into §9 RETURNING; +33 verify_null_key_subqueries; +248 concurrent_dml same-file; +92 ducklake sync §8b
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -1570,7 +1570,7 @@ case "$TIER" in
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
         # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
         #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
-        : "${MIN_ASSERTIONS:=137394}"   # 2026-11-01: +1 server_profile database_edition row; +15 join keys from the prefix-range filter as table variables + the switch (dynamic_filters 119 -> 136, guide J3 -2); +31 rowid RETURNING via JSON + the full-precision row-id key (verify_rowid_json_mssql 36 -> 67); +36 verify_rowid_json_mssql (rowid DML as JSON blocks); +31 long key lists as one JSON parameter (dynamic_filters 96 -> 119, guide J3, server_profile +1); +78 pushdown_boundary (new suite 68, guide S19 260 -> 270); +40 a declined part descends (subtree 210 -> 218) and float division under ieee_floating_point_ops off (remote_select 812 -> 828, guide S18 244 -> 260); +41 remote_select §23 unread outputs as NULL (a result row counts once each). 2026-10-31: +8 granular_types UUID insert; +130310 TPC-H / TPC-DS (every value counts) and the edge cases; +29 IN / NOT IN; +45 grouping sets; +15 single join
+        : "${MIN_ASSERTIONS:=137418}"   # 2026-11-01: +24 verify_catalog_filter §4 (a schema schema_filter left out, by name); +1 server_profile database_edition row; +15 join keys from the prefix-range filter as table variables + the switch (dynamic_filters 119 -> 136, guide J3 -2); +31 rowid RETURNING via JSON + the full-precision row-id key (verify_rowid_json_mssql 36 -> 67); +36 verify_rowid_json_mssql (rowid DML as JSON blocks); +31 long key lists as one JSON parameter (dynamic_filters 96 -> 119, guide J3, server_profile +1); +78 pushdown_boundary (new suite 68, guide S19 260 -> 270); +40 a declined part descends (subtree 210 -> 218) and float division under ieee_floating_point_ops off (remote_select 812 -> 828, guide S18 244 -> 260); +41 remote_select §23 unread outputs as NULL (a result row counts once each). 2026-10-31: +8 granular_types UUID insert; +130310 TPC-H / TPC-DS (every value counts) and the edge cases; +29 IN / NOT IN; +45 grouping sets; +15 single join
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

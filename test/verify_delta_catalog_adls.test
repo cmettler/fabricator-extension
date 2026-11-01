@@ -51,6 +51,11 @@ SET autoinstall_known_extensions = true;
 statement ok
 SET autoload_known_extensions = true;
 
+# ⚠ INSTALL, not only autoload: since DuckDB 2.0 the test runner gives each test its OWN home directory, so an
+# azure extension installed in the user's home is not found there and the suite failed at its first statement.
+statement ok
+INSTALL azure;
+
 statement ok
 LOAD azure;
 
@@ -226,22 +231,25 @@ statement ok
 ATTACH '${FABRICATOR_ADLS_ROOT}/lake' AS wguarded
   (TYPE fabricator, PROVIDER 'delta', SECRET adls_test, READ_ONLY false);
 
-# control: AUTOMATIC (no READ_ONLY clause) -> read-only, no warning owed
+# AUTOMATIC (no READ_ONLY clause): on DuckDB 1.5 an abfss attach was bumped to read-only and owed no warning. Since
+# DuckDB 2.0 it stays WRITABLE (measured 2026-11-01: duckdb_databases().readonly = false), so it is as unguarded as
+# the explicit READ_WRITE one and warns too — the gate on the RESOLVED access mode is what makes that automatic.
 statement ok
 ATTACH '${FABRICATOR_ADLS_ROOT}/lake' AS wauto (TYPE fabricator, PROVIDER 'delta');
 
-# exactly ONE warning, naming the remedy
+query T
+SELECT readonly::VARCHAR FROM duckdb_databases() WHERE database_name = 'wauto';
+----
+false
+
+# one warning per unguarded writable attach (wunguarded, wauto), none for the guarded control, each naming the remedy
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE message LIKE '%abfss root attached READ_WRITE with no named SECRET%'
+WHERE type = 'Fabricator.Delta'
+  AND message LIKE '%abfss root attached READ_WRITE with no named SECRET%'
   AND message LIKE '%Add SECRET <name> to the ATTACH%';
 ----
-1
-
-# the AUTOMATIC attach really is read-only — the reason it is exempt
-statement error
-CREATE TABLE wauto.main.nope (id INTEGER);
-----
+2
 
 statement ok
 DETACH wunguarded;
@@ -290,3 +298,95 @@ SELECT count(*) FROM duckdb_tables() WHERE database_name = 'adls' AND table_name
 
 statement ok
 DETACH adls;
+
+# ----------------------------------------------------------------------------
+# 9. NESTED SCHEMAS (`schemas 'nested'`) — the azure glob, measured
+# ----------------------------------------------------------------------------
+# ⚠ THE ROW THIS SECTION EXISTS FOR is the depth-3 read: nested discovery is ONE recursive glob
+# (`<root>/**/_delta_log/*.json`), verified against DuckDB's local glob and httpfs (verify_delta_catalog_s3),
+# and until 2026-11-01 never against the azure filesystem, a third implementation (docs/nested-schemas.md).
+# The tree is built through sub-roots attached with the ordinary two-level layout, so it comes from storage.
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/nested' AS an1 (TYPE fabricator, PROVIDER 'delta', SECRET adls_test,
+                                                READ_ONLY false, schemas true);
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS an1.sales;
+
+statement ok
+CREATE OR REPLACE TABLE an1.sales.orders AS SELECT 1 AS id, 'eu' AS region;
+
+statement ok
+DETACH an1;
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/nested/sales' AS an2 (TYPE fabricator, PROVIDER 'delta', SECRET adls_test,
+                                                      READ_ONLY false, schemas true);
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS an2.eu;
+
+statement ok
+CREATE OR REPLACE TABLE an2.eu.deep AS SELECT 42 AS v;
+
+statement ok
+DETACH an2;
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/nested' AS ank (TYPE fabricator, PROVIDER 'delta', SECRET adls_test,
+                                                READ_ONLY false, schemas 'nested');
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'ank' ORDER BY 1, 2;
+----
+eu	deep
+sales	orders
+
+query I
+SELECT v FROM ank.sales.eu.deep;
+----
+42
+
+# The leaf alone must not resolve — real nesting, not a flattened name.
+statement error
+SELECT v FROM ank.eu.deep;
+----
+schema "eu" does not exist
+
+# A write at depth 2 lands at the path's prefix (read back through the flat sub-root below).
+statement ok
+INSERT INTO ank.sales.eu.deep VALUES (7);
+
+query I
+SELECT count(*) FROM ank.sales.eu.deep;
+----
+2
+
+statement ok
+DETACH ank;
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/nested/sales' AS ansub (TYPE fabricator, PROVIDER 'delta', SECRET adls_test,
+                                                        READ_ONLY false, schemas true);
+
+query I
+SELECT sum(v) FROM ansub.eu.deep;
+----
+49
+
+statement ok
+DROP TABLE ansub.eu.deep;
+
+statement ok
+DETACH ansub;
+
+statement ok
+ATTACH '${FABRICATOR_ADLS_ROOT}/nested' AS anc (TYPE fabricator, PROVIDER 'delta', SECRET adls_test,
+                                                READ_ONLY false, schemas true);
+
+statement ok
+DROP TABLE anc.sales.orders;
+
+statement ok
+DETACH anc;
