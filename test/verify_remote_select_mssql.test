@@ -2353,3 +2353,84 @@ CALL disable_logging();
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_mo; DROP TABLE dbo.rs_mi; DROP TABLE dbo.rs_mn;', refresh_cache := true);
+
+# ═══ §23  A part's outputs nobody above reads go out as NULL (docs/duckdb-2.0-remote-execution.md §4.26) ═══════════════
+# After the optimizers a scan keeps every column it filters on in its output (it re-applies its filters itself), so a
+# pushed part carried that column up through the server's join although nothing above reads it. TPC-H q10 sent an
+# nvarchar(max) flag column that way: 18 s on the server instead of 0.3 s. The part now sends NULL for such an output.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_ua; DROP TABLE IF EXISTS dbo.rs_ub;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_ua (id INT PRIMARY KEY, k INT, flag NVARCHAR(MAX));
+INSERT INTO dbo.rs_ua SELECT value, value % 500, CHOOSE(value % 3 + 1, N''R'', N''A'', N''N'') FROM GENERATE_SERIES(1, 3000);
+CREATE TABLE dbo.rs_ub (k INT PRIMARY KEY, g INT, d DATE);
+INSERT INTO dbo.rs_ub SELECT value, value % 7, DATEADD(day, value, ''2020-01-01'') FROM GENERATE_SERIES(0, 499);', refresh_cache := true);
+
+# a LARGE local table, so DuckDB joins the two server tables first and the pass pushes that join
+statement ok
+CREATE TABLE rs_ul AS SELECT range::INT AS id, 'n' || (range % 7) AS name FROM range(1, 30001);
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+query III
+SELECT l.name, sum(a.id), count(*) FROM rs_ul l, rp.dbo.rs_ua a, rp.dbo.rs_ub b
+WHERE l.id = a.id AND a.k = b.k AND a.flag = 'R' AND b.d < DATE '2020-06-01' GROUP BY 1 ORDER BY 1;
+----
+n0	56364	43
+n1	56757	43
+n2	59301	44
+n3	58344	44
+n4	59235	44
+n5	57279	43
+n6	57672	43
+
+# the part went to the server, and flag and d — filtered there, read by nothing above — as NULL
+query III
+SELECT count(*), count(*) FILTER (WHERE contains(message, 'NULL AS [c1], NULL AS [c2]')),
+       count(*) FILTER (WHERE contains(message, '[flag] AS'))
+FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND message LIKE 'remote subtree%';
+----
+1	1	0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# the control: an output read above (the flag is grouped on) still goes out as itself
+query III
+SELECT a.flag, count(*), sum(b.g) FROM rs_ul l, rp.dbo.rs_ua a, rp.dbo.rs_ub b
+WHERE l.id = a.id AND a.k = b.k AND a.flag IN ('R', 'A') AND b.d < DATE '2020-06-01' GROUP BY 1 ORDER BY 1;
+----
+A	304	902
+R	304	902
+
+query II
+SELECT count(*), count(*) FILTER (WHERE contains(message, '[flag] AS'))
+FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND message LIKE 'remote subtree%';
+----
+1	1
+
+statement ok
+CALL disable_logging();
+
+# both ways against the same statements without remote pushdown
+query I
+SELECT count(*) FROM (
+ (SELECT l.name, a.id, b.g FROM rs_ul l, rp.dbo.rs_ua a, rp.dbo.rs_ub b WHERE l.id = a.id AND a.k = b.k AND a.flag = 'R' AND b.d < DATE '2020-06-01')
+ EXCEPT ALL
+ (SELECT l.name, a.id, b.g FROM rs_ul l, db.dbo.rs_ua a, db.dbo.rs_ub b WHERE l.id = a.id AND a.k = b.k AND a.flag = 'R' AND b.d < DATE '2020-06-01'));
+----
+0
+
+query I
+SELECT count(*) FROM (
+ (SELECT l.name, a.id, b.g FROM rs_ul l, db.dbo.rs_ua a, db.dbo.rs_ub b WHERE l.id = a.id AND a.k = b.k AND a.flag = 'R' AND b.d < DATE '2020-06-01')
+ EXCEPT ALL
+ (SELECT l.name, a.id, b.g FROM rs_ul l, rp.dbo.rs_ua a, rp.dbo.rs_ub b WHERE l.id = a.id AND a.k = b.k AND a.flag = 'R' AND b.d < DATE '2020-06-01'));
+----
+0
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_ua; DROP TABLE dbo.rs_ub;', refresh_cache := true);

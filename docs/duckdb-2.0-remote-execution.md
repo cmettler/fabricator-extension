@@ -1854,6 +1854,35 @@ ways, the route (`NOT IN (SELECT` sent, no `CASE WHEN EXISTS`); mutants without 
 and with `NOT marker` as NOT EXISTS alone (the NULL-set row) killed. Remaining gap to hand-written T-SQL (q20 7.6 s
 vs 0.28 s): the string prefix `LIKE 'forest%'` is a range on the binary ORDER key, computed per row.
 
+### 4.26 A pushed part's unread outputs go out as NULL — FIXED (2026-11-01)
+
+Found by TPC-H q10 at SF1 with lineitem and orders on SQL Server and customer local (facts-remote): > 300 s. The
+subtree pass pushed lineitem ⋈ orders, and the pushed query returned `[l_returnflag]` although nothing above the part
+reads it. After the optimizers a scan keeps every column it FILTERS on in its output (it re-applies its filters
+itself, `reapply_filters`), so the filter column rode up to the part's root. On a table our CTAS created it is
+`nvarchar(max)`, and SQL Server returns a max value through its LOB path however short: MEASURED on the join alone,
+18 s with the column, 0.3 s without; on 200k rows of a scan, 37 s returned as max, 0.28 s cast to nvarchar(4000).
+
+`ReplaceSubtree` (post pass, not for a whole statement) now asks `CollectReadBindings` over the WHOLE plan, skipping
+the part itself, which of the part's outputs are read; an unread one is sent as a NULL constant of its type (the
+column count stays — a parent join's projection map indexes by position). `CollectReadBindings` changed with it:
+a projection reads only what its READ outputs compute (DuckDB's string-compression projections name every column
+below them), and an operator counts as reading its children by POSITION unless it is on an allowlist of operators
+known to read by expression alone — a missed positional reader would now be a wrong answer, not just a larger read.
+Measured: the isolated q10 part 19 s → 0.53 s. The full q10 still timed out: its part is declined (the aggregate
+pushed through the join carries an `AGGREGATE_STATE` type), and the plain lineitem scan then returns the max column
+itself. Loaded with `nvarchar(4000)` instead, q10 still took 183 s, and the measurement showed why: in a PARALLEL plan
+SQL Server pays for the DECLARED width of an output column, not its content. 1.48M one-character `l_returnflag` rows
+through `sqlcmd`, no fabricator involved: 49 s as `nvarchar(4000)`, 5.6 s with `MAXDOP 1`, 1.2 s cast to
+`nvarchar(100)` or `nvarchar(1)`; q10's four lineitem columns 182 s as declared, 19.7 s with the flag cast to
+`nvarchar(100)` plus a `CASE WHEN LEN(c) > 100 THEN c END` fallback column (the fallback is wide again, hence not
+1.2 s). So scripts/tpc_bench.py loads with `mssql_default_varchar_length = 200` (the longest TPC value is 198 chars).
+Foreign tables with wide or max columns are still exposed; a scan returning such a column narrowed is an open idea.
+
+Gate `verify_remote_select_mssql` §23 (771 -> 812): the pushed SQL carries `NULL AS [c1], NULL AS [c2]` and no
+`[flag] AS`, the control where the flag is grouped on still sends it, and a differential both ways against the
+catalog without pushdown. Mutant (the replacement never applied) killed at the routing row.
+
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
 **As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.

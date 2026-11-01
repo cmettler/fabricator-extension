@@ -68,4 +68,29 @@ At SF 0.01 a remote run measures round trips, not computation. Notes:
 - **TPC-DS on the warehouse: q64 (47 s all remote, 94 s with the dimensions remote) and q72 (30 s)** dominate. Not yet
   analysed — the same method as q16 / q20 applies: the pushed T-SQL from the `Fabricator.Remote` log against the query
   hand-written in T-SQL.
-- The SF1 TPC-H run on box was stopped at q20 for the fixes; all placements at SF1 are still to be measured.
+- The SF1 TPC-H run on box was stopped at q20 for the fixes; the placements are measured below.
+
+### TPC-H SF1 on box, all placements (2026-11-01)
+
+Correct in every run (110 of 110). Seconds summed over the 22 queries; all local: 1.0 s. The three columns are the
+same queries against the same rows, loaded three times with a different declared width for the text columns:
+
+| placement | `nvarchar(max)` | `nvarchar(4000)` | `nvarchar(200)` |
+|---|---|---|---|
+| remote | 38.5 | 37.0 | 28.0 |
+| facts-remote | 612.1 (q10 timed out at 300) | 374.7 | 126.7 |
+| dims-remote | 20.2 | 18.8 | 4.5 |
+| random1 | 608.0 (q10 timed out) | 372.9 | 124.5 |
+| random2 | 510.8 (q10 timed out) | 332.6 | 119.1 |
+
+- **The declared text width was most of it**, and on the server, not on our side (docs/duckdb-2.0-remote-execution.md
+  §4.26): a max value goes through the LOB path however short, and a parallel plan pays for the DECLARED width — 1.48M
+  one-character `l_returnflag` rows through `sqlcmd` alone: 49 s as `nvarchar(4000)`, 1.2 s as `nvarchar(100)`. q10
+  > 300 → 183 → 4.6 s, q21 168 → 76 → 32 s, q19 49 → 24 → 0.85 s, q12 (random2) 95 → 31 → 0.83 s. Our CTAS creates
+  `nvarchar(max)` unless `mssql_default_varchar_length` is set; `scripts/tpc_bench.py` loads with 200 (the longest TPC
+  value is 198 characters).
+- A subtree fix found on the way: a pushed part returned a filter column nothing above reads; it goes out as NULL now
+  (§4.26, isolated q10 part 19 → 0.53 s).
+- **Open, width-independent**: q9 ~29 s and q3 / q4 ~12 s wherever lineitem is remote and other tables are local, q21
+  ~32 s in facts-remote / random1 / random2, q8 7–8 s (random2 q8 was 0.24 s in the first run and 6.9 s in both later
+  ones — not yet explained), q17 ~9 s.

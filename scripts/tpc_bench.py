@@ -95,6 +95,11 @@ def load(con, bench, sf, target):
     if target in ("box", "warehouse"):
         con.execute(f"SELECT fabricator_exec('rp', 'IF SCHEMA_ID(''{rs}'') IS NULL EXEC(''CREATE SCHEMA {rs}'')', "
                     "refresh_cache := true)")
+        # text columns as wide as the data (the longest TPC-H / TPC-DS value is 198 chars): SQL Server returns a max
+        # value through its LOB path however short (200k one-char flags: 37 s as max, 0.28 s cast), and a parallel plan
+        # pays for the DECLARED width (1.48M one-char rows: 49 s as nvarchar(4000), 1.2 s as nvarchar(100)) —
+        # docs/duckdb-2.0-remote-execution.md §4.26
+        con.execute("SET mssql_default_varchar_length = 200")
         writer = "rp"
     else:
         con.execute(f"CREATE SCHEMA IF NOT EXISTS lw.{rs}")

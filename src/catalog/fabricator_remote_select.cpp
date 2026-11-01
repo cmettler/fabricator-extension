@@ -51,6 +51,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
@@ -1406,28 +1407,70 @@ optional_ptr<FabricatorCatalog> RemoteCatalog(optional_ptr<Catalog> owner) {
 
 //! The bindings a plan reads: every column reference of an expression (join conditions and aggregate groups
 //! included), every column a set operation or a CTE takes from its children by position, and the root's output.
-void CollectReadBindings(LogicalOperator &op, column_binding_set_t &reads, bool root = true) {
+void CollectReadBindings(LogicalOperator &op, column_binding_set_t &reads, bool root = true,
+                         const LogicalOperator *skip = nullptr) {
+	if (&op == skip) {
+		return; // what this subtree reads of itself is not a read of its output
+	}
 	if (root) {
 		for (auto &binding : op.GetColumnBindings()) {
 			reads.insert(binding);
 		}
 	}
-	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
+	auto read_columns = [&](Expression &expr) {
 		ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
-		    **expr, [&](const BoundColumnRefExpression &ref) { reads.insert(ref.Binding()); });
-	});
-	bool positional = op.type == LogicalOperatorType::LOGICAL_UNION ||
-	                  op.type == LogicalOperatorType::LOGICAL_EXCEPT ||
-	                  op.type == LogicalOperatorType::LOGICAL_INTERSECT ||
-	                  op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
-	                  op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE;
+		    expr, [&](const BoundColumnRefExpression &ref) { reads.insert(ref.Binding()); });
+	};
+	if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		// a projection reads what its READ outputs compute: DuckDB's own pass-through projections (string compression,
+		// casts) name every column below them, used or not. The walk goes parents first, so every reader of this
+		// projection's outputs has been seen.
+		auto &projection = op.Cast<LogicalProjection>();
+		for (idx_t i = 0; i < projection.expressions.size(); i++) {
+			if (reads.find(ColumnBinding(projection.table_index, ProjectionIndex(i))) != reads.end()) {
+				read_columns(*projection.expressions[i]);
+			}
+		}
+	} else {
+		LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) { read_columns(**expr); });
+	}
+	// An operator reads its children's columns either through its expressions (above) or BY POSITION — a UNION, a CTE,
+	// an INSERT or COPY of its input, a lateral function's input table. Only the operators listed here are known to read
+	// by expression alone (passing the rest through by binding); any other counts as reading every child column, which
+	// can only make the result larger. ReplaceSubtree sends NULL for an output nobody reads, so a missed reader would be
+	// a wrong answer.
+	bool positional;
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_WINDOW:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_SAMPLE:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		positional = false;
+		break;
+	case LogicalOperatorType::LOGICAL_GET:
+		positional = !op.children.empty(); // a lateral / in-out function consumes its input table
+		break;
+	default:
+		positional = true;
+		break;
+	}
 	for (auto &child : op.children) {
 		if (positional) {
 			for (auto &binding : child->GetColumnBindings()) {
 				reads.insert(binding);
 			}
 		}
-		CollectReadBindings(*child, reads, false);
+		CollectReadBindings(*child, reads, false, skip);
 	}
 }
 
@@ -1681,6 +1724,8 @@ struct SubtreePushdown {
 	std::map<TableIndex, CteDefinition> cte_definitions;
 	//! the bindings the plan reads (CollectReadBindings): a scan reading none of its columns is still pushable
 	column_binding_set_t reads;
+	//! the plan the pass walks, for what is read OUTSIDE a subtree
+	LogicalOperator *root = nullptr;
 
 	//! Whether a subtree can be sent: it reads one catalog alone, gains something, and defines every CTE it reads.
 	//! A reference to a CTE defined ABOVE it would make the server read rows DuckDB reads too, in another statement —
@@ -2063,6 +2108,31 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		std::map<TableIndex, idx_t> copies;
 		copy = InlineCtes(state.context, std::move(copy), definitions, copies);
 		ReadRealColumnForUnused(*copy);
+		if (!state.pre && !whole_statement && state.root) {
+			// An output nobody above reads goes out as NULL. After the optimizers a scan keeps every column it filters
+			// on in its output (the scan re-applies its filters itself, see arrow_ingest), so such a column rides up to
+			// the subtree's root although the server already applies that filter. Sent, it travels through the
+			// server's join: an nvarchar(max) filter column made TPC-H q10's remote join 18 s instead of 0.3 s. NULL
+			// keeps the column count, which a parent join's projection map indexes by position.
+			column_binding_set_t outside;
+			CollectReadBindings(*state.root, outside, true, op.get());
+			vector<unique_ptr<Expression>> outputs;
+			bool unread = false;
+			for (idx_t i = 0; i < old_bindings.size(); i++) {
+				if (outside.find(old_bindings[i]) != outside.end()) {
+					outputs.push_back(make_uniq<BoundColumnRefExpression>(types[i], old_bindings[i]));
+				} else {
+					outputs.push_back(make_uniq<BoundConstantExpression>(Value(types[i])));
+					unread = true;
+				}
+			}
+			if (unread) {
+				auto projection = make_uniq<LogicalProjection>(state.optimizer.binder.GenerateTableIndex(),
+				                                               std::move(outputs));
+				projection->children.push_back(std::move(copy));
+				copy = std::move(projection);
+			}
+		}
 		for (auto &count : copies) {
 			repeated_reads = repeated_reads || count.second > 1; // the server reads that definition more than once
 		}
@@ -2290,6 +2360,7 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		CollectFilterConjuncts(*plan, state.filter_conjuncts);
 	}
 	CollectReadBindings(*plan, state.reads);
+	state.root = plan.get();
 	auto root = AnalyzeSubtree(state, plan);
 	if (state.Replaceable(root)) {
 		// a whole statement the remote optimizer did not push (a CTE, a name it cannot repeat, …)
