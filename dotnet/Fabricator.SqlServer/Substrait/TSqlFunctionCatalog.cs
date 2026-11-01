@@ -820,14 +820,18 @@ internal static class TSqlFunctionCatalog
             Scalar(ArithmeticUrn, name, op, "INFIX", SameAsFirst, c => $"({c.V(0)} {op} {c.V(1)})",
                 new TSqlFunctionVariant(ints, error), new TSqlFunctionVariant(floats, ieee));
         }
-        // [FABRICATOR-PATCH: OURS-BY-DESIGN] a float divided by zero is inf / nan in DuckDB and an error in T-SQL, which has neither value:
-        // a float division declines unless the divisor is a non-zero constant (measured: f / (t - t))
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] a float divided by zero is inf / nan under IEEE 754 (DuckDB's default) and an error in T-SQL,
+        // which has neither value: such a division declines unless the divisor is a non-zero constant (measured: f / (t - t)).
+        // With DuckDB's ieee_floating_point_ops off the producer says ERROR or NULL (error_on_division_by_zero), which T-SQL
+        // delivers. The IEEE variant comes FIRST among the floats, so a plan that names no behaviour is treated as IEEE.
         Scalar(ArithmeticUrn, "divide", "/", "INFIX", SameAsFirst,
-            c => (c.T(0).IsFloat || c.T(1).IsFloat) && !IsNonZeroConstant(c.Args[1].Value)
-                ? throw c.Unsupported("a float division by a value that may be zero is not supported; DuckDB returns inf, SQL Server fails.")
+            c => (c.T(0).IsFloat || c.T(1).IsFloat) && c.Options["on_division_by_zero"] == "IEEE" && !IsNonZeroConstant(c.Args[1].Value)
+                ? throw c.Unsupported("a float division by a value that may be zero is not supported; DuckDB returns inf, SQL Server fails "
+                    + "(SET ieee_floating_point_ops = false makes DuckDB fail too, and the division runs on the server).")
                 : Divide(c),
             new TSqlFunctionVariant(ints, ("on_division_by_zero", "ERROR"), ("on_domain_error", "ERROR"), error),
             new TSqlFunctionVariant(ints, ("on_division_by_zero", "NULL"), ("on_domain_error", "NULL"), error),
+            new TSqlFunctionVariant(floats, ("on_division_by_zero", "IEEE"), ("on_domain_error", "NAN"), ieee),
             new TSqlFunctionVariant(floats, ("on_division_by_zero", "ERROR"), ("on_domain_error", "ERROR"), ieee),
             new TSqlFunctionVariant(floats, ("on_division_by_zero", "NULL"), ("on_domain_error", "NULL"), ieee));
         Scalar(ArithmeticUrn, "modulus", "%", "INFIX", SameAsFirst, Modulus,

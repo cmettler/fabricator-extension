@@ -1282,6 +1282,72 @@ EXPLAIN SELECT max(f / (t - t)) FROM rp.dbo.rs_t;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
+# ... unless DuckDB itself does not return inf: with ieee_floating_point_ops off a float divided by zero fails (or, with
+# error_on_division_by_zero off, is NULL), and T-SQL delivers exactly that (docs/duckdb-2.0-remote-execution.md §4.28)
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+EXPLAIN SELECT max(f / (t - t)) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# the server raises it: one error for one error
+statement error
+SELECT max(f / (t - t)) FROM rp.dbo.rs_t;
+----
+<REGEX>:.*Divide by zero.*
+
+statement error
+SELECT max(f / (t - t)) FROM db.dbo.rs_t;
+----
+<REGEX>:.*zero.*
+
+# a divisor that is never zero: the same doubles both ways
+query I
+SELECT count(*) FROM (((SELECT id, f / (t + 1), f / (id + 0.5) FROM rp.dbo.rs_t) EXCEPT ALL (SELECT id, f / (t + 1), f / (id + 0.5) FROM db.dbo.rs_t))
+  UNION ALL ((SELECT id, f / (t + 1), f / (id + 0.5) FROM db.dbo.rs_t) EXCEPT ALL (SELECT id, f / (t + 1), f / (id + 0.5) FROM rp.dbo.rs_t)));
+----
+0
+
+statement ok
+SET error_on_division_by_zero = false;
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+query I
+SELECT count(*) FILTER (WHERE q IS NULL) = count(*) FROM (SELECT f / (t - t) AS q FROM rp.dbo.rs_t);
+----
+true
+
+# NULL, not an error: the divisor goes out as NULLIF(…, 0)
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND message LIKE 'remote: %' AND contains(message, 'NULLIF(');
+----
+1
+
+statement ok
+CALL disable_logging();
+
+query I
+SELECT count(*) FROM (((SELECT id, f / (t - t), f / (t + 1) FROM rp.dbo.rs_t) EXCEPT ALL (SELECT id, f / (t - t), f / (t + 1) FROM db.dbo.rs_t))
+  UNION ALL ((SELECT id, f / (t - t), f / (t + 1) FROM db.dbo.rs_t) EXCEPT ALL (SELECT id, f / (t - t), f / (t + 1) FROM rp.dbo.rs_t)));
+----
+0
+
+statement ok
+SET error_on_division_by_zero = true;
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+# back to the default: declined again
+query II
+EXPLAIN SELECT max(f / (t - t)) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
 # decimal arithmetic whose T-SQL precision exceeds 38 loses scale on the server
 query II
 EXPLAIN SELECT max(amount * big) FROM rp.dbo.rs_t;

@@ -306,6 +306,51 @@ true
 statement ok
 CALL disable_logging();
 
+# S18: a float division by a value that may be zero has no exact T-SQL (DuckDB returns inf, SQL Server fails): the
+# division stays in DuckDB, the aggregate below it still goes to the server
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+query II
+SELECT region, sum(CASE WHEN sold >= DATE '2026-02-01' THEN amount ELSE 0 END) / sum(amount) AS late_share
+FROM mssql.dbo.pg_sales GROUP BY region ORDER BY region;
+----
+EU	0.75
+US	0.8
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE 'remote subtree%SUM(%'),
+       count(*) FILTER (WHERE message LIKE '%float division by a value that may be zero%') > 0
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+1	true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# with ieee_floating_point_ops off DuckDB fails on a zero divisor too (or returns NULL, error_on_division_by_zero off),
+# and the whole statement runs on the server, division included
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT region, sum(CASE WHEN sold >= DATE '2026-02-01' THEN amount ELSE 0 END) / sum(amount) AS late_share
+FROM mssql.dbo.pg_sales GROUP BY region ORDER BY region;
+----
+EU	0.75
+US	0.8
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND message LIKE 'remote%SUM(%) / %SUM(%';
+----
+1
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+statement ok
+CALL disable_logging();
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok
@@ -540,7 +585,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 # L2: a part of a statement that reads only the server and still stays local: cf_add is a function the provider
-# implements in C#, not one of the server
+# implements in C#, not one of the server — refused twice, for the aggregate and for the projection below it (S18)
 statement ok
 SELECT t.region, s.n FROM (VALUES ('EU')) t(region) JOIN (SELECT region, sum(mssql.dbo.cf_add(id, 1)) AS n FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
 
@@ -548,7 +593,7 @@ query I
 SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote'
   AND message LIKE 'local subtree (before the optimizers): %dbo.cf_add() is not a function of the server';
 ----
-1
+2
 
 statement ok
 CALL truncate_duckdb_logs();

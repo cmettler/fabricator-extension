@@ -100,6 +100,9 @@ def load(con, bench, sf, target):
         # pays for the DECLARED width (1.48M one-char rows: 49 s as nvarchar(4000), 1.2 s as nvarchar(100)) —
         # docs/duckdb-2.0-remote-execution.md §4.26
         con.execute("SET mssql_default_varchar_length = 200")
+        # clustered columnstore, as an analytic table on box would be (a heap without keys or indexes is no fair
+        # baseline); a no-op on the warehouse, whose tables are columnstore anyway
+        con.execute("SET mssql_default_table_type = 'clustered columnstore'")
         writer = "rp"
     else:
         con.execute(f"CREATE SCHEMA IF NOT EXISTS lw.{rs}")

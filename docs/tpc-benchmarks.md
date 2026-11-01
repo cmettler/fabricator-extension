@@ -73,15 +73,16 @@ At SF 0.01 a remote run measures round trips, not computation. Notes:
 ### TPC-H SF1 on box, all placements (2026-11-01)
 
 Correct in every run (110 of 110). Seconds summed over the 22 queries; all local: 1.0 s. The three columns are the
-same queries against the same rows, loaded three times with a different declared width for the text columns:
+same queries against the same rows, loaded four times: three heaps with a different declared width for the text columns, then `nvarchar(200)` as
+clustered columnstore (`mssql_default_table_type`, which `scripts/tpc_bench.py` sets now):
 
-| placement | `nvarchar(max)` | `nvarchar(4000)` | `nvarchar(200)` |
-|---|---|---|---|
-| remote | 38.5 | 37.0 | 28.0 |
-| facts-remote | 612.1 (q10 timed out at 300) | 374.7 | 126.7 |
-| dims-remote | 20.2 | 18.8 | 4.5 |
-| random1 | 608.0 (q10 timed out) | 372.9 | 124.5 |
-| random2 | 510.8 (q10 timed out) | 332.6 | 119.1 |
+| placement | heap, `nvarchar(max)` | heap, `nvarchar(4000)` | heap, `nvarchar(200)` | columnstore, `nvarchar(200)` |
+|---|---|---|---|---|
+| remote | 38.5 | 37.0 | 28.0 | 21.8 |
+| facts-remote | 612.1 (q10 timed out at 300) | 374.7 | 126.7 | 65.2 |
+| dims-remote | 20.2 | 18.8 | 4.5 | 5.1 |
+| random1 | 608.0 (q10 timed out) | 372.9 | 124.5 | 62.4 |
+| random2 | 510.8 (q10 timed out) | 332.6 | 119.1 | 54.3 |
 
 - **The declared text width was most of it**, and on the server, not on our side (docs/duckdb-2.0-remote-execution.md
   §4.26): a max value goes through the LOB path however short, and a parallel plan pays for the DECLARED width — 1.48M
@@ -91,6 +92,14 @@ same queries against the same rows, loaded three times with a different declared
   value is 198 characters).
 - A subtree fix found on the way: a pushed part returned a filter column nothing above reads; it goes out as NULL now
   (§4.26, isolated q10 part 19 → 0.53 s).
-- **Open, width-independent**: q9 ~29 s and q3 / q4 ~12 s wherever lineitem is remote and other tables are local, q21
-  ~32 s in facts-remote / random1 / random2, q8 7–8 s (random2 q8 was 0.24 s in the first run and 6.9 s in both later
-  ones — not yet explained), q17 ~9 s.
+- **A heap without keys or indexes is no fair baseline.** Columnstore cut the lineitem-heavy queries by two to three:
+  q9 29 → 9.4 s, q21 32 → 11 s, q3 12 → 3.7 s, q7 7.9 → 2.7 s, q10 4.6 → 1.6 s (facts-remote). Part of the heap cost
+  was SQL Server's parallel plan returning many rows: q9's lineitem scan (6M rows back, only a range filter from the
+  local `part`) took 28 s at the server's default degree of parallelism (20 cores, `max degree of parallelism` 0),
+  7.8 s at `MAXDOP` 1, 2 or 4, 14 s at 8; a selective scan (1138 rows) went the other way, 0.11 s parallel vs 0.49 s
+  serial — so a blanket `MAXDOP 1` would be wrong.
+- **q8 all remote 7.65 → 0.24 s** after the run: its final DOUBLE division has no exact translation, and the subtree
+  pass gave up on the whole plan instead of pushing the aggregate below it (docs/duckdb-2.0-remote-execution.md §4.27).
+- **Open on columnstore**: q8 ~7.3 s where lineitem is remote and `part` local (DuckDB joins them first, so no
+  server-only part holds lineitem and it comes back unfiltered); q21 ~11 s and q9 ~9 s where lineitem is remote and other tables are local; q17 8.9 s and q5 6.5 s in
+  facts-remote; q18 ~5 s; q13 ~4 s.

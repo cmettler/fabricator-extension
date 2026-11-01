@@ -174,6 +174,18 @@ EXPLAIN SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.region, (SELECT co
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
+# P20: a whole statement whose top divides two sums as DOUBLE (TPC-H q8's shape): the division has no exact translation (DuckDB returns inf for a zero divisor, SQL Server fails), so it stays here and the aggregate below goes to the server
+query II
+EXPLAIN SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM rp.dbo.st_big GROUP BY region;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# P21: the same division inside a subquery joined with a local table: the aggregate below it still goes to the server
+query II
+EXPLAIN SELECT l.w, r.share FROM loc l JOIN (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM rp.dbo.st_big GROUP BY region) r USING (region);
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
 # N1: a scan with a filter only: the table scan pushes that already
 query II
 EXPLAIN SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region);
@@ -400,6 +412,28 @@ SELECT count(*) FROM (SELECT l.w, r.id, r.c FROM loc l JOIN (SELECT t.id, t.regi
 ----
 32
 
+# P20
+query I
+SELECT (SELECT count(*) FROM ((SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM rp.dbo.st_big GROUP BY region) EXCEPT ALL (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM lb GROUP BY region))) + (SELECT count(*) FROM ((SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM lb GROUP BY region) EXCEPT ALL (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM rp.dbo.st_big GROUP BY region)));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM lb GROUP BY region);
+----
+7
+
+# P21
+query I
+SELECT (SELECT count(*) FROM ((SELECT l.w, r.share FROM loc l JOIN (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM rp.dbo.st_big GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.w, r.share FROM loc l JOIN (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM lb GROUP BY region) r USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, r.share FROM loc l JOIN (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM lb GROUP BY region) r USING (region)) EXCEPT ALL (SELECT l.w, r.share FROM loc l JOIN (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM rp.dbo.st_big GROUP BY region) r USING (region))));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT l.w, r.share FROM loc l JOIN (SELECT region, sum(CASE WHEN v > 50 THEN v ELSE 0 END) / sum(v) AS share FROM lb GROUP BY region) r USING (region));
+----
+5
+
 # N1
 query I
 SELECT (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)))) + (SELECT count(*) FROM ((SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM lb WHERE v = 7) b USING (region)) EXCEPT ALL (SELECT l.w, b.id FROM loc l JOIN (SELECT id, region FROM rp.dbo.st_big WHERE v = 7) b USING (region))));
@@ -594,14 +628,16 @@ SELECT count(*) FROM duckdb_logs WHERE message LIKE 'remote subtree (before the 
 statement ok
 CALL truncate_duckdb_logs();
 
-# N2 — a function the provider implements itself (C#) does not exist on the server: the provider refuses it
+# N2 — a function the provider implements itself (C#) does not exist on the server: the provider refuses it — twice,
+# for the aggregate and then for the projection below it, which calls the function too (a declined part's children
+# are tried in turn, see P20)
 statement ok
 SELECT l.region, r.s FROM loc l JOIN (SELECT region, sum(rp.dbo.cf_add(v, 1)) AS s FROM rp.dbo.st_big GROUP BY region) r USING (region);
 
 query I
 SELECT count(*) FROM duckdb_logs WHERE message LIKE 'local subtree (before the optimizers): %dbo.cf_add() is not a function of the server';
 ----
-1
+2
 
 statement ok
 CALL truncate_duckdb_logs();

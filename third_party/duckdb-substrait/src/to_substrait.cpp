@@ -768,6 +768,18 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 		TransformConstant(Value(space_separators), *sfun->add_arguments()->mutable_value());
 		args_types.emplace_back(DuckToSubstraitType(LogicalType::VARCHAR));
 	}
+	// [FABRICATOR-PATCH: OFFER-READY] what a division by zero returns is a session setting DuckDB reads when it BINDS the
+	// call (arithmetic.cpp, BindBinaryFloatingPoint / BindDivisionByZero): inf / nan for a float `/` unless
+	// ieee_floating_point_ops is off, else an error, or NULL when error_on_division_by_zero is off — the consumer is told
+	if ((function_name == "/" || function_name == "//") && dfun.GetChildren().size() == 2 &&
+	    dfun.GetReturnType().id() != LogicalTypeId::INTERVAL) {
+		auto result = dfun.GetReturnType().id();
+		bool ieee = function_name == "/" && (result == LogicalTypeId::FLOAT || result == LogicalTypeId::DOUBLE) &&
+		            Settings::Get<IeeeFloatingPointOpsSetting>(context);
+		auto on_zero = sfun->add_options();
+		on_zero->set_name("on_division_by_zero");
+		on_zero->add_preference(ieee ? "IEEE" : Settings::Get<ErrorOnDivisionByZeroSetting>(context) ? "ERROR" : "NULL");
+	}
 	sfun->set_function_reference(RegisterFunction(RemapFunctionName(function_name), args_types));
 
 	auto output_type = sfun->mutable_output_type();

@@ -2079,18 +2079,22 @@ void EqualizeJoinKeys(LogicalOperator &op) {
 	}
 }
 
-void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog,
-                    bool whole_statement = false) {
+//! What became of a subtree: replaced by a query of its server, kept here as a whole, or declined by the translation
+//! (an expression or operator without a translation) — then parts below it may still go.
+enum class SubtreeOutcome { REPLACED, KEPT, UNTRANSLATABLE };
+
+SubtreeOutcome ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog,
+                              bool whole_statement = false) {
 	op->ResolveOperatorTypes();
 	auto old_bindings = op->GetColumnBindings();
 	auto types = op->types;
 	if (old_bindings.size() != types.size()) {
 		state.Trace("local subtree", "its bindings and types disagree");
-		return;
+		return SubtreeOutcome::KEPT;
 	}
 	if (state.pre && MayReceiveFilter(state, old_bindings)) {
 		state.Trace("local subtree", "a filter above it reads its columns; left for the pass after the optimizers");
-		return;
+		return SubtreeOutcome::KEPT;
 	}
 	string plan_bytes;
 	bool repeated_reads = false;
@@ -2155,13 +2159,17 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		DumpPlan(plan_bytes);
 	} catch (std::exception &ex) {
 		state.Trace("local subtree", DeclineReason(ex));
-		return;
+		return SubtreeOutcome::UNTRANSLATABLE;
 	}
 	string reason;
 	RemoteQuery query;
-	if (!TranslateQuery(state.context, catalog, plan_bytes, types.size(), query, reason) || query.changes_rows) {
+	if (!TranslateQuery(state.context, catalog, plan_bytes, types.size(), query, reason)) {
 		state.Trace("local subtree", reason);
-		return;
+		return SubtreeOutcome::UNTRANSLATABLE;
+	}
+	if (query.changes_rows) {
+		state.Trace("local subtree", reason);
+		return SubtreeOutcome::KEPT;
 	}
 	unique_ptr<LogicalOperator> replacement;
 	try {
@@ -2184,18 +2192,39 @@ void ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, Fab
 		}
 	} catch (std::exception &ex) {
 		state.Trace("local subtree", ErrorData(ex).RawMessage());
-		return;
+		return SubtreeOutcome::UNTRANSLATABLE;
 	}
 	auto new_bindings = replacement->GetColumnBindings();
 	if (new_bindings.size() != old_bindings.size() || replacement->types != types) {
 		state.Trace("local subtree", "the pushed query's columns do not match");
-		return;
+		return SubtreeOutcome::UNTRANSLATABLE;
 	}
 	state.Trace("remote subtree", query.sql);
 	state.old_bindings.insert(state.old_bindings.end(), old_bindings.begin(), old_bindings.end());
 	state.new_bindings.insert(state.new_bindings.end(), new_bindings.begin(), new_bindings.end());
 	state.originals.emplace_back(&op, std::move(op));
 	op = std::move(replacement);
+	return SubtreeOutcome::REPLACED;
+}
+
+SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op);
+
+//! Replaces the subtree, or — when the translation declines it — the largest parts below it that are worth it: TPC-H
+//! q8 divides two sums as DOUBLE at the top, which has no exact translation (DuckDB returns inf for a zero divisor,
+//! SQL Server fails), and its aggregate over the join of every table went local with it — 6M lineitem rows pulled,
+//! 7.5 s instead of the server's sub-second answer.
+void ReplaceOrDescend(SubtreePushdown &state, unique_ptr<LogicalOperator> &op, FabricatorCatalog &catalog,
+                      bool whole_statement = false) {
+	if (ReplaceSubtree(state, op, catalog, whole_statement) != SubtreeOutcome::UNTRANSLATABLE) {
+		return;
+	}
+	for (auto &child : op->children) {
+		// every part below reads the server alone: analysing it again replaces nothing and says what each part is
+		auto reads = AnalyzeSubtree(state, child);
+		if (state.Replaceable(reads)) {
+			ReplaceOrDescend(state, child, *reads.catalog);
+		}
+	}
 }
 
 SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> &op) {
@@ -2226,7 +2255,7 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 			return result;
 		}
 		if (state.Replaceable(input)) {
-			ReplaceSubtree(state, op->children[0], *input.catalog);
+			ReplaceOrDescend(state, op->children[0], *input.catalog);
 		}
 		return SubtreeReads();
 	}
@@ -2265,7 +2294,7 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		}
 		for (idx_t i = 0; i < op->children.size(); i++) {
 			if (state.Replaceable(children[i])) {
-				ReplaceSubtree(state, op->children[i], *children[i].catalog);
+				ReplaceOrDescend(state, op->children[i], *children[i].catalog);
 			}
 		}
 		return SubtreeReads();
@@ -2315,7 +2344,7 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 	// this operator stays local: each child that reads one catalog alone, and is worth it, goes to its server
 	for (idx_t i = 0; i < op->children.size(); i++) {
 		if (state.Replaceable(children[i])) {
-			ReplaceSubtree(state, op->children[i], *children[i].catalog);
+			ReplaceOrDescend(state, op->children[i], *children[i].catalog);
 		}
 	}
 	return SubtreeReads();
@@ -2364,7 +2393,7 @@ void SubtreePushdownPass(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	auto root = AnalyzeSubtree(state, plan);
 	if (state.Replaceable(root)) {
 		// a whole statement the remote optimizer did not push (a CTE, a name it cannot repeat, …)
-		ReplaceSubtree(state, plan, *root.catalog, true);
+		ReplaceOrDescend(state, plan, *root.catalog, true);
 	}
 	if (state.old_bindings.empty()) {
 		return;

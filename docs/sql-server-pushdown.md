@@ -85,6 +85,7 @@ SELECT t.region, s.n
 FROM (VALUES ('EU')) t(region)
 JOIN (SELECT region, sum(mssql.dbo.cf_add(id, 1)) AS n FROM mssql.dbo.pg_sales GROUP BY region) s USING (region);
 -- Fabricator.Remote | local subtree (before the optimizers): Unsupported Substrait construct: dbo.cf_add() is not a function of the server
+-- (twice: once for the aggregate, once for the projection below it that calls cf_add too — see S18)
 ```
 
 **L3** — a `DELETE` that takes the key path names the condition (DuckDB rewrote `'^l'` to `prefix`):
@@ -361,6 +362,23 @@ SELECT region, count(*) FROM mssql.dbo.pg_sales WHERE amount > 1000 GROUP BY ROL
 -- Fabricator.Remote | local: … grouping sets with the empty set (ROLLUP, CUBE) stay local …
 SELECT region, sold, count(*) FROM mssql.dbo.pg_sales GROUP BY GROUPING SETS ((region), (sold));  -- pushed
 ```
+
+**S18 — a division that stays local, with the aggregate below it pushed.** A float divided by a value that may be
+zero has no exact T-SQL: DuckDB returns inf (IEEE 754), SQL Server fails. The division then runs in DuckDB, and what
+lies below it — here the aggregate — still goes to the server. With `SET ieee_floating_point_ops = false` DuckDB
+itself fails on a zero divisor (or returns NULL with `error_on_division_by_zero` off, sent as `NULLIF(…, 0)`), and
+the whole statement is pushed:
+
+```sql
+SELECT region, sum(CASE WHEN sold >= DATE '2026-02-01' THEN amount ELSE 0 END) / sum(amount) AS late_share
+FROM mssql.dbo.pg_sales GROUP BY region;   -- EU 0.75, US 0.8
+-- Fabricator.Remote | remote subtree (before the optimizers): SELECT [t0].[region] AS [c0], SUM(…) AS [c1], SUM(…) AS [c2] …
+SET ieee_floating_point_ops = false;
+-- the same statement: Fabricator.Remote | remote: SELECT … (CAST(SUM(…) AS float) / CAST(SUM(…) AS float)) …
+```
+
+TPC-H q8 ends in such a division; all on the server it took 7.5 s while the whole plan stayed local, 0.24 s with the
+aggregate pushed, 0.21 s with the division too.
 
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where

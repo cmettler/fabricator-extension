@@ -332,7 +332,10 @@ Runs locally (each measured to answer differently on SQL Server, or not expressi
 (the table scan already pushes its filter and projection), `reverse`,
 regular expressions, `LIKE` patterns with `_`, `ILIKE`, `substring` with a negative or non-constant start, `left` /
 `right` with a negative count, comparing or
-grouping binary values (SQL Server ignores trailing zero bytes), a float divided by a value that may be zero,
+grouping binary values (SQL Server ignores trailing zero bytes), a float divided by a value that may be zero
+(DuckDB returns inf; with `SET ieee_floating_point_ops = false` DuckDB fails, or returns NULL when
+`error_on_division_by_zero` is off, and the division is pushed — the operators below such an expression are pushed
+either way),
 decimal arithmetic past precision 38 (SQL Server would round), float → string casts, `any_value`, `GROUPS` /
 `RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions with no T-SQL rendering (`date_sub`,
 `strftime`, list and JSON functions, …), functions whose value is not fixed by their arguments (`now()`,

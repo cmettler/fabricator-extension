@@ -1877,11 +1877,57 @@ through `sqlcmd`, no fabricator involved: 49 s as `nvarchar(4000)`, 5.6 s with `
 `nvarchar(100)` or `nvarchar(1)`; q10's four lineitem columns 182 s as declared, 19.7 s with the flag cast to
 `nvarchar(100)` plus a `CASE WHEN LEN(c) > 100 THEN c END` fallback column (the fallback is wide again, hence not
 1.2 s). So scripts/tpc_bench.py loads with `mssql_default_varchar_length = 200` (the longest TPC value is 198 chars).
-Foreign tables with wide or max columns are still exposed; a scan returning such a column narrowed is an open idea.
+Foreign tables with wide or max columns stay exposed BY DECISION (user, 2026-11-01): a scan narrowing them would pay
+for the fallback column anyway; the remedy is a table created with fitting widths (`CREATE TABLE … WITH
+(varchar_length = …)`, then widen the few columns that need max).
 
 Gate `verify_remote_select_mssql` §23 (771 -> 812): the pushed SQL carries `NULL AS [c1], NULL AS [c2]` and no
 `[flag] AS`, the control where the flag is grouped on still sends it, and a differential both ways against the
 catalog without pushdown. Mutant (the replacement never applied) killed at the routing row.
+
+### 4.27 A declined part's children still go — FIXED (2026-11-01)
+
+Found by TPC-H q8 at SF1, ALL tables on SQL Server: 7.5 s against DuckDB's 0.04 s. q8 ends in
+`sum(CASE … THEN volume ELSE 0 END) / sum(volume)`, a DOUBLE division by a value that may be zero, which has no exact
+translation (DuckDB returns inf, SQL Server fails), so the remote optimizer declined the statement. The subtree pass
+then judged the whole plan pushable — `PushableOperator` looks at operator kinds, not at whether each expression has a
+translation — tried the root, saw the translation decline it, and stopped: the aggregate over the eight-table join went
+local, and lineitem's 6M rows came back unfiltered.
+
+`ReplaceSubtree` now says why it did not replace (`SubtreeOutcome`): KEPT (its bindings disagree, a filter above may
+still reach it, the query writes) or UNTRANSLATABLE. `ReplaceOrDescend` — every caller goes through it — analyses each
+child of an untranslatable part again and replaces the largest worth-it parts below, recursively. For q8 the aggregate
+runs on the server and only the division here: 7.5 → 0.24 s. Placements with local tables do not change (q8 7.3 s in
+facts-remote): DuckDB's join order joins lineitem with the LOCAL part first, so no server-only part contains it.
+
+A part that calls a function the server lacks is now tried twice (the aggregate, then the projection below that calls
+it as well); the cost is one more translation attempt. Gate `verify_subtree_pushdown_mssql` P20 (a whole statement)
+and P21 (inside a join) — routing and differential, 210 -> 218 — and N2 now counts both refusals. Mutant (no descent)
+killed at P20's routing row.
+
+### 4.28 A float division follows DuckDB's own division settings — PUSHED (2026-11-01)
+
+User-raised after §4.27: DuckDB HAS a setting for it. `ieee_floating_point_ops` (default true) makes a float `/`
+return inf / nan for a zero divisor; with it off the float division behaves like the integer one — an error, or NULL
+when `error_on_division_by_zero` (default true in 2.0) is off. DuckDB reads both when it BINDS the call
+(arithmetic.cpp `BindBinaryFloatingPoint` / `BindDivisionByZero`), i.e. within the same statement our producer runs
+in. The producer sent no division option at all, so the emitter assumed ERROR for integers and refused every float
+division with a divisor that may be zero.
+
+Now `to_substrait` adds Substrait's `on_division_by_zero` to every `/` and `//` — `IEEE` for a float `/` while
+`ieee_floating_point_ops` is on, else `ERROR` or `NULL` from `error_on_division_by_zero` — and the emitter declines
+only `IEEE` (a non-zero constant divisor still goes), sends `ERROR` as a plain `/` and `NULL` as `/ NULLIF(…, 0)`.
+The IEEE variant comes first among the float ones, so a plan naming no behaviour is still read as IEEE. It also fixed
+an integer `//` under `error_on_division_by_zero = false`: DuckDB answers NULL, the server used to fail.
+
+What stays different, by nature and never a wrong answer: an overflow of a float division (1e300 / 1e-300) is inf
+in DuckDB and an error on the server; and SQL Server may evaluate a division before a filter that would have removed
+its zero divisor, failing where DuckDB answers.
+
+TPC-H q8 all remote: 0.24 s (§4.27, division local) → 0.21 s, same doubles. Gates: `verify_remote_select_mssql`
+(812 -> 828: pushed under the setting, one error for one error, a never-zero divisor both ways, NULL mode with
+`NULLIF` in the pushed SQL and the same answers, declined again at the default) and guide S18. Mutant (NULL mode
+without NULLIF) killed at the NULL row.
 
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
