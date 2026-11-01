@@ -1067,6 +1067,43 @@ Found 2026-10-31 (docs/duckdb-2.0-remote-execution.md §4.22). NOT filed. A miss
 - Even with that alias the check looks in the DEFAULT schema: after `USE db.sales`, a table only in `sales` is never
   pushed. The fix is to look it up in `GetSchemasForCatalog(remote_catalog)` from the search path.
 
+## 15. A correlated `NOT EXISTS` gets no join filter — a missed filter, never a wrong answer, 2.0 and main
+
+Found 2026-11-01 through TPC-H q21 with `lineitem` on SQL Server (docs/tpc-benchmarks.md). NOT filed; a PR is the
+user's to write. The `NOT EXISTS (… l3.l_orderkey = l1.l_orderkey …)` scan of `lineitem` (6M rows) received no
+runtime filter at all, so every row crossed the wire.
+
+Two places, both needed, both unchanged on `main` (checked 2026-11-01):
+
+1. `pushdown_mark_join.cpp`: a correlated `NOT EXISTS` is a MARK join whose condition the deliminator leaves as
+   `IS NOT DISTINCT FROM` (it rewrites NDF to `=` only for non-MARK joins). `PushdownMarkJoin` then turns MARK +
+   `NOT(marker)` into ANTI and keeps NDF. For SEMI it already calls `SimplifyNullSafeSemiJoinConditions` (NDF → `=`
+   when either key is provably non-NULL, "unlocks the existing runtime-filter infrastructure"); for ANTI it does not.
+   The same rule holds for ANTI: if one side's key is never NULL, a NULL on the other side matches nothing under NDF
+   either, so the result is the same. `JoinFilterPushdownOptimizer` skips NDF conditions, so the filter dies here.
+2. `join_filter_pushdown_optimizer.cpp` `JoinTypeIsSupported` excludes RIGHT_ANTI with "FIXME: anti/right_anti - we
+   could do this, but need to invert the join conditions". Inverting is needed for ANTI (the probe side is the one
+   returned). For RIGHT_ANTI the BUILD rows are returned, and a probe row whose key is not on the build side can match
+   nothing, so it may be dropped exactly as for RIGHT_SEMI, which is supported. The build-probe optimizer flips the
+   ANTI to RIGHT_ANTI before the join filter pass runs.
+
+MEASURED with both changes applied locally to v2.0.0 (an experiment, reverted):
+- TPC-H SF1, `lineitem`/`orders`/`partsupp` on SQL Server, the rest local: q21 5.8–6.0 s → 3.3–3.5 s; q4/q9/q16/q22
+  unchanged; every result identical (row count + per-column hash sums).
+- Correctness: our suites `verify_null_key_subqueries` (33, NULL keys in EXISTS/NOT EXISTS/IN/NOT IN),
+  `verify_pushdown_edges_mssql` (1716), `verify_tpch_mssql` (11465), `verify_tpcds_mssql` (117129); DuckDB's
+  `test/sql/subquery/*` (5735) and `test/sql/join/*` (20972) green.
+- DuckDB's `test/optimizer/*`: ONE failure, `deliminator.test:414`, a plan-shape regex expecting
+  `RIGHT_ANTI … ANTI … SEMI`; with `=` the join order changes. Its result queries pass. A PR would update that line.
+- Not measured: local-only performance (the change gives local anti joins runtime filters too, which DuckDB decides
+  per join by its usual cost rules).
+
+Related, NOT addressed by this: `CanUseBloomFilter` builds a bloom / prefix-range filter only for a join with exactly
+ONE equality condition ("the Filter API only allows single-column filters so far"). TPC-H q9 joins `lineitem` on
+`l_partkey` AND `l_suppkey`, so `lineitem` gets min/max only: 6M rows / 7.8 s where a part-key list would return 319k
+rows in 0.53 s. A filter per equality column (each alone is a valid superset) would cover it, but the prefix-range
+filter is built from `conditions[0]`'s key only, so that is a larger change.
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the
