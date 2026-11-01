@@ -76,13 +76,18 @@ Correct in every run (110 of 110). Seconds summed over the 22 queries; all local
 same queries against the same rows, loaded four times: three heaps with a different declared width for the text columns, then `nvarchar(200)` as
 clustered columnstore (`mssql_default_table_type`, which `scripts/tpc_bench.py` sets now):
 
-| placement | heap, `nvarchar(max)` | heap, `nvarchar(4000)` | heap, `nvarchar(200)` | columnstore, `nvarchar(200)` |
-|---|---|---|---|---|
-| remote | 38.5 | 37.0 | 28.0 | 21.8 |
-| facts-remote | 612.1 (q10 timed out at 300) | 374.7 | 126.7 | 65.2 |
-| dims-remote | 20.2 | 18.8 | 4.5 | 5.1 |
-| random1 | 608.0 (q10 timed out) | 372.9 | 124.5 | 62.4 |
-| random2 | 510.8 (q10 timed out) | 332.6 | 119.1 | 54.3 |
+| placement | heap, `nvarchar(max)` | heap, `nvarchar(4000)` | heap, `nvarchar(200)` | columnstore, `nvarchar(200)` | columnstore, + key lists |
+|---|---|---|---|---|---|
+| remote | 38.5 | 37.0 | 28.0 | 21.8 | 11.8 |
+| facts-remote | 612.1 (q10 timed out at 300) | 374.7 | 126.7 | 65.2 | 25.3 |
+| dims-remote | 20.2 | 18.8 | 4.5 | 5.1 | 4.4 |
+| random1 | 608.0 (q10 timed out) | 372.9 | 124.5 | 62.4 | 25.0 |
+| random2 | 510.8 (q10 timed out) | 332.6 | 119.1 | 54.3 | 24.7 |
+
+The last column is the same data after `6408792` (a declined part's children pushed, the DuckDB division settings),
+`8392a7f` (long key lists as one JSON parameter) and `196dbbf` (a join's keys read back from DuckDB's prefix-range
+filter, table variables on box) — all at DuckDB's default `dynamic_or_filter_threshold`. In facts-remote: q8 7.3 →
+1.3 s, q17 8.9 → 0.09 s, q5 6.6 → 1.0 s, q3 3.7 → 0.3 s, q18 5.0 → 1.5 s, q21 11.4 → 5.3 s, q10 1.7 → 0.2 s.
 
 - **The declared text width was most of it**, and on the server, not on our side (docs/duckdb-2.0-remote-execution.md
   §4.26): a max value goes through the LOB path however short, and a parallel plan pays for the DECLARED width — 1.48M
@@ -100,6 +105,8 @@ clustered columnstore (`mssql_default_table_type`, which `scripts/tpc_bench.py` 
   serial — so a blanket `MAXDOP 1` would be wrong.
 - **q8 all remote 7.65 → 0.24 s** after the run: its final DOUBLE division has no exact translation, and the subtree
   pass gave up on the whole plan instead of pushing the aggregate below it (docs/duckdb-2.0-remote-execution.md §4.27).
-- **Open on columnstore**: q8 ~7.3 s where lineitem is remote and `part` local (DuckDB joins them first, so no
-  server-only part holds lineitem and it comes back unfiltered); q21 ~11 s and q9 ~9 s where lineitem is remote and other tables are local; q17 8.9 s and q5 6.5 s in
+- **Open with the key lists**: q9 ~9 s (lineitem's part keys come from a coarse bitmap with more candidates than the
+  cap, so only ranges reach the server), q21 ~5 s (its EXISTS / NOT EXISTS scans of lineitem get no keys), q3 in
+  random2 3.2 s, q18 ~1.5 s. Before the key lists (columnstore column): q8 ~7.3 s where lineitem is remote and `part`
+  local (DuckDB joins them first, so no server-only part holds lineitem and it comes back unfiltered); q21 ~11 s and q9 ~9 s where lineitem is remote and other tables are local; q17 8.9 s and q5 6.5 s in
   facts-remote; q18 ~5 s; q13 ~4 s.
