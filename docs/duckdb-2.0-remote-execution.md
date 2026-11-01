@@ -2116,17 +2116,29 @@ cached — a stale type would make a key silently match nothing): `decimal(p,s)`
 `COLLATE <its collation>` (OPENJSON takes it in the WITH clause). Values that a JSON number would round go as text;
 legacy `datetime` as `.fff` and `smalldatetime` without fractions, since they take no more from text — the server then
 rounds as for a bound parameter. A row id that appears twice in one block keeps its last row (a join would let the
-server pick either; DuckDB's own UPDATE with a double match is not determined either, so this is not observable).
-Kept on the old path: RETURNING (OUTPUT / the warehouse read-back), a key or SET column of a type JSON does not carry
-exactly (binary, sql_variant, xml, spatial, rowversion …), and an engine without OPENJSON (compatibility level < 130).
+server pick either; DuckDB's own UPDATE with a double match is not determined either, so which row wins is not
+observable). The duplicate test keys a row id by its values in FULL precision (`RowIdKey`, shared with the warehouse
+VALUES path) — the first build keyed a DateTime by `Convert.ToString`, i.e. to the second, so two row ids differing in
+their microseconds were one, and an UPDATE dropped rows silently (caught by reading the warehouse path beside it, not by
+a test; §5 of the gate now pins it).
+RETURNING takes the same join (added the same day): `DELETE t OUTPUT DELETED.* FROM …` / `UPDATE t SET … OUTPUT
+INSERTED.* FROM …`, through `OUTPUT … INTO` a table variable when the table has a trigger, and on a warehouse a
+`SELECT t.* FROM <the join>` before the DELETE / after the UPDATE in the same batch (a key may not change there, as
+before). A row id matched twice now comes back ONCE with its final values — as DuckDB answers (measured: a local
+`UPDATE … FROM` with a double match returns one row) — where one statement per row returned it twice.
+Kept on the old paths: a key or SET column of a type JSON does not carry exactly (binary, sql_variant, xml, spatial,
+rowversion …) and an engine without OPENJSON (compatibility level < 130).
 MEASURED live: OPENJSON with a typed WITH, `COLLATE`, decimal and datetime2 from text, and UPDATE / DELETE through a
 join on a two-part key all work on Fabric Warehouse and the Lakehouse SQL endpoint (compatibility level 160).
 
-Gate: NEW service suite `verify_rowid_json_mssql` (36): a ten-part key of int, datetime2(7), legacy datetime,
+Gate: NEW service suite `verify_rowid_json_mssql` (67): a ten-part key of int, datetime2(7), legacy datetime,
 decimal, a CI varchar, a BIN2 nvarchar, uniqueidentifier, date, time(7) and datetimeoffset(7) — UPDATE and DELETE
 against a local copy, both ways; the declarations in the logged statement; a double match; 25 000 rows in several
-blocks; a varbinary key on the OR terms. Mutants: no COLLATE (killed at the declaration row), legacy datetime with 7
-digits (killed at the first UPDATE: conversion error). The last-row-wins mutant SURVIVES, as argued above.
+blocks; a varbinary key on the OR terms; 100 datetime2 keys a microsecond apart; UPDATE / DELETE … RETURNING against
+the same statements on the local copy (count, sum and a hash of every column), a double match returning one row as
+DuckDB does, and a trigger table (OUTPUT INTO). Mutants: no COLLATE (killed at the declaration row), legacy datetime
+with 7 digits (killed at the first UPDATE: conversion error), a row-id key to the second (killed at the microsecond
+keys). The last-row-wins mutant SURVIVES, as argued above.
 
 ### The record before it was built (2026-10-27)
 

@@ -18,7 +18,7 @@ statement ok
 SET fabricator_dml_pushdown = false;
 
 statement ok
-SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rj_k; DROP TABLE IF EXISTS dbo.rj_b;');
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rj_k; DROP TABLE IF EXISTS dbo.rj_b; DROP TABLE IF EXISTS dbo.rj_t; DROP TABLE IF EXISTS dbo.rj_tr;');
 
 # one row per key; every column a possible key part. ci: a case-insensitive collation, cs: a binary one, so 'a' and
 # 'A' are two keys only there. legacy datetime stores .127 as .1266667.
@@ -152,8 +152,103 @@ FROM duckdb_logs WHERE type = 'Fabricator.Sql';
 ----
 0	1
 
+# ═══ §5  Row ids that differ only in their microseconds are different row ids ═══════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rj_t (k DATETIME2(7) PRIMARY KEY, v INT);
+INSERT INTO dbo.rj_t SELECT DATEADD(microsecond, value, CAST(''2026-01-01 12:00:00'' AS datetime2(7))), 0 FROM GENERATE_SERIES(1, 100);', refresh_cache := true);
+
+query I
+UPDATE db.dbo.rj_t SET v = 1 WHERE v = 0;
+----
+100
+
+query I
+SELECT count(*) FROM db.dbo.rj_t WHERE v = 1;
+----
+100
+
+# ═══ §6  RETURNING through the JSON join: the same rows as DuckDB on the local copy ══════════════════════════
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+WITH r AS (UPDATE db.dbo.rj_k SET v = v + 7 WHERE i % 7 = 0 RETURNING *) SELECT count(*), sum(v), sum(hash(i, dt2, dtl, dec, ci, cs, u, d, tm, dto, v)) FROM r;
+----
+343	133618	3033925578334262559772
+
+query III
+WITH r AS (UPDATE lk SET v = v + 7 WHERE i % 7 = 0 RETURNING *) SELECT count(*), sum(v), sum(hash(i, dt2, dtl, dec, ci, cs, u, d, tm, dto, v)) FROM r;
+----
+343	133618	3033925578334262559772
+
+query I
+SELECT count(*) FROM ((SELECT * FROM db.dbo.rj_k EXCEPT ALL SELECT * FROM lk) UNION ALL (SELECT * FROM lk EXCEPT ALL SELECT * FROM db.dbo.rj_k));
+----
+0
+
+query III
+WITH r AS (DELETE FROM db.dbo.rj_k WHERE i % 11 = 0 RETURNING *) SELECT count(*), sum(v), sum(hash(i, dt2, dtl, dec, ci, cs, u, d, tm, dto, v)) FROM r;
+----
+218	83250	2019373556386982147118
+
+query III
+WITH r AS (DELETE FROM lk WHERE i % 11 = 0 RETURNING *) SELECT count(*), sum(v), sum(hash(i, dt2, dtl, dec, ci, cs, u, d, tm, dto, v)) FROM r;
+----
+218	83250	2019373556386982147118
+
+query I
+SELECT count(*) FROM ((SELECT * FROM db.dbo.rj_k EXCEPT ALL SELECT * FROM lk) UNION ALL (SELECT * FROM lk EXCEPT ALL SELECT * FROM db.dbo.rj_k));
+----
+0
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE '%UPDATE t SET%OUTPUT INSERTED.* FROM [dbo].[rj_k] AS t JOIN OPENJSON(@j)%'),
+       count(*) FILTER (WHERE message LIKE '%DELETE t OUTPUT DELETED.* FROM [dbo].[rj_k] AS t JOIN OPENJSON(@j)%')
+FROM duckdb_logs WHERE type = 'Fabricator.Sql';
+----
+1	1
+
+# a row id matched twice comes back ONCE, with its final values — as DuckDB answers
+query I
+WITH r AS (UPDATE db.dbo.rj_k SET v = s.v FROM src s WHERE rj_k.i = s.i RETURNING rj_k.i) SELECT count(*) FROM r;
+----
+15
+
+query I
+WITH r AS (UPDATE lk SET v = s.v FROM src s WHERE lk.i = s.i RETURNING lk.i) SELECT count(*) FROM r;
+----
+15
+
+# ═══ §7  A table with a trigger: OUTPUT INTO a table variable, read in the same batch ═══════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rj_tr (id INT PRIMARY KEY, v INT, touched INT NULL);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TRIGGER dbo.rj_tr_upd ON dbo.rj_tr AFTER UPDATE AS SET NOCOUNT ON; UPDATE t SET touched = 1 FROM dbo.rj_tr t JOIN inserted i ON i.id = t.id;');
+
+statement ok
+SELECT fabricator_exec('db', 'INSERT INTO dbo.rj_tr (id, v) SELECT value, value FROM GENERATE_SERIES(1, 50);');
+
+query II
+WITH r AS (UPDATE db.dbo.rj_tr SET v = v * 2 WHERE id <= 10 RETURNING id, v) SELECT count(*), sum(v) FROM r;
+----
+10	110
+
+query II
+WITH r AS (DELETE FROM db.dbo.rj_tr WHERE id > 45 RETURNING id) SELECT count(*), sum(id) FROM r;
+----
+5	240
+
+query II
+SELECT count(*) FILTER (WHERE touched = 1), sum(v) FROM db.dbo.rj_tr;
+----
+10	1090
+
 statement ok
 CALL disable_logging();
 
 statement ok
-SELECT fabricator_exec('db', 'DROP TABLE dbo.rj_k; DROP TABLE dbo.rj_b;');
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rj_k; DROP TABLE dbo.rj_b; DROP TABLE dbo.rj_t; DROP TABLE dbo.rj_tr;');
