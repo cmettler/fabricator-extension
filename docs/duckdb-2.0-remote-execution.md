@@ -1929,6 +1929,35 @@ TPC-H q8 all remote: 0.24 s (§4.27, division local) → 0.21 s, same doubles. G
 `NULLIF` in the pushed SQL and the same answers, declined again at the default) and guide S18. Mutant (NULL mode
 without NULLIF) killed at the NULL row.
 
+### 4.29 A boundary at a CTE: the server delivers rows, DuckDB computes the rest — BUILT (2026-11-01)
+
+User-asked: a CTE over server tables is the typical way to get SQL Server data into DuckDB efficiently and compute on
+with DuckDB's features — so the CTE must be a place the pushdown can STOP. MEASURED before: neither route stopped
+there. DuckDB's remote optimizer declined the statement (the CTE node has no translation), and the subtree pass
+inlined the CTE (`InlineCtes`) and pushed the whole statement, aggregate included — `AS MATERIALIZED` changed nothing.
+
+`SET fabricator_pushdown_boundary = 'cte'`, or the ATTACH option `pushdown_boundary 'cte'` (SQL Server; carried to the
+host as the capability `pushdown_boundary`). The session value wins when set; empty (the default) leaves it to the
+catalog, `'none'` turns it off; anything else is refused (the setting at use, the option at ATTACH).
+
+- **Subtree pass** (`AnalyzeSubtree`, LOGICAL_MATERIALIZED_CTE): a USER CTE — not one of DuckDB's own
+  `__duckdb_delim_…` from decorrelation — whose definition reads the catalog alone is replaced by itself, worth it or
+  not (else the post pass would push it merged into the statement around it once DuckDB has inlined it), and the
+  statement around it is not pushed (a part reading a CTE it does not define never is). The pre pass runs BEFORE
+  DuckDB's `CTEInlining`, which then inlines a CTE read once — the main query reads the replacement's rows streaming.
+  A CTE read more than once is set to MATERIALIZE ALWAYS, `NOT MATERIALIZED` included: inlined copies would be
+  separate server reads of one query, which need not agree (§4.16).
+- **Remote optimizer**: `BindToSubstrait` (the SELECT path) declines a plan holding a user CTE under the boundary.
+  Defensive today — such plans fail translation anyway — but it keeps the statement here the day CTEs translate.
+- A `WHERE` on the CTE's columns still reaches the server: the replacement takes table filters (§5.1), so
+  `WHERE b = 'x'` is sent as `… ) AS [q] WHERE [c1] = @p0`.
+
+Gate: NEW service suite `verify_pushdown_boundary_mssql` (68): the whole push without the boundary; under it the CTE
+query, the outer filter around it, no SUM on the server, no CTE operator in the plan, the same answers as the catalog
+without pushdown (a window, ORDER BY … LIMIT, a join with local data), one server read for a CTE read twice (also
+NOT MATERIALIZED), a correlated subquery still pushed whole, the ATTACH option, SET over ATTACH both ways, and both
+refusals. Guide S19.
+
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
 **As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.

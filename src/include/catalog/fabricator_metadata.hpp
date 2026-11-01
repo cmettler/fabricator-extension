@@ -85,6 +85,9 @@ struct FabricatorCapabilities {
 	//! names none and DuckDB's `main` stands (Delta, DAX). SQL Server reports the login's SCHEMA_NAME().
 	//! The one non-boolean key in the doc.
 	string default_schema;
+	//! Where the subtree pushdown stops (ATTACH option `pushdown_boundary`): empty or "none", or "cte" — a CTE that
+	//! reads the catalog alone goes to the server as its own query, the statement around it runs in DuckDB.
+	string pushdown_boundary;
 };
 
 //! Reads the catalog's capability doc (one flat JSON object, booleans plus `default_schema`). Called once at ATTACH

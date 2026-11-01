@@ -66,6 +66,9 @@ public:
 	//! Delta. See docs/multifile-delta.md §"Batch 2 slice 2".
 	//! The provider renders pushed table filters as a superset and the scan re-applies them exactly (SQL Server):
 	//! the scan may advertise filter_pushdown=true, which is what brings DuckDB's runtime join filters to it.
+	const string &PushdownBoundary() const {
+		return pushdown_boundary_;
+	}
 	bool SupersetFilterPushdown() const {
 		return superset_filter_pushdown_;
 	}
@@ -249,6 +252,9 @@ private:
 	bool supports_nested_schemas_ = false;
 	//! The provider's default schema (capability `default_schema`); empty => DuckDB's `main`.
 	string default_schema_;
+	//! The ATTACH option `pushdown_boundary` (capability of the same name); a session SET of
+	//! fabricator_pushdown_boundary wins over it.
+	string pushdown_boundary_;
 	//! The provider runs a pushed SELECT (capability `remote_select`); see Supports().
 	bool remote_select_ = false;
 	mutex remote_plans_lock_;

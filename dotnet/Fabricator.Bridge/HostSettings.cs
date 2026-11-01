@@ -55,6 +55,12 @@ internal static class HostSettings
     /// See docs/duckdb-2.0-remote-execution.md §4.10.</summary>
     public const string SubtreePushdownName = "fabricator_subtree_pushdown";
 
+    /// <summary>Where the subtree pushdown stops: 'cte' sends a CTE that reads one remote_pushdown catalog alone to the
+    /// server as its own query and runs the statement around it in DuckDB; 'none' pushes as much as translates. Unset
+    /// (the default), each catalog's ATTACH option <c>pushdown_boundary</c> decides. See
+    /// docs/duckdb-2.0-remote-execution.md §4.29.</summary>
+    public const string PushdownBoundaryName = "fabricator_pushdown_boundary";
+
     /// <summary>Answer an ungrouped <c>COUNT(*)</c> / <c>MIN</c> / <c>MAX</c> from the provider's per-file
     /// metadata instead of scanning — ABI v95. Off, the scan always runs, which is the reference oracle the
     /// differential gate compares against.</summary>
@@ -96,6 +102,14 @@ internal static class HostSettings
             Description: "Run each part of a statement that reads one remote_pushdown catalog alone (a subquery " +
                          "or CTE over its tables, joined with local data) as one query on the provider. On by " +
                          "default; turn it off to run such parts locally, which is also the reference oracle."),
+        new ProviderSetting(
+            PushdownBoundaryName,
+            ProviderSettingType.Varchar,
+            Default: "",
+            Description: "Where the pushdown to a remote_pushdown catalog stops: 'cte' runs each CTE that reads one " +
+                         "catalog alone as its own server query and the rest of the statement in DuckDB; 'none' " +
+                         "pushes as much as translates. Empty (default): the catalog's ATTACH option " +
+                         "pushdown_boundary decides."),
         new ProviderSetting(
             PartitionStatsName,
             ProviderSettingType.Bool,

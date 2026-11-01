@@ -380,6 +380,23 @@ SET ieee_floating_point_ops = false;
 TPC-H q8 ends in such a division; all on the server it took 7.5 s while the whole plan stayed local, 0.24 s with the
 aggregate pushed, 0.21 s with the division too.
 
+**S19 — stop at a CTE: the server delivers rows, DuckDB computes the rest.** Pushing everything is not always
+wanted. With `SET fabricator_pushdown_boundary = 'cte'` (or `ATTACH … (pushdown_boundary 'cte')` for one catalog; a
+session value wins, `'none'` turns it off) a CTE that reads the catalog alone is its own server query, and the
+statement around it runs in DuckDB, reading the rows as they come:
+
+```sql
+SET fabricator_pushdown_boundary = 'cte';
+WITH src AS (SELECT s.id, s.amount, r.name FROM mssql.dbo.pg_sales s JOIN mssql.dbo.pg_regions r USING (region))
+SELECT name, sum(amount) FROM src WHERE name = 'Europe' GROUP BY name;   -- Europe 40.00
+-- Fabricator.Remote | boundary (before the optimizers): CTE src is its own server query
+-- Fabricator.Sql: SELECT [c1], [c2] FROM (SELECT … INNER JOIN [dbo].[pg_regions] …) AS [q] WHERE [c2] = @p0 …
+-- (the sum is DuckDB's; without the boundary the whole statement, SUM included, is one server query)
+```
+
+A CTE read more than once is read once from the server and kept, `NOT MATERIALIZED` or not: two server reads of one
+query need not agree. A correlated subquery is no CTE of the statement and is pushed as before (S16).
+
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
 an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or

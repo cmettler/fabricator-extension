@@ -361,6 +361,20 @@ called by name inside such a query, joined with the catalog's tables; called per
 (`FROM mssql.dbo.t, mssql.dbo.tvf(t.a)`) it becomes a `CROSS APPLY` in the same statement. A `WHERE` on a column of such a part is inside the query sent (the part is taken after DuckDB has moved the
 condition down). `SET fabricator_subtree_pushdown = false` turns parts off for the session, whole statements unaffected.
 
+**Stopping at a CTE (`pushdown_boundary`).** Pushing everything is not always what you want: often the server should
+deliver the joined and filtered rows and DuckDB should compute the rest. With `SET fabricator_pushdown_boundary =
+'cte'` (or the ATTACH option `pushdown_boundary 'cte'` for one catalog; a session value wins, `'none'` turns it off) a
+CTE that reads the catalog alone goes to the server as its own query, and the statement around it runs in DuckDB.
+A `WHERE` on the CTE's columns still reaches the server (around the CTE's query); aggregates, windows and joins with
+local data stay here. A CTE read once is not materialized — DuckDB reads the server's rows as they come; one read
+more than once is read once and kept, `NOT MATERIALIZED` included, since two server reads of one query need not agree.
+
+```sql
+SET fabricator_pushdown_boundary = 'cte';
+WITH src AS (SELECT a, b FROM mssql.dbo.t1 JOIN mssql.dbo.t2 USING (k))   -- this is the server's query
+SELECT sum(a) FROM src WHERE b = 'x';                                     -- b = 'x' goes with it, sum is DuckDB's
+```
+
 ⚠ **The one accepted difference: `lower` / `upper`.** SQL Server's case tables are Unicode 5.0, DuckDB's are
 current: 298 (`lower`) and 308 (`upper`) rarely used BMP characters map differently — `upper('ß')` is `ẞ` in
 DuckDB and stays `ß` on the server, likewise `µ`, `ſ`, Greek symbol forms and some newer scripts. Latin letters,
@@ -4222,6 +4236,7 @@ Settings the extension itself owns rather than a provider, so they exist even wh
 | `fabricator_allow_plugin_install` | **Active** | Whether `fabricator_install_plugin()` (see [Function Reference](#function-reference)) may write plugin assemblies into a plugin root. **Default `false`**: an installed plugin is loaded into this process and runs with the extension's privileges, so it is opt-in rather than something a SQL statement can arrange on its own. Session-scoped like every other setting, so `RESET` closes it again |
 | `fabricator_partition_stats` | **Active** | Answer an ungrouped `COUNT(*)` / `MIN` / `MAX` from table metadata instead of scanning — on Delta, the log's per-file counts and statistics (see [Delta Lake provider](#delta-lake-provider)). **Default `true`**; `false` always scans, which is also the reference the metadata answer is tested against |
 | `fabricator_subtree_pushdown` | **Active** | Under `remote_pushdown`, run each part of a statement that reads one catalog alone — a subquery or CTE over its tables beside local data — as one query on the server (see [docs/sql-server-pushdown.md](docs/sql-server-pushdown.md), S5). **Default `true`**; `false` runs such parts locally, which is also the reference the pushdown is tested against |
+| `fabricator_pushdown_boundary` | **Active** | Where the pushdown to a `remote_pushdown` catalog stops: `'cte'` sends each CTE that reads one catalog alone to the server as its own query and runs the statement around it in DuckDB, streaming; `'none'` pushes as much as translates. **Default empty**: each catalog's ATTACH option `pushdown_boundary` (`'none'` or `'cte'`, default `'none'`) decides. Any other value is refused. See *Stopping at a CTE* under [Connection Configuration](#connection-configuration) and docs/sql-server-pushdown.md S19 |
 | `fabricator_dml_pushdown` | **Active** | Run a DELETE or UPDATE whose whole WHERE (and SET) translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)) — and, under `remote_pushdown`, an `INSERT … SELECT` reading the same catalog. **Default `true`**; `false` sends every DELETE and UPDATE down the row-id path and every INSERT through the regular bulk insert, which are also the reference the shortcut is tested against |
 
 ### Delta read tuning

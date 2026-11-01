@@ -500,6 +500,58 @@ bool ConsistentPlan(LogicalOperator &op, string &why) {
 	return consistent;
 }
 
+//! Whether the pushdown to `catalog` stops at a CTE (docs/duckdb-2.0-remote-execution.md §4.29): the session's
+//! fabricator_pushdown_boundary when set, else the catalog's ATTACH option pushdown_boundary. 'cte' sends a CTE that
+//! reads the catalog alone to the server as its own query and keeps the statement around it in DuckDB.
+bool BoundaryAtCte(ClientContext &context, FabricatorCatalog &catalog) {
+	string boundary;
+	Value value;
+	if (context.TryGetCurrentSetting("fabricator_pushdown_boundary", value) && !value.IsNull()) {
+		boundary = value.ToString();
+		StringUtil::Trim(boundary);
+		boundary = StringUtil::Lower(boundary);
+	}
+	if (boundary.empty()) {
+		boundary = StringUtil::Lower(catalog.PushdownBoundary());
+	}
+	if (boundary.empty() || boundary == "none") {
+		return false;
+	}
+	if (boundary == "cte") {
+		return true;
+	}
+	throw InvalidInputException("fabricator_pushdown_boundary must be 'none' or 'cte', got '%s'", boundary);
+}
+
+//! A CTE the statement names — not one DuckDB made while decorrelating a subquery (__duckdb_delim_…).
+bool UserCte(const LogicalOperator &op) {
+	return op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE &&
+	       !StringUtil::StartsWith(op.Cast<LogicalMaterializedCTE>().ctename.GetIdentifierName(), "__duckdb_");
+}
+
+bool HasUserCte(const LogicalOperator &op) {
+	if (UserCte(op)) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (HasUserCte(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+idx_t CountCteRefs(const LogicalOperator &op, TableIndex cte_index) {
+	idx_t count = 0;
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF && op.Cast<LogicalCTERef>().cte_index == cte_index) {
+		count++;
+	}
+	for (auto &child : op.children) {
+		count += CountCteRefs(*child, cte_index);
+	}
+	return count;
+}
+
 //! Binds a copy of `node` (this catalog's name restored on its tables) and serializes the plan as Substrait, the
 //! root's columns named c0…; false, with `reason`, when anything on the way declines. `require_worth`: decline a plan
 //! of scans, filters, projections and sorts only — the table scan already does that much.
@@ -548,6 +600,12 @@ bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const Q
 		if (require_worth && !worth_pushing(*plan)) {
 			depth--;
 			reason = "a plain scan keeps the table scan";
+			return false;
+		}
+		if (require_worth && HasUserCte(*plan) && BoundaryAtCte(context, catalog)) {
+			// the subtree pass sends each CTE on its own (§4.29); the statement around them stays here
+			depth--;
+			reason = "pushdown_boundary = 'cte': the statement around its CTEs runs here";
 			return false;
 		}
 		if (!ConsistentPlan(*plan, reason)) {
@@ -2279,9 +2337,26 @@ SubtreeReads AnalyzeSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator> 
 		return result;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-		auto cte_index = op->Cast<LogicalMaterializedCTE>().table_index;
+		auto &cte = op->Cast<LogicalMaterializedCTE>();
+		auto cte_index = cte.table_index;
 		auto &definition = children[0];
 		auto &main = children[1];
+		if (definition.pure && definition.catalog && definition.cte_refs.empty() && UserCte(*op) &&
+		    BoundaryAtCte(state.context, *definition.catalog)) {
+			// pushdown_boundary = 'cte' (§4.29): the definition is the server's query — worth it or not, or the pass
+			// after the optimizers would merge it, inlined, into the statement around it — and that statement runs
+			// here, reading the query's rows as they come (DuckDB inlines a CTE read once). A CTE read more than once
+			// is kept once: two server reads of one query need not agree (§4.16).
+			if (CountCteRefs(*op->children[1], cte_index) > 1) {
+				cte.materialize = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+			}
+			state.Trace("boundary", "CTE " + cte.ctename.GetIdentifierName() + " is its own server query");
+			ReplaceOrDescend(state, op->children[0], *definition.catalog);
+			if (state.Replaceable(main)) {
+				ReplaceOrDescend(state, op->children[1], *main.catalog);
+			}
+			return SubtreeReads();
+		}
 		if (definition.pure && main.pure &&
 		    (!definition.catalog || !main.catalog || definition.catalog.get() == main.catalog.get())) {
 			result.catalog = definition.catalog ? definition.catalog : main.catalog;

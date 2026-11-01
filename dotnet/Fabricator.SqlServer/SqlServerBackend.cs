@@ -662,6 +662,11 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // renders them into the WHERE as a superset and re-applies them to the rows (docs/duckdb-2.0-remote-execution.md
     // §5). `false` keeps the scans as before: filters stay above them.
     private readonly bool _dynamicFilters = true;
+    // ATTACH option `pushdown_boundary` ('none' | 'cte', default 'none'): with 'cte' a CTE reading this catalog alone
+    // goes to the server as its own query and the statement around it runs in DuckDB, streaming from that query — so
+    // the server delivers the joined and filtered rows and DuckDB computes the rest. A session SET of
+    // fabricator_pushdown_boundary wins over it (docs/duckdb-2.0-remote-execution.md §4.29).
+    private readonly string _pushdownBoundary = "none";
 
     private static bool DefaultRemotePushdown()
     {
@@ -815,6 +820,13 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         break;
                     case "dynamic_filters":
                         _dynamicFilters = ParseRemotePushdown(val, "dynamic_filters");
+                        break;
+                    case "pushdown_boundary":
+                        _pushdownBoundary = val.Trim().ToLowerInvariant() switch
+                        {
+                            "none" or "cte" => val.Trim().ToLowerInvariant(),
+                            _ => throw new ArgumentException($"pushdown_boundary must be 'none' or 'cte', got '{val}'"),
+                        };
                         break;
                     // ⚠ ADDED WITH CHANGE B, and it RESTORES a capability that change would otherwise have
                     // removed. MARS used to be frozen per catalog at its first connect, so attaching twice
@@ -3382,6 +3394,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
            // "OUTPUT is not supported." on DELETE, UPDATE, INSERT and MERGE alike) — the host then refuses at plan time
            $"\"dml_returning\":{(!Profile.IsWarehouse || Profile.ReturnsByReadBack ? "true" : "false")}," +
            $"\"default_schema\":{JsonSerializer.Serialize(Profile.DefaultSchema)}," +
+           $"\"pushdown_boundary\":\"{_pushdownBoundary}\"," +
            $"\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
            $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";
 

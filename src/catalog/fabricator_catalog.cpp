@@ -206,6 +206,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
 		dml_returning_ = caps.dml_returning;
 		default_schema_ = caps.default_schema;
+		pushdown_boundary_ = caps.pushdown_boundary;
 	} catch (std::exception &ex) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;
@@ -216,6 +217,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		bind_schema_cacheable_ = false;
 		dml_returning_ = false;
 		default_schema_.clear();
+		pushdown_boundary_.clear();
 		// ⚠ IT WARNS NOW, and the silence was the defect. This catch guards TWO unrelated things: a provider
 		// that cannot answer (fine — defaults are the safe direction, superset-and-re-apply) and a TRANSIENT
 		// failure of whatever the provider needs to answer. The second one used to disable string ORDER BY

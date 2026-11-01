@@ -351,6 +351,37 @@ SET ieee_floating_point_ops = true;
 statement ok
 CALL disable_logging();
 
+# S19: SET fabricator_pushdown_boundary = 'cte' — the CTE is its own server query (with the outer WHERE around it),
+# the statement around it runs in DuckDB
+statement ok
+CALL enable_logging(['Fabricator.Remote', 'Fabricator.Sql'], storage := 'memory', level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SET fabricator_pushdown_boundary = 'cte';
+
+query II
+WITH src AS (SELECT s.id, s.amount, r.name FROM mssql.dbo.pg_sales s JOIN mssql.dbo.pg_regions r USING (region))
+SELECT name, sum(amount) FROM src WHERE name = 'Europe' GROUP BY name;
+----
+Europe	40.00
+
+query III
+SELECT count(*) FILTER (WHERE message = 'boundary (before the optimizers): CTE src is its own server query'),
+       count(*) FILTER (WHERE message LIKE 'query [%[pg_regions]%) AS [q] WHERE %'),
+       count(*) FILTER (WHERE message LIKE '%SUM(%')
+FROM duckdb_logs WHERE type IN ('Fabricator.Remote', 'Fabricator.Sql');
+----
+1	1	0
+
+statement ok
+RESET fabricator_pushdown_boundary;
+
+statement ok
+CALL disable_logging();
+
 # J1: a table joined with local data: the join's keys reach the scan's WHERE as a runtime filter (EXPLAIN does not
 # show it — the filter is made at execution — the statement in Fabricator.Sql does)
 statement ok

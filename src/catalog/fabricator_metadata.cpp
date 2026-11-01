@@ -249,6 +249,10 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 		if (yyjson_is_str(schema)) {
 			caps.default_schema = string(yyjson_get_str(schema), yyjson_get_len(schema));
 		}
+		auto *boundary = yyjson_obj_get(root, "pushdown_boundary");
+		if (yyjson_is_str(boundary)) {
+			caps.pushdown_boundary = string(yyjson_get_str(boundary), yyjson_get_len(boundary));
+		}
 	}
 	return caps;
 }

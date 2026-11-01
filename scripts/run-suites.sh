@@ -1038,7 +1038,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=87}"   # 2026-10-31: +verify_tpch_mssql, +verify_tpcds_mssql, +verify_pushdown_edges_mssql
+        : "${MIN_SUITES:=88}"   # 2026-11-01: +verify_pushdown_boundary_mssql. 2026-10-31: +verify_tpch_mssql, +verify_tpcds_mssql, +verify_pushdown_edges_mssql
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1570,7 +1570,7 @@ case "$TIER" in
         #   verify_pushdown_guide_mssql 185 -> 195 (S15); nothing else moved
         # 2026-10-31: 6670 -> 6714: correlated scalar subqueries pushed — verify_remote_select_mssql 687 -> 717 (§20),
         #   verify_pushdown_guide_mssql 195 -> 209 (S16); verify_subtree_pushdown_mssql's N5 became P19 (210 unchanged)
-        : "${MIN_ASSERTIONS:=137202}"   # 2026-11-01: +40 a declined part descends (subtree 210 -> 218) and float division under ieee_floating_point_ops off (remote_select 812 -> 828, guide S18 244 -> 260); +41 remote_select §23 unread outputs as NULL (a result row counts once each). 2026-10-31: +8 granular_types UUID insert; +130310 TPC-H / TPC-DS (every value counts) and the edge cases; +29 IN / NOT IN; +45 grouping sets; +15 single join
+        : "${MIN_ASSERTIONS:=137280}"   # 2026-11-01: +78 pushdown_boundary (new suite 68, guide S19 260 -> 270); +40 a declined part descends (subtree 210 -> 218) and float division under ieee_floating_point_ops off (remote_select 812 -> 828, guide S18 244 -> 260); +41 remote_select §23 unread outputs as NULL (a result row counts once each). 2026-10-31: +8 granular_types UUID insert; +130310 TPC-H / TPC-DS (every value counts) and the edge cases; +29 IN / NOT IN; +45 grouping sets; +15 single join
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

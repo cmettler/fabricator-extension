@@ -1,0 +1,255 @@
+# name: test/verify_pushdown_boundary_mssql.test
+# description: pushdown_boundary = 'cte' (docs/duckdb-2.0-remote-execution.md §4.29): a CTE that reads one
+#              remote_pushdown catalog alone goes to the server as its own query, and the statement around it runs in
+#              DuckDB, reading that query's rows as they come — the server joins and filters, DuckDB computes the rest.
+#              Set per session (SET fabricator_pushdown_boundary) or per catalog (ATTACH option pushdown_boundary);
+#              a session value wins. Every answer is compared with the catalog without pushdown. Needs MSSQL_TESTDB_DSN.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator, remote_pushdown 'false');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS rp (TYPE fabricator, remote_pushdown 'true');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS rb (TYPE fabricator, remote_pushdown 'true', pushdown_boundary 'cte');
+
+# ═══ §0  Setup: bd_a 3000 rows over five regions, bd_b one label per region ════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.bd_a; DROP TABLE IF EXISTS dbo.bd_b;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.bd_a (id INT PRIMARY KEY, region VARCHAR(2) NOT NULL, v INT NULL);
+INSERT INTO dbo.bd_a SELECT value, CHOOSE(value % 5 + 1, ''EU'', ''US'', ''AP'', ''LA'', ''AF''),
+  CASE WHEN value % 17 = 0 THEN NULL ELSE value % 100 END FROM GENERATE_SERIES(1, 3000);
+CREATE TABLE dbo.bd_b (region VARCHAR(2) PRIMARY KEY, label VARCHAR(10) NOT NULL);
+INSERT INTO dbo.bd_b VALUES (''EU'', ''europe''), (''US'', ''america''), (''AP'', ''asia''), (''LA'', ''america''), (''AF'', ''africa'');', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+statement ok
+SELECT fabricator_refresh_cache('rb');
+
+statement ok
+CALL enable_logging(['Fabricator.Remote', 'Fabricator.Sql'], storage := 'memory', level := 'debug');
+
+# ═══ §1  No boundary: the whole statement, the aggregate included, is one server query ═════════════════════
+
+query II
+WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT label, sum(v) FROM src WHERE label = 'america' GROUP BY label;
+----
+america	55985
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND message LIKE 'remote subtree%SUM(%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# ═══ §2  SET fabricator_pushdown_boundary = 'cte': the CTE is the server's query, the aggregate DuckDB's ════════
+
+statement ok
+SET fabricator_pushdown_boundary = 'cte';
+
+query II
+WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT label, sum(v) FROM src WHERE label = 'america' GROUP BY label;
+----
+america	55985
+
+query III
+SELECT count(*) FILTER (WHERE message LIKE 'boundary (before the optimizers): CTE src is its own server query'),
+       count(*) FILTER (WHERE message LIKE 'remote subtree%JOIN%'),
+       count(*) FILTER (WHERE message LIKE 'remote subtree%SUM(%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+1	1	0
+
+# the outer WHERE on a CTE column still reaches the server, around the CTE's query
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE 'query [%JOIN%) AS [q] WHERE %';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# read once, the CTE is not materialized: DuckDB inlines it and reads the server's rows as they come
+query II
+EXPLAIN WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT label, sum(v) FROM src WHERE label = 'america' GROUP BY label;
+----
+physical_plan	<!REGEX>:.*CTE.*
+
+query II
+EXPLAIN WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT label, sum(v) FROM src WHERE label = 'america' GROUP BY label;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# the same answers as the catalog without pushdown: a window, an ORDER BY … LIMIT and a join with local data
+statement ok
+CREATE TABLE loc AS SELECT * FROM (VALUES ('europe', 1), ('asia', 2), ('mars', 3)) t(label, w);
+
+query I
+SELECT count(*) FROM (
+ ((WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region) WHERE a.v > 10)
+   SELECT l.w, s.id, s.v, row_number() OVER (PARTITION BY s.label ORDER BY s.v DESC, s.id) AS rn FROM src s JOIN loc l USING (label))
+  EXCEPT ALL
+  (WITH src AS (SELECT a.id, a.v, b.label FROM db.dbo.bd_a a JOIN db.dbo.bd_b b USING (region) WHERE a.v > 10)
+   SELECT l.w, s.id, s.v, row_number() OVER (PARTITION BY s.label ORDER BY s.v DESC, s.id) AS rn FROM src s JOIN loc l USING (label)))
+ UNION ALL
+ ((WITH src AS (SELECT a.id, a.v, b.label FROM db.dbo.bd_a a JOIN db.dbo.bd_b b USING (region) WHERE a.v > 10)
+   SELECT l.w, s.id, s.v, row_number() OVER (PARTITION BY s.label ORDER BY s.v DESC, s.id) AS rn FROM src s JOIN loc l USING (label))
+  EXCEPT ALL
+  (WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region) WHERE a.v > 10)
+   SELECT l.w, s.id, s.v, row_number() OVER (PARTITION BY s.label ORDER BY s.v DESC, s.id) AS rn FROM src s JOIN loc l USING (label))));
+----
+0
+
+query I
+WITH src AS (SELECT a.id, a.v, b.label FROM db.dbo.bd_a a JOIN db.dbo.bd_b b USING (region) WHERE a.v > 10)
+SELECT count(*) FROM src s JOIN loc l USING (label);
+----
+988
+
+query III
+WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT label, id, v FROM src ORDER BY v DESC NULLS LAST, id LIMIT 3;
+----
+africa	99	99
+africa	199	99
+africa	299	99
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# read twice, the CTE is read ONCE from the server and kept: two server reads of one query need not agree
+query I
+WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT count(*) FROM src x JOIN src y ON x.id = y.id + 5 WHERE x.label = y.label;
+----
+2995
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE 'query [%FROM [dbo].[bd_a] AS [t0]%JOIN%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# … also when it says NOT MATERIALIZED, which DuckDB would otherwise copy to both places
+query I
+WITH src AS NOT MATERIALIZED (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT count(*) FROM src x JOIN src y ON x.id = y.id + 5 WHERE x.label = y.label;
+----
+2995
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Sql' AND message LIKE 'query [%FROM [dbo].[bd_a] AS [t0]%JOIN%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# a correlated subquery is not a CTE of the statement (DuckDB decorrelates it into one of its own): pushed as before
+query I
+SELECT count(*) FROM (SELECT a.id, (SELECT count(*) FROM rp.dbo.bd_a x WHERE x.v > a.v AND x.region = a.region) AS c
+                      FROM rp.dbo.bd_a a WHERE a.id <= 40);
+----
+40
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'Fabricator.Remote' AND message LIKE 'remote%OUTER APPLY%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# ═══ §3  The ATTACH option, and the session value winning over it ══════════════════════════════════════════
+
+statement ok
+RESET fabricator_pushdown_boundary;
+
+query II
+WITH src AS (SELECT a.id, a.v, b.label FROM rb.dbo.bd_a a JOIN rb.dbo.bd_b b USING (region))
+SELECT label, sum(v) FROM src WHERE label = 'america' GROUP BY label;
+----
+america	55985
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE 'boundary%CTE src%'), count(*) FILTER (WHERE message LIKE 'remote subtree%SUM(%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+1	0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# rp has no option: the reset session pushes everything there
+query II
+WITH src AS (SELECT a.id, a.v, b.label FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region))
+SELECT label, sum(v) FROM src WHERE label = 'america' GROUP BY label;
+----
+america	55985
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE 'boundary%'), count(*) FILTER (WHERE message LIKE 'remote subtree%SUM(%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+0	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SET fabricator_pushdown_boundary = 'none';
+
+query II
+WITH src AS (SELECT a.id, a.v, b.label FROM rb.dbo.bd_a a JOIN rb.dbo.bd_b b USING (region))
+SELECT label, sum(v) FROM src WHERE label = 'america' GROUP BY label;
+----
+america	55985
+
+query II
+SELECT count(*) FILTER (WHERE message LIKE 'boundary%'), count(*) FILTER (WHERE message LIKE 'remote subtree%SUM(%')
+FROM duckdb_logs WHERE type = 'Fabricator.Remote';
+----
+0	1
+
+statement ok
+CALL disable_logging();
+
+# ═══ §4  A value that is neither 'none' nor 'cte' is refused, not read as one of them ═════════════════════
+
+statement ok
+SET fabricator_pushdown_boundary = 'ctes';
+
+statement error
+WITH src AS (SELECT a.id, a.v FROM rp.dbo.bd_a a JOIN rp.dbo.bd_b b USING (region)) SELECT sum(v) FROM src;
+----
+<REGEX>:.*fabricator_pushdown_boundary must be 'none' or 'cte', got 'ctes'.*
+
+statement ok
+RESET fabricator_pushdown_boundary;
+
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS rx (TYPE fabricator, pushdown_boundary 'subquery');
+----
+<REGEX>:.*pushdown_boundary must be 'none' or 'cte', got 'subquery'.*
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.bd_a; DROP TABLE dbo.bd_b;');
