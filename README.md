@@ -66,7 +66,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `INSERT … ON CONFLICT` | ❌ (no unique constraint is advertised — use `MERGE INTO`) |
 | | CREATE TABLE AS / COPY TO (streaming bulk via `SqlBulkCopy`) | ✅ |
 | | Bounded-memory streaming bulk write (INSERT/CTAS/COPY) | ✅ |
-| | CHECK/FK constraint enforcement on INSERT | ✅ (`SqlBulkCopyOptions.CheckConstraints`; COPY/CTAS skip for speed) |
+| | CHECK/FK constraint enforcement and triggers on INSERT | ✅ (`SqlBulkCopyOptions.CheckConstraints` + `FireTriggers`; COPY/CTAS skip for speed) |
 | **DDL** | CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE | ✅ |
 | | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
 | | `ALTER TABLE … ADD COLUMN … DEFAULT <literal>` | ✅ SQL Server (backfills, like DuckDB) — see the note below |
@@ -403,7 +403,7 @@ the transaction's own connection (`ROLLBACK` undoes it, also as a transaction's 
 attach refuses it. Only the columns the statement names are written, so the server applies its own defaults to the
 others — exactly what the regular insert does. It stays on the regular insert (DuckDB streams the rows into a bulk
 copy, and the `SELECT` alone is still pushed when worth it) for `INSERT … VALUES`, `RETURNING`, `ON CONFLICT`, a
-source outside the catalog, a named `IDENTITY` column, a table with enabled triggers (a bulk copy fires none), an
+source outside the catalog, a named `IDENTITY` column, an
 external table, and `mssql_keep_nulls = false`. `SET fabricator_dml_pushdown = false` keeps every insert on the
 regular path — use it per statement when streaming through DuckDB is faster than the server's own plan.
 
@@ -601,6 +601,12 @@ What the profile drives automatically:
     Fabric compute the notebook's own credential is used); without one the sync refuses.
   - Do not `VACUUM` these tables from Spark or Fabric: it would delete files DuckLake still keeps for its own
     time travel. Clean up through DuckLake — best with `ducklake_delta_maintain`, below.
+- **The catalog refuses what a mirror cannot follow** (DuckLake metadata in a SQL Server catalog). After a table's
+  first `ducklake_delta_sync`, a DuckLake change the Delta mirror could not express fails at COMMIT and rolls back,
+  naming the column and the reason: a column rename while data files hold it (`'name'` and `'none'` mapping — DuckLake
+  keeps the old name in its files, even through compaction), `ADD COLUMN … DEFAULT`, an unsupported type, and in
+  `'name'` mapping re-adding a column under a dropped column's name. Rename before writing data, or recreate the
+  table with `CREATE TABLE … AS SELECT`. Tables that were never synced are not affected.
 - **Maintenance for a mirrored lake (`ducklake_delta_maintain`).** One call runs DuckLake's maintenance in the order
   the Delta log needs, and returns one row per step (`step`, `object`, `count`, `detail`):
   flush inlined rows → merge small files (`merge := true`) → fold deletes into new files (`rewrite_deletes :=
@@ -791,8 +797,9 @@ DELETE FROM mssql.dbo.people WHERE id = 3;
 UPDATE mssql.dbo.people SET salary = salary * 1.1 WHERE id = 1;
 ```
 
-INSERT streams through `SqlBulkCopy` with `CheckConstraints` enabled, so a CHECK / FOREIGN KEY
-violation fails just like a classic INSERT (CTAS/COPY skip constraint checking for bulk-load speed).
+INSERT streams through `SqlBulkCopy` with `CheckConstraints` and `FireTriggers` enabled, so a CHECK / FOREIGN KEY
+violation fails and the table's triggers fire just like for a classic INSERT (CTAS/COPY skip both for bulk-load speed;
+before 2026-11-02 an INSERT fired no trigger).
 `IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
 otherwise. `UPDATE`, `DELETE` and `MERGE` support `RETURNING` on SQL Server: the rows come from the statement's own
 `OUTPUT` clause (through a table variable when the table has an enabled trigger), and a `DELETE` returns its key as

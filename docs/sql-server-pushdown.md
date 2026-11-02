@@ -513,7 +513,6 @@ It stays on the regular insert when a server `INSERT` would behave differently f
 | Case | Why |
 |---|---|
 | the statement names an `IDENTITY` column | the bulk copy keeps the given values; a server `INSERT` would need `IDENTITY_INSERT` |
-| the target has enabled triggers | a bulk copy fires none |
 | the target is an external (PolyBase) table | its rows go to storage, not to SQL Server |
 | `SET mssql_keep_nulls = false` | the bulk copy then writes a column's default for a NULL; an `INSERT` writes the NULL |
 | `RETURNING`, `ON CONFLICT`, `DEFAULT VALUES`, a source outside the catalog | not translated |
@@ -667,7 +666,7 @@ DuckDB refuses it — T-SQL would quietly delete such a row.
 | `RETURNING` | the key path returns each action's rows (see [RETURNING](#returning)) |
 | a condition or value does not translate exactly (e.g. `\|\|`), or `SET fabricator_dml_pushdown = false` | as for any pushed statement |
 | `THEN ERROR`, `UPDATE` without `SET`, `INSERT` without values, `DEFAULT`, two `INSERT` clauses naming different columns | not translated |
-| the target has an enabled trigger | a T-SQL `MERGE` fires it per action; the key path fires UPDATE / DELETE triggers per statement and none for its bulk insert |
+| the target has an enabled trigger | a T-SQL `MERGE` fires it once per action; the key path fires UPDATE / DELETE triggers per statement and the INSERT trigger per bulk batch |
 | an `INSERT` names the `IDENTITY` column, or `SET mssql_keep_nulls = false` | the INSERT rules (see [INSERT … SELECT](#insert--select-and-create-table--as)) |
 | the source is made of constants only (`USING (SELECT 1 AS id)`) | DuckDB's Substrait producer cannot write a SELECT without FROM |
 | the target is an external (PolyBase) table, or the catalog is a warehouse (no pushdown there) | not translated |

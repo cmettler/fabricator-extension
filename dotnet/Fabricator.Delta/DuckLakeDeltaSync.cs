@@ -264,6 +264,48 @@ internal sealed class DuckLakeDeltaSync
               && string.Equals(filter.Substring(dot + 1), table, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// The sync's own schema rules, for a table at snapshot <paramref name="s"/>: throws what the next sync would
+    /// throw. <paramref name="columns"/> are ducklake_column rows in the sync's column order (column_id, begin_snapshot,
+    /// end_snapshot, column_order, column_name, column_type, initial_default, nulls_allowed, parent_column);
+    /// <paramref name="fileBegins"/> the begin_snapshot of every data file live at s.
+    /// </summary>
+    internal static void CheckSchema(string table, IEnumerable<object?[]> columns, IEnumerable<long> fileBegins, long s,
+        string mode, string timestamps, bool deletionVectors)
+    {
+        var cols = columns.Select(r => new DlColumn
+        {
+            Id = Long(r[0]), Begin = Long(r[1]), End = NLong(r[2]), Order = Long(r[3]), Name = Str(r[4]),
+            Type = Str(r[5]), InitialDefault = (string?)r[6], Nullable = r[7] is null || Bool(r[7]), Parent = NLong(r[8]),
+        }).ToList();
+        var files = fileBegins.Select(b => new DlFile { Begin = b }).ToList();
+        // the constructor checks names and defaults, SchemaString the types (an unsupported one throws there)
+        _ = new SchemaPlan(table, cols, files, s, mode, timestamps, deletionVectors).SchemaString();
+        if (mode is "name" or "none")
+        {
+            // Stricter than the sync, which mirrors a rename until a new file is written: DuckLake then writes the new
+            // name, while every compaction keeps the old one in the files it rewrites (measured 2026-11-02), so after a
+            // rename with live data no further write could be mirrored. Refusing the rename itself leaves a way back.
+            foreach (var c in cols.Where(c => c.ActiveAt(s)))
+            {
+                var old = files.Select(f => cols.FirstOrDefault(o => o.Id == c.Id && o.ActiveAt(f.Begin)))
+                    .FirstOrDefault(o => o is not null && !string.Equals(o.Name, c.Name, StringComparison.Ordinal));
+                if (old is not null)
+                {
+                    throw new InvalidOperationException(
+                        $"ducklake_delta_sync: cannot mirror {table} to Delta: renaming column '{old.Name}' to '{c.Name}' while " +
+                        $"data files hold it — DuckLake writes new files under the new name but keeps the old one in every file " +
+                        $"its compaction rewrites, so in '{mode}' column mapping no later write could be mirrored. Rename before " +
+                        "writing data, or recreate the table with the new name (CREATE TABLE … AS SELECT)");
+                }
+            }
+        }
+    }
+
+    /// <summary>The marker table in the lake's metadata schema: which tables are mirrored, and how. A catalog that
+    /// hosts the metadata (SQL Server) checks DuckLake's schema changes against it (DuckLakeMirrorGuard).</summary>
+    internal const string MarkerTable = "fabricator_delta_mirror";
+
     // ── one table ──────────────────────────────────────────────────────────────────────────────────────
 
     private sealed class DlFile
@@ -275,6 +317,10 @@ internal sealed class DuckLakeDeltaSync
         public long Size;
         public long? RowIdStart;
         public long Begin;
+
+        // field id (= DuckLake column id) -> the name this file's Parquet schema gives it. Null when not read (the
+        // catalog guard), and then the name is inferred from the metadata at Begin — which a rewrite makes wrong.
+        public Dictionary<long, string>? Names;
     }
 
     private sealed class DlColumn
@@ -342,6 +388,7 @@ internal sealed class DuckLakeDeltaSync
                 try
                 {
                     SyncAll(results, ct);
+                    EnsureMarker(Open(ct));
                     return results;
                 }
                 catch (DeltaConflictException) when (stalled < MaxConflictRetries)
@@ -356,6 +403,58 @@ internal sealed class DuckLakeDeltaSync
                         "progress), re-reading the log", _root, now, stalled);
                 }
             }
+        }
+
+        // The column names every file's Parquet schema really carries, by field id (DuckLake writes column_id there).
+        // Files never change, so each is read once per sync.
+        private readonly Dictionary<long, Dictionary<long, string>> _fileNames = new();
+
+        private void LoadFileNames(List<DlFile> files)
+        {
+            var missing = files.Where(f => !_fileNames.ContainsKey(f.Id)).ToList();
+            if (missing.Count > 0)
+            {
+                var byPath = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                foreach (var f in missing)
+                {
+                    byPath[f.AbsPath.Replace('\\', '/')] = f.Id;
+                    _fileNames[f.Id] = new Dictionary<long, string>();
+                }
+                string list = "[" + string.Join(", ", missing.Select(f => Lit(f.AbsPath))) + "]";
+                foreach (var r in _o.Rows($"SELECT file_name, field_id, name FROM parquet_schema({list}) WHERE field_id IS NOT NULL"))
+                {
+                    if (byPath.TryGetValue(Str(r[0]).Replace('\\', '/'), out long id))
+                    {
+                        _fileNames[id][Long(r[1])] = Str(r[2]);
+                    }
+                }
+            }
+            foreach (var f in files)
+            {
+                f.Names = _fileNames[f.Id];
+            }
+        }
+
+        // Records the table and its mirror options in the metadata schema, so a catalog hosting the metadata can refuse a
+        // schema change the next sync could not mirror — at the change, not one sync later. Idempotent; the options are
+        // the ones the Delta table was created with (they are fixed from the first sync on).
+        private void EnsureMarker(EngineeredWood.DeltaLake.Snapshot.Snapshot? state)
+        {
+            if (state is null)
+            {
+                return;
+            }
+            var cfg = state.Metadata.Configuration;
+            string mode = cfg is not null && cfg.TryGetValue("delta.columnMapping.mode", out var m) ? m : "none";
+            string ts = cfg is not null && cfg.TryGetValue(TimestampKey, out var t) ? t : "ntz";
+            bool dv = cfg is not null && cfg.TryGetValue("delta.enableDeletionVectors", out var d)
+                      && string.Equals(d, "true", StringComparison.OrdinalIgnoreCase);
+            string marker = _o.M(MarkerTable);
+            string id = _tableId.ToString(CultureInfo.InvariantCulture);
+            _o.Rows($"CREATE TABLE IF NOT EXISTS {marker} (table_id BIGINT, column_mapping VARCHAR, timestamp_mapping VARCHAR, " +
+                    "deletion_vectors BOOLEAN)");
+            _o.Rows($"INSERT INTO {marker} SELECT {id}, {Lit(mode)}, {Lit(ts)}, {(dv ? "true" : "false")} " +
+                    $"WHERE NOT EXISTS (SELECT 1 FROM {marker} WHERE table_id = {id})");
         }
 
         // The DuckLake snapshot the log has been brought to, -1 when there is no log yet.
@@ -588,6 +687,7 @@ internal sealed class DuckLakeDeltaSync
                     };
                 })
                 .ToList();
+            LoadFileNames(files);
 
             string mode = delta?.Metadata.Configuration is { } cfg && cfg.TryGetValue("delta.columnMapping.mode", out var m)
                 ? m
@@ -1053,6 +1153,21 @@ internal sealed class DuckLakeDeltaSync
             foreach (var f in _files)
             {
                 var then = At(c.Id, f.Begin);
+                if (f.Names is not null)
+                {
+                    // ⚠ THE FILE'S OWN NAME, not the metadata's at f.Begin: ducklake_rewrite_data_files copies a file
+                    // under the column names it was WRITTEN with but gives it a begin_snapshot after a rename — so the
+                    // inferred name was the new one, and a Delta reader looked for a column the file does not have
+                    // (MEASURED 2026-11-02: rename b -> b2, delete, rewrite, sync — DuckLake 'y', the mirror NULL).
+                    if (!f.Names.TryGetValue(c.Id, out var inFile))
+                    {
+                        predatesFiles = true;
+                        continue;
+                    }
+                    namesInFiles.Add(inFile);
+                    typesInFiles.Add((then ?? c).Type);
+                    continue;
+                }
                 if (then is null)
                 {
                     predatesFiles = true;
@@ -1072,8 +1187,8 @@ internal sealed class DuckLakeDeltaSync
             {
                 throw Refuse($"column '{c.Name}' was renamed and live data files use both names " +
                              $"({string.Join(", ", namesInFiles.Select(n => "'" + n + "'"))}); in '{_mode}' column mapping " +
-                             "one physical name must cover every file. Rewrite the old files (DuckLake compaction) or mirror " +
-                             "with column_mapping := 'id'");
+                             "one physical name must cover every file. DuckLake's compaction keeps the name a file was written with, so this " +
+                             "does not heal: recreate the table (CREATE TABLE … AS SELECT) or mirror with column_mapping := 'id'");
             }
             else
             {
@@ -1081,8 +1196,8 @@ internal sealed class DuckLakeDeltaSync
                 if (_mode == "none" && physical != c.Name)
                 {
                     throw Refuse($"column '{c.Name}' was renamed from '{physical}' and live data files still use the old " +
-                                 "name; without column mapping a Delta reader looks for the new name and finds nothing. " +
-                                 "Rewrite the old files (DuckLake compaction) or mirror with column_mapping := 'name'");
+                                 "name; without column mapping a Delta reader looks for the new name and finds nothing. DuckLake's compaction " +
+                                 "keeps the old name in the files: mirror with column_mapping := 'name', or recreate the table");
                 }
             }
             _physical[c.Id] = physical;
@@ -1098,17 +1213,20 @@ internal sealed class DuckLakeDeltaSync
                 {
                     foreach (var f in _files)
                     {
-                        if (At(c.Id, f.Begin) is not null)
+                        if (f.Names is not null ? f.Names.ContainsKey(c.Id) : At(c.Id, f.Begin) is not null)
                         {
                             continue;
                         }
-                        var clash = _all.FirstOrDefault(o => o.Id != c.Id && o.Parent == c.Parent && o.ActiveAt(f.Begin)
-                                                             && string.Equals(o.Name, physical, StringComparison.Ordinal));
+                        var clash = f.Names is not null
+                            ? _all.FirstOrDefault(o => o.Id != c.Id && o.Parent == c.Parent
+                                                       && f.Names.TryGetValue(o.Id, out var n) && string.Equals(n, physical, StringComparison.Ordinal))
+                            : _all.FirstOrDefault(o => o.Id != c.Id && o.Parent == c.Parent && o.ActiveAt(f.Begin)
+                                                       && string.Equals(o.Name, physical, StringComparison.Ordinal));
                         if (clash is not null)
                         {
                             throw Refuse($"column '{c.Name}' reuses the name of a dropped column whose values are still in " +
                                          $"live data files; in '{_mode}' column mapping a Delta reader would return those old " +
-                                         "values for it. Rewrite the old files or mirror with column_mapping := 'id'");
+                                         "values for it. Recreate the table (CREATE TABLE … AS SELECT) or mirror with column_mapping := 'id'");
                         }
                     }
                 }

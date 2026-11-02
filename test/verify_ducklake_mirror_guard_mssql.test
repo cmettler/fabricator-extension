@@ -1,0 +1,158 @@
+# name: test/verify_ducklake_mirror_guard_mssql.test
+# description: DuckLake with its metadata in a SQL Server catalog, tables mirrored to Delta by ducklake_delta_sync: the
+#              catalog refuses a DuckLake schema change or write the mirror could not follow, right before DuckLake's
+#              COMMIT, so the whole DuckLake transaction rolls back. The rules are the sync's own (one less ambiguity:
+#              a rename with live data files is refused in 'name' and 'none' mapping). An unmirrored table is free.
+#              See docs/ducklake-catalog.md §11.11. Needs MSSQL_TESTDB_DSN + FABRICATOR_DELTA_WRITE_DIR.
+# group: [fabricator]
+
+require fabricator
+
+require ducklake
+
+require parquet
+
+require-env MSSQL_TESTDB_DSN
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# a fresh metadata schema (its data path is recorded in it, and this run's write dir is new)
+statement ok
+SELECT fabricator_exec('db', 'DECLARE @s nvarchar(max) = N''''; SELECT @s += N''DROP TABLE [dlguard].['' + name + N''];'' FROM sys.tables WHERE schema_id = SCHEMA_ID(N''dlguard''); EXEC(@s); IF SCHEMA_ID(N''dlguard'') IS NOT NULL DROP SCHEMA [dlguard];');
+
+statement ok
+ATTACH 'ducklake:fabricator:${MSSQL_TESTDB_DSN}' AS lake (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl/', METADATA_SCHEMA 'dlguard',
+  META_HIDDEN_ROWID true, DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake.main.t (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.main.t VALUES (1, 'x');
+
+statement ok
+CREATE TABLE lake.main.f (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.main.f VALUES (1, 'x');
+
+# ============================================================================
+# 1. Before the first sync nothing is mirrored, so nothing is refused
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.free (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.main.free VALUES (1, 'x');
+
+statement ok
+ALTER TABLE lake.main.free RENAME COLUMN b TO b2;
+
+statement ok
+ALTER TABLE lake.main.free ADD COLUMN c INTEGER DEFAULT 7;
+
+# ============================================================================
+# 2. The sync records the mirrored tables and their options in the metadata schema
+# ============================================================================
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.t', column_mapping := 'none', deletion_vectors := false,
+  metadata_schema := 'dlguard');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.f', metadata_schema := 'dlguard');
+
+query TT
+SELECT column_mapping, deletion_vectors FROM __ducklake_metadata_lake.dlguard.fabricator_delta_mirror ORDER BY table_id;
+----
+none	false
+name	true
+
+# ============================================================================
+# 3. 'none' mapping (SQL Server's DELTA reader): a rename, a default and an unsupported type are refused and roll back
+# ============================================================================
+
+statement error
+ALTER TABLE lake.main.t RENAME COLUMN b TO b2;
+----
+<REGEX>:.*DuckLake change refused: main.t is mirrored to Delta \(none column mapping\).*'b2'.*
+
+query T
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE database_name = 'lake' AND table_name = 't';
+----
+a,b
+
+statement error
+ALTER TABLE lake.main.t ADD COLUMN d INTEGER DEFAULT 7;
+----
+<REGEX>:.*was added with a default \(7\).*
+
+statement error
+ALTER TABLE lake.main.t ADD COLUMN u UUID;
+----
+<REGEX>:.*column 'u' has type uuid.*
+
+# what the mirror can follow goes through
+statement ok
+ALTER TABLE lake.main.t ADD COLUMN c INTEGER;
+
+statement ok
+INSERT INTO lake.main.t VALUES (2, 'y', 3);
+
+query T
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE database_name = 'lake' AND table_name = 't';
+----
+a,b,c
+
+# ============================================================================
+# 4. 'name' mapping (Fabric): a rename with live files and a re-add under a dropped column's name are refused
+# ============================================================================
+
+statement error
+ALTER TABLE lake.main.f RENAME COLUMN b TO b2;
+----
+<REGEX>:.*main.f is mirrored to Delta \(name column mapping\).*no later write could be mirrored.*
+
+statement ok
+INSERT INTO lake.main.f VALUES (2, 'y');
+
+statement ok
+ALTER TABLE lake.main.f DROP COLUMN a;
+
+statement error
+ALTER TABLE lake.main.f ADD COLUMN a VARCHAR;
+----
+<REGEX>:.*column 'a' reuses the name of a dropped column.*
+
+statement ok
+ALTER TABLE lake.main.f ADD COLUMN z VARCHAR;
+
+# ============================================================================
+# 5. The mirrors still sync, and read back what DuckLake holds
+# ============================================================================
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', metadata_schema := 'dlguard', table_name := 'main.t');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', metadata_schema := 'dlguard', table_name := 'main.f');
+
+query IIT
+SELECT count(*), sum(a), string_agg(b, ',' ORDER BY a) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t');
+----
+2	3	x,y
+
+query IT
+SELECT count(*), string_agg(b, ',' ORDER BY b) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/f');
+----
+2	x,y
+
+statement ok
+DETACH lake;
+
+statement ok
+SELECT fabricator_exec('db', 'DECLARE @s nvarchar(max) = N''''; SELECT @s += N''DROP TABLE [dlguard].['' + name + N''];'' FROM sys.tables WHERE schema_id = SCHEMA_ID(N''dlguard''); EXEC(@s); DROP SCHEMA [dlguard];');

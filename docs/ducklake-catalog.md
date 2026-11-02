@@ -396,9 +396,9 @@ deleted files; the synchronous post-commit sync rules that out, a manual sync mu
 3. ~~Concurrent syncs without a coordinator~~ (§11.7) and the stale-catalog read it surfaced (§11.8), fixed.
 4. ~~**Mirror only COMPLETE snapshots**~~ — built, §11.9.
 5. ~~A maintenance procedure in the safe order: flush → (merge) → sync → cleanup~~ — built, §11.10.
-6. The opt-in marker in the metadata database, so the CATALOG can refuse DDL that cannot be mirrored (today
-   only the next sync notices, after the DDL has committed). Change-data files for UPDATE; our own orphan
-   cleanup.
+6. ~~The opt-in marker in the metadata database, so the CATALOG can refuse DDL that cannot be mirrored~~ — built
+   for metadata in our SQL Server catalog, §11.11; ~~our own orphan cleanup~~ — §11.10. Open: change-data files for
+   UPDATE, partition declaration.
 
 **No automatic sync on commit (decided 2026-10-27, user).** With inlining on, a sync per commit would have to
 flush per commit, which throws away the reason for inlining — small commits bundled into one Parquet file —
@@ -607,6 +607,34 @@ per step. Order: flush → merge → rewrite → sync → expire → cleanup →
   `_delta_log/` and `_change_data/`. `older_than` is required: a file another process is still writing is unknown
   until it commits. ⚠ DuckLake additionally protects files of its OWN open transactions; ours cannot see those, so
   `older_than` is the only protection — do not pass `'0 seconds'` outside a test.
+
+### 11.11 As built — the catalog refuses what the mirror cannot follow (2026-11-02)
+
+For DuckLake whose metadata lives in our SQL Server catalog. The sync records every mirrored table in a marker table
+`fabricator_delta_mirror(table_id, column_mapping, timestamp_mapping, deletion_vectors)` in the metadata schema. A
+transaction that bulk-inserts into `ducklake_column` (a schema change) or `ducklake_data_file` (new files) of such a
+schema is checked RIGHT BEFORE its COMMIT (`SqlServerDuckLakeGuard.cs`): every marked table with rows at the newest
+snapshot goes through the sync's own `SchemaPlan` (`DuckLakeMirrorGuard`), on DuckLake's own connection, so it sees the
+uncommitted change. A refusal throws, and DuckLake's whole commit rolls back. Gate `verify_ducklake_mirror_guard_mssql`
+(service, 38), mutant "guard off" killed at its first refusal.
+
+- **MEASURED: DuckLake writes a data file BEFORE its snapshot row** (an INSERT: `ducklake_data_file`, stats, then
+  `ducklake_snapshot`), so a check at the insert itself saw half a commit — hence at COMMIT.
+- Refused: in `'none'` mapping a rename while data files hold the column; in either mapping an ADD COLUMN with a
+  default, an unsupported type, and (in `'name'`) a re-add under a dropped column's name while its values are in live
+  files. **Stricter than the sync for a rename in `'name'` mapping:** the sync mirrors a rename until a new file is
+  written, but DuckLake writes new files under the new name and keeps the old one in every file its compaction
+  rewrites (measured: `merge_adjacent_files` and `rewrite_data_files` both copy the old name), so after a rename with
+  live data no further write could be mirrored. The guard refuses the rename itself, which leaves a way back
+  (recreate the table with CREATE TABLE … AS SELECT).
+- Not refused: anything on an unmirrored table, anything before the first sync.
+- **FOUND ON THE WAY, a silent wrong answer in the sync, fixed:** it inferred a file's physical column names from the
+  metadata at the file's `begin_snapshot`. `ducklake_rewrite_data_files` gives a rewritten file a begin snapshot AFTER
+  a rename while the file keeps the old name, so the mirror looked for `b2` in a file holding `b` — DuckLake `2|y`,
+  Delta `2|NULL`. The sync now reads every live file's Parquet schema (`parquet_schema`, field id = DuckLake
+  column id, nested ones too; once per file per sync). Gate `verify_ducklake_delta_maintain` §5, mutant killed.
+- The sync's advice to "rewrite the old files (DuckLake compaction)" after a rename was wrong for the same reason and
+  now says to recreate the table or change the mapping.
 
 ## 12. SQL Server reading DuckLake directly: PolyBase over the DuckDB ODBC driver (experiment, 2026-10-27)
 

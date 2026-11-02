@@ -1221,6 +1221,13 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
         public ExternalDeltaSession? External;
 
         /// <summary>
+        /// Metadata schemas in which this transaction inserted DuckLake columns or data files: checked against the
+        /// Delta mirror right before COMMIT, when DuckLake's whole commit is in (it writes a data file BEFORE its
+        /// snapshot row, so a check at the insert itself saw half of it). Guarded by the lock on this instance.
+        /// </summary>
+        public HashSet<string>? DuckLakeChecks;
+
+        /// <summary>
         /// Commit/roll back the provider transaction (no-op if no write ever pinned one) and release the
         /// connection. Called once, after removal from the manager; fields are nulled so a later
         /// best-effort <see cref="Dispose"/> (catalog teardown) cannot double-commit.
@@ -1334,6 +1341,21 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
                     txn.Complete(commit: false);
                     throw;
                 }
+            }
+        }
+        if (commit && txn.DuckLakeChecks is { Count: > 0 } checks && txn.Connection is { } conn)
+        {
+            try
+            {
+                foreach (var schema in checks)
+                {
+                    CheckDuckLakeMirror(conn, txn.Transaction, schema);
+                }
+            }
+            catch
+            {
+                txn.Complete(commit: false);
+                throw;
             }
         }
         txn.Complete(commit);
@@ -2489,9 +2511,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
             // INSERT enforces CHECK / FOREIGN KEY constraints (SqlBulkCopy skips them by
             // default — a bulk-load optimization that would silently accept rows a
             // classic INSERT would reject). COPY/CTAS pass false for bulk-load speed.
+            // INSERT also fires the table's triggers, as a T-SQL INSERT does: SqlBulkCopy skips them by default, so an
+            // audit trigger silently recorded nothing (measured 2026-11-02: 8 rows inserted, 0 audited). COPY keeps
+            // bulk-load semantics (BULK INSERT fires none either), and a CTAS table has no triggers.
             if (checkConstraints)
             {
-                options |= SqlBulkCopyOptions.CheckConstraints;
+                options |= SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.FireTriggers;
             }
             // ⚠ Applied to INSERT, CTAS and COPY alike — the semantic is "a NULL in the source is a NULL",
             // which does not vary by statement kind. On a CTAS it is a NO-OP by construction (a freshly
@@ -2536,6 +2561,20 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
                          "options={Options} txn={Txn}", qualified, createTable, replace, checkConstraints, options, txnId);
             bulk.WriteToServer(reader);
             Log.LogInformation("bulk {Table}: {Rows} rows copied", qualified, bulk.RowsCopied);
+            if (IsDuckLakeMirrorTable(tableName))
+            {
+                if (!owns && _txns.TryGet(txnId) is { } pending)
+                {
+                    lock (pending)
+                    {
+                        (pending.DuckLakeChecks ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(schemaName);
+                    }
+                }
+                else
+                {
+                    CheckDuckLakeMirror(connection, transaction, schemaName); // autocommit: nothing to wait for
+                }
+            }
             return bulk.RowsCopied;
         }
         finally
@@ -3799,7 +3838,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
     /// Why a pushed <c>INSERT … SELECT</c> into <paramref name="table"/> would NOT do what the host's own insert
     /// (the bulk copy) does — null when it would. The bulk copy is the reference, so each difference declines
     /// rather than changing behaviour: an IDENTITY column the statement names (KeepIdentity there; an INSERT
-    /// would need IDENTITY_INSERT), enabled triggers (a bulk copy fires none), an external table (its rows go
+    /// would need IDENTITY_INSERT), an external table (its rows go
     /// to storage, not to SQL Server), and <c>mssql_keep_nulls = false</c> (the bulk copy then writes a
     /// column's default for a NULL).
     /// </summary>
@@ -3815,7 +3854,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
             // DELETE … OUTPUT … INTO: the deleting half is a DELETE like any other (only an external table differs),
             // and T-SQL refuses an OUTPUT INTO table with enabled triggers, a FOREIGN KEY on either side or a CHECK
             // constraint — decline those up front rather than fail the statement. The insert half then gets the
-            // INSERT rules below (triggers, a named IDENTITY, keep_nulls).
+            // INSERT rules below (a named IDENTITY, keep_nulls).
             if (string.Equals(source[0], table[0], StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(source[1], table[1], StringComparison.OrdinalIgnoreCase))
             {
@@ -3826,7 +3865,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
                 return $"{source[0]}.{source[1]} is an external table";
             }
             const string outputInto =
-                "SELECT N'foreign key', name FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID(@obj) OR referenced_object_id = OBJECT_ID(@obj) " +
+                "SELECT N'enabled trigger', name FROM sys.triggers WHERE parent_id = OBJECT_ID(@obj) AND is_disabled = 0 " +
+                "UNION ALL SELECT N'foreign key', name FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID(@obj) OR referenced_object_id = OBJECT_ID(@obj) " +
                 "UNION ALL SELECT N'check constraint', name FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID(@obj)";
             var target = new[] { new SqlParameter("@obj", Quote(table[0]) + "." + Quote(table[1])) };
             foreach (var row in ReadMetadataRows(outputInto, 2, target))
@@ -3837,7 +3877,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
         if (op == Clast.Drivers.SqlServer.Substrait.SubstraitFields.WriteOp_FabricatorMerge)
         {
             // MERGE against the host's rowid MERGE: that one runs UPDATE / DELETE statements (triggers fire per
-            // statement) and inserts through the bulk copy (no trigger fires) — a T-SQL MERGE fires each action's
+            // statement) and inserts through the bulk copy (fired per batch) — a T-SQL MERGE fires each action's
             // trigger once, so an enabled trigger declines. Its INSERT then follows the INSERT rules below.
             const string mergeProbe =
                 "SELECT N'external', name FROM sys.external_tables WHERE object_id = OBJECT_ID(@obj) " +
@@ -3867,9 +3907,10 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
         {
             return "mssql_keep_nulls = false replaces a NULL by the column default, an INSERT … SELECT does not";
         }
+        // An enabled trigger no longer declines: the bulk copy fires it too since 2026-11-02 (FireTriggers), once per
+        // statement like the pushed INSERT … SELECT.
         const string probe =
             "SELECT N'external', name FROM sys.external_tables WHERE object_id = OBJECT_ID(@obj) " +
-            "UNION ALL SELECT N'trigger', name FROM sys.triggers WHERE parent_id = OBJECT_ID(@obj) AND is_disabled = 0 " +
             "UNION ALL SELECT N'identity', name FROM sys.columns WHERE object_id = OBJECT_ID(@obj) AND is_identity = 1";
         var named = new HashSet<string>(columns, StringComparer.OrdinalIgnoreCase);
         var parameters = new[] { new SqlParameter("@obj", Quote(table[0]) + "." + Quote(table[1])) };
@@ -3879,8 +3920,6 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
             {
                 case "external":
                     return $"{table[0]}.{table[1]} is an external table";
-                case "trigger":
-                    return $"{table[0]}.{table[1]} has the enabled trigger {row[1]}, which a bulk insert does not fire";
                 case "identity" when row[1] is { } identity && named.Contains(identity):
                     return $"the insert names the IDENTITY column {identity}";
             }

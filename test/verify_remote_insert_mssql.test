@@ -280,11 +280,11 @@ SELECT id FROM db.dbo.rins_on WHERE k = 1001;
 ----
 1
 
-# Enabled triggers: a bulk copy fires none, and the pushed path must not start firing them
+# Enabled triggers fire on both paths (the bulk copy with FireTriggers since 2026-11-02), so such an insert is pushed
 query II
 EXPLAIN INSERT INTO db.dbo.rins_trg SELECT id FROM db.dbo.rins_src;
 ----
-physical_plan	<!REGEX>:.*FABRICATOR_REMOTE_DML.*
+physical_plan	<REGEX>:.*FABRICATOR_REMOTE_DML.*
 
 statement ok
 INSERT INTO db.dbo.rins_trg SELECT id FROM db.dbo.rins_src WHERE id < 4;
@@ -292,7 +292,22 @@ INSERT INTO db.dbo.rins_trg SELECT id FROM db.dbo.rins_src WHERE id < 4;
 query II
 SELECT (SELECT count(*) FROM db.dbo.rins_trg), (SELECT count(*) FROM db.dbo.rins_log);
 ----
-3	0
+3	3
+
+# ... and so does the regular path
+statement ok
+SET fabricator_dml_pushdown = false;
+
+statement ok
+INSERT INTO db.dbo.rins_trg SELECT id FROM db.dbo.rins_src WHERE id = 4;
+
+statement ok
+RESET fabricator_dml_pushdown;
+
+query II
+SELECT (SELECT count(*) FROM db.dbo.rins_trg), (SELECT count(*) FROM db.dbo.rins_log);
+----
+4	4
 
 # mssql_keep_nulls = false: the bulk copy writes a column's default for a NULL, an INSERT does not
 statement ok

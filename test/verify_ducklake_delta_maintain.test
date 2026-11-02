@@ -193,3 +193,64 @@ statement error
 SELECT * FROM ducklake_delta_maintain('lake', table_name := 'nope');
 ----
 no table 'nope'
+
+# ============================================================================
+# 5. A COLUMN RENAMED, THEN A FILE REWRITTEN — DuckLake's rewrite keeps the name the data was written with but gives the
+#    file a begin snapshot after the rename. The sync reads the name from the file itself (it inferred the new one from
+#    the metadata, and the mirror returned NULL for the column: measured 2026-11-02).
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.g (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.g VALUES (1, 'x'), (2, 'y');
+
+statement ok
+SELECT * FROM ducklake_flush_inlined_data('lake', table_name => 'g');
+
+statement ok
+ALTER TABLE lake.g RENAME COLUMN b TO b2;
+
+statement ok
+DELETE FROM lake.g WHERE a = 1;
+
+statement ok
+SELECT * FROM ducklake_rewrite_data_files('lake', 'g', delete_threshold => 0);
+
+query I
+SELECT count(*) FROM parquet_schema('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/g/*.parquet') WHERE name = 'b2';
+----
+0
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.g');
+
+query IT
+SELECT a, b2 FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/g');
+----
+2	y
+
+# without column mapping the new name cannot be read from those files, so the sync refuses rather than mirror NULLs
+statement ok
+CREATE TABLE lake.g2 (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO lake.g2 VALUES (1, 'x'), (2, 'y');
+
+statement ok
+SELECT * FROM ducklake_flush_inlined_data('lake', table_name => 'g2');
+
+statement ok
+ALTER TABLE lake.g2 RENAME COLUMN b TO b2;
+
+statement ok
+DELETE FROM lake.g2 WHERE a = 1;
+
+statement ok
+SELECT * FROM ducklake_rewrite_data_files('lake', 'g2', delete_threshold => 0);
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.g2', column_mapping := 'none', deletion_vectors := false);
+----
+<REGEX>:.*column 'b2' was renamed from 'b' and live data files still use the old name.*

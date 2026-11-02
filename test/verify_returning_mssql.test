@@ -213,6 +213,19 @@ SELECT id, what FROM db.dbo.ret_log;
 2	old
 9	new
 
+# A plain INSERT (the bulk path, no RETURNING) fires the trigger too, as a T-SQL INSERT does — it fired none
+# before 2026-11-02 (SqlBulkCopy without FireTriggers)
+statement ok
+INSERT INTO db.dbo.ret_trg VALUES (10, 'y');
+
+statement ok
+INSERT INTO db.dbo.ret_trg SELECT 11 + range, 'q' FROM range(2);
+
+query I
+SELECT count(*) FROM db.dbo.ret_log WHERE what = 'new' AND id >= 10;
+----
+3
+
 # ═══ §7  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
 
 statement ok
