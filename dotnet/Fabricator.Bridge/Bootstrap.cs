@@ -2002,7 +2002,17 @@ public static unsafe class Bootstrap
             var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => SELECT *
             IArrowArrayStream? filters =
                 filterValues is null ? null : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
-            var rows = bound.Execute(spec, filters);
+            IArrowArrayStream rows;
+            try
+            {
+                // The result stream releases the filter constants too, for a binding that never disposes them.
+                rows = new FilterValuesOwningStream(bound.Execute(spec, filters), filters);
+            }
+            catch
+            {
+                filters?.Dispose(); // while the host's producer is still alive
+                throw;
+            }
             // ⚠ READ THE FLAG AFTER Execute() RETURNS AND BEFORE THE STREAM IS DRAINED — that ordering is the
             // whole contract (abi.h §tablefn_execute). A binding whose DDL sits in an async-iterator body has
             // not run it yet at this point, because an iterator does not begin until the first batch PULL, a
@@ -2012,7 +2022,15 @@ public static unsafe class Bootstrap
             {
                 *schemaMayChange = 1;
             }
-            CArrowArrayStreamExporter.ExportArrayStream(rows, outStream);
+            try
+            {
+                CArrowArrayStreamExporter.ExportArrayStream(rows, outStream);
+            }
+            catch
+            {
+                rows.Dispose(); // the host never got the stream, so it will never release it
+                throw;
+            }
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

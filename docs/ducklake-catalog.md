@@ -60,8 +60,9 @@ The error surfaces as DuckLake's commit retry loop exhausting its 10 attempts, w
   Fabric SQL database case in §10) gets from `SCHEMA_NAME()` is not measured; NULL falls back to `dbo`.
   Side finding, not fixed: a login without `VIEW DATABASE PERFORMANCE STATE` prints a WARNING from the
   best-effort stats query (`TableStats … permission denied`); the query itself works.
-- Not yet measured: two writers committing concurrently (DuckLake detects a conflict through a PRIMARY KEY
-  violation on `ducklake_snapshot`), Fabric Warehouse as the metadata host, cloud data paths.
+- Measured since: two writers committing concurrently (§7 — DuckLake detects the conflict through a PRIMARY KEY
+  violation on `ducklake_snapshot`) and cloud data paths (OneLake, §11). Not measured: Fabric Warehouse as the
+  metadata host (§7: its keys are not enforced).
 
 ## 5. Options for the failing class
 
