@@ -464,6 +464,17 @@ internal static class TSqlFunctionCatalog
         return e is LiteralExpr { IsNull: false } lit && lit.Type.IsInteger && lit.IntValue >= 0;
     }
 
+    private static bool IsNonNegativeIntegralConstant(TSqlCall c, int index)
+    {
+        var e = index < c.Args.Count ? c.Args[index].Value : null;
+        while (e is CastExpr cast)
+        {
+            e = cast.Input;
+        }
+        return e is LiteralExpr { IsNull: false } lit
+            && (lit.Type.IsInteger ? lit.IntValue >= 0 : lit.Type.IsFloat && lit.FloatValue >= 0 && Math.Floor(lit.FloatValue) == lit.FloatValue && lit.FloatValue <= 1e15);
+    }
+
     private static bool IsNonZeroConstant(Expr? e) => e switch
     {
         LiteralExpr { IsNull: false } lit => lit.Type.IsFloat ? lit.FloatValue != 0 : lit.Type.IsInteger ? lit.IntValue != 0 : false,
@@ -844,10 +855,29 @@ internal static class TSqlFunctionCatalog
         Scalar(ArithmeticUrn, "abs", "ABS", "FUNCTION", SameAsFirst, c => c.Narrow($"ABS({c.V(0)})"),
             new TSqlFunctionVariant(unaryInts, error), V(unaryFloats));
         Scalar(ArithmeticUrn, "sign", "SIGN", "FUNCTION", SameAsFirst, c => c.Narrow($"SIGN({c.V(0)})"), V(unaryNumbers));
-        // POWER computes in float, so an integer power is not exact; only the float ones are listed.
-        Scalar(ArithmeticUrn, "power", "POWER", "FUNCTION", SameAsFirst, c => c.Narrow($"POWER({c.V(0)}, {c.V(1)})"), V(floats));
-        Scalar(ArithmeticUrn, "sqrt", "SQRT", "FUNCTION", FloatOf, c => c.Narrow($"SQRT({c.V(0)})"),
-            new TSqlFunctionVariant(["i64", "fp32", "fp64"], ("on_domain_error", "ERROR")));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] outside its domain a float function is NaN / -inf under IEEE 754 (DuckDB's default)
+        // and an error in T-SQL, which has neither value (measured: sqrt, ln, log10, log2, asin, acos of a column). The
+        // producer says NAN (and MINUS_INFINITY for log of zero) unless ieee_floating_point_ops is off, when DuckDB fails too.
+        // The NAN variant comes FIRST, so a plan that names no behaviour is treated as IEEE, like the division above.
+        TSqlFunctionVariant[] Domain(string[] impls, Func<TSqlCall, string> write, out Func<TSqlCall, string> guarded, params (string, string)[] ieeeExtra)
+        {
+            guarded = c => c.Options.TryGetValue("on_domain_error", out var d) && d == "NAN"
+                ? throw c.Unsupported("a value outside the domain is NaN or -inf in DuckDB and an error on SQL Server "
+                    + "(SET ieee_floating_point_ops = false makes DuckDB fail too, and the function runs on the server).")
+                : write(c);
+            return [new TSqlFunctionVariant(impls, [("on_domain_error", "NAN"), .. ieeeExtra]),
+                    new TSqlFunctionVariant(impls, [("on_domain_error", "ERROR"), .. ieeeExtra.Select(o => (o.Item1, "ERROR"))])];
+        }
+        // POWER computes in float, so an integer power is not exact; only the float ones are listed. A negative base and a
+        // fractional exponent is NaN in DuckDB whatever the setting, so POWER runs on the server only with a constant
+        // integer exponent >= 0: then the base has no domain (0^0 = 1 on both), and only an overflow past 1e308 differs.
+        Scalar(ArithmeticUrn, "power", "POWER", "FUNCTION", SameAsFirst,
+            c => IsNonNegativeIntegralConstant(c, 1) ? c.Narrow($"POWER({c.V(0)}, {c.V(1)})")
+                : throw c.Unsupported("power with an exponent that is not a constant integer >= 0: DuckDB returns NaN or inf "
+                    + "for a negative base or a zero base, SQL Server fails."),
+            new TSqlFunctionVariant(floats, ("on_domain_error", "NAN")), new TSqlFunctionVariant(floats, ("on_domain_error", "ERROR")));
+        var sqrtVariants = Domain(["i64", "fp32", "fp64"], c => c.Narrow($"SQRT({c.V(0)})"), out var sqrtWrite);
+        Scalar(ArithmeticUrn, "sqrt", "SQRT", "FUNCTION", FloatOf, sqrtWrite, sqrtVariants);
         Scalar(ArithmeticUrn, "exp", "EXP", "FUNCTION", FloatOf, c => c.Narrow($"EXP({c.V(0)})"), V("i64", "fp32", "fp64"));
         foreach (var (name, sql) in new[] { ("sin", "SIN"), ("cos", "COS"), ("tan", "TAN"), ("atan", "ATAN"), ("radians", "RADIANS"), ("degrees", "DEGREES") })
         {
@@ -855,8 +885,8 @@ internal static class TSqlFunctionCatalog
         }
         foreach (var (name, sql) in new[] { ("asin", "ASIN"), ("acos", "ACOS") })
         {
-            Scalar(ArithmeticUrn, name, sql, "FUNCTION", FloatOf, c => c.Narrow($"{sql}({c.V(0)})"),
-                new TSqlFunctionVariant(unaryFloats, ("on_domain_error", "ERROR")));
+            var variants = Domain(unaryFloats, c => c.Narrow($"{sql}({c.V(0)})"), out var write);
+            Scalar(ArithmeticUrn, name, sql, "FUNCTION", FloatOf, write, variants);
         }
         foreach (var (name, op) in new[] { ("bitwise_and", "&"), ("bitwise_or", "|"), ("bitwise_xor", "^") })
         {
@@ -1112,13 +1142,15 @@ internal static class TSqlFunctionCatalog
             new TSqlFunctionVariant(["dec_i32"], ("rounding", "TIE_AWAY_FROM_ZERO")), new TSqlFunctionVariant(["dec_i32"], ("rounding", "TRUNCATE")));
 
         // ── functions_logarithmic ───────────────────────────────────────
-        var logErrors = new[] { ("on_domain_error", "ERROR"), ("on_log_zero", "ERROR") };
         string[] logImpls = ["i64", "fp32", "fp64", "dec"];
-        Scalar(LogarithmicUrn, "ln", "LOG", "FUNCTION", FloatOf, c => c.Narrow($"LOG({c.V(0)})"), new TSqlFunctionVariant(logImpls, logErrors));
-        Scalar(LogarithmicUrn, "log10", "LOG10", "FUNCTION", FloatOf, c => c.Narrow($"LOG10({c.V(0)})"), new TSqlFunctionVariant(logImpls, logErrors));
-        Scalar(LogarithmicUrn, "log2", "LOG", "FUNCTION", FloatOf, c => c.Narrow($"LOG({c.V(0)}, 2)"), new TSqlFunctionVariant(logImpls, logErrors));
-        Scalar(LogarithmicUrn, "logb", "LOG", "FUNCTION", FloatOf, c => c.Narrow($"LOG({c.V(0)}, {c.V(1)})"),
-            new TSqlFunctionVariant(["i64_i64", "fp32_fp32", "fp64_fp64", "dec_dec"], logErrors));
+        foreach (var (name, sql, impls) in new[] {
+            ("ln", "LOG({0})", logImpls), ("log10", "LOG10({0})", logImpls), ("log2", "LOG({0}, 2)", logImpls),
+            ("logb", "LOG({0}, {1})", new[] { "i64_i64", "fp32_fp32", "fp64_fp64", "dec_dec" }) })
+        {
+            var variants = Domain(impls, c => c.Narrow(string.Format(sql, c.V(0), c.Args.Count > 1 ? c.V(1) : "")), out var write,
+                ("on_log_zero", "MINUS_INFINITY"));
+            Scalar(LogarithmicUrn, name, sql[..sql.IndexOf('(')], "FUNCTION", FloatOf, write, variants);
+        }
 
         // ── functions_aggregate_generic / functions_aggregate_approx ────
         Aggregate(AggregateGenericUrn, "count", "COUNT_BIG", t => SType.I64.WithNullable(false), Count, distinct: true,

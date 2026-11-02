@@ -780,6 +780,24 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 		on_zero->set_name("on_division_by_zero");
 		on_zero->add_preference(ieee ? "IEEE" : Settings::Get<ErrorOnDivisionByZeroSetting>(context) ? "ERROR" : "NULL");
 	}
+	// [FABRICATOR-PATCH: OFFER-READY] the same setting decides a float function outside its domain (sqrt(-1), ln(0),
+	// asin(2)): NaN / -inf under ieee_floating_point_ops, an error without it (measured, DuckDB 2.0). pow returns NaN for
+	// a negative base and a fractional exponent either way, so it always says NAN.
+	if (dfun.GetReturnType().id() == LogicalTypeId::DOUBLE || dfun.GetReturnType().id() == LogicalTypeId::FLOAT) {
+		bool is_log = function_name == "ln" || function_name == "log10" || function_name == "log2";
+		bool is_pow = function_name == "pow" || function_name == "power";
+		if (is_log || is_pow || function_name == "sqrt" || function_name == "asin" || function_name == "acos") {
+			bool ieee = is_pow || Settings::Get<IeeeFloatingPointOpsSetting>(context);
+			auto on_domain = sfun->add_options();
+			on_domain->set_name("on_domain_error");
+			on_domain->add_preference(ieee ? "NAN" : "ERROR");
+			if (is_log) {
+				auto on_zero = sfun->add_options();
+				on_zero->set_name("on_log_zero");
+				on_zero->add_preference(ieee ? "MINUS_INFINITY" : "ERROR");
+			}
+		}
+	}
 	sfun->set_function_reference(RegisterFunction(RemapFunctionName(function_name), args_types));
 
 	auto output_type = sfun->mutable_output_type();

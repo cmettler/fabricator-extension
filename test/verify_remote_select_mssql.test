@@ -1348,6 +1348,96 @@ EXPLAIN SELECT max(f / (t - t)) FROM rp.dbo.rs_t;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
+# a float function outside its domain (sqrt(-1), ln(0), asin(2)) is NaN / -inf here and an error on the server
+# (docs/duckdb-2.0-remote-execution.md §4.30) — declined under the default, like the division
+query II
+EXPLAIN SELECT max(sqrt(f)) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT max(ln(f)), max(log10(f)), max(log2(f)) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT max(asin(f / 100)), max(acos(f / 100)) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# the answers are DuckDB's, NaN and -inf included (f - 50 is negative for a sixth of the rows, t is 0 once)
+query I
+SELECT count(*) FROM (((SELECT id, max(sqrt(f - 50)), max(ln(t)), max(log2(f - 50)), max(asin(f / 50 - 1)) FROM rp.dbo.rs_t GROUP BY id)
+    EXCEPT ALL (SELECT id, max(sqrt(f - 50)), max(ln(t)), max(log2(f - 50)), max(asin(f / 50 - 1)) FROM db.dbo.rs_t GROUP BY id))
+  UNION ALL ((SELECT id, max(sqrt(f - 50)), max(ln(t)), max(log2(f - 50)), max(asin(f / 50 - 1)) FROM db.dbo.rs_t GROUP BY id)
+    EXCEPT ALL (SELECT id, max(sqrt(f - 50)), max(ln(t)), max(log2(f - 50)), max(asin(f / 50 - 1)) FROM rp.dbo.rs_t GROUP BY id)));
+----
+0
+
+# power: a negative base and a fractional exponent is NaN in DuckDB whatever the setting, so only a constant integer
+# exponent >= 0 is sent (then only an overflow past 1e308 could differ)
+query II
+EXPLAIN SELECT max(power(f, 2)) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT max(power(f, 0.5)) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT max(power(f, -1)) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (((SELECT id, max(power(t::INT - 100, 3)), max(power(f - 50, 0.5)) FROM rp.dbo.rs_t GROUP BY id)
+    EXCEPT ALL (SELECT id, max(power(t::INT - 100, 3)), max(power(f - 50, 0.5)) FROM db.dbo.rs_t GROUP BY id))
+  UNION ALL ((SELECT id, max(power(t::INT - 100, 3)), max(power(f - 50, 0.5)) FROM db.dbo.rs_t GROUP BY id)
+    EXCEPT ALL (SELECT id, max(power(t::INT - 100, 3)), max(power(f - 50, 0.5)) FROM rp.dbo.rs_t GROUP BY id)));
+----
+0
+
+# ... and with ieee_floating_point_ops off DuckDB fails too, so they run on the server: one error for one error
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+EXPLAIN SELECT max(sqrt(f)), max(ln(f)), max(asin(f / 100)) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement error
+SELECT max(sqrt(f - 50)) FROM rp.dbo.rs_t;
+----
+<REGEX>:.*invalid floating point operation.*
+
+statement error
+SELECT max(sqrt(f - 50)) FROM db.dbo.rs_t;
+----
+<REGEX>:.*square root of a negative.*
+
+statement error
+SELECT max(ln(t)) FROM rp.dbo.rs_t;
+----
+<REGEX>:.*invalid floating point operation.*
+
+statement error
+SELECT max(ln(t)) FROM db.dbo.rs_t;
+----
+<REGEX>:.*logarithm of zero.*
+
+# inside the domain: sqrt is correctly rounded on both sides (IEEE 754), so the doubles are equal
+query I
+SELECT count(*) FROM (((SELECT id, max(sqrt(f)) FROM rp.dbo.rs_t GROUP BY id) EXCEPT ALL (SELECT id, max(sqrt(f)) FROM db.dbo.rs_t GROUP BY id))
+  UNION ALL ((SELECT id, max(sqrt(f)) FROM db.dbo.rs_t GROUP BY id) EXCEPT ALL (SELECT id, max(sqrt(f)) FROM rp.dbo.rs_t GROUP BY id)));
+----
+0
+
+statement ok
+SET ieee_floating_point_ops = true;
+
 # decimal arithmetic whose T-SQL precision exceeds 38 loses scale on the server
 query II
 EXPLAIN SELECT max(amount * big) FROM rp.dbo.rs_t;

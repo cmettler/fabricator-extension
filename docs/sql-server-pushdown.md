@@ -47,10 +47,18 @@ A `SELECT` that is not pushed is therefore not "pulled whole": its scans still c
 | a function the provider implements in C# or a plugin, or a function of another catalog | it does not exist on SQL Server (L2) | DuckDB |
 | `ROLLUP`, `CUBE`, grouping sets with `()` beside others | no grand-total row on an empty input (S17) | DuckDB |
 | a float division whose divisor may be 0 (with DuckDB's default `ieee_floating_point_ops`) | DuckDB returns inf, SQL Server raises an error (S18) | the division in DuckDB, the part below it pushed; with `SET ieee_floating_point_ops = false` it is pushed |
+| `sqrt`, `ln`, `log10`, `log2`, `asin`, `acos` (with DuckDB's default `ieee_floating_point_ops`) | outside their domain DuckDB returns NaN / -inf, SQL Server raises an error | the function in DuckDB, the part below it pushed; with `SET ieee_floating_point_ops = false` they are pushed |
+| `power` with an exponent that is not a constant integer ≥ 0 | a negative base with a fractional exponent is NaN in DuckDB, an error on the server | DuckDB |
+| `cbrt`, `trunc`, one-argument `round`, `atan2`, `gcd` / `lcm`, `factorial`, `<<` / `>>` / `~` | no translation | DuckDB |
 | `INSERT … VALUES` | the bulk copy is already the fast path (I2) | bulk copy |
 | `UPDATE … FROM` | a row matched twice would take whichever match SQL Server picks (U2) | key path |
 | `DELETE` / `UPDATE` / `MERGE` with `RETURNING` | not built as one statement | key path, rows from T-SQL `OUTPUT` (see [RETURNING](#returning)) |
 | anything on **Fabric Warehouse / Synapse** | query pushdown is not enabled there | scan pushdown + key path |
+
+Pushed but not always bit-identical: `sin`, `cos`, `tan`, `asin`, `acos`, `exp`, `log2` and `power` on floats come
+from SQL Server's math library and can differ from DuckDB's in the last bit (relative ≈ 2e-16). A float overflow
+(`exp(1000)`, `1e308 * 10`) is inf in DuckDB and an error on the server. The function list is in the README
+(section *remote_pushdown*).
 
 ## Seeing what happens
 

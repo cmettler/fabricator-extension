@@ -333,6 +333,14 @@ the default schema stays local — a DuckDB limit). Pushed:
   (SQL Server 2022+), `lpad`/`rpad`, `length`, `substring`, `left` / `right` (a count of at least 0), `strpos`
   (counted in code points), `LIKE` without `_`, `starts_with` / `contains` / `ends_with`, `lower` / `upper` (see
   below); a date cast of a timestamp (`CAST(ts AS DATE) = …`).
+- math: `abs`, `floor` / `ceil`, `round(x, n)`, `greatest` / `least`, `degrees` / `radians`, `pi()`, integer `%`,
+  `&` / `|` / `xor`, `exp`, `sin` / `cos` / `tan` / `atan`, and `power` with a constant integer exponent >= 0.
+  `sqrt`, `ln`, `log10`, `log2`, `asin`, `acos` only with `SET ieee_floating_point_ops = false`: under DuckDB's
+  default a value outside their domain is NaN or -inf, which SQL Server cannot return (it fails instead).
+  ⚠ Floats are not always bit-identical: `sin`, `cos`, `tan`, `asin`, `acos`, `exp`, `log2` and `power` come back
+  from SQL Server's math library, which differs from DuckDB's in the LAST BIT for some values (measured 0.2–30 %
+  of random inputs, relative difference ≈ 2e-16). A float that overflows (`exp(1000)`, `1e308 * 10`) is inf in
+  DuckDB and an error on the server, and `ceil(-0.25)` comes back as `0.0`, not `-0.0`.
 
 Runs locally (each measured to answer differently on SQL Server, or not expressible): a plain scan of one table
 (the table scan already pushes its filter and projection), `reverse`,
@@ -344,7 +352,8 @@ grouping binary values (SQL Server ignores trailing zero bytes), a float divided
 either way),
 decimal arithmetic past precision 38 (SQL Server would round), float → string casts, `any_value`, `GROUPS` /
 `RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions with no T-SQL rendering (`date_sub`,
-`strftime`, list and JSON functions, …), functions whose value is not fixed by their arguments (`now()`,
+`strftime`, list and JSON functions, `cbrt`, `trunc`, `atan2`, `gcd` / `lcm`, `factorial`, `<<` / `>>` / `~`,
+one-argument `round`, …), functions whose value is not fixed by their arguments (`now()`,
 `current_date`, `random()`, … — the server would use its own clock, time zone or generator), and a part of a
 statement that only scans, filters and projects.
 (A statement naming a result column twice, or reading a CTE, is pushed as a whole by the part-of-a-statement pushdown below; a

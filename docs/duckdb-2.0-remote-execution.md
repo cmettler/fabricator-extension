@@ -1978,6 +1978,43 @@ without pushdown (a window, ORDER BY … LIMIT, a join with local data), one ser
 NOT MATERIALIZED), a correlated subquery still pushed whole, the ATTACH option, SET over ATTACH both ways, and both
 refusals. Guide S19.
 
+### 4.30 Math functions: measured, and a float outside its domain follows the division rule — FIXED (2026-11-02)
+
+User-asked: which DuckDB math functions are pushed at all. Measured on the docker SQL Server, two ways — routing
+(`Fabricator.Remote`) and the answer against DuckDB on the same rows (10 000 random doubles per function, and the
+domain edges from a COLUMN, since a constant is folded by DuckDB before Substrait sees it).
+
+| result | functions |
+|---|---|
+| pushed, equal on all 10 000 values | `abs`, `floor`, `ceil`, `round(x, n)`, `+ − * /`, `greatest`/`least`, `degrees`, `radians`, `pi()`, `atan`, `sqrt`, `ln`, `log10`; integer `%`, `& | xor`, decimal `round(x, n)`/`ceil`/`floor` |
+| pushed, LAST BIT differs on some values (1 ULP, relative ≈ 2e-16; SQL Server's math library) | `sin` 0.8 %, `cos` 0.9 %, `tan` 2.5 %, `asin` 1.2 %, `acos` 0.7 %, `exp` 0.2 %, `log2` 30 %, `power` 0.3 % |
+| local: no translation | one-argument `round`, `round_even`, `trunc`, `cbrt`, `**`, `log(x)`/`log(b, x)`, `atan2`, `cot`, `~`, `<<`, `>>`, `gcd`, `lcm`, `factorial`, `even`, `isnan`/`isinf`/`isfinite`, decimal/float `%`, `max` over `sign` (TINYINT) |
+
+USER DECISION: the last-bit differences are DOCUMENTED, not declined (README). Only `sqrt` and `+ − * /` are bit-exact
+by IEEE 754; `ln`/`log10`/`atan` matched here, which is the two math libraries agreeing, not a guarantee.
+
+**FIXED — a float outside its domain failed the pushed query.** `sqrt(-1)`, `ln(0)`, `log10(-1)`, `log2(0)`,
+`asin(2)`, `acos(-2)`, `power(-8, 1/3)`, `power(0, -1)` on a column: DuckDB answers NaN / ±inf, SQL Server raised
+*"An invalid floating point operation occurred"* (or *"Divide by zero"*), so the statement FAILED where DuckDB
+answers — error, not a wrong answer. MEASURED with `ieee_floating_point_ops = false`: sqrt, ln, log10, log2, log,
+asin and acos then FAIL in DuckDB too; `power(-8, 1/3)` is still NaN, `exp(1000)` and `1e308 * 10` still inf.
+- to_substrait sends `on_domain_error` NAN | ERROR (plus `on_log_zero` MINUS_INFINITY | ERROR for the logs) from
+  that setting, like `on_division_by_zero` in §4.28; `pow` always says NAN.
+- the emitter declines NAN (variant first, so a plan that names nothing is IEEE) and runs ERROR on the server.
+- `power` goes only with a constant integer exponent ≥ 0 — then the base has no domain (0^0 = 1 both ways) and only an
+  overflow differs. With any other exponent it stays local, whatever the setting.
+- NOT changed, documented: a float OVERFLOW (`exp(x)` past x ≈ 709.78, `* + −` past 1e308) is inf in DuckDB in both
+  modes and an *"Arithmetic overflow"* error on SQL Server. No setting makes the two agree, and it is loud.
+- also documented: `ceil(-0.25)` is `-0.0` in DuckDB and `0.0` from the server (equal under comparison).
+- a NaN CONSTANT (DuckDB folds `sqrt(-1.0)` before translation) fails on the server as *"Error converting data type
+  nvarchar to float"* — SQL Server has no NaN. Not fixed; unlikely in practice.
+
+Gate: verify_remote_select_mssql §14 (828 → 851): routing under the default and under `ieee_floating_point_ops =
+false`, a differential with NaN / -inf rows, power routing, one-error-for-one-error. Mutants killed: domain guard
+off (line 1353), power exponent check off (line 1384). The producer half is unmutated (a C++ rebuild); a producer
+that sent ERROR under IEEE would be caught by the same rows. Harness: session scratchpad `math/` (probe2.py,
+wide.py, domain.py).
+
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
 **As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.
