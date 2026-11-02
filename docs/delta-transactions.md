@@ -929,6 +929,10 @@ access the file because it is being used by another process"*.
   rows left, CI red on linux/osx). Here: a local POSIX commit is written to `.<name>.<guid>.tmp` and published by
   `link()` (EEXIST = the version exists; a filesystem without `link()`, Fabric's FUSE mount, keeps `O_EXCL`), and
   `ReadAllBytesAsync` never returns an empty commit JSON (re-reads ~2 s, then fails).
+  On Fabric's FUSE mount the `link()` attempt is skipped (`/proc/self/mountinfo`, type `fuse*`; a failure elsewhere
+  is remembered per table root): on 2.0 the attempt's slow first commit put 16 writers in step and one lost 16 races
+  in a row in 3 of 4 runs. The commit retry also backs off (0–min(1 s, 10 ms·2^n)) and allows 64 attempts. Measured
+  on 2.0 only (320/320 INSERTs, deletes exact, at most 4 attempts); not run on Fabric with 1.5.
   6×) and then deleting (deletion vectors, 5×) only its own rows, exact counts after. The mutant "no pinned version"
   fails 5 of 5 runs (four loud, one silent `min(v)` mismatch). Not gated: the unchanged-file refusal (needs a commit
   between a statement's scan and its DML open on the SAME file — sqllogictest cannot interleave inside a statement).
