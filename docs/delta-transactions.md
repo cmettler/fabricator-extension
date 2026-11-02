@@ -488,7 +488,7 @@ depends on the filesystem:
 
 | Storage | Commit guard | Verdict |
 |---|---|---|
-| Local POSIX | `O_EXCL` exclusive create | multi-process safe (validated: 4 processes × 200 rows → 800/800). **MEASURED 2026-11-01 on DuckDB 2.0 + engineered-wood `805c91b`, WSL ext4, `scratchpad/posix_race.sh`:** 16 writer processes × (1 INSERT + 11 UPDATEs of their own rows), each writer one process so commits crowd: 800/800 rows, v 8800/8800, 193/193 commits, no error, no empty commit file — three runs, with 8 / 2 / 3 commit races LOST and retried (the positive control: the `exclusive publish … -> LOST (exists)` Debug line, added for this). Also 8 × 6 inserts 2400/2400 and 8 × (1 + 5) 400/400 three times. The create-then-write window (§8.5b) did not show at this contention. **Fabric fuse mount on DuckDB 2.0, measured the same night** (`scratchpad/fuse_race2.py` through the notebook harness, PySpark kernel): 16 writers × 20 single-row commits on `/lakehouse/default/Tables` → 320/320, every (w,c) group present, 0 writers failed, 82 OCC retries (max attempt 4), no EEXIST |
+| Local POSIX | `O_EXCL` exclusive create | multi-process safe (validated: 4 processes × 200 rows → 800/800). **MEASURED 2026-11-01 on DuckDB 2.0 + engineered-wood `805c91b`, WSL ext4, `scratchpad/posix_race.sh`:** 16 writer processes × (1 INSERT + 11 UPDATEs of their own rows), each writer one process so commits crowd: 800/800 rows, v 8800/8800, 193/193 commits, no error, no empty commit file — three runs, with 8 / 2 / 3 commit races LOST and retried (the positive control: the `exclusive publish … -> LOST (exists)` Debug line, added for this). Also 8 × 6 inserts 2400/2400 and 8 × (1 + 5) 400/400 three times. The create-then-write window (§8.5b) did not show at this contention — it did with threads on 2 cores, and lost deletes; fixed 2026-11-02 (`link()` publish + no empty commit read). **Fabric fuse mount on DuckDB 2.0, measured the same night** (`scratchpad/fuse_race2.py` through the notebook harness, PySpark kernel): 16 writers × 20 single-row commits on `/lakehouse/default/Tables` → 320/320, every (w,c) group present, 0 writers failed, 82 OCC retries (max attempt 4), no EEXIST |
 | **Local WINDOWS (`D:\…`, DuckDB's `LocalFileSystem`)** | **Since 2026-10-31 (DuckDB 2.0): the commit is written to a temporary name and MOVED onto the version without replacing** (`DuckDbTableFileSystem.TryPublishLocalWindows`); DuckDB 2.0 also maps `EXCLUSIVE_CREATE` to `CREATE_NEW` now (§8.5b) | **MEASURED 2026-10-31: 8 processes × (1 INSERT + 5 UPDATEs): 400/400 rows, v 2000/2000, 40/40 updates, three runs** — after the row-id fix of §8.5b. Before 2.0: 400 of 900 rows (§8.5) |
 | OneLake / abfss (`onelake://`) | ADLS conditional create (`If-None-Match: *`) | multi-process safe for DATA (no lost writes measured), but a losing writer can surface an ERROR instead of retrying — see §8.1 |
 | Plain ADLS Gen2 `abfss://` **with an azure `SECRET` NAMED** | the SAME ADLS conditional create — a credentialed abfss root now takes the direct-SDK filesystem, which is what OneLake always took | **MEASURED 2026-08-02 (§8.4): 6 writers × 8 commits ⇒ 48/48, zero losses, commit versions fully interleaved across writers so contention was real** |
@@ -895,7 +895,7 @@ access the file because it is being used by another process"*.
   MOVEFILE_REPLACE_EXISTING, atomic and failing when the version exists. ⚠ NOT on POSIX: .NET's no-replace move is a
   `link()` there, which a FUSE mount (Fabric's `/lakehouse/default`) does not support — it falls back to
   check-then-rename, a race, while `O_EXCL` is the measured-safe primitive on that mount (§8.1). The create-then-write
-  window therefore still exists on POSIX; not measured there.
+  window therefore still existed on POSIX — ⚠ and it LOST DELETES, see the next bullet but one (fixed 2026-11-02).
 - **⚠⚠ THE MEASUREMENT FOUND A SILENT WRONG-ROW BUG THAT HAS NOTHING TO DO WITH WINDOWS.** 8 processes × (1 INSERT +
   5 UPDATEs of their OWN rows): 300 of 400 rows, v 1200 of 2000, every statement exit 0. Per process: an UPDATE that
   "succeeded" without a visible change, one applied twice, values going DOWN. Ruled out by measurement, in this order:
@@ -927,6 +927,27 @@ access the file because it is being used by another process"*.
   one file never overlapped here, in-process or across 8 processes × 6 statements (0 conflicts with the strict
   check), so a relaxation there would be unmeasured. ⚠ Its transaction is based on the snapshot it OPENED, not on
   the pin — safe only because the strict check covers the gap; drop the check and it must move to the pin.
+- **⚠⚠ THE POSIX CREATE-THEN-WRITE WINDOW LOST DELETES SILENTLY — FOUND BY CI, FIXED 2026-11-02.** The same-file
+  section of `verify_delta_concurrent_dml` was red on linux_amd64 and osx_arm64 in 5 of 9 CI runs after `5d5d0d4`,
+  never on Windows: 800 to 7800 of 8000 rows left where 0 was expected, every DELETE succeeding. Reproduced in WSL only
+  with the process held to 2 cores (`taskset -c 0,1`, 2 of 5 runs; 20 cores never, nor 8 separate processes).
+  - **Cause:** on POSIX the commit is published by `O_EXCL` create, THEN written. A writer that lost the race re-reads
+    the winner's commit to judge the conflict — and read it EMPTY (a probe in `ReadAllBytesAsync` counted 1 and 7
+    empty commit reads in exactly the failing runs). `ReadCommitAsync` turns zero bytes into zero actions, so the
+    conflict check saw nothing, the loser committed `remove(file, old DV) + add(file, its DV)` on top, and the log
+    then held TWO active entries for the file (replayed: v3 `-dv200 +dv400`, v4 `-dv200 (NOT ACTIVE) +dv400`). Not
+    only deletion vectors: one failing run broke the insert-and-delete section instead (279 rows where 80 belong).
+  - **Fix, two halves, each sufficient alone (each 0 of 10 runs; together 0 of 10):** (1) a local POSIX commit is
+    written to `.<name>.<guid>.tmp` and published by `link()`, which fails with EEXIST when the version exists — the
+    name appears with its content (`TryPublishLocalPosix`). A filesystem without `link()` (Fabric's FUSE mount) falls
+    back to `O_EXCL`, remembered per table. (2) `ReadAllBytesAsync` never returns an empty COMMIT file
+    (`<20 digits>.json` in `_delta_log`): it re-reads for about 2 s and then fails loudly — a commit is never empty,
+    and that half also covers the FUSE fallback and foreign writers.
+  - Gate: the existing `verify_delta_concurrent_dml`, which only fails under CPU pressure — linux CI runners have 4
+    vCPUs, macOS 3. Harness: `scratchpad/wsl_cdml2.sh <payload> <runs>` (2 cores, keeps failing dirs) and
+    `scratchpad/dvlog.py` (replays a log, flags removes of entries that are not active).
+  - ⚠ The 1.5 line publishes the same way; not measured there (its same-file DELETE refuses rather than reconciles,
+    but a snapshot read of an empty commit misses that version just the same).
 - **A crash between the temp write and the move leaves `.<version>.json.<guid>.tmp` in `_delta_log`** — the
   `finally` that deletes it never runs. MEASURED harmless (a planted, truncated one for v1): the table reads, the next
   commit takes v1 itself (another guid, so no clash), a path scan reads it — the name ends in `.tmp` and starts with

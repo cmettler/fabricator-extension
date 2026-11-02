@@ -264,6 +264,28 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         }
     }
 
+    /// <summary>How often a zero-length commit file is re-read before it is reported (about 2 s in all).</summary>
+    private const int EmptyCommitRetries = 120;
+
+    private static bool IsCommitFile(string path)
+    {
+        // <20 digits>.json under _delta_log — a version's commit, never a checksum or checkpoint
+        int slash = path.LastIndexOf('/');
+        var name = path.AsSpan(slash + 1);
+        if (name.Length != 25 || !name.EndsWith(".json", StringComparison.Ordinal))
+        {
+            return false;
+        }
+        foreach (char c in name[..20])
+        {
+            if (c < '0' || c > '9')
+            {
+                return false;
+            }
+        }
+        return path.Contains("_delta_log", StringComparison.Ordinal);
+    }
+
     public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
     {
         if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
@@ -286,6 +308,22 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
                 try
                 {
                     long size = HostFs.Size(file);
+                    if (size == 0 && IsCommitFile(path) && attempt < EmptyCommitRetries)
+                    {
+                        // A commit is never empty: a zero-length one is being written right now (a POSIX publish by
+                        // O_EXCL creates the name before the content). Read as it is, it has NO actions, so a
+                        // conflict check sees nothing and a rebased commit replaces the winner's deletion vector —
+                        // MEASURED 2026-11-02, Linux, 8 threads deleting their own rows of one file: 7800 of 8000
+                        // rows came back, every statement succeeding. Wait for the content instead.
+                        Thread.Sleep(Math.Min(attempt, 20));
+                        continue;
+                    }
+                    if (size == 0 && IsCommitFile(path))
+                    {
+                        throw new System.IO.IOException(
+                            $"DuckDbTableFileSystem: commit file {path} is still empty after {EmptyCommitRetries} reads; "
+                            + "a writer may have stopped between creating and writing it.");
+                    }
                     var buffer = new byte[size];
                     if (size > 0)
                     {
@@ -436,6 +474,15 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             }
             return new ValueTask<bool>(won);
         }
+        if (!_root.Contains("://") && !_noLink && TryPublishLocalPosix(dst, data.Span) is bool linked)
+        {
+            if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+            {
+                Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "local link publish {Path} -> {Outcome}", path,
+                    linked ? "won" : "LOST (exists)");
+            }
+            return new ValueTask<bool>(linked);
+        }
         bool created = HostFs.TryOpenWriteExclusive(Opener, dst, out nint target);
         if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
         {
@@ -506,6 +553,71 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             if (System.IO.File.Exists(temp))
             {
                 System.IO.File.Delete(temp);
+            }
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "link", SetLastError = true)]
+    private static extern int PosixLink(string oldPath, string newPath);
+
+    private const int EEXIST = 17; // the same on Linux and macOS
+
+    /// <summary>Set once link() failed for another reason than EEXIST: this filesystem has none.</summary>
+    private volatile bool _noLink;
+
+    /// <summary>
+    /// The commit on a local POSIX root: the whole file is written under a temporary name and then hard-linked onto
+    /// the commit name. link() fails with EEXIST when the name exists, so it is put-if-absent, and the name appears
+    /// WITH its content — no reader can meet the commit half-written. True = published, false = the target exists,
+    /// null = this filesystem has no link() (Fabric's FUSE mount /lakehouse/default), where the caller falls back to
+    /// O_EXCL at open, the primitive measured safe on that mount (the reader then waits out an empty commit).
+    /// </summary>
+    private bool? TryPublishLocalPosix(string path, ReadOnlySpan<byte> data)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+        string temp = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!,
+            "." + System.IO.Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            try
+            {
+                using var file = new System.IO.FileStream(temp, System.IO.FileMode.CreateNew, System.IO.FileAccess.Write,
+                    System.IO.FileShare.None);
+                file.Write(data);
+                file.Flush(flushToDisk: true);
+            }
+            catch (System.IO.IOException)
+            {
+                return null; // not a path System.IO can write: leave it to the host filesystem
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return null;
+            }
+            if (PosixLink(temp, path) == 0)
+            {
+                return true;
+            }
+            int errno = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
+            if (errno == EEXIST)
+            {
+                return false;
+            }
+            _noLink = true; // remembered for this table: the next commit goes straight to O_EXCL
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                System.IO.File.Delete(temp);
+            }
+            catch (System.IO.IOException)
+            {
+                // an orphaned temp file is litter, not a fault
             }
         }
     }
