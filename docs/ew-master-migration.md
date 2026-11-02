@@ -3219,6 +3219,25 @@ blind claims where one is true.
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
 
+## THE 2026-11-02 BUMP — `805c91b → 957d24d`, five commits, zero patches (a fast-forward)
+
+- **#613 `957d24d` — a deletion vector with RUN containers was misread.** The portable roaring format writes an
+  offset header after the run cookie once a bitmap has 4+ containers; EW assumed it never did, so such a bitmap
+  threw or — worse — parsed into WRONG positions. EW and Delta Spark 4.0 never write run containers; CRoaring-based
+  writers do. ⇒ a foreign table's DV could hide the wrong rows on BOTH our read paths (both decode DVs through EW).
+  A fix we inherit.
+- **#611 `4980107` — a scan reads up to `min(4, cores)` data files at once** (`DeltaTableOptions
+  .MaxConcurrentFileReads`, byte budget `MaxBufferedReadBytes` 256 MiB), batches still in file order. Applies to the
+  built-in reader only — through our `IDataFileReader` seam it stays serial unless the option is set. MEASURED on the
+  codec engine (40 files × 250k rows, best of 5): `count + sum` 0.34 → 0.26 s, `GROUP BY` 0.36 → 0.29 s, identical
+  answers. The default `PROVIDER 'delta'` (native_read) is unaffected.
+- #609 local log listing without a second stat (EW's `LocalTableFileSystem` — ours lists through DuckDB) and
+  `ArrowCompute.Filter`; #602 opt-in `mergeSchema` (we do not pass it); #606 benchmarks.
+- Sweep: option records gained only the two read options above; `known-issues.md` changed only for mergeSchema.
+- Gates: compile zero; EW Core 540/540, DeltaLake.Tests 646/646, Table.Tests 1944 passed / 166 skipped (all under
+  `Tests.Interop`) on net10.0; hermetic **92/92 — 11923** and service **89/89 — 137441**, both IDENTICAL to the
+  previous pin.
+
 ## THE 2026-08-25 BUMP — `3a31d9e → bab9a89`, THIRTY-NINE commits, still ZERO patches
 
 A fast-forward, not a merge. The user's framing was *"most parquet fixes and a few delta"* and the shape is
