@@ -1,0 +1,195 @@
+# name: test/verify_ducklake_delta_maintain.test
+# description: ducklake_delta_maintain runs DuckLake's maintenance in the order a Delta mirror needs: flush, merge,
+#              rewrite, sync, then expire + cleanup of scheduled files (refused while a Delta log still lists one),
+#              then orphans (DuckLake's rule, minus what a Delta log owns). Each section compares the lake with the
+#              Delta table read back, and lists the files on disk. See docs/ducklake-catalog.md §11.10.
+#              Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require ducklake
+
+require parquet
+
+require json
+
+require icu
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta.ducklake' AS lake (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl/');
+
+# A mirrored lake: the global auto_compact false (a DuckLake CHECKPOINT would otherwise delete Delta checkpoints and
+# run its own orphan cleanup), and true for the schema, or DuckLake skips flush / merge / rewrite without a word.
+statement ok
+CALL lake.set_option('auto_compact', false);
+
+statement ok
+CALL lake.set_option('auto_compact', true, schema => 'main');
+
+# ============================================================================
+# 1. THE WHOLE PASS — inlined rows flushed, small files merged, the Delta log follows, old files and an orphan go;
+#    a file under _change_data/ (owned by the Delta log, unknown to DuckLake) stays.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.t AS SELECT range AS id FROM range(1000);
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake');
+
+statement ok
+INSERT INTO lake.t SELECT range + 1000 FROM range(5);
+
+statement ok
+INSERT INTO lake.t SELECT range + 2000 FROM range(3000);
+
+statement ok
+INSERT INTO lake.t SELECT range + 6000 FROM range(3000);
+
+statement ok
+DELETE FROM lake.t WHERE id < 10;
+
+statement ok
+COPY (SELECT 1 AS x) TO '{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/orphan.parquet';
+
+statement ok
+COPY (SELECT 1 AS x) TO '{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/_change_data' (FORMAT parquet, PER_THREAD_OUTPUT true);
+
+# dry_run: flush, merge and sync run, nothing is deleted
+query TI
+SELECT step, count FROM ducklake_delta_maintain('lake', older_than => '0 seconds', orphans => true, dry_run => true)
+WHERE step IN ('flush', 'merge', 'orphans') ORDER BY step;
+----
+flush	5
+merge	3
+orphans	1
+
+query I
+SELECT count(*) FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/orphan.parquet');
+----
+1
+
+query TI
+SELECT step, count FROM ducklake_delta_maintain('lake', older_than => '0 seconds', orphans => true)
+WHERE step IN ('cleanup', 'orphans') ORDER BY step;
+----
+cleanup	3
+orphans	1
+
+query II
+SELECT (SELECT count(*) FROM lake.t), (SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t'));
+----
+6995	6995
+
+query I
+SELECT (SELECT sum(id) FROM lake.t) = (SELECT sum(id) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t'));
+----
+true
+
+query I
+SELECT count(*) FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/orphan.parquet');
+----
+0
+
+query I
+SELECT count(*) > 0 FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/_change_data/*.parquet');
+----
+true
+
+# every Parquet file left is one DuckLake knows
+query I
+SELECT count(*) FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/t/ducklake-*.parquet') g
+WHERE NOT EXISTS (SELECT 1 FROM ducklake_list_files('lake', 't') f WHERE replace(f.data_file, '\', '/') = replace(g.file, '\', '/')
+                  OR replace(f.delete_file, '\', '/') = replace(g.file, '\', '/'));
+----
+0
+
+# ============================================================================
+# 2. A SYNC THAT IS BEHIND — a mirror without deletion vectors waits for live deletes to be rewritten, so its log
+#    still lists the files a merge replaced. Expire schedules them, and the cleanup must NOT delete them.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.u AS SELECT range AS id FROM range(1000);
+
+statement ok
+INSERT INTO lake.u SELECT range + 2000 FROM range(3000);
+
+statement ok
+INSERT INTO lake.u SELECT range + 6000 FROM range(3000);
+
+query I
+SELECT files_added FROM ducklake_delta_sync('lake', table_name := 'main.u', deletion_vectors := false, column_mapping := 'none');
+----
+3
+
+statement ok
+DELETE FROM lake.u WHERE id < 10;
+
+query TIT
+SELECT step, count, detail LIKE 'skipped: a Delta log still lists 2 of the % scheduled files%' FROM ducklake_delta_maintain('lake',
+  table_name := 'main.u', older_than => '0 seconds', deletion_vectors := false) WHERE step IN ('merge', 'cleanup') ORDER BY step;
+----
+cleanup	0	true
+merge	2	false
+
+# the Delta log is behind (before the delete) but every file it lists is still there
+query II
+SELECT (SELECT count(*) FROM lake.u), (SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/u'));
+----
+6990	7000
+
+# rewriting the deletes lets the sync catch up — across the snapshots the expire removed — and then the cleanup runs
+query TI
+SELECT step, count FROM ducklake_delta_maintain('lake', table_name := 'main.u', rewrite_deletes => true,
+  older_than => '0 seconds', deletion_vectors := false) WHERE step IN ('rewrite', 'sync', 'cleanup') ORDER BY step;
+----
+cleanup	4
+rewrite	1
+sync	1
+
+query II
+SELECT (SELECT count(*) FROM lake.u), (SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/u'));
+----
+6990	6990
+
+# ============================================================================
+# 3. A TABLE DUCKLAKE WOULD NOT COMPACT is reported, not silently left inlined
+# ============================================================================
+
+statement ok
+CREATE SCHEMA lake.s2;
+
+statement ok
+CREATE TABLE lake.s2.v AS SELECT 1 AS id;
+
+statement ok
+INSERT INTO lake.s2.v VALUES (2);
+
+query TT
+SELECT step, detail LIKE 'skipped: auto_compact is false for this table%set_option(''auto_compact'', true, schema => ''s2'')'
+FROM ducklake_delta_maintain('lake', table_name := 's2.v') WHERE step = 'flush';
+----
+flush	true
+
+# ============================================================================
+# 4. REFUSALS
+# ============================================================================
+
+statement error
+SELECT * FROM ducklake_delta_maintain('lake', orphans => true);
+----
+needs older_than
+
+statement error
+SELECT * FROM ducklake_delta_maintain('lake', older_than => 'not an interval');
+----
+<REGEX>:.*(interval|Interval).*
+
+statement error
+SELECT * FROM ducklake_delta_maintain('lake', table_name := 'nope');
+----
+no table 'nope'

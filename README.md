@@ -600,7 +600,25 @@ What the profile drives automatically:
     conditional write, so ATTACH the data path as a Delta catalog with a `SECRET` in the same session (on
     Fabric compute the notebook's own credential is used); without one the sync refuses.
   - Do not `VACUUM` these tables from Spark or Fabric: it would delete files DuckLake still keeps for its own
-    time travel. Clean up through DuckLake.
+    time travel. Clean up through DuckLake — best with `ducklake_delta_maintain`, below.
+- **Maintenance for a mirrored lake (`ducklake_delta_maintain`).** One call runs DuckLake's maintenance in the order
+  the Delta log needs, and returns one row per step (`step`, `object`, `count`, `detail`):
+  flush inlined rows → merge small files (`merge := true`) → fold deletes into new files (`rewrite_deletes :=
+  false`) → `ducklake_delta_sync` → with `older_than := '7 days'`: expire older snapshots and delete the files
+  DuckLake scheduled for deletion → with `orphans := true`: delete Parquet files under the data path that neither
+  DuckLake nor a Delta log knows, older than `older_than`.
+  - The cleanup is skipped, with the reason in `detail`, while a Delta log still lists a scheduled file (a sync
+    that is behind — e.g. live deletes under `deletion_vectors := false` before `rewrite_deletes`).
+  - DuckLake's own orphan cleanup does not run on a mirrored lake (it is off while the global `auto_compact` is
+    false, and it would delete Delta checkpoints); this one keeps `_delta_log/` and `_change_data/`.
+  - A table DuckLake would not compact (its `auto_compact` resolves to false) is reported, with the
+    `set_option` call that enables it.
+  - `dry_run := true` reports what the deleting steps would delete; flush, merge and sync still run.
+    `table_name := 'schema.table'` limits flush, merge and sync; expire and cleanup are lake-wide, as in DuckLake.
+    The sync options (`column_mapping`, `deletion_vectors`, `timestamp_mapping`, `metadata_schema`) pass through.
+  ```sql
+  SELECT * FROM ducklake_delta_maintain('lake', older_than := '7 days', orphans := true);
+  ```
   ```sql
   ATTACH 'ducklake:fabricator:<connstr>' AS lake (DATA_PATH 'abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables/',
       META_HIDDEN_ROWID true);

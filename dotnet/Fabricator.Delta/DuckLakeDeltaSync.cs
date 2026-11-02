@@ -184,7 +184,12 @@ internal sealed class DuckLakeDeltaSync
         _timestamps = timestamps;
     }
 
-    public List<Result> Run(string? tableFilter, string? metadataSchema, CancellationToken ct)
+    /// <summary>A DuckLake table as the sync sees it: its schema, name, metadata id, uuid and data folder.</summary>
+    internal sealed record LakeTable(string Schema, string Table, long Id, string Uuid, string Root);
+
+    /// <summary>The lake's data_path (with a trailing separator), whether checkpoints are safe, the current
+    /// snapshot and every live table with its data folder — what a sync and the maintenance both need.</summary>
+    internal (string DataPath, bool CheckpointsSafe, long Current, List<LakeTable> Tables) Describe(string? metadataSchema)
     {
         // DuckLake attaches its metadata catalog HIDDEN — duckdb_databases()/duckdb_tables() do not list it — and
         // ducklake_settings() does not name METADATA_SCHEMA, so the schema is found by probing (measured).
@@ -217,21 +222,30 @@ internal sealed class DuckLakeDeltaSync
             $"FROM {M("ducklake_table")} t JOIN {M("ducklake_schema")} s ON s.schema_id = t.schema_id " +
             $"WHERE {Active("t", current)} AND {Active("s", current)} ORDER BY s.schema_name, t.table_name");
 
+        var list = new List<LakeTable>();
+        foreach (var t in tables)
+        {
+            string root = dataPath;
+            root = Bool(t[7]) ? root + (string)t[6]! : (string)t[6]!;
+            root = Bool(t[4]) ? root + (string)t[3]! : (string)t[3]!;
+            list.Add(new LakeTable((string)t[5]!, (string)t[2]!, Long(t[0]), Str(t[1]), root.TrimEnd('/', '\\')));
+        }
+        return (dataPath, checkpointsSafe, current, list);
+    }
+
+    public List<Result> Run(string? tableFilter, string? metadataSchema, CancellationToken ct)
+    {
+        var (_, checkpointsSafe, current, tables) = Describe(metadataSchema);
         var results = new List<Result>();
         bool matched = false;
         foreach (var t in tables)
         {
-            string table = (string)t[2]!;
-            string schema = (string)t[5]!;
-            if (tableFilter is not null && !MatchesFilter(tableFilter, schema, table))
+            if (tableFilter is not null && !MatchesFilter(tableFilter, t.Schema, t.Table))
             {
                 continue;
             }
             matched = true;
-            string root = dataPath;
-            root = Bool(t[7]) ? root + (string)t[6]! : (string)t[6]!;
-            root = Bool(t[4]) ? root + (string)t[3]! : (string)t[3]!;
-            var sync = new TableSync(this, Long(t[0]), Str(t[1]), root.TrimEnd('/', '\\'), current, checkpointsSafe);
+            var sync = new TableSync(this, t.Id, t.Uuid, t.Root, current, checkpointsSafe);
             results.AddRange(sync.Run(ct));
         }
         if (tableFilter is not null && !matched)
@@ -241,7 +255,7 @@ internal sealed class DuckLakeDeltaSync
         return results;
     }
 
-    private static bool MatchesFilter(string filter, string schema, string table)
+    internal static bool MatchesFilter(string filter, string schema, string table)
     {
         int dot = filter.IndexOf('.');
         return dot < 0
@@ -502,8 +516,12 @@ internal sealed class DuckLakeDeltaSync
             string id = _tableId.ToString(CultureInfo.InvariantCulture);
             var list = new List<long>();
             foreach (var r in _o.Rows(
+                         // Only snapshots that still exist: ducklake_expire_snapshots leaves their change rows behind,
+                         // and a scan AT an expired snapshot fails ("No snapshot found at version 4", measured when
+                         // a sync behind live deletes met an expire). The next existing snapshot carries the changes.
                          $"SELECT snapshot_id, changes_made FROM {_o.M("ducklake_snapshot_changes")} " +
-                         $"WHERE snapshot_id > {last} AND snapshot_id <= {_current} ORDER BY snapshot_id"))
+                         $"WHERE snapshot_id > {last} AND snapshot_id <= {_current} " +
+                         $"AND snapshot_id IN (SELECT snapshot_id FROM {_o.M("ducklake_snapshot")}) ORDER BY snapshot_id"))
             {
                 string changes = (string?)r[1] ?? "";
                 foreach (var entry in changes.Split(','))
@@ -1405,7 +1423,7 @@ internal sealed class DuckLakeDeltaSync
     private static bool SameConfig(IReadOnlyDictionary<string, string>? a, IReadOnlyDictionary<string, string> b) =>
         a is not null && a.Count == b.Count && b.All(kv => a.TryGetValue(kv.Key, out var v) && v == kv.Value);
 
-    private string M(string table) => $"{Q(_meta)}.{Q(_ms)}.{Q(table)}";
+    internal string M(string table) => $"{Q(_meta)}.{Q(_ms)}.{Q(table)}";
 
     private string L(string schema, string table) => $"{Q(_lake)}.{Q(schema)}.{Q(table)}";
 
@@ -1415,15 +1433,15 @@ internal sealed class DuckLakeDeltaSync
         return $"{p}begin_snapshot <= {s} AND ({p}end_snapshot IS NULL OR {p}end_snapshot > {s})";
     }
 
-    private static string Q(string identifier) => "\"" + identifier.Replace("\"", "\"\"") + "\"";
+    internal static string Q(string identifier) => "\"" + identifier.Replace("\"", "\"\"") + "\"";
 
-    private static string Lit(string value) => "'" + value.Replace("'", "''") + "'";
+    internal static string Lit(string value) => "'" + value.Replace("'", "''") + "'";
 
-    private static long Long(object? v) => Convert.ToInt64(v, CultureInfo.InvariantCulture);
+    internal static long Long(object? v) => Convert.ToInt64(v, CultureInfo.InvariantCulture);
 
     private static long? NLong(object? v) => v is null ? null : Convert.ToInt64(v, CultureInfo.InvariantCulture);
 
-    private static bool Bool(object? v) => v switch
+    internal static bool Bool(object? v) => v switch
     {
         bool b => b,
         null => false,
@@ -1445,7 +1463,9 @@ internal sealed class DuckLakeDeltaSync
         }
     }
 
-    private List<object?[]> Rows(string sql)
+    private List<object?[]> Rows(string sql) => Query(sql);
+
+    internal static List<object?[]> Query(string sql)
     {
         // ⚠ A host query that reaches one of OUR catalogs (the metadata catalog is ours whenever SQL Server hosts
         // it) re-enters the bridge on this flow, and every crossing sets the ambients to ITS short-lived

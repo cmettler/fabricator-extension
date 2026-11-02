@@ -106,6 +106,8 @@ internal static class CustomFunctions
         // ducklake_delta_sync(lake, …) — a Delta log next to every DuckLake table's data files, derived from
         // the lake's metadata (docs/ducklake-catalog.md §11).
         new Fabricator.Bridge.DuckLakeDeltaSyncFunction(),
+        // ducklake_delta_maintain(lake, …) — flush, merge, sync, expire, cleanup, orphans in the order a mirror needs.
+        new Fabricator.Bridge.DuckLakeDeltaMaintainFunction(),
         // fabricator_va_args(label, …) — a VARIADIC table function: one row per tail argument.
         new GfVaArgsFunction(),
     };

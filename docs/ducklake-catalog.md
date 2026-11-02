@@ -395,7 +395,7 @@ deleted files; the synchronous post-commit sync rules that out, a manual sync mu
    checkpoints.~~ Built, §11.6; gate `verify_ducklake_delta_sync` (DuckLake is statically linked since `330e9df`).
 3. ~~Concurrent syncs without a coordinator~~ (§11.7) and the stale-catalog read it surfaced (§11.8), fixed.
 4. ~~**Mirror only COMPLETE snapshots**~~ — built, §11.9.
-5. A maintenance procedure in the safe order: flush → (merge) → sync → cleanup (§11.3's ordering problem).
+5. ~~A maintenance procedure in the safe order: flush → (merge) → sync → cleanup~~ — built, §11.10.
 6. The opt-in marker in the metadata database, so the CATALOG can refuse DDL that cannot be mirrored (today
    only the next sync notices, after the DDL has committed). Change-data files for UPDATE; our own orphan
    cleanup.
@@ -579,6 +579,34 @@ mapping, 19726 for a materialized vector, both pinned in `verify_mssql_s3_polyba
   columns would read as NULL through an external table (an MS limitation); the mirror declares no partitions.
 - Mutants: the delete rule off (dies in both suites), the completeness check off (dies in the hermetic suite;
   SQL Server sees the same current state either way), column mapping declared under `'none'` (dies in both).
+
+### 11.10 As built — `ducklake_delta_maintain` (2026-11-02)
+
+`ducklake_delta_maintain(lake [, table_name] [, merge := true] [, rewrite_deletes := false] [, older_than := '…']
+[, orphans := false] [, dry_run := false] [, the sync options])` — `Fabricator.Delta/DuckLakeDeltaMaintain.cs`, one row
+per step. Order: flush → merge → rewrite → sync → expire → cleanup → orphans. Gate `verify_ducklake_delta_maintain`
+(hermetic, 57), four mutants each killed in its own section.
+
+- **MEASURED: with the global `auto_compact` false, DuckLake skips flush, merge and rewrite of a table without a
+  word** unless the table or its schema sets it true (`rows_flushed` empty while 10 rows sat inlined). The mirror needs
+  the global false (§11.3), so the maintenance resolves the option per table (table → schema → global → true, from
+  `ducklake_options`) and reports a skipped table with the `set_option` call.
+- **The cleanup guard.** `ducklake_cleanup_old_files` is first run `dry_run`; if any scheduled file is still listed
+  by the newest version of a Delta log, the cleanup is skipped. Reproduced: a mirror without deletion vectors waits for
+  a live delete to be rewritten while a merge replaces the files its log lists; an expire schedules them — deleting
+  them would leave the log pointing at nothing. After `rewrite_deletes` the sync catches up and the cleanup runs.
+- **FOUND ON THE WAY, fixed in the sync:** a sync behind an expire failed with *"No snapshot found at version 4"* —
+  `ducklake_expire_snapshots` leaves the snapshot's rows in `ducklake_snapshot_changes`, and the sync scanned `AT` it.
+  Only snapshots still in `ducklake_snapshot` are mirrored now; the next one carries the changes (the squash §11.6
+  already describes).
+- **Orphans: DuckLake's rule, ours to run.** DuckLake's `ducklake_delete_orphaned_files` returns nothing at all while
+  the global `auto_compact` is false (measured, even with `dry_run`), and toggling it would let a concurrent
+  `CHECKPOINT` delete our checkpoints. So the known set is DuckLake's own query (`GetKnownFilesForCleanupQuery`: data
+  and delete files of every snapshot, files scheduled for deletion), plus every file a Delta log lists; candidates
+  are `.parquet`/`.puffin` under `data_path` older than `older_than` (`read_blob`'s `last_modified`), minus
+  `_delta_log/` and `_change_data/`. `older_than` is required: a file another process is still writing is unknown
+  until it commits. ⚠ DuckLake additionally protects files of its OWN open transactions; ours cannot see those, so
+  `older_than` is the only protection — do not pass `'0 seconds'` outside a test.
 
 ## 12. SQL Server reading DuckLake directly: PolyBase over the DuckDB ODBC driver (experiment, 2026-10-27)
 
