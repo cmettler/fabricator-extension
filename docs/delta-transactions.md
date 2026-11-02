@@ -952,6 +952,14 @@ access the file because it is being used by another process"*.
     be remembered for ANY failure, not only a failed `link()`: in two earlier runs one writer of 16 kept paying a
     failing temporary write on every attempt and lost every race (16 of 16 attempts, the statement failed loudly).
     The verdict is process-wide per table root, because an instance of the filesystem lives about one statement.
+  - **⚠ And on FUSE the `link()` attempt is not even made** (`/proc/self/mountinfo`, the longest mount point under the
+    root, type `fuse*`). The attempt was correct but not free: each process's FIRST commit paid the temporary write
+    and its fsync on the mount, all at the same moment, so 16 writers fell into step and one lost 16 races in a row
+    — 3 of 4 runs, with and without backoff alike. With the attempt off: 320/320, at most 4 attempts, 262 s (control
+    on the 2026-11-01 build: at most 3). The commit retry now also waits a random 0–min(1 s, 10 ms·2^n)
+    (`CommitBackoff`) and allows 64 attempts for what is safe to retry (it never depends on the conflicting commit);
+    neither changed the FUSE result alone, both are cheap insurance on any slow store. Harness:
+    `scratchpad/fuse_race8_full.py` + `fabricnb` (`put` the payload zip, `run` with FABRICNB_KERNEL=pyspark).
   - ⚠ The 1.5 line publishes the same way; not measured there (its same-file DELETE refuses rather than reconciles,
     but a snapshot read of an empty commit misses that version just the same).
 - **A crash between the temp write and the move leaves `.<version>.json.<guid>.tmp` in `_delta_log`** — the

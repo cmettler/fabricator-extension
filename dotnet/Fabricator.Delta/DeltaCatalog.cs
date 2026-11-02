@@ -3875,10 +3875,16 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         // it degrades to a rollback. Opener is fresh (CommitTransaction set it). See docs/cancellation.md.
         using var interrupt = new InterruptScope(opener);
         var token = interrupt.Token;
-        const int maxAttempts = 16;
+        const int maxAttempts = DeltaWriter.MaxCommitAttempts; // see there for why 64
+        bool retryAfterBackoff = false;
         for (int attempt = 1; ; attempt++)
         {
             token.ThrowIfCancellationRequested(); // break out of the retry loop on interrupt
+            if (retryAfterBackoff)
+            {
+                await CommitBackoff.DelayAsync(attempt - 1, token).ConfigureAwait(false);
+                retryAfterBackoff = false;
+            }
             var fs = TableFileSystems.Create(opener, tablePath);
             var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token)
                 .ConfigureAwait(false);
@@ -3924,6 +3930,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 // exercised. This is the one signal that says the put-if-absent actually rejected a commit.
                 _log.LogWarning("delta flush {Path}: commit conflict — reopening at latest (attempt {Attempt}/{Max})",
                     tablePath, attempt, maxAttempts);
+                retryAfterBackoff = true;
             }
             finally
             {

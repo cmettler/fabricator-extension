@@ -713,7 +713,11 @@ internal static class DeltaWriter
     // has moved (the guard on the catch). Rowid DELETE/UPDATE do NOT retry either (their absolute positions
     // are tied to the scanned snapshot — a concurrent change invalidates them; DeltaReader surfaces a clear
     // conflict error instead), which is the same rule: retry only what does not depend on what it read.
-    internal const int MaxCommitAttempts = 16;
+    // 64, not 16: what is retried here never depends on the conflicting commit, so the budget only decides when a
+    // writer that keeps losing gives up. On Fabric's FUSE mount (about one commit per second), 16 concurrent writers
+    // made one of them lose 16 times in a row in 3 of 4 runs (2026-11-02); with CommitBackoff's 1 s ceiling, 64
+    // attempts is about a minute of trying.
+    internal const int MaxCommitAttempts = 64;
 
     /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
     /// in <paramref name="mode"/> (Overwrite for CTAS/REPLACE, Append for INSERT). Returns the committed version.
@@ -774,6 +778,7 @@ internal static class DeltaWriter
             {
                 Log.LogWarning("delta write {Path}: commit conflict — reopening at latest (attempt {Attempt}/{Max})",
                     path, attempt, MaxCommitAttempts);
+                await CommitBackoff.DelayAsync(attempt - 1, ct).ConfigureAwait(false);
             }
             var fs = TableFileSystems.Create(opener, path);
             var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
