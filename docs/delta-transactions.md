@@ -960,6 +960,11 @@ access the file because it is being used by another process"*.
     (`CommitBackoff`) and allows 64 attempts for what is safe to retry (it never depends on the conflicting commit);
     neither changed the FUSE result alone, both are cheap insurance on any slow store. Harness:
     `scratchpad/fuse_race8_full.py` + `fabricnb` (`put` the payload zip, `run` with FABRICNB_KERNEL=pyspark).
+  - **⚠ The temporary file lives in `<table>/_fabricator_tmp/`, not in `_delta_log/`** (2026-11-02): creating and
+    deleting it inside the log made a concurrent reader's listing SKIP a commit on macOS — CI osx_arm64,
+    *"version 85 is missing or unreadable … requires every version in [78..86]"*, 1 run in 2 (APFS `readdir` under
+    concurrent unlinks; before the `link()` publish nothing was ever deleted in `_delta_log`). Not reproducible here
+    (no Mac); the CI run after the move is the check. A name starting with `_` is ignored by Delta readers and VACUUM.
   - ⚠ The 1.5 line publishes the same way; not measured there (its same-file DELETE refuses rather than reconciles,
     but a snapshot read of an empty commit misses that version just the same).
 - **A crash between the temp write and the move leaves `.<version>.json.<guid>.tmp` in `_delta_log`** — the
