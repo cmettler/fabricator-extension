@@ -315,6 +315,10 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
                         // conflict check sees nothing and a rebased commit replaces the winner's deletion vector —
                         // MEASURED 2026-11-02, Linux, 8 threads deleting their own rows of one file: 7800 of 8000
                         // rows came back, every statement succeeding. Wait for the content instead.
+                        if (attempt == 1 && IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+                        {
+                            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "empty commit {Path}: waiting for its content", path);
+                        }
                         Thread.Sleep(Math.Min(attempt, 20));
                         continue;
                     }
@@ -323,6 +327,10 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
                         throw new System.IO.IOException(
                             $"DuckDbTableFileSystem: commit file {path} is still empty after {EmptyCommitRetries} reads; "
                             + "a writer may have stopped between creating and writing it.");
+                    }
+                    if (attempt > 1 && IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+                    {
+                        Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "empty commit {Path}: content after {Reads} reads", path, attempt);
                     }
                     var buffer = new byte[size];
                     if (size > 0)
@@ -474,7 +482,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             }
             return new ValueTask<bool>(won);
         }
-        if (!_root.Contains("://") && !_noLink && TryPublishLocalPosix(dst, data.Span) is bool linked)
+        if (!_root.Contains("://") && !s_noLinkRoots.ContainsKey(_root) && TryPublishLocalPosix(dst, data.Span) is bool linked)
         {
             if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
             {
@@ -562,8 +570,13 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
 
     private const int EEXIST = 17; // the same on Linux and macOS
 
-    /// <summary>Set once link() failed for another reason than EEXIST: this filesystem has none.</summary>
-    private volatile bool _noLink;
+    /// <summary>
+    /// Table roots where link() failed for another reason than EEXIST: that filesystem has none. PROCESS-wide, because
+    /// an instance of this class lives for one table open — about one statement — and a per-instance flag would make
+    /// every commit on such a mount pay the temporary file and the failed link() again.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> s_noLinkRoots =
+        new(StringComparer.Ordinal);
 
     /// <summary>
     /// The commit on a local POSIX root: the whole file is written under a temporary name and then hard-linked onto
@@ -589,25 +602,19 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
                 file.Write(data);
                 file.Flush(flushToDisk: true);
             }
-            catch (System.IO.IOException)
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
             {
-                return null; // not a path System.IO can write: leave it to the host filesystem
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return null;
+                // Not a path System.IO can write: leave this root to the host filesystem for good. REMEMBERED like a
+                // missing link(): on Fabric's FUSE mount one writer in 16 kept failing here, and paying the slow
+                // temporary write again on every attempt made it lose every race (16 attempts, 2 of 2 runs).
+                return NoLink(ex.GetType().Name + ": " + ex.Message);
             }
             if (PosixLink(temp, path) == 0)
             {
                 return true;
             }
             int errno = System.Runtime.InteropServices.Marshal.GetLastPInvokeError();
-            if (errno == EEXIST)
-            {
-                return false;
-            }
-            _noLink = true; // remembered for this table: the next commit goes straight to O_EXCL
-            return null;
+            return errno == EEXIST ? false : NoLink("errno " + errno);
         }
         finally
         {
@@ -615,11 +622,22 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             {
                 System.IO.File.Delete(temp);
             }
-            catch (System.IO.IOException)
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
             {
-                // an orphaned temp file is litter, not a fault
+                // an orphaned temp file is litter, not a fault — and must never fail a commit that was published
             }
         }
+    }
+
+    /// <summary>Remembers that this root has no usable link() publish; the commit falls back to O_EXCL.</summary>
+    private bool? NoLink(string reason)
+    {
+        if (s_noLinkRoots.TryAdd(_root, true) && IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog,
+                "link() publish unusable under {Root} ({Reason}); commits there use O_EXCL", _root, reason);
+        }
+        return null;
     }
 
     public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)

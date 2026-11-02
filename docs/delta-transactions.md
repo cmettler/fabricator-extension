@@ -946,6 +946,12 @@ access the file because it is being used by another process"*.
   - Gate: the existing `verify_delta_concurrent_dml`, which only fails under CPU pressure — linux CI runners have 4
     vCPUs, macOS 3. Harness: `scratchpad/wsl_cdml2.sh <payload> <runs>` (2 cores, keeps failing dirs) and
     `scratchpad/dvlog.py` (replays a log, flags removes of entries that are not active).
+  - **Fabric's FUSE mount, MEASURED 2026-11-02 (PySpark notebook, `scratchpad/fuse_race5_fix.py`):** `link()` fails
+    with EPERM there and creates nothing, so commits fall back to `O_EXCL`; 16 writers × 20 INSERTs 320/320, 8
+    processes deleting their own rows of one file 0 left, and no empty commit read in three runs. ⚠ The fallback must
+    be remembered for ANY failure, not only a failed `link()`: in two earlier runs one writer of 16 kept paying a
+    failing temporary write on every attempt and lost every race (16 of 16 attempts, the statement failed loudly).
+    The verdict is process-wide per table root, because an instance of the filesystem lives about one statement.
   - ⚠ The 1.5 line publishes the same way; not measured there (its same-file DELETE refuses rather than reconciles,
     but a snapshot read of an empty commit misses that version just the same).
 - **A crash between the temp write and the move leaves `.<version>.json.<guid>.tmp` in `_delta_log`** — the
