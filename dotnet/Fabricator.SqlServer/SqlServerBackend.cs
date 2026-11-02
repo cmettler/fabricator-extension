@@ -2405,6 +2405,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
                            string? optionsJson)
     {
         RecordTouch(schemaName, tableName, schemaChanged: false);
+        RefuseDuckLakeOnWarehouse(tableName);
         if (partitionOverwrite)
         {
             // An overwrite flag must never be silently ignored: SQL Server's bulk path has no partition
@@ -5098,8 +5099,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
         // A caller without a database user of its own runs as principal 0 (public) — an Entra service principal
         // admitted to a Fabric SQL database through its workspace role does (measured). The schema's owner then
         // defaults to a principal SQL Server cannot resolve (33134), so it is owned by dbo instead.
+        // ⚠ A warehouse engine has no DATABASE_PRINCIPAL_ID (15871, measured on Fabric Warehouse), and a failing
+        // statement there aborts the transaction, so the probe is gated on the profile, not caught.
         string create = "CREATE SCHEMA " + Quote(schemaName).Replace("'", "''");
-        string createExec = $"IF DATABASE_PRINCIPAL_ID() = 0 EXEC('{create} AUTHORIZATION [dbo]') ELSE EXEC('{create}')";
+        string createExec = Profile.IsWarehouse
+            ? $"EXEC('{create}')"
+            : $"IF DATABASE_PRINCIPAL_ID() = 0 EXEC('{create} AUTHORIZATION [dbo]') ELSE EXEC('{create}')";
         ExecuteNonQuery(ifNotExists
             ? $"IF SCHEMA_ID(N'{schemaName.Replace("'", "''")}') IS NULL BEGIN {createExec} END"
             : createExec);

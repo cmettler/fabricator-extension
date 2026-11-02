@@ -560,7 +560,9 @@ What the profile drives automatically:
   metadata tables in the login's default schema (usually `dbo`); `METADATA_SCHEMA '…'` puts them elsewhere.
   Do not turn `remote_pushdown` off there: DuckLake reads the latest snapshot with a subquery that only remote
   pushdown keeps off a full scan, so without it every commit grows dearer with the snapshot history (measured
-  78 → 335 ms per commit at 200,000 snapshots; flat with it).
+  78 → 335 ms per commit at 200,000 snapshots; flat with it). The metadata host can be SQL Server, Azure SQL or
+  a Fabric SQL database; a DuckLake commit on Fabric Warehouse or Synapse is refused, because their keys are not
+  enforced and DuckLake detects two writers committing at once through a primary key violation.
   ```sql
   ATTACH '...' AS db (TYPE fabricator, hidden_rowid true);
   CREATE TABLE db.dbo.events (id INTEGER, note VARCHAR);   -- no key: gets the hidden row id

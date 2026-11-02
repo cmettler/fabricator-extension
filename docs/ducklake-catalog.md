@@ -61,8 +61,8 @@ The error surfaces as DuckLake's commit retry loop exhausting its 10 attempts, w
   Side finding, not fixed: a login without `VIEW DATABASE PERFORMANCE STATE` prints a WARNING from the
   best-effort stats query (`TableStats … permission denied`); the query itself works.
 - Measured since: two writers committing concurrently (§7 — DuckLake detects the conflict through a PRIMARY KEY
-  violation on `ducklake_snapshot`) and cloud data paths (OneLake, §11). Not measured: Fabric Warehouse as the
-  metadata host (§7: its keys are not enforced).
+  violation on `ducklake_snapshot`) and cloud data paths (OneLake, §11). Fabric Warehouse as the metadata host is
+  refused (§7: its keys are not enforced).
 
 ## 5. Options for the failing class
 
@@ -163,7 +163,12 @@ SNAPSHOT transaction).
   (`route=read_isolation pin`).
 - **Fabric SQL database, not Fabric Warehouse.** The Warehouse emits PK/UNIQUE as `NOT ENFORCED` hints, which
   would remove the very PRIMARY KEY violation DuckLake's conflict detection rests on (reasoned, not measured).
-  A Fabric SQL database is Azure SQL underneath and enforces keys. ⚠ Unverified live: that its
+  A Fabric SQL database is Azure SQL underneath and enforces keys. **Refused since 2026-11-02:** on a warehouse
+  profile the catalog refuses the insert into `ducklake_snapshot` that every writing DuckLake commit makes, the
+  first one included (`SqlServerDuckLakeGuard.RefuseDuckLakeOnWarehouse`); reads stay allowed. Measured live on
+  Fabric Warehouse: the ATTACH fails with that message and the metadata tables it had created roll back with it.
+  ⚠ Found on the way: our CREATE SCHEMA probed `DATABASE_PRINCIPAL_ID()` (§10), which Fabric Warehouse does not
+  have (15871), so every CREATE SCHEMA on a warehouse failed since `b0a1f86`; the probe is gated on the profile now. ⚠ Unverified live: that its
   `SERVERPROPERTY('EngineEdition')` is outside `ServerProfile.IsWarehouse` (editions 6 and 11), which decides
   whether we emit enforced keys.
 

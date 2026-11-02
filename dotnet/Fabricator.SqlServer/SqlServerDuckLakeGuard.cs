@@ -23,6 +23,24 @@ public sealed partial class SqlServerCatalog
         string.Equals(tableName, "ducklake_column", StringComparison.OrdinalIgnoreCase)
         || string.Equals(tableName, "ducklake_data_file", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Refuses a DuckLake commit whose metadata lives on a warehouse engine (Fabric Warehouse, Synapse dedicated).
+    /// DuckLake detects a concurrent commit through a PRIMARY KEY violation on <c>ducklake_snapshot</c>, and a
+    /// warehouse declares keys NOT ENFORCED, so two writers could both commit the same snapshot id without an error.
+    /// Every writing DuckLake commit, the first one included, inserts its snapshot row here, so refusing that insert
+    /// refuses every write and leaves reading alone. See docs/ducklake-catalog.md §7.
+    /// </summary>
+    private void RefuseDuckLakeOnWarehouse(string tableName)
+    {
+        if (string.Equals(tableName, "ducklake_snapshot", StringComparison.OrdinalIgnoreCase) && Profile.IsWarehouse)
+        {
+            throw new NotSupportedException(
+                "DuckLake cannot keep its metadata on Fabric Warehouse or Synapse: their PRIMARY KEYs are not enforced, "
+                + "and DuckLake relies on one to detect two writers committing at once. Use a Fabric SQL database, "
+                + "Azure SQL or SQL Server for the metadata.");
+        }
+    }
+
     private void CheckDuckLakeMirror(SqlConnection connection, SqlTransaction? transaction, string schemaName)
     {
         string s = Quote(schemaName);
