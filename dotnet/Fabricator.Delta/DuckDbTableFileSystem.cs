@@ -558,6 +558,14 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         {
             return null;
         }
+        if (IsOnFuseMount(path))
+        {
+            // Not even tried: Fabric's FUSE mount refuses link() (EPERM), and the attempt is not free — the temporary
+            // write and its fsync on that mount made every writer's FIRST commit slow at the same moment, so 16
+            // writers fell into step and one lost 16 races in a row (3 of 4 runs; with the attempt switched off: 0 of
+            // 1, at most 4 attempts — MEASURED 2026-11-02). O_EXCL is the primitive measured safe there.
+            return NoLink("a FUSE mount");
+        }
         string temp = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!,
             "." + System.IO.Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
         try
@@ -595,6 +603,54 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             }
         }
     }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> lies on a FUSE filesystem, from <c>/proc/self/mountinfo</c> (Linux; elsewhere
+    /// false): the type of the LONGEST mount point that is a prefix of the path.
+    /// </summary>
+    private static bool IsOnFuseMount(string path)
+    {
+        string? best = null;
+        string bestType = "";
+        foreach (var (mountPoint, type) in s_mounts.Value)
+        {
+            bool under = path == mountPoint || mountPoint == "/"
+                || (path.StartsWith(mountPoint, StringComparison.Ordinal) && path.Length > mountPoint.Length
+                    && path[mountPoint.Length] == '/');
+            if (under && (best is null || mountPoint.Length > best.Length))
+            {
+                best = mountPoint;
+                bestType = type;
+            }
+        }
+        return bestType.StartsWith("fuse", StringComparison.Ordinal);
+    }
+
+    private static readonly Lazy<List<(string MountPoint, string Type)>> s_mounts = new(() =>
+    {
+        var mounts = new List<(string, string)>();
+        try
+        {
+            // <id> <parent> <major:minor> <root> <mount point> <options> [optional fields] - <type> <source> <super options>
+            foreach (var line in System.IO.File.ReadLines("/proc/self/mountinfo"))
+            {
+                int dash = line.IndexOf(" - ", StringComparison.Ordinal);
+                var head = line.Split(' ');
+                if (dash < 0 || head.Length < 5)
+                {
+                    continue;
+                }
+                string type = line.Substring(dash + 3).Split(' ')[0];
+                string mountPoint = head[4].Replace(@"\040", " ").Replace(@"\011", "\t").Replace(@"\134", @"\");
+                mounts.Add((mountPoint, type));
+            }
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
+        {
+            // not Linux, or no procfs: no FUSE detection — link() is tried, and a failure is remembered
+        }
+        return mounts;
+    });
 
     /// <summary>Remembers that this root has no usable link() publish; the commit falls back to O_EXCL.</summary>
     private bool? NoLink(string reason)
