@@ -566,12 +566,22 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             // 1, at most 4 attempts — MEASURED 2026-11-02). O_EXCL is the primitive measured safe there.
             return NoLink("a FUSE mount");
         }
-        string temp = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!,
+        // The temporary file goes BESIDE _delta_log, not into it: creating and deleting it there made a concurrent
+        // reader's directory listing skip a commit on macOS (APFS readdir under concurrent unlinks — CI,
+        // verify_delta_concurrent_dml: "version 85 is missing … requires every version in [78..86]"). link() only
+        // needs the same filesystem. A name starting with '_' is ignored by Delta readers and by VACUUM.
+        string dir = System.IO.Path.GetDirectoryName(path)!;
+        if (string.Equals(System.IO.Path.GetFileName(dir), "_delta_log", StringComparison.Ordinal))
+        {
+            dir = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(dir)!, "_fabricator_tmp");
+        }
+        string temp = System.IO.Path.Combine(dir,
             "." + System.IO.Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
         try
         {
             try
             {
+                System.IO.Directory.CreateDirectory(dir);
                 using var file = new System.IO.FileStream(temp, System.IO.FileMode.CreateNew, System.IO.FileAccess.Write,
                     System.IO.FileShare.None);
                 file.Write(data);

@@ -933,6 +933,8 @@ access the file because it is being used by another process"*.
   is remembered per table root): on 2.0 the attempt's slow first commit put 16 writers in step and one lost 16 races
   in a row in 3 of 4 runs. The commit retry also backs off (0–min(1 s, 10 ms·2^n)) and allows 64 attempts. Measured
   on 2.0 only (320/320 INSERTs, deletes exact, at most 4 attempts); not run on Fabric with 1.5.
+  The temporary file lives in `<table>/_fabricator_tmp/`, not in `_delta_log/`: on 2.0 creating and deleting it
+  inside the log made a concurrent listing skip a commit on macOS (APFS readdir under concurrent unlinks).
   6×) and then deleting (deletion vectors, 5×) only its own rows, exact counts after. The mutant "no pinned version"
   fails 5 of 5 runs (four loud, one silent `min(v)` mismatch). Not gated: the unchanged-file refusal (needs a commit
   between a statement's scan and its DML open on the SAME file — sqllogictest cannot interleave inside a statement).
