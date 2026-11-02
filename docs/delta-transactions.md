@@ -895,7 +895,7 @@ access the file because it is being used by another process"*.
   MOVEFILE_REPLACE_EXISTING, atomic and failing when the version exists. ⚠ NOT on POSIX: .NET's no-replace move is a
   `link()` there, which a FUSE mount (Fabric's `/lakehouse/default`) does not support — it falls back to
   check-then-rename, a race, while `O_EXCL` is the measured-safe primitive on that mount (§8.1). The create-then-write
-  window therefore still exists on POSIX; not measured there.
+  window therefore still existed on POSIX — ⚠ and it LOST DELETES, see the next bullet but one (fixed 2026-11-02).
 - **⚠⚠ THE MEASUREMENT FOUND A SILENT WRONG-ROW BUG THAT HAS NOTHING TO DO WITH WINDOWS.** 8 processes × (1 INSERT +
   5 UPDATEs of their OWN rows): 300 of 400 rows, v 1200 of 2000, every statement exit 0. Per process: an UPDATE that
   "succeeded" without a visible change, one applied twice, values going DOWN. Ruled out by measurement, in this order:
@@ -923,6 +923,12 @@ access the file because it is being used by another process"*.
   v 1500/2000, every process exit 0 — the row-id bug, isolated and silent in the shipped line; WITH both 900/900 and
   v 2000/2000, three runs, and `verify_delta_concurrent_dml` green 3/3.
 - Gate: NEW hermetic `verify_delta_concurrent_dml` (105): 8 `concurrentloop` threads, each updating (merge-on-read,
+- **⚠ The POSIX create-then-write window (backported 2026-11-02 from 2.0).** On POSIX the commit was created by
+  `O_EXCL`, THEN written, and a writer judging a conflict could read the winner's commit EMPTY — zero actions, no
+  conflict seen. On 2.0 that lost deletes silently (8 threads deleting their own rows of one file: up to 7800 of 8000
+  rows left, CI red on linux/osx). Here: a local POSIX commit is written to `.<name>.<guid>.tmp` and published by
+  `link()` (EEXIST = the version exists; a filesystem without `link()`, Fabric's FUSE mount, keeps `O_EXCL`), and
+  `ReadAllBytesAsync` never returns an empty commit JSON (re-reads ~2 s, then fails).
   6×) and then deleting (deletion vectors, 5×) only its own rows, exact counts after. The mutant "no pinned version"
   fails 5 of 5 runs (four loud, one silent `min(v)` mismatch). Not gated: the unchanged-file refusal (needs a commit
   between a statement's scan and its DML open on the SAME file — sqllogictest cannot interleave inside a statement).
