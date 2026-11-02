@@ -15,7 +15,7 @@ RUN echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] http
 RUN /opt/mssql/bin/installexecutionservice.sh --non-interactive
 # Register the DuckDB driver BESIDE Microsoft's ODBC Driver 18 -- replacing /etc/odbcinst.ini would remove the
 # driver sqlcmd and PolyBase's own SQL Server connector need.
-RUN printf '\n[DuckDB]\nDescription=DuckDB ODBC driver (rebuilt with -Wl,-Bsymbolic, see docs/ducklake-catalog.md §12)\nDriver=/opt/duckodbc/libduckdb_odbc.so\n' >> /etc/odbcinst.ini
+RUN printf '\n[DuckDB]\nDescription=DuckDB ODBC driver (release v2.0.0.1+, see docs/ducklake-catalog.md §12)\nDriver=/opt/duckodbc/libduckdb_odbc.so\n' >> /etc/odbcinst.ini
 COPY start.sh /opt/fabricator/start.sh
 RUN chmod 755 /opt/fabricator/start.sh
 ENTRYPOINT ["/opt/fabricator/start.sh"]

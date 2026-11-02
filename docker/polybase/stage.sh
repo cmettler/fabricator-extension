@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage the ODBC side of the PolyBase/DuckLake experiment into docker/polybase/stage, which the `sqlpoly`
 # service mounts at /opt/duckodbc (docs/ducklake-catalog.md §12). Run in WSL after building:
-#   - the DuckDB ODBC driver with the -Wl,-Bsymbolic fix   (DRIVER, default ~/duckdb-odbc-src/...)
+#   - the DuckDB ODBC driver: release v2.0.0.1 or later   (DRIVER; downloaded when unset)
 #   - our linux loadable with a v2.0.0 footer               (LOADABLE, default ~/sqlext2/build/odbc/...)
 #   - a SELF-CONTAINED linux-x64 managed payload            (PAYLOAD, published from Windows)
 # The payload is self-contained so it does not depend on whatever .NET the PolyBase service brings.
@@ -9,7 +9,8 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 STAGE=$HERE/stage
-DRIVER=${DRIVER:-$HOME/duckdb-odbc-src/build/release/libduckdb_odbc.so}
+ODBC_RELEASE=${ODBC_RELEASE:-v2.0.0.1}   # the first release with our three fixes (duckdb-odbc #574, #575, #577)
+DRIVER=${DRIVER:-}
 LOADABLE=${LOADABLE:-$HOME/sqlext2/build/odbc/extension/fabricator/fabricator.duckdb_extension}
 PAYLOAD=${PAYLOAD:-/mnt/d/repos/fabricator-extension/scratchpad/linuxpub-sc/extension/fabricator/fabricator}
 # DuckLake metadata lives in the SAME SQL Server (inside the container it is localhost:1433); the data on MinIO,
@@ -18,13 +19,18 @@ META="Server=localhost,1433;Database=DLPoly;User Id=sa;Password=Arrow_Net_123!;T
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "$DRIVER" "$STAGE/libduckdb_odbc.so"
+if [ -z "$DRIVER" ]; then
+  curl -fsSL -o "$STAGE/odbc.zip" "https://github.com/duckdb/duckdb-odbc/releases/download/$ODBC_RELEASE/duckdb_odbc-linux-amd64.zip"
+  unzip -o -q "$STAGE/odbc.zip" libduckdb_odbc.so -d "$STAGE" && rm "$STAGE/odbc.zip"
+else
+  cp "$DRIVER" "$STAGE/libduckdb_odbc.so"
+fi
 cp "$LOADABLE" "$STAGE/fabricator.duckdb_extension"
 cp -r "$PAYLOAD" "$STAGE/fabricator"
 
 cat > "$STAGE/odbcinst.ini" <<EOF
 [DuckDB]
-Description = DuckDB ODBC driver (rebuilt with -Wl,-Bsymbolic, see docs/ducklake-catalog.md §12)
+Description = DuckDB ODBC driver (release $ODBC_RELEASE, see docs/ducklake-catalog.md §12)
 Driver = /opt/duckodbc/libduckdb_odbc.so
 EOF
 

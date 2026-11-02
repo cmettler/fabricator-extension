@@ -604,7 +604,7 @@ Whether anyone runs this in production is doubtful; the question here is whether
   means to prevent exactly that with `-Bsymbolic -Bsymbolic-functions`, but passes them WITHOUT `-Wl,`, so gcc
   reads `-Bsymbolic` as its own `-B<dir>` search-path option and the linker never sees it. Rebuilt with
   `-Wl,-Bsymbolic -Wl,-Bsymbolic-functions` (two lines in `duckdb-odbc` v2.0.0.0's CMakeLists.txt) it works.
-  Worth an upstream issue. ⚠ `readelf -d` shows no `SYMBOLIC` flag even after the fix (`-Bsymbolic-functions`
+  Fixed upstream in v2.0.0.1 (#577). ⚠ `readelf -d` shows no `SYMBOLIC` flag even after the fix (`-Bsymbolic-functions`
   comes last and binds at link time without setting it); the binding trace is the right check.
 - **End to end over ODBC (pyodbc, `DSN=…`)**: CTAS 1000 rows, DELETE 10, an inlined INSERT, an UPDATE, then a
   second connection on a fresh in-memory instance: 991 rows, sum 504455, the updated value, both times.
@@ -645,7 +645,11 @@ ODBC side staged by `docker/polybase/stage.sh` (run in WSL). What it took:
   never reach either. **And a wrong answer with no error:** `SQL_C_NUMERIC` dropped an all-zero fraction
   (`30.0` → digits `30`) but kept `scale = 1`, so every whole DECIMAL value arrived divided by ten (the sum of
   the test column came back 4124992459.6). All three fixes plus the `-Wl,-Bsymbolic` one are in
-  `docker/polybase/duckdb-odbc.patch` (against duckdb-odbc v2.0.0.0); worth upstream issues.
+  a patch against duckdb-odbc v2.0.0.0 at the time; ✅ **all four are upstream since v2.0.0.1** (2026-10-31:
+  #574 numeric, #575 rowset indexing incl. the missing indicator, #577 `-Wl,-Bsymbolic`). Re-measured 2026-11-02 on
+  the rig with the OFFICIAL v2.0.0.1 binary in place of ours: 99 992 rows over many rowsets, sum of ids, sum of the
+  DECIMAL column and the count of whole values identical to the patched build. The patch is deleted;
+  `docker/polybase/stage.sh` downloads the release.
 - Found on the way, ours, fixed: since table names missing from the list are looked up by name (§11.8), every
   existence probe DuckLake makes for its helper tables crossed the bridge, failed with "not found" and was
   LOGGED AS A WARNING — a screenful per CREATE. An established absence is an answer, so it is logged at
@@ -703,5 +707,5 @@ ODBC Driver 18. Every measurement reproduces, the conclusion did not: they were 
   such change next to the numbers it produced.
 
 Open: the Windows server with PolyBase (system DSN in the registry, the Windows loadable + payload — the
-official driver should not have the `-Bsymbolic` bug, the fetch and numeric bugs are platform-independent),
+official driver v2.0.0.1 or later, which carries the fetch and numeric fixes the Windows side needs too),
 type mapping beyond BIGINT/VARCHAR/DECIMAL/DATE, and throughput on a large scan.
