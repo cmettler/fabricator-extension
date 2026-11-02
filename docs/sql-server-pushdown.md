@@ -24,6 +24,34 @@ statement, **what is pushed, what is not, and how to tell**. Every example is ch
 | `WITH moved AS (DELETE … RETURNING …) INSERT INTO … SELECT … FROM moved` | source and target are tables of the same catalog, the columns keep their types (R4) | `FABRICATOR_REMOTE_DML` | the `DELETE … RETURNING` (R2), then the regular insert (R5) |
 | `MERGE` | its conditions and values translate exactly; any number of `WHEN` clauses (M1) | `FABRICATOR_REMOTE_DML` | merge by key (M2), see [MERGE](#merge) |
 
+## Three mechanisms, not one
+
+"Pushdown" covers three different mechanisms. Only the first one translates the query (through Substrait into
+T-SQL); the other two always run, the first is the one that can say no.
+
+| Mechanism | `EXPLAIN` shows | What reaches the server | Where |
+|---|---|---|---|
+| **query pushdown** (this page's main topic) | `Fabricator Query`, `Fabricator Remote Dml` / `Fabricator Remote Ctas` | the whole statement, or a part of it, as ONE T-SQL statement | SQL Server 2019+ and Azure SQL, ATTACH option `remote_pushdown` (default on) |
+| **scan pushdown** | `Fabricator Scan` | the columns read, the `WHERE` conditions it can render, a `TOP`, and a join's keys (J1) — DuckDB computes the rest | every catalog, Fabric Warehouse included |
+| **key path** (rowid) | `Mssql Net Delete` / `Mssql Net Update`, `Merge Into` | first a scan for the keys of the rows, then the change by key, in blocks | the fallback for every `DELETE` / `UPDATE` / `MERGE` |
+
+A `SELECT` that is not pushed is therefore not "pulled whole": its scans still carry their filter and columns (S2).
+
+## What is never pushed
+
+| Case | Why | Instead |
+|---|---|---|
+| a plain scan of one table | nothing to gain (S2) | scan pushdown |
+| regular expressions, `reverse`, `ILIKE`, `TRY_CAST`, `strftime`, `concat_ws`, `hash`, float → string casts | no T-SQL with the same answer (S3) | DuckDB |
+| `now()`, `current_date`, `random()`, … | the server would use its own clock, time zone or generator | DuckDB |
+| a function the provider implements in C# or a plugin, or a function of another catalog | it does not exist on SQL Server (L2) | DuckDB |
+| `ROLLUP`, `CUBE`, grouping sets with `()` beside others | no grand-total row on an empty input (S17) | DuckDB |
+| a float division whose divisor may be 0 (with DuckDB's default `ieee_floating_point_ops`) | DuckDB returns inf, SQL Server raises an error (S18) | the division in DuckDB, the part below it pushed; with `SET ieee_floating_point_ops = false` it is pushed |
+| `INSERT … VALUES` | the bulk copy is already the fast path (I2) | bulk copy |
+| `UPDATE … FROM` | a row matched twice would take whichever match SQL Server picks (U2) | key path |
+| `DELETE` / `UPDATE` / `MERGE` with `RETURNING` | not built as one statement | key path, rows from T-SQL `OUTPUT` (see [RETURNING](#returning)) |
+| anything on **Fabric Warehouse / Synapse** | query pushdown is not enabled there | scan pushdown + key path |
+
 ## Seeing what happens
 
 - **`EXPLAIN <statement>`** — the operator names in the table above: *where* it runs.
