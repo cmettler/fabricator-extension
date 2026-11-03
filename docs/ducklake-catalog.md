@@ -359,7 +359,7 @@ physical name per column for all files, which decides the DDL:
 | DROP + ADD under the same name | ✓ | ✗ **silently wrong**: the dropped column's old values reappear in the new one |
 | type widening (`INT → BIGINT`) | Delta `typeWidening` (Fabric reads it, §11.4a) | same |
 | ADD COLUMN with a non-NULL DEFAULT | ✗ old rows read NULL in Delta, the default in DuckLake | ✗ same |
-| partitioning, also changed later | ✓ declared UNPARTITIONED (the files contain the column) | same |
+| partitioning | ✓ identity keys declared, transforms not (§11.12); a later change is refused | same |
 
 ⇒ in `name` mode the ✗ rows must be REFUSED, not mirrored wrong. Our catalog sees DuckLake's DDL as writes to
 `ducklake_column`, so it can fail that DuckLake commit for a mirrored table with a message naming the operation —
@@ -403,8 +403,8 @@ deleted files; the synchronous post-commit sync rules that out, a manual sync mu
 4. ~~**Mirror only COMPLETE snapshots**~~ — built, §11.9.
 5. ~~A maintenance procedure in the safe order: flush → (merge) → sync → cleanup~~ — built, §11.10.
 6. ~~The opt-in marker in the metadata database, so the CATALOG can refuse DDL that cannot be mirrored~~ — built
-   for metadata in our SQL Server catalog, §11.11; ~~our own orphan cleanup~~ — §11.10. Open: change-data files for
-   UPDATE, partition declaration.
+   for metadata in our SQL Server catalog, §11.11; ~~our own orphan cleanup~~ — §11.10. ~~Change-data files for
+   UPDATE, partition declaration~~ — §11.12.
 
 **No automatic sync on commit (decided 2026-10-27, user).** With inlining on, a sync per commit would have to
 flush per commit, which throws away the reason for inlining — small commits bundled into one Parquet file —
@@ -467,9 +467,8 @@ OneLake); that is the only setting where it makes sense, and it is not built.
   transaction keeps a filesystem built at statement time until COMMIT, and the commit flush deliberately makes
   its own short-lived connection the ambient. Same root cause on the managed side: a host query from managed
   code clobbers the caller's ambients on its own thread, so the sync restores them after each query.
-- Not built: change-data files, the automatic trigger, our own orphan cleanup, partition declaration (files keep
-  the partition column, so the Delta table is unpartitioned), stats beyond ints/floats/decimals/exact
-  strings/dates.
+- Not built: the automatic trigger. (Change data, partitions and timestamp/struct statistics: §11.12; our own
+  orphan cleanup: §11.10.)
 
 ### 11.7 Several processes, no coordinator (2026-10-27)
 
@@ -582,7 +581,8 @@ mapping, 19726 for a materialized vector, both pinned in `verify_mssql_s3_polyba
   row sat inlined, 1001 after the flush, still 1001 after a DELETE (waiting), 991 with the exact sum after the
   rewrite. Protocol `minReaderVersion` 1.
 - Not refused, not readable by SQL Server: type widening and `timestamp_ntz` (both reader features). Partition
-  columns would read as NULL through an external table (an MS limitation); the mirror declares no partitions.
+  columns read as NULL through an external table (an MS limitation; OPENROWSET reads them), so sync such a table with
+  `partitioning := false` (§11.12).
 - Mutants: the delete rule off (dies in both suites), the completeness check off (dies in the hermetic suite;
   SQL Server sees the same current state either way), column mapping declared under `'none'` (dies in both).
 
@@ -641,6 +641,77 @@ uncommitted change. A refusal throws, and DuckLake's whole commit rolls back. Ga
   column id, nested ones too; once per file per sync). Gate `verify_ducklake_delta_maintain` §5, mutant killed.
 - The sync's advice to "rewrite the old files (DuckLake compaction)" after a rename was wrong for the same reason and
   now says to recreate the table or change the mapping.
+
+### 11.12 Partitions, change data and more statistics (2026-11-03)
+
+**Statistics.** Timestamps (`timestamp`, `timestamptz`) are rendered at Delta's millisecond precision — a minimum
+rounded down, a maximum up, so both stay bounds — with `Z` for a Delta `timestamp` and without for `timestamp_ntz`.
+Members of structs get nested `minValues`/`maxValues`/`nullCount` objects keyed by physical name; nothing inside a
+list or map (Delta keeps none there). Booleans, binary and JSON are left out, as Spark does. Partition columns get
+none (a reader prunes them by `partitionValues`). Gate `verify_ducklake_delta_sync` §12, incl. filters right at
+the sub-millisecond edges.
+
+**Partitions (`partitioning := true`, the default).** Measured: DuckLake writes one file per partition value whether
+`hive_file_pattern` is on or off — only the path differs — keeps the partition column INSIDE the file either way, and
+records each file's values in `ducklake_file_partition_value` (text: `5`, `a b/c=d`, `2024-02-03`, `true`, `12.50`,
+`2024-01-01 12:34:56.123456`, a timestamptz as `…+00`, NULL for NULL). So:
+- An IDENTITY key becomes a Delta partition column: `partitionColumns` = the logical names, `partitionValues` from
+  DuckLake's metadata keyed by the physical name (the logical one under `'none'`). Delta takes the value from
+  `partitionValues`, never from the path, so the hive layout is irrelevant.
+- A TRANSFORM (`year`, `month`, `day`, `hour`, `bucket`) is NOT declared: Delta has value partitions only, and
+  declared as `ts` the year would REPLACE the column's values for every reader. The layout still pays: one file per
+  year has tight `ts` statistics, so the files are skipped by stats.
+- Eligible types: integers, varchar, date, boolean, decimal. Not timestamps (Delta reads a timestamp partition value
+  in the reader's zone unless it carries one), not nested columns.
+- Decided at the FIRST sync and persisted (`fabricator.ducklake.partitionColumnIds`, column ids, so a rename only
+  changes the logical name): the current partitioning's identity keys that every live file carries. A key with an
+  empty string in some file stays undeclared — DuckLake keeps `''` apart from NULL, Delta reads an empty partition
+  value as NULL. A later sync whose file lacks a value for a declared column (the partitioning changed) is REFUSED,
+  naming the file and the column: Delta cannot change a table's partition columns. ⚠ The catalog guard (§11.11)
+  does not check this yet; the sync does.
+- MEASURED LIVE on Fabric (data on `LH/Tables/dbo`, metadata on box): `PARTITIONED BY (region, d, year(ts))`, an
+  UPDATE moving a row to another region, a DELETE of the NULL partition's row — the SQL endpoint read the exact rows
+  after 190 s, `WHERE region = 'eu'` 1, with `region` and `d` declared AND present in the files.
+- ⚠⚠ **FOUND ON THE WAY, a silent wrong answer in OUR Delta reader, fixed:** under `id` column mapping the native
+  per-file path looked a partition value up by the name THIS FILE gives the column (`k`) and the logical name, never
+  by the physical one (`col-2`) the keys use — harmless for Spark-written files, which do not carry the partition
+  column, and NULL for every row of a file that does. Now the physical name first. Gate §13 (`WHERE k = 20`, which
+  prunes to one file and so takes the per-file path; the two-file read takes the batched form, which was right,
+  and passed with the bug).
+
+**Change data feed (`change_data_feed := true`).** DuckLake has its own feed: `ducklake_table_changes(lake, schema,
+table, start, end)` pairs `ducklake_table_insertions` with `ducklake_table_deletions` on (snapshot_id, rowid) and
+labels `insert` / `delete` / `update_preimage` / `update_postimage` — the Delta names. A Delta version for snapshot
+s, synced after snapshot `last`, gets every change row with `last < snapshot_id ≤ s`, written to
+`_change_data/cdc-<guid>.parquet` (physical names at every level, struct members rebuilt with `struct_pack`,
+FIELD_IDS like our data files; one file per partition value, with its `partitionValues`). Measured first:
+- `start` must be an EXISTING snapshot (*"No snapshot found at version n"*), and the rows of an expired snapshot keep
+  their `snapshot_id` — after expiring an UPDATE's snapshot it shows as a delete there plus an insert at the next
+  update (net right, the middle value gone). So `start` = the newest existing snapshot ≤ `last`, filtered by
+  `snapshot_id > last`. With none left (all expired) the version gets no change files and a warning.
+- `ducklake_merge_adjacent_files` produces no change rows; `ducklake_rewrite_data_files` reports every row it moved
+  as an update with identical images; a flush of inlined rows produces none (its rows carry their original
+  snapshot). So snapshots whose changes for the table are only `compacted_table` / `merge_adjacent` /
+  `rewrite_delete` are left out — and a version with no change rows at all marks its adds and removes
+  `dataChange: false` (what Delta's OPTIMIZE does), keeping it out of the feed and out of streaming reads.
+- A version of only inserts and no removes needs no change file: a reader takes the adds as inserts. Every other
+  version with changes gets them, because a reader uses a version's change files ALONE once it has any.
+- Switchable on later (the feed starts at that version), not off. Writer feature `changeDataFeed`.
+- Gate §14: an `id`-mapped, partitioned table with a struct and a list of structs, an UPDATE moving a row across
+  partitions, a DELETE, an INSERT — `delta.changes(…)` returns exactly the DuckLake changes; one change file per
+  partition; the change files' physical names and field ids; the rewrite version has `dataChange: false`, no change
+  file and an empty feed; switching it on later. Mutants: compaction snapshots kept (dies at the rewrite version),
+  change files under logical names (dies at the field-id check), the reader fix reverted (dies at §13).
+- Not measured: Spark's `table_changes` over these files; Fabric's SQL endpoint has no change feed.
+
+⚠⚠ **FOUND, NOT FIXED — our own Delta catalog cannot read a `timestamp_mapping := 'utc'` column of a mirror.** The
+files hold DuckDB's naive `TIMESTAMP` (Parquet `isAdjustedToUTC = false`) and the mirror declares Delta `timestamp`.
+Fabric reads that as UTC (measured, §11.6), `fabricator_delta_scan` too; the `PROVIDER 'delta'` catalog's native
+reader fails a plain scan (*"column 'ts' … is TIMESTAMP on the provider but TIMESTAMP WITH TIME ZONE in the
+catalog"*) and, on the per-file path of a partitioned table, CASTs it in the SESSION time zone — a wrong instant
+(`2025-01-01 00:00+01` for `2025-01-01 00:00Z`). The same holds for any writer that puts unadjusted timestamps into
+a Delta `timestamp` column. The fix belongs in the reader (read such a column as UTC: `timezone('UTC', col)`), which
+needs the file's own type, not the table's.
 
 ## 12. SQL Server reading DuckLake directly: PolyBase over the DuckDB ODBC driver (experiment, 2026-10-27)
 

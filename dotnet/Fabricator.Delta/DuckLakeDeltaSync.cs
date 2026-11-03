@@ -27,7 +27,8 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// <c>ducklake_delta_sync(lake [, table_name := 'schema.table'] [, column_mapping := 'name' | 'id' | 'none']
-/// [, deletion_vectors := true | false] [, timestamp_mapping := 'utc' | 'ntz'] [, metadata_schema := '…'])</c> — writes a
+/// [, deletion_vectors := true | false] [, timestamp_mapping := 'utc' | 'ntz'] [, partitioning := true | false]
+/// [, change_data_feed := false | true] [, metadata_schema := '…'])</c> — writes a
 /// Delta log next to every DuckLake table's data files, so an engine that reads only Delta (Fabric's SQL
 /// endpoint, Spark, Direct Lake) reads the table from the SAME Parquet files DuckLake wrote. DuckLake stays
 /// the source of truth; the Delta log is derived from it and nothing else may write to it.
@@ -64,6 +65,8 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
         Params.Named("metadata_schema", StringType.Default),
         Params.Named("timestamp_mapping", StringType.Default),
         Params.Named("deletion_vectors", BooleanType.Default),
+        Params.Named("partitioning", BooleanType.Default),
+        Params.Named("change_data_feed", BooleanType.Default),
     }, null);
 
     internal static readonly Schema ResultSchema = new(new[]
@@ -98,7 +101,10 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
                 $"ducklake_delta_sync: timestamp_mapping must be 'ntz' or 'utc', not '{timestamps}'.");
         }
         bool deletionVectors = FabricArgs.Bool(args, 5) ?? true;
-        return new SyncBinding(lake, table, mapping, FabricArgs.Str(args, 3), timestamps, deletionVectors);
+        bool partitioning = FabricArgs.Bool(args, 6) ?? true;
+        bool changeDataFeed = FabricArgs.Bool(args, 7) ?? false;
+        return new SyncBinding(lake, table, mapping, FabricArgs.Str(args, 3), timestamps, deletionVectors, partitioning,
+            changeDataFeed);
     }
 
     private sealed class SyncBinding : ITableFunctionBinding
@@ -109,12 +115,16 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
         private readonly string? _metadataSchema;
         private readonly string _timestamps;
         private readonly bool _deletionVectors;
+        private readonly bool _partitioning;
+        private readonly bool _changeDataFeed;
 
         public SyncBinding(string lake, string? table, string mapping, string? metadataSchema, string timestamps,
-            bool deletionVectors)
+            bool deletionVectors, bool partitioning, bool changeDataFeed)
         {
             _timestamps = timestamps;
             _deletionVectors = deletionVectors;
+            _partitioning = partitioning;
+            _changeDataFeed = changeDataFeed;
             _lake = lake;
             _table = table;
             _mapping = mapping;
@@ -130,7 +140,8 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
             // The work runs NOW, while the opener (this call's ClientContext) is valid; a lazy body would run
             // inside get_next, after the call returned. Connection-free → the host-FS path.
             AmbientAdlsCredential.Current = null;
-            var results = new DuckLakeDeltaSync(AmbientOpener.Current, _lake, _mapping, _timestamps, _deletionVectors).Run(_table, _metadataSchema, ct);
+            var results = new DuckLakeDeltaSync(AmbientOpener.Current, _lake, _mapping, _timestamps, _deletionVectors,
+                _partitioning, _changeDataFeed).Run(_table, _metadataSchema, ct);
             return Single(DuckLakeDeltaSync.ToBatch(results));
         }
 
@@ -162,6 +173,8 @@ internal sealed class DuckLakeDeltaSync
     private readonly string _mapping;
     private readonly string _timestamps;
     private readonly bool _deletionVectors;
+    private readonly bool _partitioning;
+    private readonly bool _changeDataFeed;
     private string _ms = "";
 
     // What a DuckDB TIMESTAMP (no time zone) is declared as. 'utc' (the DEFAULT, user decision 2026-10-27)
@@ -174,8 +187,16 @@ internal sealed class DuckLakeDeltaSync
     internal sealed record Result(
         string Schema, string Table, long Snapshot, long Version, long Added, long Removed, long Dvs, bool Checkpoint);
 
-    public DuckLakeDeltaSync(nint opener, string lake, string mapping, string timestamps, bool deletionVectors)
+    // The DuckLake column ids the Delta table is partitioned by, comma-separated ("" for none). Chosen at a table's first
+    // sync and fixed from then on, because Delta cannot change a table's partition columns without rewriting it. Ids, not
+    // names: a rename changes the logical name in partitionColumns, not which column it is.
+    internal const string PartitionKey = "fabricator.ducklake.partitionColumnIds";
+
+    public DuckLakeDeltaSync(nint opener, string lake, string mapping, string timestamps, bool deletionVectors,
+        bool partitioning = true, bool changeDataFeed = false)
     {
+        _partitioning = partitioning;
+        _changeDataFeed = changeDataFeed;
         _deletionVectors = deletionVectors;
         _opener = opener;
         _lake = lake;
@@ -317,6 +338,7 @@ internal sealed class DuckLakeDeltaSync
         public long Size;
         public long? RowIdStart;
         public long Begin;
+        public long? PartitionId;
 
         // field id (= DuckLake column id) -> the name this file's Parquet schema gives it. Null when not read (the
         // catalog guard), and then the name is inferred from the metadata at Begin — which a rewrite makes wrong.
@@ -666,7 +688,7 @@ internal sealed class DuckLakeDeltaSync
 
             var files = _o.Rows(
                     $"SELECT data_file_id, path, path_is_relative, record_count, file_size_bytes, row_id_start, begin_snapshot, " +
-                    $"encryption_key, mapping_id FROM {_o.M("ducklake_data_file")} WHERE table_id = {_tableId} AND {Active("", s)}")
+                    $"encryption_key, mapping_id, partition_id FROM {_o.M("ducklake_data_file")} WHERE table_id = {_tableId} AND {Active("", s)}")
                 .Select(r =>
                 {
                     if (r[7] is not null)
@@ -684,6 +706,7 @@ internal sealed class DuckLakeDeltaSync
                     {
                         Id = Long(r[0]), RelPath = rel.Replace('\\', '/'), AbsPath = _root + "/" + rel.Replace('\\', '/'),
                         Records = Long(r[3]), Size = Long(r[4]), RowIdStart = NLong(r[5]), Begin = Long(r[6]),
+                        PartitionId = NLong(r[9]),
                     };
                 })
                 .ToList();
@@ -700,19 +723,29 @@ internal sealed class DuckLakeDeltaSync
                 ? string.Equals(dvv, "true", StringComparison.OrdinalIgnoreCase)
                 : _o._deletionVectors;
             var schemaPlan = new SchemaPlan(tableName, _columns, files, s, mode, timestamps, deletionVectors);
+            // switched on by an option or already on; once on it stays on (the feed of later versions depends on it)
+            bool changeDataFeed = _o._changeDataFeed
+                || delta?.Metadata.Configuration is { } cfg4 && cfg4.TryGetValue("delta.enableChangeDataFeed", out var cdfv)
+                   && string.Equals(cdfv, "true", StringComparison.OrdinalIgnoreCase);
+            var partitionValues = FilePartitionValues();
+            var partitionIds = PartitionColumns(delta, files, s, schemaPlan, partitionValues);
+            var partitionNames = partitionIds.Select(id => schemaPlan.LogicalName(id) ?? throw Refuse(tableName,
+                $"column {id}, which the Delta mirror is partitioned by, was dropped; Delta cannot change a table's partition " +
+                "columns. Recreate the table, or the mirror")).ToList();
 
             long version = delta is null ? 0 : delta.Version + 1;
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var actions = new List<DeltaAction>();
 
             // protocol + metaData: written whenever what they would say differs from what the log says.
-            var protocol = schemaPlan.Protocol(delta?.Protocol);
+            var protocol = schemaPlan.Protocol(delta?.Protocol, changeDataFeed);
             bool protocolChanged = delta is null || !SameFeatures(delta.Protocol, protocol);
-            var config = schemaPlan.Configuration(delta?.Metadata.Configuration);
+            var config = schemaPlan.Configuration(delta?.Metadata.Configuration, partitionIds, changeDataFeed);
             string schemaString = schemaPlan.SchemaString();
             bool metaChanged = delta is null
                 || delta.Metadata.SchemaString != schemaString
-                || !SameConfig(delta.Metadata.Configuration, config);
+                || !SameConfig(delta.Metadata.Configuration, config)
+                || !(delta.Metadata.PartitionColumns ?? Array.Empty<string>()).SequenceEqual(partitionNames, StringComparer.Ordinal);
 
             // deleted rows, for the files DuckLake has any deletes on at s
             var candidates = new HashSet<long>(_o.Rows(
@@ -805,7 +838,7 @@ internal sealed class DuckLakeDeltaSync
             }
             long hwmBefore = nextRowId;
 
-            var stats = Stats(newAdds, schemaPlan);
+            var stats = Stats(newAdds, schemaPlan, new HashSet<long>(partitionIds));
             var dvWriter = new DeletionVectorWriter(_fs);
             int dvs = 0;
             foreach (var f in newAdds)
@@ -831,7 +864,7 @@ internal sealed class DuckLakeDeltaSync
                 actions.Add(new AddFile
                 {
                     Path = DeltaPath.Encode(f.RelPath),
-                    PartitionValues = new Dictionary<string, string>(),
+                    PartitionValues = PartitionValuesOf(f, partitionIds, partitionValues, schemaPlan, tableName),
                     Size = f.Size,
                     ModificationTime = now,
                     DataChange = true,
@@ -855,6 +888,27 @@ internal sealed class DuckLakeDeltaSync
                 });
             }
 
+            if (changeDataFeed && delta is not null)
+            {
+                var (cdcFiles, anyChange) = ChangeData(schema, table, SyncedSnapshot(delta), s, schemaPlan, partitionIds,
+                    needsFiles: removed > 0 || dvChanges.Count > 0 || bornWithDeletes.Count > 0, ct);
+                if (!anyChange)
+                {
+                    // Only files were rearranged (a merge or rewrite), no row changed: dataChange = false keeps such a
+                    // commit out of the change feed and out of a streaming read, as Delta's own OPTIMIZE does.
+                    for (int i = 0; i < actions.Count; i++)
+                    {
+                        actions[i] = actions[i] switch
+                        {
+                            AddFile a => a with { DataChange = false },
+                            RemoveFile r => r with { DataChange = false },
+                            var other => other,
+                        };
+                    }
+                }
+                actions.AddRange(cdcFiles);
+            }
+
             var head = new List<DeltaAction> { CommitInfo(now, s, delta is null) };
             if (protocolChanged)
             {
@@ -867,7 +921,7 @@ internal sealed class DuckLakeDeltaSync
                     Id = _uuid,
                     Format = new Format { Provider = "parquet", Options = new Dictionary<string, string>() },
                     SchemaString = schemaString,
-                    PartitionColumns = Array.Empty<string>(),
+                    PartitionColumns = partitionNames,
                     Configuration = config,
                     CreatedTime = delta?.Metadata.CreatedTime ?? now,
                 });
@@ -894,6 +948,184 @@ internal sealed class DuckLakeDeltaSync
                 checkpoint = true;
             }
             return new Result(schema, table, s, version, newAdds.Count, removed + dvChanges.Count, dvs, checkpoint);
+        }
+
+        // ── partitioning ──────────────────────────────────────────────────────────────────────────────
+        // Delta has value partitions only, so an IDENTITY key of DuckLake's partitioning maps to a Delta partition column
+        // and a transform (year(ts), bucket(…)) does not: declared as `ts`, partitionValues would REPLACE the column's
+        // values with the year for every reader. Such a key is left undeclared; DuckLake still writes one file per value,
+        // so the files' statistics are tight and Delta skips them by stats instead. Whether the path is a hive path
+        // (hive_file_pattern) does not matter: Delta takes the values from partitionValues, never from the path. The
+        // partition column stays in the data file too (DuckLake writes it there); a Delta reader takes partitionValues.
+
+        // identity partition values per data file: data_file_id -> column id -> value (null for NULL)
+        private Dictionary<long, Dictionary<long, string?>> FilePartitionValues()
+        {
+            var result = new Dictionary<long, Dictionary<long, string?>>();
+            foreach (var r in _o.Rows(
+                         $"SELECT v.data_file_id, c.column_id, v.partition_value FROM {_o.M("ducklake_file_partition_value")} v " +
+                         $"JOIN {_o.M("ducklake_data_file")} f ON f.data_file_id = v.data_file_id " +
+                         $"JOIN {_o.M("ducklake_partition_column")} c ON c.partition_id = f.partition_id AND c.table_id = v.table_id " +
+                         $"AND c.partition_key_index = v.partition_key_index " +
+                         $"WHERE v.table_id = {_tableId} AND c.transform = 'identity'"))
+            {
+                long file = Long(r[0]);
+                if (!result.TryGetValue(file, out var map))
+                {
+                    result[file] = map = new Dictionary<long, string?>();
+                }
+                map[Long(r[1])] = (string?)r[2];
+            }
+            return result;
+        }
+
+        // The DuckLake column ids the Delta table is partitioned by. Fixed at the first sync: the identity keys of the
+        // partitioning current then whose type has a Delta partition-value form and that EVERY live file carries (a file
+        // written before the table was partitioned has no value, and Delta needs one in every add).
+        private List<long> PartitionColumns(EngineeredWood.DeltaLake.Snapshot.Snapshot? delta, List<DlFile> files, long s,
+            SchemaPlan plan, Dictionary<long, Dictionary<long, string?>> values)
+        {
+            if (delta is not null)
+            {
+                if (delta.Metadata.Configuration is not { } cfg || !cfg.TryGetValue(PartitionKey, out var text)
+                    || string.IsNullOrEmpty(text))
+                {
+                    return new List<long>();
+                }
+                return text.Split(',').Select(x => long.Parse(x, NumberStyles.Integer, CultureInfo.InvariantCulture)).ToList();
+            }
+            var chosen = new List<long>();
+            if (!_o._partitioning)
+            {
+                return chosen;
+            }
+            foreach (var r in _o.Rows(
+                         $"SELECT c.column_id FROM {_o.M("ducklake_partition_info")} p JOIN {_o.M("ducklake_partition_column")} c " +
+                         $"ON c.partition_id = p.partition_id AND c.table_id = p.table_id WHERE p.table_id = {_tableId} " +
+                         $"AND {Active("p", s)} AND c.transform = 'identity' ORDER BY c.partition_key_index"))
+            {
+                long id = Long(r[0]);
+                if (!plan.PartitionEligible(id))
+                {
+                    _log.LogDebug("ducklake sync {Root}: partition key column {Id} has a type Delta cannot hold as a partition " +
+                                  "value, left undeclared", _root, id);
+                    continue;
+                }
+                // ⚠ an empty string is a distinct value in DuckLake and NULL in Delta, so it cannot be a partition value
+                if (files.All(f => values.TryGetValue(f.Id, out var v) && v.TryGetValue(id, out var x) && x != ""))
+                {
+                    chosen.Add(id);
+                }
+            }
+            return chosen;
+        }
+
+        private Dictionary<string, string> PartitionValuesOf(DlFile f, List<long> partitionIds,
+            Dictionary<long, Dictionary<long, string?>> values, SchemaPlan plan, string tableName)
+        {
+            var result = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (long id in partitionIds)
+            {
+                string column = plan.LogicalName(id) ?? id.ToString(CultureInfo.InvariantCulture);
+                if (!values.TryGetValue(f.Id, out var v) || !v.TryGetValue(id, out var value))
+                {
+                    throw Refuse(tableName,
+                        $"data file {f.RelPath} has no value for partition column '{column}', which the Delta mirror is " +
+                        "partitioned by: the table's partitioning changed after its first sync, and Delta cannot change a " +
+                        "table's partition columns. Recreate the table, or the mirror (sync it into a new folder with " +
+                        "partitioning := false)");
+                }
+                if (value == "")
+                {
+                    throw Refuse(tableName,
+                        $"data file {f.RelPath} holds an empty string in partition column '{column}'; Delta reads an " +
+                        "empty partition value as NULL");
+                }
+                result[plan.PartitionKeyName(id)] = value!;
+            }
+            return result;
+        }
+
+        // ── change data feed ──────────────────────────────────────────────────────────────────────────
+        // The change rows of one Delta commit come from DuckLake's own change feed (ducklake_table_changes: insert,
+        // delete, update_preimage, update_postimage — the Delta names), for the snapshots after `last` up to s. A commit
+        // carrying cdc files is read from them alone, so they hold every change of the commit, inserts included.
+        // Without any: a commit of only inserts (adds, no removes) needs none — a reader takes the adds as inserts.
+        // Compaction snapshots are left out: DuckLake reports a rewrite as an update of every row it moved (measured).
+        private static readonly HashSet<string> CompactionChanges =
+            new(StringComparer.Ordinal) { "compacted_table", "merge_adjacent", "rewrite_delete" };
+
+        private (List<CdcFile> Files, bool AnyChange) ChangeData(string schema, string table, long last, long s,
+            SchemaPlan plan, List<long> partitionIds, bool needsFiles, CancellationToken ct)
+        {
+            string id = _tableId.ToString(CultureInfo.InvariantCulture);
+            var compaction = new List<long>();
+            foreach (var r in _o.Rows($"SELECT snapshot_id, changes_made FROM {_o.M("ducklake_snapshot_changes")} " +
+                                      $"WHERE snapshot_id > {last} AND snapshot_id <= {s}"))
+            {
+                var kinds = ((string?)r[1] ?? "").Split(',')
+                    .Select(e => (Colon: e.IndexOf(':'), Entry: e))
+                    .Where(e => e.Colon > 0 && e.Entry.Substring(e.Colon + 1) == id)
+                    .Select(e => e.Entry.Substring(0, e.Colon))
+                    .ToList();
+                if (kinds.Count > 0 && kinds.All(CompactionChanges.Contains))
+                {
+                    compaction.Add(Long(r[0]));
+                }
+            }
+            // ducklake_table_changes needs an existing snapshot to start from; the changes after `last` are then selected
+            // by their snapshot_id, which DuckLake keeps on the rows of an expired snapshot too (measured).
+            long? start = NLong(_o.Rows($"SELECT max(snapshot_id) FROM {_o.M("ducklake_snapshot")} WHERE snapshot_id <= {last}")[0][0]);
+            if (start is null)
+            {
+                _log.LogWarning("ducklake sync {Root}: every snapshot up to {Last} was expired, so the change data of the " +
+                                "commit for snapshot {Snapshot} is taken from its added and removed files", _root, last, s);
+                return (new List<CdcFile>(), true);
+            }
+            string from = $"ducklake_table_changes({Lit(_o._lake)}, {Lit(schema)}, {Lit(table)}, {start}, {s}) " +
+                          $"WHERE snapshot_id > {last}" +
+                          (compaction.Count > 0 ? $" AND snapshot_id NOT IN ({string.Join(", ", compaction)})" : "");
+            var counts = _o.Rows($"SELECT count(*), count(*) FILTER (WHERE change_type <> 'insert') FROM {from}")[0];
+            if (Long(counts[0]) == 0)
+            {
+                return (new List<CdcFile>(), false);
+            }
+            if (Long(counts[1]) == 0 && !needsFiles)
+            {
+                return (new List<CdcFile>(), true);
+            }
+
+            string select = plan.ChangeDataSelect() + ", change_type AS \"_change_type\"";
+            string? fieldIds = plan.FieldIdsSpec();
+            string options = "FORMAT parquet" + (fieldIds is null ? "" : ", FIELD_IDS " + fieldIds);
+            // one file per partition: a cdc file carries partitionValues like an add
+            var keys = partitionIds.Select(p => plan.LogicalName(p)!).ToList();
+            var tuples = keys.Count == 0
+                ? new List<object?[]> { Array.Empty<object?>() }
+                : _o.Rows($"SELECT DISTINCT {string.Join(", ", keys.Select(k => $"CAST({Q(k)} AS VARCHAR)"))} FROM {from}");
+            if (!_root.Contains("://"))
+            {
+                Directory.CreateDirectory(Path.Combine(_root, "_change_data"));
+            }
+            var result = new List<CdcFile>();
+            foreach (var tuple in tuples)
+            {
+                ct.ThrowIfCancellationRequested();
+                var pv = new Dictionary<string, string>(StringComparer.Ordinal);
+                var where = new StringBuilder();
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    var value = (string?)tuple[i];
+                    pv[plan.PartitionKeyName(partitionIds[i])] = value!;
+                    where.Append($" AND CAST({Q(keys[i])} AS VARCHAR) IS NOT DISTINCT FROM {(value is null ? "NULL" : Lit(value))}");
+                }
+                string rel = "_change_data/cdc-" + Guid.NewGuid().ToString("N") + ".parquet";
+                string abs = _root + "/" + rel;
+                _o.Rows($"COPY (SELECT {select} FROM {from}{where}) TO {Lit(abs)} ({options})");
+                long size = Long(_o.Rows($"SELECT size FROM read_blob({Lit(abs)})")[0][0]);
+                result.Add(new CdcFile { Path = DeltaPath.Encode(rel), PartitionValues = pv, Size = size, DataChange = false });
+            }
+            return (result, true);
         }
 
         private string RelativeTo(string tableName, string absolute)
@@ -974,7 +1206,9 @@ internal sealed class DuckLakeDeltaSync
         // Delta file statistics from DuckLake's per-file column stats, keyed by PHYSICAL name. Only types whose
         // DuckLake text form is the Delta JSON form are rendered; a missing bound only costs pruning, a wrong one
         // costs rows, so anything doubtful is left out.
-        private Dictionary<long, string> Stats(List<DlFile> files, SchemaPlan plan)
+        // Partition columns get no statistics: a Delta reader prunes them by partitionValues, and Spark collects stats
+        // for data columns only.
+        private Dictionary<long, string> Stats(List<DlFile> files, SchemaPlan plan, HashSet<long> partitionColumns)
         {
             var result = new Dictionary<long, string>();
             if (files.Count == 0)
@@ -996,24 +1230,35 @@ internal sealed class DuckLakeDeltaSync
             }
             foreach (var f in files)
             {
+                var rows = perFile.TryGetValue(f.Id, out var l) ? l : new List<object?[]>();
+                var min = new StatNode();
+                var max = new StatNode();
+                var nulls = new StatNode();
+                foreach (var r in rows)
+                {
+                    long col = Long(r[1]);
+                    if (partitionColumns.Contains(col) || plan.StatsPath(col) is not { } path)
+                    {
+                        continue;
+                    }
+                    string type = plan.TypeAtCurrent(col) ?? "";
+                    bool nan = r[5] is not null && Bool(r[5]);
+                    min.Add(path, Bound(type, (string?)r[3], r[6], nan, isMin: true, plan.UtcTimestamps));
+                    max.Add(path, Bound(type, (string?)r[4], r[7], nan, isMin: false, plan.UtcTimestamps));
+                    if (r[2] is not null)
+                    {
+                        long n = Long(r[2]);
+                        nulls.Add(path, (w, name) => w.WriteNumber(name, n));
+                    }
+                }
                 using var ms = new MemoryStream();
                 using (var w = new Utf8JsonWriter(ms))
                 {
                     w.WriteStartObject();
                     w.WriteNumber("numRecords", f.Records);
-                    var rows = perFile.TryGetValue(f.Id, out var l) ? l : new List<object?[]>();
-                    var tops = rows.Where(r => plan.TopLevelPhysical(Long(r[1])) is not null).ToList();
-                    WriteBound(w, "minValues", tops, plan, isMin: true);
-                    WriteBound(w, "maxValues", tops, plan, isMin: false);
-                    w.WriteStartObject("nullCount");
-                    foreach (var r in tops)
-                    {
-                        if (r[2] is not null)
-                        {
-                            w.WriteNumber(plan.TopLevelPhysical(Long(r[1]))!, Long(r[2]));
-                        }
-                    }
-                    w.WriteEndObject();
+                    min.Write(w, "minValues");
+                    max.Write(w, "maxValues");
+                    nulls.Write(w, "nullCount");
                     w.WriteEndObject();
                 }
                 result[f.Id] = Encoding.UTF8.GetString(ms.ToArray());
@@ -1021,48 +1266,118 @@ internal sealed class DuckLakeDeltaSync
             return result;
         }
 
-        private static void WriteBound(Utf8JsonWriter w, string name, List<object?[]> rows, SchemaPlan plan, bool isMin)
+        // One bound as Delta writes it, or null when DuckLake's text form cannot be rendered exactly. Timestamps go
+        // to milliseconds (Delta's stats precision): a minimum rounds down and a maximum up, so they stay bounds.
+        private static Action<Utf8JsonWriter, string>? Bound(string type, string? value, object? isExact, bool nan, bool isMin,
+                                                            bool utcTimestamps)
         {
-            w.WriteStartObject(name);
-            foreach (var r in rows)
+            if (value is null || (isExact is not null && !Bool(isExact)))
             {
-                long col = Long(r[1]);
-                string? value = (string?)r[isMin ? 3 : 4];
-                bool exact = r[isMin ? 6 : 7] is null || Bool(r[isMin ? 6 : 7]);
-                bool nan = r[5] is not null && Bool(r[5]);
-                if (value is null || !exact)
+                return null;
+            }
+            switch (type)
+            {
+                case "int8" or "int16" or "int32" or "int64":
+                    return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var lv)
+                        ? (w, n) => w.WriteNumber(n, lv) : null;
+                case "float32" or "float64":
+                    return !nan && double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var dv)
+                           && !double.IsNaN(dv) && !double.IsInfinity(dv)
+                        ? (w, n) => w.WriteNumber(n, dv) : null;
+                case var t when t.StartsWith("decimal(", StringComparison.Ordinal):
+                    return decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out _)
+                        ? (w, n) => { w.WritePropertyName(n); w.WriteRawValue(value); } : null;
+                case "varchar" or "date":
+                    return (w, n) => w.WriteString(n, value);
+                case "timestamp" or "timestamptz":
                 {
-                    continue;
-                }
-                string phys = plan.TopLevelPhysical(col)!;
-                switch (plan.TypeAtCurrent(col) ?? "")
-                {
-                    case "int8" or "int16" or "int32" or "int64":
-                        if (long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var lv))
-                        {
-                            w.WriteNumber(phys, lv);
-                        }
-                        break;
-                    case "float32" or "float64":
-                        if (!nan && double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var dv)
-                            && !double.IsNaN(dv) && !double.IsInfinity(dv))
-                        {
-                            w.WriteNumber(phys, dv);
-                        }
-                        break;
-                    case var t when t.StartsWith("decimal(", StringComparison.Ordinal):
-                        if (decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out _))
-                        {
-                            w.WritePropertyName(phys);
-                            w.WriteRawValue(value);
-                        }
-                        break;
-                    case "varchar" or "date":
-                        w.WriteString(phys, value);
-                        break;
+                    if (!TryParseTimestamp(value, type == "timestamptz", out long ticks))
+                    {
+                        return null;
+                    }
+                    long rem = ticks % TimeSpan.TicksPerMillisecond;
+                    if (rem != 0)
+                    {
+                        ticks += isMin ? -rem : TimeSpan.TicksPerMillisecond - rem;
+                    }
+                    if (ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
+                    {
+                        return null;
+                    }
+                    // the Delta type decides the form: timestamp is an instant (UTC), timestamp_ntz has no zone
+                    bool instant = type == "timestamptz" || utcTimestamps;
+                    string text = new DateTime(ticks, DateTimeKind.Unspecified)
+                        .ToString("yyyy-MM-dd'T'HH:mm:ss.fff", CultureInfo.InvariantCulture) + (instant ? "Z" : "");
+                    return (w, n) => w.WriteString(n, text);
                 }
             }
-            w.WriteEndObject();
+            return null;
+        }
+
+        // DuckLake's text form: "2024-01-01 12:34:56.123456", a timestamptz with a UTC offset ("+00").
+        private static bool TryParseTimestamp(string value, bool withOffset, out long ticks)
+        {
+            ticks = 0;
+            if (withOffset)
+            {
+                if (!DateTimeOffset.TryParseExact(value, new[] { "yyyy-MM-dd HH:mm:ss.FFFFFFFzz", "yyyy-MM-dd HH:mm:ss.FFFFFFFzzz" },
+                        CultureInfo.InvariantCulture, DateTimeStyles.None, out var dto))
+                {
+                    return false;
+                }
+                ticks = dto.UtcTicks;
+                return true;
+            }
+            if (!DateTime.TryParseExact(value, "yyyy-MM-dd HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var dt))
+            {
+                return false;
+            }
+            ticks = dt.Ticks;
+            return true;
+        }
+
+        // Delta's nested stats objects, one level per struct, keyed by physical name.
+        private sealed class StatNode
+        {
+            private readonly List<(string Name, object Value)> _entries = new();
+
+            public void Add(IReadOnlyList<string> path, Action<Utf8JsonWriter, string>? leaf, int at = 0)
+            {
+                if (leaf is null)
+                {
+                    return;
+                }
+                if (at == path.Count - 1)
+                {
+                    _entries.Add((path[at], leaf));
+                    return;
+                }
+                var child = _entries.FirstOrDefault(e => e.Name == path[at] && e.Value is StatNode).Value as StatNode;
+                if (child is null)
+                {
+                    child = new StatNode();
+                    _entries.Add((path[at], child));
+                }
+                child.Add(path, leaf, at + 1);
+            }
+
+            public void Write(Utf8JsonWriter w, string name)
+            {
+                w.WriteStartObject(name);
+                foreach (var (n, v) in _entries)
+                {
+                    if (v is StatNode node)
+                    {
+                        node.Write(w, n);
+                    }
+                    else
+                    {
+                        ((Action<Utf8JsonWriter, string>)v)(w, n);
+                    }
+                }
+                w.WriteEndObject();
+            }
         }
 
         private CommitInfo CommitInfo(long now, long snapshot, bool create)
@@ -1287,10 +1602,123 @@ internal sealed class DuckLakeDeltaSync
                 && int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out s);
         }
 
-        public string? TopLevelPhysical(long id) =>
-            _active.FirstOrDefault(c => c.Id == id && c.Parent is null) is { } c && IsPrimitive(c.Type) ? _physical[id] : null;
+        // The physical path of a column's stats in Delta: a primitive whose ancestors are all structs (Delta keeps no
+        // stats inside arrays or maps), outermost first; null otherwise.
+        public bool UtcTimestamps => _timestamps == "utc";
+
+        public IReadOnlyList<string>? StatsPath(long id)
+        {
+            var c = _active.FirstOrDefault(x => x.Id == id);
+            if (c is null || !IsPrimitive(c.Type))
+            {
+                return null;
+            }
+            var path = new List<string>();
+            for (var at = c; ; )
+            {
+                path.Insert(0, _physical[at.Id]);
+                if (at.Parent is not { } parent)
+                {
+                    return path;
+                }
+                at = _active.FirstOrDefault(x => x.Id == parent);
+                if (at is null || at.Type != "struct")
+                {
+                    return null;
+                }
+            }
+        }
 
         public string? TypeAtCurrent(long id) => _active.FirstOrDefault(c => c.Id == id)?.Type;
+
+        // Partition columns: top level, and a type whose DuckLake partition value IS the Delta partition-value text
+        // (measured: integers, strings, dates, true/false, decimals with their scale). Timestamps are left out: Delta
+        // reads a timestamp partition value in the reader's time zone unless it carries one, which DuckLake's does not.
+        public bool PartitionEligible(long id) =>
+            _active.FirstOrDefault(c => c.Id == id && c.Parent is null) is { } c
+            && (c.Type is "int8" or "int16" or "int32" or "int64" or "varchar" or "date" or "boolean"
+                || TryDecimal(c.Type, out _, out _));
+
+        public string? LogicalName(long id) => _active.FirstOrDefault(c => c.Id == id && c.Parent is null)?.Name;
+
+        // partitionValues are keyed by the physical name under column mapping, by the name without it
+        public string PartitionKeyName(long id) => _mode == "none" ? LogicalName(id)! : _physical[id];
+
+        // The SELECT list that writes a change row the way the table's data files hold it: physical names at every
+        // level, so a cdc file is read with the same column mapping as the data files.
+        public string ChangeDataSelect() =>
+            string.Join(", ", Children(null).Select(c => $"{ChangeExpr(c, Q(c.Name), 0)} AS {Q(_physical[c.Id])}"));
+
+        // The COPY FIELD_IDS option for a cdc file, as DeltaWriter.BuildFieldIdsSpec writes it for data files: keyed by
+        // physical name, a struct with DuckDB's __duckdb_field_id sentinel, a list or map descending only to reach a
+        // struct ('element' / 'key' / 'value' carry no Delta id). Null without column mapping.
+        public string? FieldIdsSpec() =>
+            _mode == "none" ? null : "{" + string.Join(", ", Children(null).Select(FieldIdEntry)) + "}";
+
+        private string FieldIdEntry(DlColumn c) => $"'{_physical[c.Id].Replace("'", "''")}': {FieldIdValue(c)}";
+
+        private string FieldIdValue(DlColumn c)
+        {
+            string id = c.Id.ToString(CultureInfo.InvariantCulture);
+            return c.Type switch
+            {
+                "struct" => "{__duckdb_field_id: " + id + string.Concat(Children(c.Id).Select(ch => ", " + FieldIdEntry(ch))) + "}",
+                "list" or "map" when ContainsStruct(c) => "{__duckdb_field_id: " + id + string.Concat(
+                    Children(c.Id).Where(ContainsStruct).Select(ch => $", '{(c.Type == "list" ? "element" : ch.Name)}': {InnerNode(ch)}")) + "}",
+                _ => id,
+            };
+        }
+
+        // a list element or map key/value: no Delta id of its own
+        private string InnerNode(DlColumn c) => c.Type switch
+        {
+            "struct" => "{" + string.Join(", ", Children(c.Id).Select(FieldIdEntry)) + "}",
+            "list" or "map" => "{" + string.Join(", ", Children(c.Id).Where(ContainsStruct)
+                .Select(ch => $"'{(c.Type == "list" ? "element" : ch.Name)}': {InnerNode(ch)}")) + "}",
+            _ => "{}",
+        };
+
+        private bool ContainsStruct(DlColumn c) => c.Type == "struct" || Children(c.Id).Any(ContainsStruct);
+
+        // whether a column's value must be rebuilt for its physical names (a list element and a map's key and value
+        // are named by Parquet's structure, not by Delta)
+        private bool NeedsRename(DlColumn c) => c.Type switch
+        {
+            "struct" => Children(c.Id).Any(ch => _physical[ch.Id] != ch.Name || NeedsRename(ch)),
+            "list" or "map" => Children(c.Id).Any(NeedsRename),
+            _ => false,
+        };
+
+        private string ChangeExpr(DlColumn c, string src, int depth)
+        {
+            if (!NeedsRename(c))
+            {
+                return src;
+            }
+            switch (c.Type)
+            {
+                case "struct":
+                    // struct_pack of a NULL struct is a struct of NULLs, so the NULL is kept explicitly
+                    return $"CASE WHEN {src} IS NULL THEN NULL ELSE struct_pack(" + string.Join(", ", Children(c.Id).Select(
+                        ch => $"{Q(_physical[ch.Id])} := {ChangeExpr(ch, $"({src}).{Q(ch.Name)}", depth)}")) + ") END";
+                case "list":
+                {
+                    var element = Children(c.Id).Single();
+                    string v = "x" + depth.ToString(CultureInfo.InvariantCulture);
+                    return $"list_transform({src}, lambda {v}: {ChangeExpr(element, v, depth + 1)})";
+                }
+                case "map":
+                {
+                    var kv = Children(c.Id);
+                    var key = kv.First(k => k.Name == "key");
+                    var value = kv.First(k => k.Name == "value");
+                    string v = "e" + depth.ToString(CultureInfo.InvariantCulture);
+                    return $"map_from_entries(list_transform(map_entries({src}), lambda {v}: struct_pack(key := " +
+                           $"{ChangeExpr(key, v + ".key", depth + 1)}, value := {ChangeExpr(value, v + ".value", depth + 1)})))";
+                }
+            }
+            return src;
+        }
 
         private static bool IsPrimitive(string t) => t is not ("struct" or "list" or "map");
 
@@ -1411,7 +1839,7 @@ internal sealed class DuckLakeDeltaSync
             }
         }
 
-        public ProtocolAction Protocol(ProtocolAction? existing)
+        public ProtocolAction Protocol(ProtocolAction? existing, bool changeDataFeed)
         {
             SchemaString(); // resolves _needsNtz
             // Only what the table needs: a reader without column mapping or deletion vectors (SQL Server's DELTA
@@ -1438,6 +1866,10 @@ internal sealed class DuckLakeDeltaSync
                 reader.Add("typeWidening");
                 writer.Add("typeWidening");
             }
+            if (changeDataFeed)
+            {
+                writer.Add("changeDataFeed");
+            }
             // a feature once declared stays declared: older versions of a file may still need it
             foreach (var f in existing?.ReaderFeatures ?? Array.Empty<string>())
             {
@@ -1456,7 +1888,8 @@ internal sealed class DuckLakeDeltaSync
             };
         }
 
-        public Dictionary<string, string> Configuration(IReadOnlyDictionary<string, string>? existing)
+        public Dictionary<string, string> Configuration(IReadOnlyDictionary<string, string>? existing,
+            IReadOnlyList<long> partitionIds, bool changeDataFeed)
         {
             var config = new Dictionary<string, string>(StringComparer.Ordinal);
             if (existing is not null)
@@ -1485,6 +1918,11 @@ internal sealed class DuckLakeDeltaSync
             if (_typeChanges.Values.Any(v => v.Count > 0))
             {
                 config["delta.enableTypeWidening"] = "true";
+            }
+            config[PartitionKey] = string.Join(",", partitionIds.Select(i => i.ToString(CultureInfo.InvariantCulture)));
+            if (changeDataFeed)
+            {
+                config["delta.enableChangeDataFeed"] = "true";
             }
             return config;
         }

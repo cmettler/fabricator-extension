@@ -18,7 +18,7 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// <c>ducklake_delta_maintain(lake [, table_name := 'schema.table'] [, merge := true] [, rewrite_deletes := false]
 /// [, older_than := '7 days'] [, orphans := false] [, dry_run := false] [, column_mapping / deletion_vectors /
-/// timestamp_mapping / metadata_schema as for ducklake_delta_sync])</c> — DuckLake's maintenance in the one order
+/// timestamp_mapping / metadata_schema / partitioning / change_data_feed as for ducklake_delta_sync])</c> — DuckLake's maintenance in the one order
 /// that keeps a Delta mirror valid (docs/ducklake-catalog.md §11.10):
 /// <list type="number">
 /// <item>flush inlined rows, so the newest snapshot is complete;</item>
@@ -49,6 +49,8 @@ public sealed class DuckLakeDeltaMaintainFunction : ITableFunction
         Params.Named("deletion_vectors", BooleanType.Default),
         Params.Named("timestamp_mapping", StringType.Default),
         Params.Named("metadata_schema", StringType.Default),
+        Params.Named("partitioning", BooleanType.Default),
+        Params.Named("change_data_feed", BooleanType.Default),
     }, null);
 
     internal static readonly Schema ResultSchema = new(new[]
@@ -75,6 +77,8 @@ public sealed class DuckLakeDeltaMaintainFunction : ITableFunction
             DeletionVectors = FabricArgs.Bool(args, 8) ?? true,
             Timestamps = (FabricArgs.Str(args, 9) ?? "utc").Trim().ToLowerInvariant(),
             MetadataSchema = FabricArgs.Str(args, 10),
+            Partitioning = FabricArgs.Bool(args, 11) ?? true,
+            ChangeDataFeed = FabricArgs.Bool(args, 12) ?? false,
         };
         if (o.Mapping is not ("name" or "id" or "none"))
         {
@@ -108,6 +112,8 @@ public sealed class DuckLakeDeltaMaintainFunction : ITableFunction
         public bool DeletionVectors = true;
         public string Timestamps = "utc";
         public string? MetadataSchema;
+        public bool Partitioning = true;
+        public bool ChangeDataFeed;
     }
 
     private sealed class MaintainBinding : ITableFunctionBinding
@@ -176,7 +182,8 @@ internal sealed class DuckLakeDeltaMaintain
             cutoff = $"(now() - CAST({Lit(_o.OlderThan)} AS INTERVAL))";
             Query($"SELECT {cutoff} IS NOT NULL");
         }
-        var sync = new DuckLakeDeltaSync(_opener, _o.Lake, _o.Mapping, _o.Timestamps, _o.DeletionVectors);
+        var sync = new DuckLakeDeltaSync(_opener, _o.Lake, _o.Mapping, _o.Timestamps, _o.DeletionVectors, _o.Partitioning,
+            _o.ChangeDataFeed);
         var (dataPath, checkpointsSafe, _, tables) = sync.Describe(_o.MetadataSchema);
         var targets = tables.Where(t => _o.Table is null || DuckLakeDeltaSync.MatchesFilter(_o.Table, t.Schema, t.Table)).ToList();
         if (_o.Table is not null && targets.Count == 0)

@@ -679,3 +679,390 @@ column_mapping must be 'name', 'id' or 'none'
 
 statement ok
 DETACH lake3;
+
+# ============================================================================
+# 12. STATISTICS — timestamps (to milliseconds, a minimum rounded down and a maximum up) and fields inside structs
+#     reach the Delta stats; nothing inside a list does.
+# ============================================================================
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta4.ducklake' AS lake4 (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl4/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake4.st (id INTEGER, ts TIMESTAMP, tz TIMESTAMPTZ, s STRUCT(x INTEGER, y VARCHAR), l INTEGER[]);
+
+statement ok
+INSERT INTO lake4.st VALUES
+  (1, TIMESTAMP '2024-01-01 12:34:56.123456', TIMESTAMPTZ '2024-01-01 12:34:56.123456+01', {'x': 5, 'y': NULL}, [1]),
+  (2, TIMESTAMP '2024-01-01 12:34:56.123900', TIMESTAMPTZ '2024-01-01 12:34:56.123900+01', {'x': 9, 'y': 'q'}, [2]);
+
+statement ok
+CREATE TABLE lake4.st2 AS SELECT * FROM lake4.st;
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake4', table_name := 'main.st');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake4', table_name := 'main.st2', timestamp_mapping := 'ntz');
+
+query TTTTIIIT
+SELECT json_extract_string(add.stats, '$.minValues.ts'), json_extract_string(add.stats, '$.maxValues.ts'),
+       json_extract_string(add.stats, '$.minValues.tz'), json_extract_string(add.stats, '$.maxValues.tz'),
+       json_extract(add.stats, '$.minValues.s.x')::INT, json_extract(add.stats, '$.maxValues.s.x')::INT,
+       json_extract(add.stats, '$.nullCount.s.y')::INT, json_extract(add.stats, '$.minValues.l') IS NULL
+FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl4/main/st/_delta_log/00000000000000000000.json') WHERE add IS NOT NULL;
+----
+2024-01-01T12:34:56.123Z	2024-01-01T12:34:56.124Z	2024-01-01T11:34:56.123Z	2024-01-01T11:34:56.124Z	5	9	1	true
+
+# timestamp_ntz has no zone
+query TT
+SELECT json_extract_string(add.stats, '$.minValues.ts'), json_extract_string(add.stats, '$.minValues.tz')
+FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl4/main/st2/_delta_log/00000000000000000000.json') WHERE add IS NOT NULL;
+----
+2024-01-01T12:34:56.123	2024-01-01T11:34:56.123Z
+
+# filters right at the sub-millisecond edges still find their rows (a bound on the wrong side would prune the file)
+query II
+SELECT (SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl4/main/st') WHERE ts < TIMESTAMP '2024-01-01 12:34:56.1235'),
+       (SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl4/main/st') WHERE ts > TIMESTAMP '2024-01-01 12:34:56.1238');
+----
+1	1
+
+query II
+SELECT (SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl4/main/st') WHERE s.x = 9),
+       (SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl4/main/st') WHERE s.x > 9);
+----
+1	0
+
+statement ok
+DETACH lake4;
+
+# ============================================================================
+# 13. PARTITIONING — an IDENTITY key of DuckLake's partitioning becomes a Delta partition column (partitionValues
+#     from DuckLake's metadata, keyed by the physical name; the column stays in the file too); a transform such as
+#     year(ts) is not declared — as `ts` it would REPLACE the column's values — and works through the statistics
+#     instead. The path layout (hive_file_pattern) does not matter. Fixed at the first sync.
+# ============================================================================
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta5.ducklake' AS lake5 (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl5/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake5.p (id INTEGER, region VARCHAR, d DATE, ts TIMESTAMP);
+
+statement ok
+ALTER TABLE lake5.p SET PARTITIONED BY (region, d, year(ts));
+
+statement ok
+INSERT INTO lake5.p VALUES (1, 'eu', DATE '2024-01-01', TIMESTAMP '2024-05-01'), (2, 'us', DATE '2024-01-02', TIMESTAMP '2025-05-01'),
+  (3, NULL, NULL, TIMESTAMP '2025-06-01'), (4, 'eu', DATE '2024-01-01', TIMESTAMP '2025-07-01');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.p');
+
+query T
+SELECT metaData.partitionColumns FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/p/_delta_log/00000000000000000000.json') WHERE metaData IS NOT NULL;
+----
+[region, d]
+
+# one add per DuckLake file, each with its values (NULL for NULL); partition columns get no statistics
+query TTII
+SELECT add.partitionValues.region, add.partitionValues.d, json_extract(add.stats, '$.numRecords')::INT,
+       (json_extract(add.stats, '$.minValues.region') IS NULL AND json_extract(add.stats, '$.minValues.id') IS NOT NULL)::INT
+FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/p/_delta_log/00000000000000000000.json') WHERE add IS NOT NULL
+ORDER BY 1 NULLS LAST, 2;
+----
+eu	2024-01-01	1	1
+eu	2024-01-01	1	1
+us	2024-01-02	1	1
+NULL	NULL	1	1
+
+statement ok
+UPDATE lake5.p SET region = 'us' WHERE id = 1;
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.p');
+
+query ITT
+SELECT id, region, d FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/p') ORDER BY id;
+----
+1	us	2024-01-01
+2	us	2024-01-02
+3	NULL	NULL
+4	eu	2024-01-01
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl5' AS d5 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query ITT
+SELECT id, region, d FROM d5.main.p ORDER BY id;
+----
+1	us	2024-01-01
+2	us	2024-01-02
+3	NULL	NULL
+4	eu	2024-01-01
+
+query II
+SELECT (SELECT count(*) FROM d5.main.p WHERE region = 'us'), (SELECT count(*) FROM d5.main.p WHERE region IS NULL);
+----
+2	1
+
+statement ok
+DETACH d5;
+
+# id column mapping: the keys are col-<id>, and our native reader found no value when the file holds the partition
+# column too (it looked the value up by the file's name for the column) — read NULL before the fix
+statement ok
+CREATE TABLE lake5.pid (id INTEGER, k INTEGER);
+
+statement ok
+ALTER TABLE lake5.pid SET PARTITIONED BY (k);
+
+statement ok
+INSERT INTO lake5.pid VALUES (1, 10), (2, 20);
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.pid', column_mapping := 'id');
+
+query T
+SELECT list_sort(list(add.partitionValues."col-2")) FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/pid/_delta_log/00000000000000000000.json')
+WHERE add IS NOT NULL;
+----
+[10, 20]
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl5' AS d5 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query II
+SELECT id, k FROM d5.main.pid ORDER BY id;
+----
+1	10
+2	20
+
+# pruned to one file, which the native reader reads on its per-file path — the one that had the wrong lookup
+query II
+SELECT id, k FROM d5.main.pid WHERE k = 20;
+----
+2	20
+
+statement ok
+DETACH d5;
+
+# a transform alone is not declared; hive_file_pattern := false is declared like the default; an empty string (NULL
+# in Delta) keeps a key undeclared; partitioning := false declares nothing
+statement ok
+CREATE TABLE lake5.py (id INTEGER, ts TIMESTAMP);
+
+statement ok
+ALTER TABLE lake5.py SET PARTITIONED BY (year(ts));
+
+statement ok
+INSERT INTO lake5.py VALUES (1, TIMESTAMP '2024-01-01'), (2, TIMESTAMP '2025-01-01');
+
+statement ok
+CREATE TABLE lake5.pflat (id INTEGER, r VARCHAR);
+
+statement ok
+CALL lake5.set_option('hive_file_pattern', false, table_name => 'pflat');
+
+statement ok
+ALTER TABLE lake5.pflat SET PARTITIONED BY (r);
+
+statement ok
+INSERT INTO lake5.pflat VALUES (1, 'x'), (2, 'y');
+
+statement ok
+CREATE TABLE lake5.pempty (id INTEGER, r VARCHAR);
+
+statement ok
+ALTER TABLE lake5.pempty SET PARTITIONED BY (r);
+
+statement ok
+INSERT INTO lake5.pempty VALUES (1, ''), (2, 'y');
+
+statement ok
+CREATE TABLE lake5.poff (id INTEGER, r VARCHAR);
+
+statement ok
+ALTER TABLE lake5.poff SET PARTITIONED BY (r);
+
+statement ok
+INSERT INTO lake5.poff VALUES (3, 'z');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.py');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.pflat');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.pempty');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.poff', partitioning := false);
+
+query TT
+SELECT parse_filename(parse_dirpath(parse_dirpath(filename))), metaData.partitionColumns
+FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/p*/_delta_log/00000000000000000000.json', filename := true)
+WHERE metaData IS NOT NULL ORDER BY 1;
+----
+p	[region, d]
+pempty	[]
+pflat	[r]
+pid	[k]
+poff	[]
+py	[]
+
+# the year() table still skips by statistics: the files are one per year, so their bounds do not overlap
+query I
+SELECT count(*) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/py') WHERE ts >= TIMESTAMP '2025-01-01';
+----
+1
+
+# a partitioning changed after the first sync cannot be mirrored: Delta cannot change a table's partition columns
+statement ok
+ALTER TABLE lake5.pflat SET PARTITIONED BY (id);
+
+statement ok
+INSERT INTO lake5.pflat VALUES (3, 'z');
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.pflat');
+----
+has no value for partition column 'r', which the Delta mirror is partitioned by
+
+# ============================================================================
+# 14. CHANGE DATA FEED (change_data_feed := true) — a commit's change rows come from DuckLake's own change feed
+#     (ducklake_table_changes) and go to _change_data files with physical names and field ids, one per partition.
+#     A commit of only inserts needs none; a compaction (merge, rewrite) is not a change: dataChange = false.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake5.c (id INTEGER, k INTEGER, s STRUCT(a INTEGER, b VARCHAR), l STRUCT(q INTEGER)[]);
+
+statement ok
+ALTER TABLE lake5.c SET PARTITIONED BY (k);
+
+statement ok
+INSERT INTO lake5.c VALUES (1, 10, {'a': 1, 'b': 'x'}, [{'q': 1}]), (2, 20, NULL, NULL), (3, 20, {'a': 3, 'b': 'z'}, []);
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.c', column_mapping := 'id', change_data_feed := true);
+
+statement ok
+UPDATE lake5.c SET k = 20, s = {'a': 9, 'b': 'w'} WHERE id = 1;
+
+statement ok
+DELETE FROM lake5.c WHERE id = 2;
+
+statement ok
+INSERT INTO lake5.c VALUES (4, 10, NULL, [{'q': 4}]);
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.c');
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl5' AS d5 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query TIIIIT
+SELECT _change_type, _commit_version, id, k, s.a, l FROM d5.delta.changes('main.c', starting_version := 0, ending_version := 9)
+ORDER BY _commit_version, id, _change_type;
+----
+insert	0	1	10	1	[{'q': 1}]
+insert	0	2	20	NULL	NULL
+insert	0	3	20	3	[]
+update_postimage	1	1	20	9	[{'q': 1}]
+update_preimage	1	1	10	1	[{'q': 1}]
+delete	2	2	20	NULL	NULL
+insert	3	4	10	NULL	[{'q': 4}]
+
+# the update moved its row across partitions: one cdc file per partition, each with its partitionValues; the pure
+# insert commit (v3) has none
+query IT
+SELECT parse_filename(filename, true)[-1:]::INT AS v, cdc.partitionValues."col-2"
+FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/c/_delta_log/0000000000000000000*.json', filename := true)
+WHERE cdc IS NOT NULL ORDER BY 1, 2;
+----
+1	10
+1	20
+2	20
+
+# the cdc files carry the physical names and field ids, struct members included
+query TI
+SELECT DISTINCT name, field_id FROM parquet_schema('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/c/_change_data/*.parquet')
+WHERE name LIKE 'col-%' OR name = '_change_type' ORDER BY field_id NULLS LAST;
+----
+col-1	1
+col-2	2
+col-3	3
+col-4	4
+col-5	5
+col-6	6
+col-8	8
+_change_type	NULL
+
+statement ok
+DETACH d5;
+
+statement ok
+SELECT 'rewrite', * FROM ducklake_rewrite_data_files('lake5', 'c', delete_threshold => 0);
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.c');
+
+# the rewrite's commit: files only rearranged, no row changed
+query IIT
+SELECT count(*) FILTER (WHERE add IS NOT NULL OR remove IS NOT NULL), count(*) FILTER (WHERE add.dataChange OR remove.dataChange),
+       (SELECT content LIKE '%"cdc"%' FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/c/_delta_log/00000000000000000004.json'))
+FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/dl5/main/c/_delta_log/00000000000000000004.json');
+----
+2	0	false
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl5' AS d5 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query I
+SELECT count(*) FROM d5.delta.changes('main.c', starting_version := 4, ending_version := 4);
+----
+0
+
+query IIT
+SELECT id, k, s.b FROM d5.main.c ORDER BY id;
+----
+1	20	w
+3	20	z
+4	10	NULL
+
+statement ok
+DETACH d5;
+
+# switched on later: the feed starts at the commit that switched it on
+statement ok
+CREATE TABLE lake5.late (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO lake5.late VALUES (1, 'a'), (2, 'b');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.late');
+
+statement ok
+UPDATE lake5.late SET v = 'B' WHERE id = 2;
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake5', table_name := 'main.late', change_data_feed := true);
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl5' AS d5 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query TIT
+SELECT _change_type, id, v FROM d5.delta.changes('main.late', starting_version := 1, ending_version := 1) ORDER BY _change_type;
+----
+update_postimage	2	B
+update_preimage	2	b
+
+statement ok
+DETACH d5;
+
+statement ok
+DETACH lake5;

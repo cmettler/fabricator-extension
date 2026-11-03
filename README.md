@@ -576,7 +576,19 @@ What the profile drives automatically:
   deletes as deletion vectors, DuckLake's row ids as Delta row tracking, and type widening (`INT` → `BIGINT`)
   declared as such. Options: `table_name := 'schema.table'`, `column_mapping := 'name'` (default; what Fabric
   reads), `'id'` or `'none'`, `deletion_vectors := false`, `timestamp_mapping := 'utc'` (default) or `'ntz'`,
-  `metadata_schema := '…'`.
+  `partitioning := false`, `change_data_feed := true`, `metadata_schema := '…'`.
+  - **Partitioning.** A partition key that is a plain column (`PARTITIONED BY (region)`) becomes a Delta partition
+    column, so Delta readers skip partitions by value. A key with a transform (`year(ts)`, `bucket(…)`) is not
+    declared, because Delta has no such partitions; DuckLake still writes one file per value, and Delta readers skip
+    them by the file statistics instead. Integer, string, date, boolean and decimal columns qualify; timestamps do
+    not. It does not matter whether DuckLake writes hive-style paths. The partitioning is fixed at a table's first
+    sync: if it changes later, the sync refuses, since Delta cannot change a table's partition columns.
+    `partitioning := false` declares none.
+  - **Change data feed** (`change_data_feed := true`, can be switched on later, not off). Each Delta version then
+    carries DuckLake's own row changes (`ducklake_table_changes`: inserts, deletes, and updates as pre- and
+    post-images) in `_change_data` files, the files Delta's change feed reads (measured with
+    `<catalog>.delta.changes(…)`; Spark's `table_changes` not yet). A version that only rearranges files (merge,
+    rewrite) is marked as no data change.
   - Put the lake's data under the Lakehouse's `Tables/` folder (`DATA_PATH '…/LH.Lakehouse/Tables/'`, a DuckLake
     schema `dbo`): Fabric only reads a Delta table whose files sit inside its folder.
   - Set `CALL lake.set_option('auto_compact', false)` and `true` per schema
@@ -588,7 +600,8 @@ What the profile drives automatically:
     DuckLake snapshot only once it has none: a small insert reaches Delta when `ducklake_flush_inlined_data`
     (or a DuckLake `CHECKPOINT`) moves it into a file, and then with its own snapshot.
   - For SQL Server's DELTA reader (`OPENROWSET … FORMAT = 'DELTA'`, external tables), which reads neither column
-    mapping nor deletion vectors, sync with `column_mapping := 'none', deletion_vectors := false`. A DELETE then
+    mapping nor deletion vectors, sync with `column_mapping := 'none', deletion_vectors := false` (and
+    `partitioning := false` for an external table, which reads partition columns as NULL). A DELETE then
     reaches Delta only after `CALL ducklake_rewrite_data_files('lake', 'tbl', delete_threshold => 0)` has
     rewritten the affected files, and a column rename is refused while files with the old name exist.
   - Refused rather than mirrored wrong, naming the column: with `'name'` mapping, a rename after which new
@@ -623,7 +636,8 @@ What the profile drives automatically:
     `set_option` call that enables it.
   - `dry_run := true` reports what the deleting steps would delete; flush, merge and sync still run.
     `table_name := 'schema.table'` limits flush, merge and sync; expire and cleanup are lake-wide, as in DuckLake.
-    The sync options (`column_mapping`, `deletion_vectors`, `timestamp_mapping`, `metadata_schema`) pass through.
+    The sync options (`column_mapping`, `deletion_vectors`, `timestamp_mapping`, `partitioning`,
+    `change_data_feed`, `metadata_schema`) pass through.
   ```sql
   SELECT * FROM ducklake_delta_maintain('lake', older_than := '7 days', orphans := true);
   ```

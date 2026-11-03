@@ -1849,7 +1849,11 @@ internal static class DeltaNativeReader
                 // is the authoritative source (paths are opaque; the presence probe would otherwise
                 // NULL-backfill them like schema evolution). Keys are PHYSICAL under column mapping
                 // (new commits) or logical (old EW commits) — dual lookup, sentinel/missing => NULL.
-                string? pv = LookupPartitionValue(f.PartitionValues, c, stored);
+                // ⚠ `stored` is the name THIS FILE gives the column, which in id mode is not the physical name the
+                // keys use whenever the file carries the partition column too (DuckLake writes it there; measured:
+                // the value read as NULL). So the physical name is tried first.
+                string? pv = LookupPartitionValue(f.PartitionValues, c, PhysicalName(field))
+                             ?? LookupPartitionValue(f.PartitionValues, c, stored);
                 expr = pv is null
                     ? $"CAST(NULL AS {TypeText(field.Type)})"
                     : $"CAST('{pv.Replace("'", "''")}' AS {TypeText(field.Type)})";
