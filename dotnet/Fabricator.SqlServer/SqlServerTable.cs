@@ -313,6 +313,14 @@ SELECT N'd', c.name, dc.definition
     private System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>>? _uncollatable;
 
     /// <summary>
+    /// The NOLOCK hint for the database-wide catalog reads below, or nothing on a warehouse engine. On box SQL Server
+    /// these reads would otherwise wait for every other transaction's uncommitted DDL (the 2026-11-03 hang). Fabric
+    /// Warehouse and the Lakehouse SQL endpoint REFUSE the hint ("Table hint NOLOCK is not allowed", measured
+    /// 2026-11-03) and read catalog views under snapshot isolation, so they neither need nor accept it.
+    /// </summary>
+    private string CatalogNoLock => Profile.IsWarehouse ? "" : " WITH (NOLOCK)";
+
+    /// <summary>
     /// Columns of this database whose server type takes no COLLATE clause (json, text, ntext, xml,
     /// sql_variant, CLR types), keyed by <see cref="ExternalKey"/>. The remote pushdown reads them: they surface
     /// as DuckDB strings, and the T-SQL emitter gives every string its collation. Loaded once, dropped with the
@@ -325,10 +333,11 @@ SELECT N'd', c.name, dc.definition
             return cached;
         }
         var loaded = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-        const string sql =
+        string nl = CatalogNoLock;
+        string sql =
             "SELECT s.name, o.name, c.name, TYPE_NAME(c.system_type_id) " +
-            "FROM sys.columns c WITH (NOLOCK) JOIN sys.objects o WITH (NOLOCK) ON o.object_id = c.object_id " +
-            "JOIN sys.schemas s WITH (NOLOCK) ON s.schema_id = o.schema_id " +
+            $"FROM sys.columns c{nl} JOIN sys.objects o{nl} ON o.object_id = c.object_id " +
+            $"JOIN sys.schemas s{nl} ON s.schema_id = o.schema_id " +
             "WHERE o.type IN ('U', 'V') AND (c.system_type_id IN (35, 98, 99, 240, 241) " +
             "OR TYPE_NAME(c.system_type_id) = 'json')";
         foreach (var row in ReadMetadataRows(sql, 4))
@@ -363,11 +372,12 @@ SELECT N'd', c.name, dc.definition
             return cached;
         }
         var loaded = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, (int Bytes, bool Unicode)>>(StringComparer.OrdinalIgnoreCase);
-        const string sql =
+        string nl = CatalogNoLock;
+        string sql =
             "SELECT s.name, o.name, c.name, CAST(c.max_length AS VARCHAR(10)), " +
             "CASE WHEN c.system_type_id IN (231, 239) THEN '1' ELSE '0' END " +
-            "FROM sys.columns c WITH (NOLOCK) JOIN sys.objects o WITH (NOLOCK) ON o.object_id = c.object_id " +
-            "JOIN sys.schemas s WITH (NOLOCK) ON s.schema_id = o.schema_id " +
+            $"FROM sys.columns c{nl} JOIN sys.objects o{nl} ON o.object_id = c.object_id " +
+            $"JOIN sys.schemas s{nl} ON s.schema_id = o.schema_id " +
             "WHERE o.type IN ('U', 'V', 'IF', 'TF') AND c.max_length > 0 AND (" +
             "(c.system_type_id IN (167, 175) AND c.max_length <= 2666) OR " +
             "(c.system_type_id IN (231, 239) AND c.max_length <= 5332))";
