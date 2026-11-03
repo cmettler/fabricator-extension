@@ -190,8 +190,58 @@ static void RetireMatching(MAP &cache, const std::function<bool(const string &)>
 	}
 }
 
-void FabricatorSchemaEntry::AddTable(const string &table_name, const string &table_type) {
+int64_t FabricatorSchemaEntry::ActiveTxnId(ClientContext &context) {
+	if (!context.transaction.HasActiveTransaction()) {
+		return -1;
+	}
+	return (int64_t)MetaTransaction::Get(context).global_transaction_id;
+}
+
+void FabricatorSchemaEntry::NotePendingLocked(const string &table_name, int64_t owner_txn) {
+	if (owner_txn < 0 || pending_.find(table_name) != pending_.end()) {
+		return;
+	}
+	auto it = table_types_.find(table_name);
+	pending_[table_name] = PendingTableName {owner_txn, it != table_types_.end(),
+	                                         it != table_types_.end() ? it->second : string()};
+}
+
+void FabricatorSchemaEntry::RemoveTable(const string &table_name, int64_t owner_txn) {
 	lock_guard<mutex> lock(entry_lock_);
+	NotePendingLocked(table_name, owner_txn);
+	table_types_.erase(table_name);
+	RetireErase(entries_, table_name, retired_entries_);
+	RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
+}
+
+void FabricatorSchemaEntry::EndTransaction(int64_t txn_id, bool committed) {
+	{
+		lock_guard<mutex> lock(entry_lock_);
+		for (auto it = pending_.begin(); it != pending_.end();) {
+			if (it->second.owner != txn_id) {
+				++it;
+				continue;
+			}
+			if (!committed) {
+				if (it->second.existed_before) {
+					table_types_[it->first] = it->second.type_before;
+				} else {
+					table_types_.erase(it->first);
+				}
+				RetireErase(entries_, it->first, retired_entries_);
+				RetireAtEntriesFor(at_entries_, it->first, retired_entries_);
+			}
+			it = pending_.erase(it);
+		}
+	}
+	for (auto &child : child_schemas_) {
+		child.second->EndTransaction(txn_id, committed);
+	}
+}
+
+void FabricatorSchemaEntry::AddTable(const string &table_name, const string &table_type, int64_t owner_txn) {
+	lock_guard<mutex> lock(entry_lock_);
+	NotePendingLocked(table_name, owner_txn);
 	table_types_[table_name] = table_type;
 	// Drop any cached entry so the schema is re-fetched (e.g. after CREATE OR REPLACE).
 	RetireErase(entries_, table_name, retired_entries_);
@@ -404,8 +454,21 @@ static void ApplyColumnDefault(ColumnDefinition &column, const string &text) {
 }
 
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name,
-                                                                 optional_ptr<BoundAtClause> at) {
-	lock_guard<mutex> lock(entry_lock_);
+                                                                 optional_ptr<BoundAtClause> at, bool enumerating) {
+	unique_lock<mutex> lock(entry_lock_);
+	// A name another transaction changed and has not committed (see pending_): enumeration skips it, and a
+	// direct reference sees the state before — absent if it was created, otherwise described afresh,
+	// neither taken from nor put into the shared cache, and never erased on a miss.
+	bool foreign_pending = false;
+	{
+		auto pending = pending_.find(table_name);
+		if (pending != pending_.end() && pending->second.owner != ActiveTxnId(context)) {
+			if (enumerating || !pending->second.existed_before) {
+				return nullptr;
+			}
+			foreign_pending = true;
+		}
+	}
 	// A time-travel reference resolves against its OWN map: the entry it needs describes the table as of
 	// that version, and putting it in entries_ would both shadow the latest one and leak into the
 	// context-free Scan() overload, which walks entries_ directly.
@@ -418,7 +481,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		if (at_cached != at_entries_.end()) {
 			return at_cached->second.get();
 		}
-	} else {
+	} else if (!foreign_pending) {
 		auto cached = entries_.find(table_name);
 		if (cached != entries_.end()) {
 			return cached->second.get();
@@ -449,8 +512,22 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 			return h;
 		}
 	};
+	// ⚠⚠ THE LOCK IS RELEASED FOR THE PROVIDER CALLS BELOW. Holding it across them deadlocked parallel
+	// transactions doing DDL (dbt's table swap at --threads > 1, 2026-11-03): enumerating in transaction A
+	// described a table transaction B had created or renamed and not committed, so A's describe waited in
+	// SQL Server for B — while B waited here, in the client, for this lock. SQL Server saw only an idle
+	// session holding locks and the run hung forever. Without the lock B goes on and commits, and A's
+	// describe returns. Two threads that both miss the same name each describe it; the first to come back
+	// wins and the other's entry is dropped unused.
+	lock.unlock();
+
 	// Established absence, from EITHER crossing: forget the name everywhere and answer not-found.
 	auto forget_absent = [&]() {
+		lock_guard<mutex> relock(entry_lock_);
+		auto pending = pending_.find(table_name);
+		if (foreign_pending || (pending != pending_.end() && pending->second.owner != ActiveTxnId(context))) {
+			return;
+		}
 		table_types_.erase(table_name);
 		RetireErase(entries_, table_name, retired_entries_);
 		RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
@@ -593,12 +670,28 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	                                           std::move(rowid_indices), std::move(rowid_type),
 	                                           std::move(virtual_rowid_columns),
 	                                           std::move(provider_virtual_columns));
-	auto &ref = *entry;
-	if (at) {
-		at_entries_[at_key] = std::move(entry);
-	} else {
-		entries_[table_name] = std::move(entry);
+	lock.lock();
+	if (foreign_pending) {
+		// handed out as a raw pointer like every entry, so it lives in the graveyard rather than the cache
+		auto &ref = *entry;
+		retired_entries_.push_back(std::move(entry));
+		return &ref;
 	}
+	if (at) {
+		auto raced = at_entries_.find(at_key);
+		if (raced != at_entries_.end()) {
+			return raced->second.get();
+		}
+		auto &ref = *entry;
+		at_entries_[at_key] = std::move(entry);
+		return &ref;
+	}
+	auto raced = entries_.find(table_name);
+	if (raced != entries_.end()) {
+		return raced->second.get();
+	}
+	auto &ref = *entry;
+	entries_[table_name] = std::move(entry);
 	return &ref;
 }
 
@@ -4502,7 +4595,7 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			// the empty-result-as-success failure this file records elsewhere.
 			optional_ptr<CatalogEntry> catalog_entry;
 			try {
-				catalog_entry = GetOrCreateEntry(context, table_name);
+				catalog_entry = GetOrCreateEntry(context, table_name, nullptr, /*enumerating=*/true);
 			} catch (std::exception &ex) {
 				ErrorData error(ex);
 				// ⚠⚠ THREE KINDS ARE NOT "this one table is broken" AND MUST NOT BE SWALLOWED.
@@ -4842,7 +4935,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	                      defaults_arg, partition_arg, sort_arg, identity_arg, options_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
-	AddTable(base.GetQualifiedName().Name().GetIdentifierName(), "BASE TABLE");
+	AddTable(base.GetQualifiedName().Name().GetIdentifierName(), "BASE TABLE", ActiveTxnId(context));
 	return GetOrCreateEntry(context, base.GetQualifiedName().Name().GetIdentifierName());
 }
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
@@ -4882,10 +4975,7 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	FabricatorSetActiveTxn(handle_, context);
 	fabricator::DropTable(handle_, SchemaPathStrings(), info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
 
-	lock_guard<mutex> lock(entry_lock_);
-	table_types_.erase(info.GetQualifiedName().Name().GetIdentifierName());
-	RetireErase(entries_, info.GetQualifiedName().Name().GetIdentifierName(), retired_entries_);
-	RetireAtEntriesFor(at_entries_, info.GetQualifiedName().Name().GetIdentifierName(), retired_entries_);
+	RemoveTable(info.GetQualifiedName().Name().GetIdentifierName(), ActiveTxnId(context));
 }
 // (The hand-rolled JsonPathArray helper died with ABI v74: FabricatorRenderAlterJson owns every string in
 //  the request now. It escaped only `"` and `\`, so a legal DuckDB identifier carrying a control character
@@ -5268,12 +5358,15 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		// A rename MOVES the entry rather than refreshing it: the name list is re-keyed and both names are
 		// evicted (the old one is gone, the new one may shadow a stale entry).
 		auto &rt = table_info.Cast<RenameTableInfo>();
+		auto txn_id = ActiveTxnId(context);
 		lock_guard<mutex> lock(entry_lock_);
 		auto it = table_types_.find(table);
 		string type = it != table_types_.end() ? it->second : string("BASE TABLE");
+		NotePendingLocked(table, txn_id);
 		table_types_.erase(table);
 		RetireErase(entries_, table, retired_entries_);
 		RetireAtEntriesFor(at_entries_, table, retired_entries_);
+		NotePendingLocked(rt.new_table_name.GetIdentifierName(), txn_id);
 		table_types_[rt.new_table_name.GetIdentifierName()] = type;
 		RetireErase(entries_, rt.new_table_name.GetIdentifierName(), retired_entries_);
 		RetireAtEntriesFor(at_entries_, rt.new_table_name.GetIdentifierName(), retired_entries_);

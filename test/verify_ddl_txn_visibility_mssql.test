@@ -1,0 +1,225 @@
+# name: test/verify_ddl_txn_visibility_mssql.test
+# description: Table names changed by a DuckDB transaction that has not ended. A CREATE, RENAME or DROP is seen
+#              by its own transaction at once and by every other transaction only after COMMIT; a ROLLBACK
+#              puts the old names back. Before this, the catalog's name list was shared, so another
+#              transaction's enumeration described a table SQL Server had not committed: it either waited
+#              while the owner waited for it in the client (a hang SQL Server cannot detect), or got 208 and
+#              erased the name, after which the owner could not find its own table. §5 is dbt-duckdb's table
+#              swap in parallel transactions, the shape that hung (2026-11-03).
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('db', 'IF SCHEMA_ID(''fab_ddlvis'') IS NULL EXEC(''CREATE SCHEMA fab_ddlvis'');
+  DECLARE @s nvarchar(max) = N''''; SELECT @s += N''DROP TABLE fab_ddlvis.'' + QUOTENAME(name) + N'';''
+  FROM sys.tables WHERE schema_id = SCHEMA_ID(''fab_ddlvis''); EXEC(@s)');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# ── §1 a CREATE is the creating transaction's until COMMIT ───────────────────────────────────────────────
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+CREATE TABLE db.fab_ddlvis.c1 AS SELECT 41 AS a;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name = 'c1';
+----
+1
+
+query I con2
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name = 'c1';
+----
+0
+
+# a direct reference from another transaction sees the state before: the table does not exist yet
+statement error con2
+SELECT * FROM db.fab_ddlvis.c1;
+----
+does not exist
+
+query I con1
+SELECT a FROM db.fab_ddlvis.c1;
+----
+41
+
+statement ok con1
+COMMIT;
+
+query I con2
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name = 'c1';
+----
+1
+
+query I con2
+SELECT a FROM db.fab_ddlvis.c1;
+----
+41
+
+# ── §2 a rolled-back CREATE leaves no name behind, for anyone ────────────────────────────────────────────
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+CREATE TABLE db.fab_ddlvis.c2 AS SELECT 1 AS a;
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name = 'c2';
+----
+0
+
+query I con2
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name = 'c2';
+----
+0
+
+# ── §3 a RENAME: both names are left out of other transactions' listings until it ends ──────────────────
+
+statement ok
+CREATE TABLE db.fab_ddlvis.r1 AS SELECT 7 AS a;
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+ALTER TABLE db.fab_ddlvis.r1 RENAME TO r2;
+
+query T con1
+SELECT string_agg(table_name, ',' ORDER BY table_name) FROM duckdb_tables()
+WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name IN ('r1', 'r2');
+----
+r2
+
+query I con2
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name IN ('r1', 'r2');
+----
+0
+
+# ROLLBACK puts the old name back — in the transaction that renamed and in every other one
+statement ok con1
+ROLLBACK;
+
+query T con1
+SELECT string_agg(table_name, ',' ORDER BY table_name) FROM duckdb_tables()
+WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name IN ('r1', 'r2');
+----
+r1
+
+query I con2
+SELECT a FROM db.fab_ddlvis.r1;
+----
+7
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+ALTER TABLE db.fab_ddlvis.r1 RENAME TO r2;
+
+statement ok con1
+COMMIT;
+
+query T con2
+SELECT string_agg(table_name, ',' ORDER BY table_name) FROM duckdb_tables()
+WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name IN ('r1', 'r2');
+----
+r2
+
+# ── §4 a rolled-back DROP keeps the table ────────────────────────────────────────────────────────────────
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DROP TABLE db.fab_ddlvis.r2;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name = 'r2';
+----
+0
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis' AND table_name = 'r2';
+----
+1
+
+query I con2
+SELECT a FROM db.fab_ddlvis.r2;
+----
+7
+
+# ── §5 dbt-duckdb's table swap in parallel transactions ──────────────────────────────────────────────────
+
+loop w 0 6
+
+statement ok
+CREATE TABLE db.fab_ddlvis.s{w} AS SELECT -1 AS r;
+
+endloop
+
+concurrentloop w 0 6
+
+loop r 0 3
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE db.fab_ddlvis.s{w}__dbt_tmp AS SELECT {r} AS r FROM range(100);
+
+statement ok
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis';
+
+statement ok
+ALTER TABLE db.fab_ddlvis.s{w} RENAME TO s{w}__dbt_backup;
+
+statement ok
+ALTER TABLE db.fab_ddlvis.s{w}__dbt_tmp RENAME TO s{w};
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE db.fab_ddlvis.s{w}__dbt_backup;
+
+endloop
+
+endloop
+
+# every swap landed: six tables, each holding the last round, no tmp or backup left behind
+query III
+SELECT count(*), min(r), max(r) FROM (
+  SELECT DISTINCT r FROM db.fab_ddlvis.s0 UNION ALL SELECT DISTINCT r FROM db.fab_ddlvis.s1 UNION ALL
+  SELECT DISTINCT r FROM db.fab_ddlvis.s2 UNION ALL SELECT DISTINCT r FROM db.fab_ddlvis.s3 UNION ALL
+  SELECT DISTINCT r FROM db.fab_ddlvis.s4 UNION ALL SELECT DISTINCT r FROM db.fab_ddlvis.s5);
+----
+6	2	2
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'db' AND schema_name = 'fab_ddlvis'
+AND (table_name LIKE '%dbt_tmp' OR table_name LIKE '%dbt_backup');
+----
+0
+
+query I
+SELECT fabricator_exec('db', 'IF EXISTS (SELECT 1 FROM sys.tables WHERE schema_id = SCHEMA_ID(''fab_ddlvis'')
+  AND (name LIKE ''%dbt_tmp'' OR name LIKE ''%dbt_backup'')) THROW 50000, ''leftover'', 1');
+----
+0

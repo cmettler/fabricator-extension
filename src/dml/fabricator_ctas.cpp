@@ -113,9 +113,10 @@ SinkFinalizeType FabricatorPhysicalCreateTableAs::Finalize(Pipeline &pipeline, E
 	gstate.bulk_completed = true;
 	gstate.bulk_session = nullptr;
 	gstate.total = (idx_t)fabricator::CompleteBulk(session, /*abort=*/false);
-	// Make the new table visible in the attached catalog for this session.
+	// Make the new table visible in the attached catalog — to this transaction until it commits.
 	if (info_.schema_entry) {
-		const_cast<FabricatorSchemaEntry &>(*info_.schema_entry).AddTable(info_.table_name, "BASE TABLE");
+		const_cast<FabricatorSchemaEntry &>(*info_.schema_entry)
+		    .AddTable(info_.table_name, "BASE TABLE", FabricatorSchemaEntry::ActiveTxnId(context));
 	}
 	return SinkFinalizeType::READY;
 }
@@ -177,7 +178,8 @@ SourceResultType FabricatorPhysicalRemoteCreateTableAs::GetDataInternal(Executio
 	FabricatorSetActiveTxn(info_.handle, client);
 	auto rows = fabricator::ExecuteDml(info_.handle, info_.remote_insert_sql);
 	if (info_.schema_entry) {
-		const_cast<FabricatorSchemaEntry &>(*info_.schema_entry).AddTable(info_.table_name, "BASE TABLE");
+		const_cast<FabricatorSchemaEntry &>(*info_.schema_entry)
+		    .AddTable(info_.table_name, "BASE TABLE", FabricatorSchemaEntry::ActiveTxnId(client));
 	}
 	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT(rows));

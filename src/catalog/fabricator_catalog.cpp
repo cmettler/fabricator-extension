@@ -281,6 +281,13 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	RegisterDeclarationsLocked();
 }
 
+void FabricatorCatalog::EndTransaction(int64_t txn_id, bool committed) {
+	lock_guard<mutex> lock(schema_lock_);
+	for (auto &entry : schemas_) {
+		entry.second->EndTransaction(txn_id, committed);
+	}
+}
+
 void FabricatorCatalog::InvalidateAllEntries() {
 	lock_guard<mutex> lock(schema_lock_);
 	for (auto &entry : schemas_) {

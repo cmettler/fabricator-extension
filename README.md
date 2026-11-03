@@ -797,6 +797,13 @@ transaction's life (and on Fabric/Synapse it buffers reads instead of streaming 
 to materialise once into DuckDB (`CREATE TEMP TABLE … AS SELECT`). Details and measurements:
 [known-limitations.md](docs/known-limitations.md) 1.16–1.17.
 
+**Tables created, renamed or dropped inside a transaction belong to that transaction until it ends.** Other
+DuckDB connections on the same `ATTACH` do not see a table another transaction is creating: `duckdb_tables()`
+leaves it out, and a direct reference reports that it does not exist. A table that is being renamed or
+dropped is also left out of their listings. After `COMMIT` everyone sees the new state; after `ROLLBACK` the
+old names are back. This is what lets parallel `BEGIN … COMMIT` blocks swap tables, as dbt does at
+`--threads > 1`. Until 2026-11-03 such runs could hang forever. Details: [transactions.md](docs/transactions.md) §8.
+
 ## INSERT / UPDATE / DELETE
 
 ```sql

@@ -1457,6 +1457,52 @@ exchange gate (`MaxThreads = 1`) serializes the EXECs on the pinned connection. 
 propagates out → fails the statement → DuckDB rolls it back. This is the proc analog of the general
 "DuckDB owns the commit signal" rule.
 
+## 8. Parallel DDL transactions — the catalog shows a transaction its own uncommitted names only (2026-11-03)
+
+dbt-duckdb's `table` materialization at `--threads > 1` is N DuckDB transactions, each running `BEGIN; CREATE
+TABLE x__dbt_tmp AS …; SELECT … FROM duckdb_tables(); ALTER TABLE x RENAME TO x__dbt_backup; ALTER TABLE
+x__dbt_tmp RENAME TO x; COMMIT; DROP TABLE x__dbt_backup`. On SQL Server this HUNG forever (user-reported,
+reproduced at 4 threads × 3 rounds every time). Each transaction ends up holding schema locks on its uncommitted
+tables, so anything another transaction reads about those tables waits in SQL Server. Three things turned that wait
+into a cycle SQL Server cannot see: the second half of each cycle was a wait in the CLIENT, and to SQL Server the
+blocking session just looked idle, sleeping on an open transaction.
+
+1. **The comment/DEFAULT read-back was database-wide** (one query over `sys.extended_properties` and
+   `sys.default_constraints`, cached, dropped by every DDL through the catalog). The next entry to materialize
+   reloaded it inside its own transaction and waited on every other transaction's uncommitted CREATE or RENAME, all
+   while holding the cache lock. MEASURED against a session holding an uncommitted `CREATE TABLE` with a default and
+   a description: the database-wide reads block under READ COMMITTED, and the DEFAULT read blocks even under READ
+   UNCOMMITTED, because `dc.definition` locks the pending object. Reading ONE committed object `WITH (NOLOCK)`
+   returns at once. So the read-back is per table now (one query for comments and defaults together), and so are
+   the two `sys.columns` scans the pushdown uses (`UncollatableColumns`, `BoundedStringColumns`).
+2. **`GetOrCreateEntry` held the schema's `entry_lock_` across the provider calls.** One transaction's
+   enumeration waited in SQL Server for a second transaction, which in turn waited in the client for that lock.
+   The lock now covers only the cache; two threads that miss the same name each describe it, and the first one
+   back wins.
+3. **The catalog's table-name list was shared by every transaction.** A CREATE or RENAME changed it for everyone
+   at once, so another transaction's `duckdb_tables()` described a table SQL Server had not committed. It either
+   waited (a cycle once the owner enumerated in turn) or got 208 and ERASED the name, after which the owner failed
+   with *"Table with name x__dbt_tmp does not exist!"* on its own rename (measured from the log: three foreign
+   enumerations erased one name). Now a name changed by an open transaction is recorded with its owner and its
+   state before (`FabricatorSchemaEntry::pending_`):
+
+   | who | sees |
+   |---|---|
+   | the owning transaction | its own state (created, renamed, dropped) at once |
+   | another transaction's enumeration | nothing for that name: it is skipped, never described |
+   | another transaction's direct reference | the state before: a created name does not exist, an existing one is described without the shared cache (it may block in SQL Server, which resolves when the owner ends) |
+   | everyone after COMMIT | the owner's state |
+   | everyone after ROLLBACK | the state before, restored. Before this, a rolled-back DROP or RENAME lost the name until a refresh |
+
+Gate: `test/verify_ddl_txn_visibility_mssql.test` (service), covering a CREATE invisible to a second connection,
+a rolled-back CREATE, a RENAME and a DROP each rolled back and committed, and the swap in six parallel
+transactions × 3 rounds. Three mutants each fail the suite: the visibility check removed (line 39), rollback
+not restoring names (line 116), and the old database-wide read restored (the swap hangs). The 16 × 10 form of the
+swap runs in 2–3 s.
+
+⚠ The pending record is in memory, per ATTACH. Another PROCESS's uncommitted DDL is not covered by it, and
+there the cycle cannot form: the other side never waits in this client.
+
 ## Key invariants & safety nets
 
 - **DuckDB owns commit/rollback.** The extension relays the decision; it never self-commits. The one place

@@ -141,32 +141,34 @@ public sealed partial class SqlServerCatalog
         }
     }
 
-    // ── COMMENT ON read-back ─────────────────────────────────────────────────────────────────────────────
+    // ── COMMENT ON + DEFAULT read-back ───────────────────────────────────────────────────────────────────
     //
-    // ⚠⚠ ONE query for the WHOLE database, cached, rather than one per table — and that is a correctness-
-    // adjacent decision, not a micro-optimisation. A comment must be on the CatalogEntry when the host
-    // CONSTRUCTS it, so it rides table_info, which is the ENTRY MATERIALIZATION crossing. Entry
-    // materialization is what catalog ENUMERATION does to EVERY table (duckdb_tables(), and dbt introspects
-    // before it builds anything), so a per-table query here would add one round trip per table to every
-    // enumeration — the cost that this provider has already been burned by twice (the OneLake enumeration
-    // slowness, and the 15871 discovery defect). sys.extended_properties is database-wide, so asking once
-    // costs one query no matter how many tables materialize afterwards.
+    // A comment and the column defaults must be on the CatalogEntry when the host CONSTRUCTS it, so they ride
+    // table_info, the entry MATERIALIZATION crossing — once per table, one round trip for both.
     //
-    // ⚠ STALENESS: a comment or default written THROUGH this catalog invalidates the cache at the write
-    // site (every ALTER, and every COMMENT ON), so read-your-own-writes holds. One changed OUT OF BAND
-    // shows up on re-ATTACH or after fabricator_refresh_cache — the latter because GetTables drops this
-    // cache, which is the ONLY thing that makes the refresh_cache half of that sentence true. It was NOT
-    // true when this cache was first written: the claim was made by appealing to a contract _externalInfo
-    // was said to document, and _externalInfo neither documents it nor lives in this file. Fixed and the
-    // reasoning replaced 2026-09-09, after a surviving mutant showed the gap.
-    private System.Collections.Generic.Dictionary<string, TableMetadata>? _meta;
-    private readonly object _metaLock = new();
+    // ⚠⚠ PER TABLE, and every system view read WITH (NOLOCK). This used to be ONE query for the whole
+    // database, and that deadlocked parallel transactions doing DDL (dbt's table swap at --threads > 1,
+    // 2026-11-03). Every write through the catalog drops the cache, so the next materialization reloaded it
+    // inside its transaction — and a database-wide read of sys.default_constraints waits for every OTHER
+    // transaction's uncommitted CREATE/RENAME, while those transactions waited for this one in the client
+    // (behind the cache lock, or for their own statement). SQL Server saw only an idle session holding locks,
+    // so it detected nothing and the run hung forever. MEASURED against a session holding an uncommitted
+    // CREATE TABLE with a default and a description: the database-wide reads block under READ COMMITTED,
+    // and the defaults block even under READ UNCOMMITTED (dc.definition takes a lock on the pending object);
+    // reading ONE committed object WITH (NOLOCK) returns at once. Per table the only object read is the one
+    // being materialized, whose own describe runs in the same statement anyway.
+    //
+    // STALENESS: a comment or default written THROUGH this catalog drops the cache at the write site (every
+    // ALTER, every COMMENT ON), so read-your-own-writes holds; one changed OUT OF BAND shows up on re-ATTACH
+    // or after fabricator_refresh_cache (GetTables drops this cache).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, TableMetadata> _meta =
+        new(StringComparer.OrdinalIgnoreCase);
 
-    // ⚠ Comments and DEFAULTS share one cache and one load although they are two catalog surfaces behind
-    // two capability flags, because they are wanted at the SAME moment (entry materialization) and by the
-    // same caller. The cost of sharing is that either kind of write reloads both, which is a re-read rather
-    // than a wrong answer; the benefit is one lock, one lazy load, and no way for the two to disagree about
-    // which tables exist.
+    // Bumped by InvalidateMetadata: a load that STARTED before a write must not cache what it read.
+    private int _metaGeneration;
+
+    // ⚠ Comments and DEFAULTS are two catalog surfaces behind two capability flags, read together because
+    // they are wanted at the SAME moment by the same caller.
     private sealed class TableMetadata
     {
         internal string? Table;
@@ -178,96 +180,79 @@ public sealed partial class SqlServerCatalog
     // resolved to a NAME here so the host never has to know about ordinals. MS_Description is the property
     // SSMS's "Description" box uses, which is what makes this interoperable in both directions.
     private const string CommentsSql = @"
-SELECT s.name, o.name,
-       CASE WHEN ep.minor_id = 0 THEN NULL ELSE c.name END,
-       CAST(ep.value AS nvarchar(4000))
-  FROM sys.extended_properties ep
-  JOIN sys.objects o ON o.object_id = ep.major_id
-  JOIN sys.schemas s ON s.schema_id = o.schema_id
-  LEFT JOIN sys.columns c ON c.object_id = ep.major_id AND c.column_id = ep.minor_id
- WHERE ep.class = 1 AND ep.name = N'MS_Description'";
+SELECT N'c', CASE WHEN ep.minor_id = 0 THEN NULL ELSE c.name END, CAST(ep.value AS nvarchar(4000))
+  FROM sys.extended_properties ep WITH (NOLOCK)
+  LEFT JOIN sys.columns c WITH (NOLOCK) ON c.object_id = ep.major_id AND c.column_id = ep.minor_id
+ WHERE ep.class = 1 AND ep.name = N'MS_Description' AND ep.major_id = @oid";
 
-    // The column DEFAULTS, database-wide and in ONE query for the same reason the comments are. `definition`
-    // is SQL Server's own rendering and always arrives PARENTHESISED — ((10)), (N'2024-01-01'), (getdate()) —
-    // which is what NormaliseDefault strips before the host tries to parse it.
+    // `definition` is SQL Server's own rendering and always arrives PARENTHESISED — ((10)), (N'2024-01-01'),
+    // (getdate()) — which is what NormaliseDefault strips before the host tries to parse it.
     private const string DefaultsSql = @"
-SELECT s.name, o.name, c.name, dc.definition
-  FROM sys.default_constraints dc
-  JOIN sys.objects o ON o.object_id = dc.parent_object_id
-  JOIN sys.schemas s ON s.schema_id = o.schema_id
-  JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id";
+SELECT N'd', c.name, dc.definition
+  FROM sys.default_constraints dc WITH (NOLOCK)
+  JOIN sys.columns c WITH (NOLOCK) ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id
+ WHERE dc.parent_object_id = @oid";
 
-    private Dictionary<string, TableMetadata> MetadataCache()
+    private TableMetadata? MetadataFor(string schemaName, string tableName)
     {
-        if (_meta is { } cached)
+        var key = ExternalKey(schemaName, tableName);
+        if (_meta.TryGetValue(key, out var cached))
         {
             return cached;
         }
-        lock (_metaLock)
+        // ⚠ CAPABILITY-GATED, never probed: extended properties and DEFAULT constraints are not part of the
+        // warehouse surface, and there a statement that errors inside an explicit transaction ABORTS the
+        // transaction (docs/warehouse-support.md §6.5). Same gates as the WRITE side.
+        var parts = new List<string>(2);
+        if (Profile.SupportsExtendedProperties)
         {
-            if (_meta is { } raced)
+            parts.Add(CommentsSql);
+        }
+        if (Profile.SupportsDefaultConstraints)
+        {
+            parts.Add(DefaultsSql);
+        }
+        var generation = System.Threading.Volatile.Read(ref _metaGeneration);
+        var loaded = new TableMetadata();
+        if (parts.Count > 0)
+        {
+            // OBJECT_ID BRACKETS the parts: it parses a multi-part NAME, so a dot inside a name would
+            // otherwise resolve to nothing.
+            var sql = "DECLARE @oid int = OBJECT_ID(@name);" + string.Join("\nUNION ALL", parts);
+            var name = new Microsoft.Data.SqlClient.SqlParameter("@name", System.Data.SqlDbType.NVarChar, 600)
             {
-                return raced;
-            }
-            var loaded = new Dictionary<string, TableMetadata>(StringComparer.OrdinalIgnoreCase);
-            TableMetadata EntryFor(string schemaName, string tableName)
+                Value = Quote(schemaName) + "." + Quote(tableName),
+            };
+            foreach (var row in ReadMetadataRows(sql, 3, new[] { name }))
             {
-                var cacheKey = ExternalKey(schemaName, tableName);
-                if (!loaded.TryGetValue(cacheKey, out var found))
+                if (row[2] is not { } value)
                 {
-                    found = new TableMetadata();
-                    loaded[cacheKey] = found;
+                    continue;
                 }
-                return found;
-            }
-            // ⚠ CAPABILITY-GATED, never probed: extended properties are not part of the warehouse surface,
-            // and on those engines a statement that errors inside an explicit transaction ABORTS the
-            // transaction — so a swallowed "are they here?" query would poison whatever the caller does
-            // next (docs/warehouse-support.md §6.5). An empty cache is the honest answer there: no comments,
-            // no statement issued. Same gate as the WRITE side, so the two cannot disagree.
-            if (Profile.SupportsExtendedProperties)
-            {
-                foreach (var row in ReadMetadataRows(CommentsSql, 4))
+                if (row[0] == "c")
                 {
-                    if (row[0] is not { } schemaName || row[1] is not { } tableName || row[3] is not { } descr)
+                    if (row[1] is { } columnName)
                     {
-                        continue;
-                    }
-                    var entry = EntryFor(schemaName, tableName);
-                    if (row[2] is { } columnName)
-                    {
-                        (entry.Columns ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))
-                            [columnName] = descr;
+                        (loaded.Columns ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))
+                            [columnName] = value;
                     }
                     else
                     {
-                        entry.Table = descr;
+                        loaded.Table = value;
                     }
                 }
-            }
-            // ⚠ Gated on its OWN capability, not on the comments' one: they are separate catalog surfaces
-            // and a warehouse has no DEFAULT constraint at all, so there is nothing to ask for. Same rule
-            // as above — never issue a statement on a warehouse whose failure you would have to swallow.
-            if (Profile.SupportsDefaultConstraints)
-            {
-                foreach (var row in ReadMetadataRows(DefaultsSql, 4))
+                else if (row[1] is { } columnName && NormaliseDefault(value) is { } normalised)
                 {
-                    if (row[0] is not { } schemaName || row[1] is not { } tableName ||
-                        row[2] is not { } columnName || row[3] is not { } definition)
-                    {
-                        continue;
-                    }
-                    if (NormaliseDefault(definition) is { } normalised)
-                    {
-                        (EntryFor(schemaName, tableName).Defaults ??=
-                            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))[columnName] =
-                            normalised;
-                    }
+                    (loaded.Defaults ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))
+                        [columnName] = normalised;
                 }
             }
-            _meta = loaded;
-            return loaded;
         }
+        if (System.Threading.Volatile.Read(ref _metaGeneration) == generation)
+        {
+            _meta[key] = loaded;
+        }
+        return loaded;
     }
 
     /// <summary>Turns SQL Server's own rendering of a DEFAULT into something DuckDB's parser can read, or
@@ -319,7 +304,8 @@ SELECT s.name, o.name, c.name, dc.definition
     /// written through this catalog, which is what makes read-your-own-writes hold.</summary>
     internal void InvalidateMetadata()
     {
-        _meta = null;
+        System.Threading.Interlocked.Increment(ref _metaGeneration);
+        _meta.Clear();
         _uncollatable = null;
         _boundedStrings = null;
     }
@@ -341,8 +327,8 @@ SELECT s.name, o.name, c.name, dc.definition
         var loaded = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
         const string sql =
             "SELECT s.name, o.name, c.name, TYPE_NAME(c.system_type_id) " +
-            "FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id " +
-            "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+            "FROM sys.columns c WITH (NOLOCK) JOIN sys.objects o WITH (NOLOCK) ON o.object_id = c.object_id " +
+            "JOIN sys.schemas s WITH (NOLOCK) ON s.schema_id = o.schema_id " +
             "WHERE o.type IN ('U', 'V') AND (c.system_type_id IN (35, 98, 99, 240, 241) " +
             "OR TYPE_NAME(c.system_type_id) = 'json')";
         foreach (var row in ReadMetadataRows(sql, 4))
@@ -380,8 +366,8 @@ SELECT s.name, o.name, c.name, dc.definition
         const string sql =
             "SELECT s.name, o.name, c.name, CAST(c.max_length AS VARCHAR(10)), " +
             "CASE WHEN c.system_type_id IN (231, 239) THEN '1' ELSE '0' END " +
-            "FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id " +
-            "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+            "FROM sys.columns c WITH (NOLOCK) JOIN sys.objects o WITH (NOLOCK) ON o.object_id = c.object_id " +
+            "JOIN sys.schemas s WITH (NOLOCK) ON s.schema_id = o.schema_id " +
             "WHERE o.type IN ('U', 'V', 'IF', 'TF') AND c.max_length > 0 AND (" +
             "(c.system_type_id IN (167, 175) AND c.max_length <= 2666) OR " +
             "(c.system_type_id IN (231, 239) AND c.max_length <= 5332))";
@@ -408,16 +394,16 @@ SELECT s.name, o.name, c.name, dc.definition
 
     /// <summary>The table's own comment (the MS_Description extended property), or null.</summary>
     internal string? TableCommentCore(string schemaName, string tableName) =>
-        MetadataCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Table : null;
+        MetadataFor(schemaName, tableName)?.Table;
 
     /// <summary>Per-column comments for the table, or null when it has none.</summary>
     internal IReadOnlyDictionary<string, string>? ColumnCommentsCore(string schemaName, string tableName) =>
-        MetadataCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Columns : null;
+        MetadataFor(schemaName, tableName)?.Columns;
 
     /// <summary>Per-column DEFAULT expressions for the table, normalised out of T-SQL, or null when it has
     /// none. What the HOST does with them is much narrower — it keeps only constants.</summary>
     internal IReadOnlyDictionary<string, string>? ColumnDefaultsCore(string schemaName, string tableName) =>
-        MetadataCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Defaults : null;
+        MetadataFor(schemaName, tableName)?.Defaults;
 
     /// <summary>The rowid column names: a detected external DELTA table with a Delta IDENTITY column
     /// advertises THAT column (slice D — an external table has no PK/UNIQUE/IDENTITY SQL-side); everything

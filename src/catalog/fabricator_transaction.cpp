@@ -111,8 +111,13 @@ ErrorData FabricatorTransactionManager::CommitTransaction(ClientContext &context
 		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), user_session);
 		flush_conn.Rollback();
 	} catch (std::exception &ex) {
+		try {
+			db.GetCatalog().Cast<FabricatorCatalog>().EndTransaction(txn_id, /*committed=*/false);
+		} catch (...) {
+		}
 		return ErrorData(ex);
 	}
+	db.GetCatalog().Cast<FabricatorCatalog>().EndTransaction(txn_id, /*committed=*/true);
 	return ErrorData();
 }
 
@@ -166,6 +171,7 @@ void FabricatorTransactionManager::RollbackTransaction(Transaction &transaction)
 	// Discard any catalog entry that an ALTER's eager re-fetch cached from this now-undone (uncommitted)
 	// schema, so the next access re-fetches the committed state. Best-effort; never throw out of rollback.
 	try {
+		db.GetCatalog().Cast<FabricatorCatalog>().EndTransaction(txn_id, /*committed=*/false);
 		db.GetCatalog().Cast<FabricatorCatalog>().InvalidateAllEntries();
 	} catch (...) {
 	}

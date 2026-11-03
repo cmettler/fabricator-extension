@@ -44,8 +44,14 @@ public:
 	FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, FabricatorHandle handle,
 	                      optional_ptr<SchemaCatalogEntry> parent_schema = nullptr);
 
-	//! Registers a discovered table/view name (called at attach time).
-	void AddTable(const string &table_name, const string &table_type);
+	//! Registers a table/view name. Discovery passes no transaction. A CREATE passes the creating DuckDB
+	//! transaction, and until that transaction ends the name exists for IT alone (see pending_).
+	void AddTable(const string &table_name, const string &table_type, int64_t owner_txn = -1);
+	//! A table name went away in `owner_txn` (DROP, the old name of a RENAME). Others keep seeing it until
+	//! the transaction commits.
+	void RemoveTable(const string &table_name, int64_t owner_txn);
+	//! The transaction ended: its table names become everyone's (commit) or are put back (rollback).
+	void EndTransaction(int64_t txn_id, bool committed);
 
 	//! Returns the CHILD schema called `name`, creating it if absent (DuckDB 2.0 nested schemas).
 	//! \warning The child's `parent_schema` is set to this entry, which is what makes DuckDB's
@@ -149,6 +155,8 @@ public:
 	//! ClientContext needed). Used on transaction ROLLBACK to discard any entry that an ALTER's eager
 	//! re-fetch cached from the now-undone (uncommitted) schema. See Alter() / fabricator_transaction.cpp.
 	void InvalidateEntryCache();
+	//! The DuckDB transaction `context` is in, or -1.
+	static int64_t ActiveTxnId(ClientContext &context);
 
 	//! Scoped lazy invalidation: drop only the MATERIALIZED entries whose name matches `matches` (keep the
 	//! discovered name lists — an ALTER'd object re-fetches its fresh schema on next access; a DROPped one
@@ -216,7 +224,7 @@ private:
 	//! duckdb_tables()/information_schema.tables. Time travel is a property of a table REFERENCE, not of
 	//! the catalog, so the listing must keep showing one row per table at latest.
 	optional_ptr<CatalogEntry> GetOrCreateEntry(ClientContext &context, const string &table_name,
-	                                            optional_ptr<BoundAtClause> at = nullptr);
+	                                            optional_ptr<BoundAtClause> at = nullptr, bool enumerating = false);
 	optional_ptr<CatalogEntry> GetOrCreateScalarFunction(ClientContext &context, const string &func_name);
 	optional_ptr<CatalogEntry> GetOrCreateTableFunction(ClientContext &context, const string &func_name);
 	//! Materializes a provider-authored SQL-GENERATING table function (v68): a bind_replace-only table
@@ -300,6 +308,22 @@ private:
 	// Neither wins: the name is refused at lookup, naming both sides. See AddView.
 	case_insensitive_set_t view_collisions_;
 	mutex entry_lock_;
+	// ⚠⚠ TABLE NAMES CHANGED BY A TRANSACTION THAT HAS NOT ENDED. table_types_ is shared by every DuckDB
+	// transaction, and a CREATE or RENAME used to change it for all of them at once — so another
+	// transaction's enumeration described a table SQL Server had not committed, got 208, and ERASED the name:
+	// the creating transaction then failed to find its own table (dbt's table swap at --threads > 1,
+	// 2026-11-03). Now table_types_ holds the OWNER's view of such a name and this records what every other
+	// transaction sees: the state before the owner touched it. Enumeration in another transaction skips the
+	// name altogether (never blocking on an uncommitted object); a direct reference sees the state before.
+	// Commit drops the record, rollback puts the state before back. Guarded by entry_lock_.
+	struct PendingTableName {
+		int64_t owner;
+		bool existed_before;
+		string type_before;
+	};
+	case_insensitive_map_t<PendingTableName> pending_;
+	//! Records `table_name` as changed by `owner_txn` (first change only). Requires entry_lock_.
+	void NotePendingLocked(const string &table_name, int64_t owner_txn);
 	case_insensitive_map_t<unique_ptr<FabricatorTableEntry>> entries_;
 	// Time-travel entries, keyed name+unit+value (see AtEntryKey). Separate from entries_ so no enumeration
 	// path can reach them (see GetOrCreateEntry). Cleared by the same invalidation hooks as entries_:

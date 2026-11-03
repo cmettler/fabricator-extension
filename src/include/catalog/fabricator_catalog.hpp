@@ -39,6 +39,8 @@ public:
 	//! none). Used on transaction ROLLBACK to discard entries an ALTER's eager re-fetch cached from the
 	//! now-undone uncommitted schema. See FabricatorSchemaEntry::Alter / fabricator_transaction.cpp.
 	void InvalidateAllEntries();
+	//! A DuckDB transaction ended: see FabricatorSchemaEntry::pending_.
+	void EndTransaction(int64_t txn_id, bool committed);
 
 	//! Scoped invalidation: drop materialized entries whose name matches the icase regex `pattern`, keeping
 	//! the discovered name lists (lazy re-fetch on next access). UNBOUNDED by the ATTACH object filter — a
