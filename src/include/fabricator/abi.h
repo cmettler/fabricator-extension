@@ -949,6 +949,10 @@ typedef struct FabricatorVTable {
 	// entries live in their own map (time travel is a property of a reference). NO IO and NO absence probe:
 	// absence is established by table_schema, the first actual read — same contract as the old kind-2, one
 	// entry over. Cheap opening is load-bearing: catalog enumeration materializes every table.
+	// ⚠ A provider that ALREADY KNOWS the name is absent (its GetTable resolves against a listing it holds)
+	// may answer FABRICATOR_NOT_FOUND here instead, and the host treats it exactly as table_schema's — an
+	// undiscovered name is opened by name, so CREATE TABLE and DROP … IF EXISTS reach this call for names
+	// that do not exist yet.
 	//
 	// ⚠ `schema_path` IS AN ARRAY OF `schema_path_len` UTF-8 NAMES, OUTERMOST FIRST (v91, was a single
 	// `const char *schema`). `["a","b"]` is the schema `b` nested inside `a` — the same shape, and for the

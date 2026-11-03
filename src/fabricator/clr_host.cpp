@@ -786,6 +786,19 @@ FabricatorHandle TableOpen(FabricatorHandle handle, const std::vector<std::strin
 	                           static_cast<int32_t>(path_ptrs.size()), table.c_str(),
 	                           at_unit.empty() ? nullptr : at_unit.c_str(),
 	                           at_value.empty() ? nullptr : at_value.c_str(), &out_table, &err);
+	if (rc == FABRICATOR_NOT_FOUND) {
+		// ESTABLISHED absence, the same status table_schema answers — kept distinct from failure for the
+		// same reason (see TableSchema below): the entry materialization treats it as "no such table".
+		std::string message = "Fabricator: table_open failed";
+		if (err) {
+			message += ": ";
+			message += err;
+			if (vt.free_error) {
+				vt.free_error(err);
+			}
+		}
+		throw ObjectNotFoundException(message);
+	}
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: table_open failed");
 	}

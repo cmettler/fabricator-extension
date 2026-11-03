@@ -594,6 +594,19 @@ public static unsafe class Bootstrap
             *outTable = Handles.Alloc(session);
             return FabricatorStatus.Ok;
         }
+        catch (ObjectNotFoundException ex)
+        {
+            // ⚠ Not every provider opens cheap: one whose GetTable resolves against a listing it already
+            // holds (Grist) establishes absence HERE and throws. That is the same answer table_schema gives,
+            // so it gets the same status — reported as Error, it turned every CREATE TABLE on such a provider
+            // into a failure, because the host opens an undiscovered name to learn whether it exists.
+            BridgeLog.LogDebug("abi TableOpen: {Message}", ex.Message);
+            if (err is not null)
+            {
+                *err = (byte*)Marshal.StringToCoTaskMemUTF8(FormatError(ex));
+            }
+            return FabricatorStatus.NotFound;
+        }
         catch (Exception ex)
         {
             SetError(err, ex);

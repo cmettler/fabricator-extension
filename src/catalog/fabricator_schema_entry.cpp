@@ -448,7 +448,28 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 			handle = nullptr;
 			return h;
 		}
-	} table_guard {fabricator::TableOpen(handle_, SchemaPathStrings(), table_name, at_unit, at_value)};
+	};
+	// Established absence, from EITHER crossing: forget the name everywhere and answer not-found.
+	auto forget_absent = [&]() {
+		table_types_.erase(table_name);
+		RetireErase(entries_, table_name, retired_entries_);
+		RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
+	};
+
+	// ⚠⚠ table_open MAY answer NOT_FOUND too. The ABI asks for a cheap open with no absence probe, and most
+	// providers comply — but a provider whose GetTable resolves against a listing it already holds (Grist:
+	// one /tables request per document) KNOWS the name is absent and says so there. That was harmless while
+	// only DISCOVERED names were opened; since an undiscovered name is looked up by name (above), every
+	// CREATE TABLE and DROP TABLE IF EXISTS on such a provider reaches this call with a name that does not
+	// exist yet, and an uncaught absence here turned both into "table_open failed: … does not exist".
+	FabricatorHandle opened = nullptr;
+	try {
+		opened = fabricator::TableOpen(handle_, SchemaPathStrings(), table_name, at_unit, at_value);
+	} catch (fabricator::ObjectNotFoundException &) {
+		forget_absent();
+		return nullptr;
+	}
+	TableHandleGuard table_guard {opened};
 
 	vector<string> names;
 	vector<LogicalType> types;
@@ -466,9 +487,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		// credential, a transient outage) discarded one frame after the provider produced it. A user given
 		// "table does not exist" checks their spelling and their permissions; nothing about that search
 		// leads to a missing commit file.
-		table_types_.erase(table_name);
-		RetireErase(entries_, table_name, retired_entries_);
-		RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
+		forget_absent();
 		return nullptr;
 	}
 
