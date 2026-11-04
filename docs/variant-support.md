@@ -40,6 +40,20 @@ Other findings from the build:
   operator casts via JSON and fails on the VARIANT repr.
 - The DuckDB parquet writer **shreds** small variants by default (`typed_value` columns appear); reads are
   shredding-transparent via `read_parquet`.
+- **⚠⚠ AND THAT BROKE THE PROTOCOL WE DECLARE — fixed 2026-11-04.** Delta allows a shredded variant only when the table
+  enables `variantShredding` (`delta.enableVariantShredding = true`, PROTOCOL.md "Writer Requirements for Variant
+  Shredding"); our tables declare `variantType` alone, and engineered-wood cannot declare the shredding feature (it does
+  not even READ a table that has it: *"unsupported reader features: [variantShredding]"*, measured —
+  clast-project/engineered-wood#671). Every native COPY now passes `SHREDDING {'<col>': 'VARIANT'}` per top-level
+  variant column, which writes it unshredded (measured; reads back exactly). The pure-codec engine never shredded.
+  - ⚠ DuckDB 2.0 defect: `SHREDDING` lowercases the name and then silently misses a column with upper-case letters,
+    so under `column_mapping 'none'` such a column stays shredded (pinned in `verify_delta_catalog_variant`). Under
+    column mapping the physical names are `col-<guid>`, lower-case.
+  - Variants below the root cannot be written by DuckDB at all, and the clustered OPTIMIZE declines a variant table
+    (it bin-packs), so the three top-level COPY paths are the whole surface.
+  - The DuckLake sync refuses a variant column, so a mirror cannot carry DuckLake's (shredded) variant files either.
+  - Next, once engineered-wood has the feature: shredding as a per-table opt-in that declares it, then Spark's
+    footer-derived path statistics (delta-spark `VariantStats.scala`).
 - `PARQUET_VARIANT` (the transform's return alias) blocks `struct_extract`/dot access on its result — the
   alias prevents the STRUCT function match. Irrelevant to the blob transport, but a trap for SQL-side use.
 

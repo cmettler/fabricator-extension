@@ -4824,6 +4824,13 @@ principal wins even if `PROVIDER` says something else:
 > new writes record the right bounds. Partition columns were never affected. Details:
 > [docs/known-limitations.md](docs/known-limitations.md).
 
+> ⚠ **VARIANT data files written by `PROVIDER 'delta'` before 2026-11-04 are SHREDDED** (`typed_value` columns —
+> DuckDB's Parquet writer does that by default), while the table declares only `variantType`. The Delta protocol
+> allows shredded files only with the `variantShredding` feature, so a strict reader may refuse them. New writes are
+> unshredded; rewrite an older table once (`CREATE OR REPLACE TABLE t AS SELECT * FROM t`) to bring it in line. A column whose name has
+> upper-case letters in a table with `column_mapping 'none'` is still written shredded (a DuckDB defect, see
+> [docs/variant-support.md](docs/variant-support.md)). Shredding as an opt-in comes once the feature can be declared.
+
 > **Partition values are escaped the way Spark escapes them**, so a value containing `/ : = % ? * " ' #` or a
 > backslash or a control character becomes `%XX` in the directory name (`region=a/b` → `region=a%2Fb`). The
 > value you read back is always the original — Delta records it in the log, not in the path.

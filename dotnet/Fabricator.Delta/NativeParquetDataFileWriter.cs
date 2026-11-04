@@ -264,8 +264,10 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         var sql =
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
+            + NoShredding(src.Schema, renameToPhysical)
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native copy {Uri}", uri);
+        Log.LogDebug("delta native copy sql: {Sql}", sql);
         var input = new (string, IArrowArrayStream)[] { (InputView, src) };
         using var result = Host.Query(sql, input);
         var files = ReadFileStats(result, ct, statsSchema, writableRoot);
@@ -291,8 +293,12 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         var sql =
             $"COPY ({sourceSql}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS"
+            // ⚠ unreachable by a variant today: the clustered rewrite declines a table with one and bin-packs it
+            // (DeltaReader.Optimize). A guard for the day it does not, so no gate exercises it.
+            + (statsSchema is not null ? NoShredding(statsSchema, null) : "")
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native clustered copy {Uri}", uri);
+        Log.LogDebug("delta native copy sql: {Sql}", sql);
         using var result = Host.Query(sql);
         return ReadFileStats(result, ct, statsSchema, writableRoot);
     }
@@ -320,8 +326,10 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
             "WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
+            + NoShredding(src.Schema, renameToPhysical)
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
+        Log.LogDebug("delta native copy sql: {Sql}", sql);
         var input = new (string, IArrowArrayStream)[] { (InputView, src) };
         using var result = Host.Query(sql, input);
         return ReadFileStats(result, ct, statsSchema, writableRoot);
@@ -589,6 +597,37 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     }
 
     private static string QuoteIdent(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
+
+    /// <summary>
+    /// The COPY option that writes every top-level VARIANT column UNSHREDDED: <c>, SHREDDING {'col': 'VARIANT'}</c>,
+    /// or empty without one. DuckDB's parquet writer shreds variants by default (<c>typed_value</c> columns), and the
+    /// Delta protocol forbids a shredded variant unless the table enables <c>variantShredding</c>
+    /// (<c>delta.enableVariantShredding</c>), which engineered-wood cannot declare yet
+    /// (clast-project/engineered-wood#671) — so every such file we wrote broke the protocol it declared. MEASURED:
+    /// <c>SHREDDING {v: 'VARIANT'}</c> leaves <c>metadata</c>/<c>value</c> only and reads back exactly; the
+    /// global <c>variant_minimum_shredding_size = -1</c> would do it too, but is GLOBAL_ONLY and would change the
+    /// user's own parquet writes.
+    /// <para>⚠ A DuckDB 2.0 defect: the option LOWERCASES the column name and then silently misses a column whose name
+    /// has upper-case letters (measured: <c>"Payload"</c> stays shredded, <c>"payload"</c> does not). Physical names
+    /// under column mapping are <c>col-&lt;guid&gt;</c>, lower-case, so only <c>column_mapping 'none'</c> with such a
+    /// name is affected. Nested variants are not reachable: DuckDB cannot write a variant below the root at all.</para>
+    /// </summary>
+    internal static string NoShredding(Schema schema, IReadOnlyDictionary<string, string>? renameToPhysical)
+    {
+        var names = new List<string>();
+        foreach (var f in schema.FieldsList)
+        {
+            // A stream from DuckDB carries the variant as the arrow.parquet.variant MARKER on a plain struct, a
+            // batch from engineered-wood as a VariantType — the shared test knows both.
+            if (VariantMarker.IsVariantArrowField(f))
+            {
+                names.Add(renameToPhysical is not null && renameToPhysical.TryGetValue(f.Name, out var phys) ? phys : f.Name);
+            }
+        }
+        return names.Count == 0
+            ? ""
+            : ", SHREDDING {" + string.Join(", ", names.Select(n => "'" + n.Replace("'", "''") + "': 'VARIANT'")) + "}";
+    }
 
     // Renders the COPY `FIELD_IDS { … }` value from the `PARQUET:field_id` Arrow metadata engineered-wood stamps on
     // a column-mapping batch at EVERY level (ColumnMappingRecursive.ToPhysical), so DuckDB's parquet writer
