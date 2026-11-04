@@ -43,11 +43,20 @@ struct HostQueryInput {
 //
 // Applied ONLY to the user-facing table function. The C#-callable `host_query` service deliberately does NOT
 // inherit — see docs/host-query.md ("Session state").
+//
+// ⚠ 2026-11-04: what is copied is everything the caller SET in its session (every setting whose value is the
+// session's own, not the global one), its search path and its variables (`SET VARIABLE`). It used to be two
+// hand-picked settings (TimeZone, search path); a list like that has no boundary, and each gap surfaced as a
+// separate bug. A NULL session is NOT "DuckDB defaults" either: see ApplyHostQuerySession — it pins TimeZone
+// to UTC, because the default is the MACHINE's zone and internal queries must not depend on the machine.
 struct HostQuerySession {
 	//! The caller's explicitly-set search path (`USE x` / `SET search_path`). Empty => leave the default.
 	vector<CatalogSearchEntry> search_path;
-	//! The caller's `TimeZone`. Empty => leave the default (also what an ICU-less build yields).
-	string time_zone;
+	//! Every setting the caller SET for its session (generic and extension settings whose lookup reports the
+	//! session scope), by name. Global settings are not here: the fresh connection already sees them.
+	vector<pair<string, Value>> settings;
+	//! The caller's variables (`SET VARIABLE`), copied as values, so their types survive.
+	vector<pair<Identifier, Value>> variables;
 };
 
 // A PINNED host connection (ABI v84): several host_query calls run on ONE DuckDB Connection, so its

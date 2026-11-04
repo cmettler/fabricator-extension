@@ -726,7 +726,8 @@ it (*"column 'ts' … is TIMESTAMP on the provider but TIMESTAMP WITH TIME ZONE 
 returned `00:00+01` — its `schema` map declares `TIMESTAMPTZ`, so DuckDB cast the naive value in the zone of the
 reader's own connection, which is the MACHINE's. It was never mirror-specific: Spark's INT96 files and a legacy
 converted type without a logical type read as naive `TIMESTAMP` too.
-- The batched statement now runs with `SET SESSION TimeZone='UTC'`, which makes that cast right.
+- The batched statement runs in UTC, which makes that cast right — first with its own `SET SESSION TimeZone='UTC'`, since
+  later the same day through every NEUTRAL host query being UTC (docs/host-query.md, session state reworked).
 - The per-file path (and with it the clustered OPTIMIZE, which runs the same SQL inside its COPY) reads which leaves
   the file stores naive from the footer probe it already runs, and converts exactly those with
   `timezone('UTC', CAST(x AS TIMESTAMP))` — zone-free, unlike `CAST(x AS TIMESTAMPTZ)`, so a COPY in a non-UTC

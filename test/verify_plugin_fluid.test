@@ -4399,9 +4399,11 @@ SELECT typeof(v) FROM fluid_replacement_query('SELECT getvariable(''params'') AS
 ----
 "NULL"
 
-# --- ⚠⚠ COLLISION-FREEDOM, which is what makes the fixed name `params` safe: a variable of the CALLER's is
-# NOT visible on the render's pin, so nothing of the user's can be read as the bag and nothing we set can be
-# read by them. The pin is a fresh ClientContext and only its TimeZone and search path are inherited. ---
+# --- ⚠⚠ COLLISION-FREEDOM, which is what makes the fixed name `params` safe: since 2026-11-04 the render's pin
+# inherits the caller's settings AND variables (docs/host-query.md), so a caller's own `params` WOULD be read as
+# the bag — unless the render clears the name when it has no bag of its own, which it does. This row pins that;
+# the next rows pin the rest: a bag the render sets wins over the inherited one, and any OTHER variable of the
+# caller is visible to the template's queries. ---
 statement ok
 SET VARIABLE params = 'from-the-caller';
 
@@ -4410,8 +4412,24 @@ SELECT fluid_render('{% query r %}SELECT typeof(getvariable(''params'')) AS t{% 
 ----
 "NULL"
 
+query T
+SELECT fluid_render('{% query r %}SELECT getvariable(''params'').region AS g{% endquery %}{{ r[0].g }}', {'region': 'se'});
+----
+se
+
 statement ok
 RESET VARIABLE params;
+
+statement ok
+SET VARIABLE fluid_region = 'fr';
+
+query T
+SELECT fluid_render('{% query r %}SELECT getvariable(''fluid_region'') AS g{% endquery %}{{ r[0].g }}', NULL);
+----
+fr
+
+statement ok
+RESET VARIABLE fluid_region;
 
 # =====================================================================================================
 # §38 — `fluid_scalar`: a template rendered to a SQL SELECT, whose RETURN TYPE the template declares.

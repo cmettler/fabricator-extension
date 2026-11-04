@@ -513,20 +513,15 @@ internal static class DeltaNativeReader
         /// table function (whose caller's result order is theirs, not ours) and with the sort/COPY paths.
         /// Those are unaffected in any case — an explicit <c>ORDER BY</c> yields <c>FIXED_ORDER</c>, which
         /// short-circuits before the setting is read — but narrow is the point.</para>
-        /// <para>⚠ <b><c>TimeZone='UTC'</c> is a CORRECTNESS setting, unlike the first.</b> The <c>schema</c> map
-        /// declares a Delta <c>timestamp</c> column <c>TIMESTAMPTZ</c>, and a file storing it naive (a DuckLake
-        /// mirror, Spark's INT96, a legacy converted type) is cast by DuckDB in the SESSION zone — which on a fresh
-        /// host-query connection is the MACHINE's, so off UTC every value moved by the zone's offset with no error
-        /// (measured: <c>00:00+01</c> for <c>00:00Z</c> on a Berlin machine). Delta's timestamps are UTC, and so
-        /// are timestamp partition values written without an offset, which this statement also casts.</para>
-        /// <para>⚠ The setting exists only once ICU is loaded (*"Setting with name TimeZone is not in the catalog,
-        /// but it exists in the icu extension"* otherwise — measured, it failed every read in a suite without
-        /// <c>require icu</c>). Without ICU, DuckDB casts <c>TIMESTAMP</c> to <c>TIMESTAMPTZ</c> as UTC anyway, so
-        /// the setting is only needed where it can be set: see <see cref="IcuLoaded"/>.</para>
+        /// <para>⚠ The statement runs in UTC, and that is a CORRECTNESS property: the <c>schema</c> map declares a
+        /// Delta <c>timestamp</c> column <c>TIMESTAMPTZ</c>, and a file storing it naive (a DuckLake mirror, Spark's
+        /// INT96, a legacy converted type) is cast by DuckDB in the session zone. It used to be set here; since
+        /// 2026-11-04 every host query without a caller session is NEUTRAL, i.e. UTC (ApplyHostQuerySession), so
+        /// the machine's zone cannot reach this cast — measured before either fix: <c>00:00+01</c> for
+        /// <c>00:00Z</c> on a Berlin machine.</para>
         /// </summary>
         internal string Statement(string? suffix = null)
-            => "SET SESSION preserve_insertion_order=false; " + (IcuLoaded() ? "SET SESSION TimeZone='UTC'; " : "")
-               + (suffix is null ? Sql : Sql + suffix);
+            => "SET SESSION preserve_insertion_order=false; " + (suffix is null ? Sql : Sql + suffix);
 
         /// <summary>Runs this plan, binding its inputs.</summary>
         internal IArrowArrayStream Query(string? suffix = null)

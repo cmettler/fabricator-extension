@@ -82,7 +82,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Functions** | `fabricator_query`, `fabricator_exec`, `fabricator_refresh_cache`, `fabricator_invalidate_cache`, `fabricator_version` | ✅ |
 | | `fabricator_functions(catalog)` — list discovered routines | ✅ |
 | | `fabricator_delta_scan(path)` / `fabricator_delta_native_scan(path)` — read a Delta table by path, no ATTACH (C# reader / DuckDB's parquet reader) | ✅ |
-| | `fabricator_host_query(sql)` — run a query on DuckDB itself (inherits your search path + `TimeZone`) | ✅ |
+| | `fabricator_host_query(sql)` — run a query on DuckDB itself (inherits your session: settings, search path, variables) | ✅ |
 | | `fabricator_host_exec(sql)` — DDL/DML on DuckDB itself, returning the affected-row count (table + scalar) | ✅ |
 | | `fabricator_http_request(url, …)` — an HTTP call through DuckDB's own stack (its `TYPE http` secret, TLS trust, proxy, retries) | ✅ |
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
@@ -2170,10 +2170,11 @@ distinguishes the two.
 > statement running it. Rows are held in memory (a template may loop over them repeatedly), and a result
 > above one million rows is refused rather than truncated.
 >
-> It *does* inherit your session's **`TimeZone`** and **`search_path`** (and with them `current_catalog()`
-> and `current_schema()`), so an unqualified `FROM t` resolves the way it does in the statement that
-> rendered the template, and a timestamp renders in the zone you set. Name and time resolution are
-> inherited; the transaction is not.
+> It *does* inherit your session: every setting you `SET` (`TimeZone`, `default_null_order`, …), your
+> **`search_path`** (and with it `current_catalog()` and `current_schema()`) and your variables (`SET VARIABLE`),
+> so an unqualified `FROM t` resolves the way it does in the statement that rendered the template, a timestamp
+> renders in the zone you set, and `getvariable('x')` reads yours. The one exception is `params`, which is the
+> template's own bag. The settings are inherited; the transaction is not.
 
 **A template can also WRITE — `exec(sql)`.** It is `query()`'s mirror image: `query()` runs `SELECT`
 statements only, `exec()` runs everything else, and both decide with DuckDB's own parser. It returns the
@@ -3075,8 +3076,9 @@ seeing what the bridge sees.
 SELECT * FROM fabricator_host_query('SELECT 1 AS a, ''x'' AS b');
 ```
 
-It runs on a **fresh connection**, which has two visible consequences. It **inherits your session's active
-catalog/schema and `TimeZone`**, so unqualified names and timestamps mean what they mean in your session:
+It runs on a **fresh connection**, which has two visible consequences. It **inherits your session** — every
+setting you `SET`, your active catalog/schema and your variables — so unqualified names, timestamps and
+`getvariable()` mean what they mean in your session:
 
 ```sql
 USE lake.main;

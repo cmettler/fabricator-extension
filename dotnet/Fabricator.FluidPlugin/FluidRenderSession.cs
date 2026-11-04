@@ -226,8 +226,10 @@ internal sealed class FluidRenderSession : IDisposable
         var rows = _variableRows();
         if (rows is null)
         {
-            // ⚠ No bag ⇒ no statement. An UNSET DuckDB variable already reads as NULL, so writing one would
-            // buy nothing and cost a round trip on every render that passed no params.
+            // ⚠ No bag ⇒ CLEAR the name rather than leave it. Since 2026-11-04 the pin inherits the caller's
+            // variables (docs/host-query.md), so a caller's own `params` would otherwise be read as the bag — the
+            // collision the fixed name has to rule out. RESET on an unset variable is a no-op (measured).
+            pin.ExecuteNonQuery($"RESET VARIABLE {DuckSql.QuoteIdent(_variableName)}");
             return;
         }
         var token = _host.RegisterRows(rows);

@@ -29,6 +29,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/literal.hpp" // 2.0: ConstantExpression takes a Literal
+#include "duckdb/parser/keyword_helper.hpp"   // WriteOptionallyQuoted, for the replayed settings
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
@@ -125,6 +126,19 @@ struct HostQueryStream {
 //! reads the batches through converters built from the DECLARED schema. One function, no drift.
 void ApplyHostQuerySession(Connection &conn, const HostQuerySession *session) {
 	if (!session) {
+		// NEUTRAL: DuckDB's defaults — except TimeZone, whose default is the MACHINE's zone. A query that runs on
+		// behalf of no session (the Delta reader, a sync, a provider's own SQL) must give the same answer on every
+		// machine; with the machine's zone a naive-to-TIMESTAMPTZ cast moved values by its offset with no error
+		// (docs/ducklake-catalog.md §11.12). Skipped where the default already is UTC (Linux servers, Fabric), so
+		// those pay no statement; and without ICU there is no TimeZone to set, and casts are UTC-based anyway.
+		Value tz;
+		if (conn.context->TryGetCurrentSetting("TimeZone", tz) && !tz.IsNull() && tz.ToString() != "UTC") {
+			auto tz_result = conn.Query("SET SESSION TimeZone='UTC'");
+			if (tz_result->HasError()) {
+				throw IOException("fabricator host_query: could not set the neutral session's TimeZone: %s",
+				                  tz_result->GetError());
+			}
+		}
 		return;
 	}
 	if (!session->search_path.empty()) {
@@ -160,16 +174,24 @@ void ApplyHostQuerySession(Connection &conn, const HostQuerySession *session) {
 			                  path_sql, sp_result->GetError());
 		}
 	}
-	if (!session->time_zone.empty()) {
-		// TimeZone is an ICU-registered EXTENSION option (icu_extension.cpp AddExtensionOption), so there is
-		// no core set_local to call — it goes through the normal SET path. Value::ToSQLString() quotes and
-		// escapes the literal, so a hostile zone string cannot break out.
-		auto tz_result = conn.Query("SET TimeZone=" + Value(session->time_zone).ToSQLString());
-		if (tz_result->HasError()) {
-			// Non-fatal by design: the caller's query is what matters, and a build without ICU has no
-			// TimeZone option to set. Falling back to the fresh connection's default beats refusing to run.
-			tz_result.reset();
+	// Settings go through SET, not into the settings map directly: SET runs the option's callback (validation,
+	// and for some core settings side effects), and the direct setters are not exported to a loadable extension.
+	// The name is quoted as an identifier and the value is DuckDB's own literal rendering.
+	for (auto &setting : session->settings) {
+		auto sql = "SET SESSION " + KeywordHelper::WriteOptionallyQuoted(setting.first) + " = " +
+		           setting.second.ToSQLString();
+		auto set_result = conn.Query(sql);
+		if (set_result->HasError()) {
+			// ⚠ FATAL, like the search path: a setting the caller chose that does not reach this connection
+			// means a silently different answer (a time zone, a collation, a float rule).
+			throw IOException("fabricator host_query: could not apply the caller's setting %s: %s", setting.first,
+			                  set_result->GetError());
 		}
+	}
+	// Variables as VALUES, straight into the session's map — what SET VARIABLE itself does (no callback), and a
+	// rendered literal would lose a STRUCT's or a DECIMAL's exact type.
+	for (auto &variable : session->variables) {
+		conn.context->config.user_variables[variable.first] = variable.second;
 	}
 }
 
@@ -390,6 +412,8 @@ void HostQueryRelease(ArrowArrayStream *stream) {
 	stream->release = nullptr;
 }
 
+HostQuerySession CaptureSession(ClientContext &context); // defined with the exec surfaces below
+
 // Table function bind: stash a factory that (re)runs the query on a fresh connection + produces the result
 // stream, then read the output schema from it (PopulateReturnSchema runs the factory once for the schema;
 // the scan runs it again for the data — like the other fabricator table functions).
@@ -401,12 +425,7 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 	// Capture the caller's session state BY VALUE here, at bind, while `context` is definitely alive. The
 	// factory below runs later (and again per execution), so capturing `&context` would be a dangling pointer —
 	// the same bug class as the host-FS opener that commit 142b350 moved to per-call resolution.
-	HostQuerySession session;
-	session.search_path = ClientData::Get(context).catalog_search_path->GetSetPaths();
-	Value tz_value;
-	if (context.TryGetCurrentSetting("TimeZone", tz_value) && !tz_value.IsNull()) {
-		session.time_zone = tz_value.ToString();
-	}
+	auto session = CaptureSession(context);
 	bind_data->factory = [db, sql, session](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
 		// the table-function form takes no params/inputs; it DOES inherit the caller's session (unlike the
 		// C#-callable host_query service — see docs/host-query.md).
@@ -603,9 +622,28 @@ void MakeHostExecStream(DatabaseInstance &db, const string &sql, ArrowArrayStrea
 HostQuerySession CaptureSession(ClientContext &context) {
 	HostQuerySession session;
 	session.search_path = ClientData::Get(context).catalog_search_path->GetSetPaths();
-	Value tz_value;
-	if (context.TryGetCurrentSetting("TimeZone", tz_value) && !tz_value.IsNull()) {
-		session.time_zone = tz_value.ToString();
+	// "Set in this session" = the lookup reports the SESSION scope. For a generic setting that holds exactly when
+	// the session map has it (LocalUserSettings::TryGetSetting); a legacy option with its own get_setting callback
+	// always reports the session scope (ClientContext::TryGetCurrentSetting), so those are skipped — they are the
+	// profiler / progress-bar options and the search path, which is copied above.
+	auto capture = [&](const Identifier &name) {
+		Value value;
+		auto lookup = context.TryGetCurrentSetting(name, value);
+		if (lookup && lookup.GetScope() == SettingScope::LOCAL) {
+			session.settings.emplace_back(name.GetIdentifierName(), std::move(value));
+		}
+	};
+	for (idx_t i = 0; i < DBConfig::GetOptionCount(); i++) {
+		auto option = DBConfig::GetOptionByIndex(i);
+		if (option && !option->get_setting) {
+			capture(Identifier(option->name));
+		}
+	}
+	for (auto &extension_option : DBConfig::GetConfig(context).GetExtensionSettings()) {
+		capture(extension_option.first);
+	}
+	for (auto &variable : context.config.user_variables) {
+		session.variables.emplace_back(variable.first, variable.second);
 	}
 	return session;
 }
@@ -1084,6 +1122,8 @@ int32_t HostConnectionOpenService(FabricatorHandle client_context, FabricatorHan
 		if (client_context) {
 			auto session = CaptureSession(*reinterpret_cast<ClientContext *>(client_context));
 			ApplyHostQuerySession(*pin->conn, &session);
+		} else {
+			ApplyHostQuerySession(*pin->conn, nullptr); // neutral, see there
 		}
 		*out_connection = reinterpret_cast<FabricatorHandle>(new shared_ptr<HostConnection>(std::move(pin)));
 		return FABRICATOR_OK;

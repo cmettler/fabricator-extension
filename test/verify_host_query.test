@@ -633,6 +633,31 @@ RESET search_path;
 statement ok
 RESET TimeZone;
 
+# EVERYTHING the caller SET reaches it, not two hand-picked settings (2026-11-04): a setting that has nothing to do
+# with time, and a variable with its exact type (a STRUCT of a TINYINT). A setting the caller did NOT set keeps the
+# default — threads is GLOBAL and arrives anyway, so default_null_order is the discriminating one.
+query T
+SELECT * FROM fabricator_host_query('SELECT current_setting(''default_null_order'')');
+----
+NULLS_LAST
+
+statement ok
+SET default_null_order = 'NULLS_FIRST';
+
+statement ok
+SET VARIABLE hq_var = {'a': 1::TINYINT, 'b': 'z'};
+
+query TTT
+SELECT * FROM fabricator_host_query('SELECT current_setting(''default_null_order''), getvariable(''hq_var'').b, typeof(getvariable(''hq_var''))');
+----
+NULLS_FIRST	z	STRUCT(a TINYINT, b VARCHAR)
+
+statement ok
+RESET default_null_order;
+
+statement ok
+RESET VARIABLE hq_var;
+
 # ============================================================================================
 # PROJECTING A COLUMN THAT IS NOT THE FIRST — the missing `projection_pushdown` flag.
 # ============================================================================================

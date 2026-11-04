@@ -327,7 +327,38 @@ fail that way. Mutation-tested afterwards: restoring `temporary: false` kills th
 line after 53 assertions pass.
 
 
+## ✅ Session state, reworked (2026-11-04): INHERIT copies everything the caller set, NEUTRAL is UTC
+
+The two modes below (2026-07-30, ABI v83) stay; what each one MEANS changed, because both kept producing bugs:
+
+| mode | who | before | since 2026-11-04 |
+|---|---|---|---|
+| **inherit** | `fabricator_host_query` / `_exec`, Fluid's pin, plugins through `IHostQuery` (default `inheritSession: true`), the C# `Host.Query(…, clientSession)` | `TimeZone` + search path, two hand-picked items | every setting the caller **set** for its session, the search path, and its variables (`SET VARIABLE`) |
+| **neutral** | every other managed host query: the Delta reader and writer, the DuckLake sync, provider SQL | DuckDB defaults — i.e. the **machine's** zone | DuckDB defaults with **`TimeZone = 'UTC'`** |
+
+- **"Set" is measured, not listed.** A setting is copied when its lookup reports the SESSION scope, which for a
+  generic or extension setting holds exactly when the session map has it (`LocalUserSettings::TryGetSetting`).
+  Legacy options with their own `get_setting` always report the session scope, so they are skipped — they are
+  the profiler/progress-bar options and the search path, which has its own replay. A fresh session lists 16 such
+  "LOCAL" entries in `duckdb_settings()`; none of them was set by anyone, which is why `scope = 'LOCAL'` from SQL
+  is the wrong test.
+- **Settings are replayed with `SET SESSION`** (the callback runs, and the direct setters are not exported to a
+  loadable extension); a setting that does not apply is FATAL, like the search path. **Variables are copied as
+  values** into the session's map, which is what `SET VARIABLE` does, so a STRUCT keeps its member types.
+- **Neutral pins UTC because the machine's zone made internal queries machine-dependent**: a naive Parquet
+  timestamp cast to `TIMESTAMPTZ` moved by the zone's offset with no error (docs/ducklake-catalog.md §11.12). It
+  costs a `SET` statement only where the default is not UTC already (Linux servers and Fabric skip it); without
+  ICU there is no `TimeZone`, and casts are UTC-based anyway.
+- **Fluid owns `params`.** With variables inherited, a caller's own `params` would read as the template's bag, so
+  a render without a bag now RESETs the name on its pin (gate `verify_plugin_fluid`).
+- Gates: `verify_host_query` (a non-time setting and a STRUCT variable reach the inner query, an unset setting
+  keeps its default), `verify_plugin_fluid` (a caller's variable reaches `query()`, `params` does not), and
+  `verify_ducklake_delta_sync` §15, whose batched read is right under `SET GLOBAL TimeZone='Asia/Kathmandu'` only
+  if neutral means UTC (the Delta reader no longer sets it itself).
+
 ## Session state — the table function inherits, the C# service deliberately does NOT (2026-07-30)
+
+⚠ What each mode copies is superseded by the section above; the reasoning here still holds.
 
 A fresh `ClientContext` starts at DuckDB's **defaults**, which is a second consequence of the above and was
 missed until measured. What is and is not carried over splits exactly along DuckDB's global/session line:
