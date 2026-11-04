@@ -582,7 +582,8 @@ What the profile drives automatically:
     declared, because Delta has no such partitions; DuckLake still writes one file per value, and Delta readers skip
     them by the file statistics instead. Integer, string, date, boolean and decimal columns qualify; timestamps do
     not. It does not matter whether DuckLake writes hive-style paths. The partitioning is fixed at a table's first
-    sync: if it changes later, the sync refuses, since Delta cannot change a table's partition columns.
+    sync: if it changes later, the sync refuses, since Delta cannot change a table's partition columns. With the
+    metadata in a SQL Server catalog the change itself is refused (see below).
     `partitioning := false` declares none, and then DuckLake may change its partitioning freely.
   - **Writing a mirror anew** (`rebuild := true`, needs `table_name`). Deletes what the sync wrote into the table's
     folder (the log, `_change_data`, its deletion-vector files; never DuckLake's files) and syncs again as a first
@@ -630,8 +631,10 @@ What the profile drives automatically:
   first `ducklake_delta_sync`, a DuckLake change the Delta mirror could not express fails at COMMIT and rolls back,
   naming the column and the reason: a column rename while data files hold it (`'name'` and `'none'` mapping — DuckLake
   keeps the old name in its files, even through compaction), `ADD COLUMN … DEFAULT`, an unsupported type, and in
-  `'name'` mapping re-adding a column under a dropped column's name. Rename before writing data, or recreate the
-  table with `CREATE TABLE … AS SELECT`. Tables that were never synced are not affected.
+  `'name'` mapping re-adding a column under a dropped column's name, and a `SET`/`RESET PARTITIONED BY` that drops a
+  partition column the mirror declared (adding one is fine). Rename before writing data, or recreate the table with
+  `CREATE TABLE … AS SELECT`; to change the partitioning, rebuild the mirror without partitions first
+  (`rebuild := true, partitioning := false`). Tables that were never synced are not affected.
 - **Maintenance for a mirrored lake (`ducklake_delta_maintain`).** One call runs DuckLake's maintenance in the order
   the Delta log needs, and returns one row per step (`step`, `object`, `count`, `detail`):
   flush inlined rows → merge small files (`merge := true`) → fold deletes into new files (`rewrite_deletes :=

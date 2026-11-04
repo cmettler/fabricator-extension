@@ -548,12 +548,21 @@ internal sealed class DuckLakeDeltaSync
             string ts = cfg is not null && cfg.TryGetValue(TimestampKey, out var t) ? t : "ntz";
             bool dv = cfg is not null && cfg.TryGetValue("delta.enableDeletionVectors", out var d)
                       && string.Equals(d, "true", StringComparison.OrdinalIgnoreCase);
+            // The declared partition columns (DuckLake column ids, comma-separated, '' for none): the catalog guard
+            // refuses a partitioning change that drops one of them, since Delta cannot change partition columns.
+            string parts = cfg is not null && cfg.TryGetValue(PartitionKey, out var pk) ? pk : "";
             string marker = _o.M(MarkerTable);
             string id = _tableId.ToString(CultureInfo.InvariantCulture);
             _o.Rows($"CREATE TABLE IF NOT EXISTS {marker} (table_id BIGINT, column_mapping VARCHAR, timestamp_mapping VARCHAR, " +
-                    "deletion_vectors BOOLEAN)");
-            _o.Rows($"INSERT INTO {marker} SELECT {id}, {Lit(mode)}, {Lit(ts)}, {(dv ? "true" : "false")} " +
+                    "deletion_vectors BOOLEAN, partition_column_ids VARCHAR)");
+            if (!_o.Probe($"SELECT partition_column_ids FROM {marker} LIMIT 0"))
+            {
+                _o.Rows($"ALTER TABLE {marker} ADD COLUMN partition_column_ids VARCHAR"); // a marker from before 2026-11-04
+            }
+            _o.Rows($"INSERT INTO {marker} SELECT {id}, {Lit(mode)}, {Lit(ts)}, {(dv ? "true" : "false")}, {Lit(parts)} " +
                     $"WHERE NOT EXISTS (SELECT 1 FROM {marker} WHERE table_id = {id})");
+            _o.Rows($"UPDATE {marker} SET partition_column_ids = {Lit(parts)} " +
+                    $"WHERE table_id = {id} AND partition_column_ids IS NULL");
         }
 
         // The DuckLake snapshot the log has been brought to, -1 when there is no log yet.

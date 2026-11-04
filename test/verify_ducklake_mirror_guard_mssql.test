@@ -132,6 +132,82 @@ statement ok
 ALTER TABLE lake.main.f ADD COLUMN z VARCHAR;
 
 # ============================================================================
+# 4b. Partitioning (2026-11-04): a mirror that declared partition columns refuses a SET / RESET PARTITIONED BY that
+#     drops one, since Delta cannot change a table's partition columns. Adding a key is allowed, an unmirrored table
+#     changes freely, and rebuild with partitioning := false is the way out. Every partitioning change inserts a
+#     ducklake_partition_info row, RESET included (measured), which is what the guard keys on.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.p (k INTEGER, region VARCHAR, d DATE);
+
+statement ok
+ALTER TABLE lake.main.p SET PARTITIONED BY (region);
+
+statement ok
+INSERT INTO lake.main.p VALUES (1, 'eu', DATE '2024-01-01'), (2, 'us', DATE '2024-01-02');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', metadata_schema := 'dlguard', table_name := 'main.p');
+
+# The marker records the declared column (region is column id 2).
+query T
+SELECT partition_column_ids FROM fabricator_query('db', 'SELECT m.partition_column_ids FROM dlguard.fabricator_delta_mirror m JOIN dlguard.ducklake_table t ON t.table_id = m.table_id AND t.end_snapshot IS NULL WHERE t.table_name = N''p''');
+----
+2
+
+# Adding a key keeps region: allowed.
+statement ok
+ALTER TABLE lake.main.p SET PARTITIONED BY (region, d);
+
+statement error
+ALTER TABLE lake.main.p SET PARTITIONED BY (d);
+----
+<REGEX>:.*main\.p is mirrored to Delta partitioned by \[region\].*rebuild := true, partitioning := false.*
+
+statement error
+ALTER TABLE lake.main.p RESET PARTITIONED BY;
+----
+<REGEX>:.*main\.p is mirrored to Delta partitioned by \[region\].*
+
+# The refused changes rolled back: a new file still carries region, and the mirror follows it.
+statement ok
+INSERT INTO lake.main.p VALUES (3, 'eu', DATE '2024-01-03');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', metadata_schema := 'dlguard', table_name := 'main.p');
+
+query IIT
+SELECT count(*), sum(k), string_agg(region, ',' ORDER BY k) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/p');
+----
+3	6	eu,us,eu
+
+# Control: the same changes on a table nobody mirrors.
+statement ok
+ALTER TABLE lake.main.free SET PARTITIONED BY (a);
+
+statement ok
+ALTER TABLE lake.main.free RESET PARTITIONED BY;
+
+# The way out: write the mirror anew without partitions; then the change goes through.
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', metadata_schema := 'dlguard', table_name := 'main.p', rebuild := true, partitioning := false);
+
+statement ok
+ALTER TABLE lake.main.p SET PARTITIONED BY (d);
+
+statement ok
+INSERT INTO lake.main.p VALUES (4, 'us', DATE '2024-01-04');
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake', metadata_schema := 'dlguard', table_name := 'main.p');
+
+query IIT
+SELECT count(*), sum(k), string_agg(region, ',' ORDER BY k) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl/main/p');
+----
+4	10	eu,us,eu,us
+
+# ============================================================================
 # 5. The mirrors still sync, and read back what DuckLake holds
 # ============================================================================
 
