@@ -7,3 +7,13 @@
 # without this rule the conversion is decided by whatever git config a machine or runner image
 # happens to have.
 *.sh text eol=lf
+
+# SQL files too. The macro files under dotnet/Fabricator.Functions/Macros are embedded into the
+# assembly as resources, so their line endings end up in the SQL a macro produces: with
+# core.autocrlf=true a Windows checkout would ship CRLF and a Linux one LF, and
+# decision_render_tsql would generate different T-SQL text depending on where it was built.
+*.sql text eol=lf
+
+# sqllogictest files likewise: an expected value spanning several lines would carry a CR on a
+# CRLF checkout and stop matching (verify_decision_render_tsql does).
+*.test text eol=lf
