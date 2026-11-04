@@ -47,9 +47,21 @@ SELECT id, v FROM lake.main.idt ORDER BY id;
 4	d
 5	e
 
-# An explicit NULL is likewise engine-assigned (GENERATED ALWAYS — allowExplicitInsert=false).
-statement ok
+# GENERATED ALWAYS (allowExplicitInsert=false): a value supplied for the column is REFUSED, an explicit NULL
+# included, as Spark does (engineered-wood #595, since 2026-11-04). Before, the table replaced it with a generated
+# one, i.e. stored a key other than the one the statement named.
+statement error
 INSERT INTO lake.main.idt VALUES (NULL, 'f');
+----
+GENERATED ALWAYS AS IDENTITY column 'id' is not supported
+
+statement error
+INSERT INTO lake.main.idt VALUES (99, 'f');
+----
+GENERATED ALWAYS AS IDENTITY column 'id' is not supported
+
+statement ok
+INSERT INTO lake.main.idt (v) VALUES ('f');
 
 query I
 SELECT id FROM lake.main.idt WHERE v = 'f';

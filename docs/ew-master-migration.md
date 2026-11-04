@@ -3219,6 +3219,24 @@ blind claims where one is true.
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
 
+## THE 2026-11-04 EVENING BUMP — `b644f50 → 3d3be76`, fourteen commits, zero patches (a fast-forward)
+
+- **Why now: #672 implements our issue #671** (`variantShredding` / `-preview` as reader and writer features;
+  `delta.enableVariantShredding = true` declares it; EW's own writer shreds only then, else
+  `DELTA_SHREDDING_TABLE_PROPERTY_DISABLED`; checkpoints unshredded). Variant statistics moved to #675. Two limits in
+  `doc/known-issues.md` are ours to carry: files a HOST commits are not inspected for shredding (our `native_write`,
+  where DuckDB shreds by default), and there is no ALTER for the property.
+- **Compile cost: zero.** The option records gained no member; the read-concurrency default now comes from an
+  `IReadConcurrencyHint` the file system may implement — ours do not, so it stays `min(4, cores)`.
+- **#653 / #595 — the ONE behaviour change, and the right one: a value supplied for a `GENERATED ALWAYS` identity
+  column is refused** (Spark's rule), an explicit NULL included. Before, the table silently replaced it with a
+  generated value, i.e. stored a key other than the one the statement named. Gate `verify_delta_catalog_identity`
+  (38 -> 40, both engines). `INSERT … (v) VALUES` without the column is unchanged.
+- Tiers: hermetic 94/94 — 12407 (+2, that gate), service 91/91 — 137690 IDENTICAL.
+- **Found on the way, PRE-EXISTING (the refusal is in `b644f50` too):** an autocommit UPDATE on a Delta table with an
+  identity column failed on BOTH paths (`WriteDataFilesAsync` / `StageDataFiles` want `identityValuesPreGenerated`).
+  Fixed separately in the commit after this bump.
+
 ## THE 2026-11-04 BUMP — `957d24d → b644f50`, twenty-five commits, zero patches (a fast-forward)
 
 - **Compile cost: one line.** `DeletionVectorWriter.CreateAsync(positions, cardinality)` is gone; the cardinality
