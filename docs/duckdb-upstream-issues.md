@@ -1104,6 +1104,25 @@ ONE equality condition ("the Filter API only allows single-column filters so far
 rows in 0.53 s. A filter per equality column (each alone is a valid superset) would cover it, but the prefix-range
 filter is built from `conditions[0]`'s key only, so that is a larger change.
 
+## 16. `SHREDDING` misses a VARIANT column whose name has upper-case letters — silent, 2.0
+
+**Ready to file, not filed** (draft with repro: the session scratchpad `shredcase/issue.md`; the user posts).
+Reproduced on the STOCK `duckdb==2.0.0` wheel: `SHREDDING {'v': 'VARIANT'}` writes `v` unshredded, while a
+column `"Payload"` stays shredded whether the option names it `Payload` or `payload`; no error either way.
+
+**Cause, read from the v2.0.0 source:** the bind lower-cases the name
+(`parquet_extension.cpp`, `StringUtil::Lower(StructType::GetChildName(...))`), validates it against the VARIANT
+columns through a case-insensitive `identifier_set_t`, and stores it LOWER-CASED in `ShreddingType::children`,
+an `unordered_map<string, ShreddingType>`. The writer looks the column up by its REAL name
+(`ShreddingType::GetChild` → `find(name.GetIdentifierName())`), so `Payload` misses `payload` and the column
+falls back to the default shredding. Fix: store the matched column's own name, or make the map
+case-insensitive.
+
+**Our exposure:** we pass `SHREDDING {col: 'VARIANT'}` on every native Delta write (the protocol forbids a
+shredded variant without `variantShredding`). Under column mapping the physical names are `col-<guid>`, lower
+case, so only `column_mapping 'none'` with a mixed-case variant column is affected. Pinned in
+`verify_delta_catalog_variant` (the `uppername` row fails the day upstream fixes it).
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the
