@@ -675,6 +675,14 @@ records each file's values in `ducklake_file_partition_value` (text: `5`, `a b/c
   `ducklake_rewrite_data_files` touched no file without deletes. So after a change the live files carry neither key
   in full, and a first sync with `partitioning := true` declares neither — the mirror is unpartitioned until no file
   of the old partitioning is live (delete + re-insert, or recreate the table).
+- **`rebuild := true` (2026-11-04)** writes a mirror anew: it deletes what the sync wrote into the table folder
+  (`_delta_log/`, `_change_data/`, engineered-wood's `deletion_vector_*.bin`; DuckLake's files are never touched),
+  deletes the marker row, and the sync that follows is a first sync with the options given. Refused without
+  `table_name`, and for a log the sync did not write (its oldest commit has no `ducklake` txn). `_last_checkpoint`
+  goes first and the commits in descending order, so an interruption leaves a valid shorter log. Not coordinated
+  with readers or another sync. A key left undeclared because some live file lacks it now logs a warning. The
+  refusal of a partitioning change used to say "sync it into a new folder", which no option allows (the log has
+  to live in DuckLake's folder, §11.2); it names `rebuild` now. Gate `verify_ducklake_delta_sync` §16.
 - MEASURED LIVE on Fabric (data on `LH/Tables/dbo`, metadata on box): `PARTITIONED BY (region, d, year(ts))`, an
   UPDATE moving a row to another region, a DELETE of the NULL partition's row — the SQL endpoint read the exact rows
   after 190 s, `WHERE region = 'eu'` 1, with `region` and `d` declared AND present in the files.

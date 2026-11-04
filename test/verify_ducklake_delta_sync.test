@@ -1169,3 +1169,152 @@ SELECT v, epoch_us(ts) FROM r6.main.pt WHERE v = 2;
 
 statement ok
 SET GLOBAL TimeZone = 'UTC';
+
+# ============================================================================
+# 16. rebuild := true WRITES A TABLE'S MIRROR ANEW. Delta cannot change a table's partition columns without
+#     rewriting it, and the files are DuckLake's, so after a partitioning change a normal sync refuses (§13). A
+#     rebuild deletes what the sync wrote into the folder — the log, the change data files and engineered-wood's
+#     deletion-vector files, never DuckLake's own files — clears the marker row, and syncs again as a FIRST sync
+#     with the options it is given. DuckLake's compaction does not move files into a new partitioning (measured,
+#     docs/ducklake-catalog.md §11.12), so after a change neither key is in every file and nothing is declared.
+# ============================================================================
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta7.ducklake' AS lake7 (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl7/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake7.t (id INTEGER, region VARCHAR, k INTEGER);
+
+statement ok
+ALTER TABLE lake7.t SET PARTITIONED BY (region);
+
+statement ok
+INSERT INTO lake7.t SELECT i, CASE WHEN i % 2 = 0 THEN 'eu' ELSE 'us' END, i % 5 FROM range(10000) r(i);
+
+query II
+SELECT delta_version, files_added FROM ducklake_delta_sync('lake7', table_name := 'main.t', change_data_feed := true);
+----
+0	2
+
+statement ok
+DELETE FROM lake7.t WHERE id % 3 = 0;
+
+query II
+SELECT delta_version, deletion_vectors FROM ducklake_delta_sync('lake7', table_name := 'main.t');
+----
+1	2
+
+# What the sync wrote: two commits, change data files, and two deletion vectors too large to inline.
+query III
+SELECT count(*) FILTER (WHERE file LIKE '%/_delta_log/%.json'), count(*) FILTER (WHERE file LIKE '%/_change_data/%') > 0,
+       count(*) FILTER (WHERE file LIKE '%/deletion_vector_%.bin')
+FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/t/**');
+----
+2	true	2
+
+statement ok
+CREATE TEMP TABLE old_dv AS SELECT file FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/t/deletion_vector_*.bin');
+
+query I
+SELECT content LIKE '%"partitionColumns":["region"]%' FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/t/_delta_log/00000000000000000000.json');
+----
+true
+
+statement ok
+ALTER TABLE lake7.t SET PARTITIONED BY (k);
+
+statement ok
+INSERT INTO lake7.t VALUES (20000, 'eu', 1);
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake7', table_name := 'main.t');
+----
+Write the mirror anew with rebuild := true
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake7', rebuild := true);
+----
+needs table_name
+
+query III
+SELECT delta_version, files_added, deletion_vectors FROM ducklake_delta_sync('lake7', table_name := 'main.t', rebuild := true);
+----
+0	3	2
+
+# One commit again, no change data (not asked for this time), new deletion vectors only, DuckLake's files untouched.
+query IIII
+SELECT count(*) FILTER (WHERE file LIKE '%/_delta_log/%.json'), count(*) FILTER (WHERE file LIKE '%/_change_data/%'),
+       count(*) FILTER (WHERE file LIKE '%/deletion_vector_%.bin'), count(*) FILTER (WHERE file LIKE '%-delete.parquet')
+FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/t/**');
+----
+1	0	2	2
+
+query I
+SELECT count(*) FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/t/deletion_vector_*.bin') WHERE file IN (SELECT file FROM old_dv);
+----
+0
+
+# Neither 'region' (the new file has none) nor 'k' (the old files have none) is in every file.
+query I
+SELECT content LIKE '%"partitionColumns":[]%' FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/t/_delta_log/00000000000000000000.json');
+----
+true
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl7' AS d7 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query II
+SELECT count(*), sum(id) FROM d7.main.t;
+----
+6667	33346667
+
+query II
+SELECT count(*), sum(id) FROM lake7.t;
+----
+6667	33346667
+
+statement ok
+DETACH d7;
+
+# The marker row follows the rebuild's options.
+query T
+SELECT column_mapping FROM __ducklake_metadata_lake7.main.fabricator_delta_mirror;
+----
+name
+
+query I
+SELECT delta_version FROM ducklake_delta_sync('lake7', table_name := 'main.t', rebuild := true, column_mapping := 'none', partitioning := false);
+----
+0
+
+query T
+SELECT column_mapping FROM __ducklake_metadata_lake7.main.fabricator_delta_mirror;
+----
+none
+
+# A Delta log the sync did not write is refused and left as it is.
+statement ok
+CREATE TABLE lake7.f (x INTEGER);
+
+statement ok
+INSERT INTO lake7.f VALUES (1);
+
+statement ok
+COPY (SELECT 1 AS x) TO '{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/f' (FORMAT delta);
+
+statement ok
+CREATE TEMP TABLE foreign_log AS SELECT file FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/f/_delta_log/*.json');
+
+statement error
+SELECT * FROM ducklake_delta_sync('lake7', table_name := 'main.f', rebuild := true);
+----
+did not write
+
+query II
+SELECT count(*), count(*) = (SELECT count(*) FROM foreign_log) FROM glob('{FABRICATOR_DELTA_WRITE_DIR}/dl7/main/f/_delta_log/*.json')
+WHERE file IN (SELECT file FROM foreign_log);
+----
+2	true
+
+statement ok
+DETACH lake7;

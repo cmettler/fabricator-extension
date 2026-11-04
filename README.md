@@ -576,14 +576,24 @@ What the profile drives automatically:
   deletes as deletion vectors, DuckLake's row ids as Delta row tracking, and type widening (`INT` → `BIGINT`)
   declared as such. Options: `table_name := 'schema.table'`, `column_mapping := 'name'` (default; what Fabric
   reads), `'id'` or `'none'`, `deletion_vectors := false`, `timestamp_mapping := 'utc'` (default) or `'ntz'`,
-  `partitioning := false`, `change_data_feed := true`, `metadata_schema := '…'`.
+  `partitioning := false`, `change_data_feed := true`, `metadata_schema := '…'`, `rebuild := true`.
   - **Partitioning.** A partition key that is a plain column (`PARTITIONED BY (region)`) becomes a Delta partition
     column, so Delta readers skip partitions by value. A key with a transform (`year(ts)`, `bucket(…)`) is not
     declared, because Delta has no such partitions; DuckLake still writes one file per value, and Delta readers skip
     them by the file statistics instead. Integer, string, date, boolean and decimal columns qualify; timestamps do
     not. It does not matter whether DuckLake writes hive-style paths. The partitioning is fixed at a table's first
     sync: if it changes later, the sync refuses, since Delta cannot change a table's partition columns.
-    `partitioning := false` declares none.
+    `partitioning := false` declares none, and then DuckLake may change its partitioning freely.
+  - **Writing a mirror anew** (`rebuild := true`, needs `table_name`). Deletes what the sync wrote into the table's
+    folder (the log, `_change_data`, its deletion-vector files; never DuckLake's files) and syncs again as a first
+    sync with the options given — the way to switch `partitioning`, `column_mapping` or `timestamp_mapping` on an
+    existing mirror, or to follow a changed partitioning. The Delta history starts again at version 0; a Delta
+    reader reading during the rebuild fails, so run it when nothing reads. After a partitioning change the old files
+    keep the old partitioning (DuckLake's compaction does not move them), so until they are gone the rebuilt mirror
+    declares no partition column and says so in a warning.
+  ```sql
+  SELECT * FROM ducklake_delta_sync('lake', table_name := 'main.t', rebuild := true, partitioning := false);
+  ```
   - **Change data feed** (`change_data_feed := true`, can be switched on later, not off). Each Delta version then
     carries DuckLake's own row changes (`ducklake_table_changes`: inserts, deletes, and updates as pre- and
     post-images) in `_change_data` files, the files Delta's change feed reads (measured with

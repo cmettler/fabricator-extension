@@ -9,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Apache.Arrow;
@@ -28,7 +29,7 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// <c>ducklake_delta_sync(lake [, table_name := 'schema.table'] [, column_mapping := 'name' | 'id' | 'none']
 /// [, deletion_vectors := true | false] [, timestamp_mapping := 'utc' | 'ntz'] [, partitioning := true | false]
-/// [, change_data_feed := false | true] [, metadata_schema := '…'])</c> — writes a
+/// [, change_data_feed := false | true] [, metadata_schema := '…'] [, rebuild := false | true])</c> — writes a
 /// Delta log next to every DuckLake table's data files, so an engine that reads only Delta (Fabric's SQL
 /// endpoint, Spark, Direct Lake) reads the table from the SAME Parquet files DuckLake wrote. DuckLake stays
 /// the source of truth; the Delta log is derived from it and nothing else may write to it.
@@ -67,6 +68,7 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
         Params.Named("deletion_vectors", BooleanType.Default),
         Params.Named("partitioning", BooleanType.Default),
         Params.Named("change_data_feed", BooleanType.Default),
+        Params.Named("rebuild", BooleanType.Default),
     }, null);
 
     internal static readonly Schema ResultSchema = new(new[]
@@ -103,8 +105,15 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
         bool deletionVectors = FabricArgs.Bool(args, 5) ?? true;
         bool partitioning = FabricArgs.Bool(args, 6) ?? true;
         bool changeDataFeed = FabricArgs.Bool(args, 7) ?? false;
+        bool rebuild = FabricArgs.Bool(args, 8) ?? false;
+        if (rebuild && table is null)
+        {
+            throw new ArgumentException(
+                "ducklake_delta_sync: rebuild := true deletes a table's Delta log and writes it anew, so it needs " +
+                "table_name := 'schema.table'.");
+        }
         return new SyncBinding(lake, table, mapping, FabricArgs.Str(args, 3), timestamps, deletionVectors, partitioning,
-            changeDataFeed);
+            changeDataFeed, rebuild);
     }
 
     private sealed class SyncBinding : ITableFunctionBinding
@@ -117,10 +126,12 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
         private readonly bool _deletionVectors;
         private readonly bool _partitioning;
         private readonly bool _changeDataFeed;
+        private readonly bool _rebuild;
 
         public SyncBinding(string lake, string? table, string mapping, string? metadataSchema, string timestamps,
-            bool deletionVectors, bool partitioning, bool changeDataFeed)
+            bool deletionVectors, bool partitioning, bool changeDataFeed, bool rebuild)
         {
+            _rebuild = rebuild;
             _timestamps = timestamps;
             _deletionVectors = deletionVectors;
             _partitioning = partitioning;
@@ -141,7 +152,7 @@ public sealed class DuckLakeDeltaSyncFunction : ITableFunction
             // inside get_next, after the call returned. Connection-free → the host-FS path.
             AmbientAdlsCredential.Current = null;
             var results = new DuckLakeDeltaSync(AmbientOpener.Current, _lake, _mapping, _timestamps, _deletionVectors,
-                _partitioning, _changeDataFeed).Run(_table, _metadataSchema, ct);
+                _partitioning, _changeDataFeed).Run(_table, _metadataSchema, ct, _rebuild);
             return Single(DuckLakeDeltaSync.ToBatch(results));
         }
 
@@ -254,7 +265,7 @@ internal sealed class DuckLakeDeltaSync
         return (dataPath, checkpointsSafe, current, list);
     }
 
-    public List<Result> Run(string? tableFilter, string? metadataSchema, CancellationToken ct)
+    public List<Result> Run(string? tableFilter, string? metadataSchema, CancellationToken ct, bool rebuild = false)
     {
         var (_, checkpointsSafe, current, tables) = Describe(metadataSchema);
         var results = new List<Result>();
@@ -267,6 +278,10 @@ internal sealed class DuckLakeDeltaSync
             }
             matched = true;
             var sync = new TableSync(this, t.Id, t.Uuid, t.Root, current, checkpointsSafe);
+            if (rebuild)
+            {
+                sync.Reset($"{t.Schema}.{t.Table}", ct);
+            }
             results.AddRange(sync.Run(ct));
         }
         if (tableFilter is not null && !matched)
@@ -425,6 +440,68 @@ internal sealed class DuckLakeDeltaSync
                         "progress), re-reading the log", _root, now, stalled);
                 }
             }
+        }
+
+        /// <summary>
+        /// <c>rebuild := true</c>: removes everything the sync wrote into the table folder — the log, the change data
+        /// files and engineered-wood's deletion-vector files — and the marker row, so the next sync is a FIRST sync
+        /// again and takes the options it is given (partitioning, mapping, …). DuckLake's own files are untouched.
+        /// <para>Refused for a log this sync did not write: every commit it writes carries the <c>ducklake</c> txn
+        /// action, so the oldest remaining commit is checked (not the snapshot, which a half-deleted log may not
+        /// rebuild from). <c>_last_checkpoint</c> goes first and the rest in DESCENDING name order, so an interruption
+        /// leaves the commits 0..n of a valid log, which a normal sync continues and a second rebuild removes.</para>
+        /// <para>⚠ Not coordinated with readers or with another sync: a Delta reader reading meanwhile fails, and a
+        /// concurrent sync could commit into the old log while it is being deleted. An administrative step.</para>
+        /// </summary>
+        public void Reset(string tableName, CancellationToken ct)
+        {
+            var log = List("_delta_log/", ct);
+            var commits = log.Where(p => Regex.IsMatch(p, @"(^|/)\d{20}\.json$", RegexOptions.CultureInvariant))
+                .OrderBy(p => p, StringComparer.Ordinal).ToList();
+            if (commits.Count > 0)
+            {
+                string first = Encoding.UTF8.GetString(_fs.ReadAllBytesAsync(commits[0], ct).AsTask().GetAwaiter().GetResult());
+                if (!Regex.IsMatch(first, "\"appId\"\\s*:\\s*\"" + AppId + "\""))
+                {
+                    throw new InvalidOperationException(
+                        $"ducklake_delta_sync: '{_root}' holds a Delta log that this sync did not write (no 'ducklake' txn " +
+                        "action); rebuild deletes only its own log.");
+                }
+            }
+            var doomed = new List<string>();
+            doomed.AddRange(log.Where(p => p.EndsWith("_last_checkpoint", StringComparison.Ordinal)));
+            doomed.AddRange(log.Except(doomed).OrderByDescending(p => p, StringComparer.Ordinal));
+            doomed.AddRange(List("_change_data/", ct));
+            doomed.AddRange(List("deletion_vector_", ct).Where(p => p.EndsWith(".bin", StringComparison.Ordinal)));
+            foreach (var path in doomed)
+            {
+                _fs.DeleteAsync(path, ct).AsTask().GetAwaiter().GetResult();
+            }
+            string marker = _o.M(MarkerTable);
+            if (_o.Probe($"SELECT 1 FROM {marker} LIMIT 0"))
+            {
+                _o.Rows($"DELETE FROM {marker} WHERE table_id = {_tableId.ToString(CultureInfo.InvariantCulture)}");
+            }
+            _log.LogInformation("ducklake sync {Table}: rebuild removed {Log} log, {Other} change-data/deletion-vector files",
+                tableName, log.Count, doomed.Count - log.Count);
+        }
+
+        private List<string> List(string prefix, CancellationToken ct)
+        {
+            var list = new List<string>();
+            var e = _fs.ListAsync(prefix, ct).GetAsyncEnumerator(ct);
+            try
+            {
+                while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+                {
+                    list.Add(e.Current.Path);
+                }
+            }
+            finally
+            {
+                e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+            return list;
         }
 
         // The column names every file's Parquet schema really carries, by field id (DuckLake writes column_id there).
@@ -1016,6 +1093,15 @@ internal sealed class DuckLakeDeltaSync
                 {
                     chosen.Add(id);
                 }
+                else
+                {
+                    // Typically files written under an earlier partitioning: DuckLake's compaction keeps a file in the
+                    // partitioning it was written under (measured, docs/ducklake-catalog.md §11.12), so the key stays
+                    // undeclared until no such file is live. Files are still skipped by statistics.
+                    _log.LogWarning("ducklake sync {Root}: partition key {Column} is not declared in Delta — some live " +
+                                    "file has no value for it (written under another partitioning) or an empty string",
+                        _root, plan.LogicalName(id) ?? id.ToString(CultureInfo.InvariantCulture));
+                }
             }
             return chosen;
         }
@@ -1032,8 +1118,8 @@ internal sealed class DuckLakeDeltaSync
                     throw Refuse(tableName,
                         $"data file {f.RelPath} has no value for partition column '{column}', which the Delta mirror is " +
                         "partitioned by: the table's partitioning changed after its first sync, and Delta cannot change a " +
-                        "table's partition columns. Recreate the table, or the mirror (sync it into a new folder with " +
-                        "partitioning := false)");
+                        "table's partition columns. Write the mirror anew with rebuild := true (partitioning := false keeps it " +
+                        "unpartitioned), or recreate the table");
                 }
                 if (value == "")
                 {
