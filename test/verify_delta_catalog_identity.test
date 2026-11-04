@@ -116,3 +116,40 @@ SELECT id, v FROM codec.main.idt ORDER BY id;
 ----
 1	a
 2	b
+
+# UPDATE on an identity table (2026-11-04). It failed on both paths: the post-image keeps the row's identity value,
+# and engineered-wood wanted that said (identityValuesPreGenerated). An UPDATE that sets the identity column is
+# refused, as Spark does: the high-water mark would not follow, and a later INSERT would issue the value again.
+foreach dv true false
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/idupd_${dv}' AS upd (TYPE fabricator, PROVIDER 'delta', deletion_vectors ${dv});
+
+statement ok
+CREATE TABLE upd.main.t (id BIGINT AS (0), v VARCHAR);
+
+statement ok
+INSERT INTO upd.main.t (v) VALUES ('a'), ('b');
+
+statement ok
+UPDATE upd.main.t SET v = 'x' WHERE v = 'a';
+
+statement error
+UPDATE upd.main.t SET id = 7 WHERE v = 'b';
+----
+UPDATE cannot change the IDENTITY column 'id'
+
+statement ok
+INSERT INTO upd.main.t (v) VALUES ('c');
+
+query IT
+SELECT id, v FROM upd.main.t ORDER BY id;
+----
+1	x
+2	b
+3	c
+
+statement ok
+DETACH upd;
+
+endloop

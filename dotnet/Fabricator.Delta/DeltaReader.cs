@@ -3173,6 +3173,7 @@ internal static class DeltaReader
             // rewrite, and row-tracking ids are preserved via the materialized column. Copy-on-write remains
             // the path for DV-less tables (master's CoW preserves ids itself; it rejects CDF — a DV-less CDF
             // table's UPDATE surfaces that clean error).
+            RefuseIdentityUpdate(table, updates);
             var cfg = table.CurrentSnapshot.Metadata.Configuration;
             bool mor = EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.IsEnabled(cfg)
                        && !table.IsIcebergCompat;
@@ -3208,6 +3209,30 @@ internal static class DeltaReader
         finally
         {
             await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Refuses an UPDATE that sets an IDENTITY column, as Spark does (<c>DELTA_IDENTITY_COLUMNS_UPDATE_NOT_SUPPORTED</c>):
+    /// the high-water mark does not follow an updated value, so a later INSERT would issue it again. Every other
+    /// UPDATE keeps the rows' identity values, which is why the post-images may be written as pre-generated.
+    /// </summary>
+    private static void RefuseIdentityUpdate(DeltaTable table, RecordBatch updates)
+    {
+        foreach (var set in updates.Schema.FieldsList)
+        {
+            if (set.Name == DeltaCatalog.RowIdColumn)
+            {
+                continue;
+            }
+            var column = table.CurrentSnapshot.Schema.Fields.FirstOrDefault(
+                f => string.Equals(f.Name, set.Name, StringComparison.OrdinalIgnoreCase));
+            if (column is not null && EngineeredWood.DeltaLake.Schema.IdentityColumn.GetConfig(column) is not null)
+            {
+                throw new NotSupportedException(
+                    $"UPDATE cannot change the IDENTITY column '{column.Name}': the table assigns its values, and a "
+                    + "changed one would be issued again by a later INSERT.");
+            }
         }
     }
 
@@ -3598,7 +3623,9 @@ internal static class DeltaReader
             // Post-images become data files NOW (invisible until the commit references them). An abort
             // therefore leaves them as orphans for VACUUM — the same eager-write contract the buffered path
             // documents.
-            written.AddRange(await table.WriteDataFilesAsync(ewPost, token, materializedRowIds: ids)
+            // identityValuesPreGenerated: a post-image keeps its row's identity value (RefuseIdentityUpdate).
+            written.AddRange(await table.WriteDataFilesAsync(ewPost, token, materializedRowIds: ids,
+                    identityValuesPreGenerated: true)
                 .ConfigureAwait(false));
 
             if (ewPre is not null)
@@ -3703,7 +3730,8 @@ internal static class DeltaReader
         // left undeclared, engineered-wood (#530) would add a delete and an insert for the same rows.
         await txn.StageRowDeletesAsync(selection, RowDeleteMode.DeletionVector, token, changeDataStagedByCaller: true)
             .ConfigureAwait(false);
-        await txn.StageDataFilesAsync(written, changeDataStagedByCaller: true, cancellationToken: token)
+        await txn.StageDataFilesAsync(written, identityValuesPreGenerated: true, changeDataStagedByCaller: true,
+                cancellationToken: token)
             .ConfigureAwait(false);
         await txn.CommitAsync(token).ConfigureAwait(false);
         MemoryProbe.Mark("delta update mor: committed", matched);
