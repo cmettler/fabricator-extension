@@ -1872,9 +1872,14 @@ internal static class DeltaNativeReader
                 needsInner = true;
             }
             else if (field?.Type is DeltaSchema.StructType st
-                     && (StructShapeDiffers(st, stored, fm) || HasNaiveTimestamp(st, stored, fm)))
+                     && (StructShapeDiffers(st, stored, fm) || HasNaiveTimestamp(stored, fm)))
             {
                 expr = RebuildExpr(field.Type, Quote(stored), stored, fm);
+                needsInner = true;
+            }
+            else if (field?.Type is DeltaSchema.ArrayType or DeltaSchema.MapType && HasNaiveTimestamp(stored, fm))
+            {
+                expr = NestedUtcExpr(field.Type, Quote(stored), stored, fm, 0);
                 needsInner = true;
             }
             else if (IsDeltaTimestamp(field?.Type) && fm.Nodes.NaiveTimestamps.Contains(stored))
@@ -2527,6 +2532,10 @@ internal static class DeltaNativeReader
         {
             return UtcInstantExpr(src);
         }
+        if (type is DeltaSchema.ArrayType or DeltaSchema.MapType)
+        {
+            return NestedUtcExpr(type, src, srcPath, fm, 0);
+        }
         if (type is not DeltaSchema.StructType st || st.Fields.Count == 0)
         {
             return src;
@@ -2589,20 +2598,75 @@ internal static class DeltaNativeReader
         ? $"timezone('UTC', CAST({src} AS TIMESTAMP))"
         : $"CAST(CAST({src} AS TIMESTAMP) AS TIMESTAMPTZ)";
 
-    // Whether a struct holds a Delta timestamp member this file stores naive (lists/maps are not looked into: a
-    // member there keeps the file's type and the scan's type check names it).
-    private static bool HasNaiveTimestamp(DeltaSchema.StructType st, string path, FileMapping fm)
+    // Whether this file stores a naive timestamp anywhere below the column or member at path, lists and maps
+    // included.
+    private static bool HasNaiveTimestamp(string path, FileMapping fm)
     {
-        foreach (var ch in st.Fields)
+        var prefix = path + PathSep;
+        foreach (var naive in fm.Nodes.NaiveTimestamps)
         {
-            var childPath = path + PathSep + StoredChildName(ch, fm);
-            if (IsDeltaTimestamp(ch.Type) ? fm.Nodes.NaiveTimestamps.Contains(childPath)
-                : ch.Type is DeltaSchema.StructType inner && HasNaiveTimestamp(inner, childPath, fm))
+            if (naive.StartsWith(prefix, StringComparison.Ordinal))
             {
                 return true;
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// A list or map (or a struct inside one) with every naive timestamp below it converted by
+    /// <see cref="UtcInstantExpr"/>, through <c>list_transform</c> and <c>map_entries</c>. Without it a file whose
+    /// list holds naive timestamps failed the scan's type check on the per-file path (the batched path's declared
+    /// type already converts them). Struct members inside keep the FILE's names, as they do when nothing needs
+    /// converting: the per-batch column-mapping rename resolves them. <paramref name="depth"/> names the lambda
+    /// variables apart.
+    /// </summary>
+    private static string NestedUtcExpr(DeltaSchema.DeltaDataType type, string src, string path, FileMapping fm, int depth)
+    {
+        if (IsDeltaTimestamp(type))
+        {
+            return fm.Nodes.NaiveTimestamps.Contains(path) ? UtcInstantExpr(src) : src;
+        }
+        if (!HasNaiveTimestamp(path, fm) || !fm.Nodes.Children.TryGetValue(path, out var kids))
+        {
+            return src;
+        }
+        string v = "e" + depth.ToString(CultureInfo.InvariantCulture);
+        switch (type)
+        {
+            case DeltaSchema.ArrayType a when kids.Count == 1:
+            {
+                // The standard three-level list (<col>/list/element); a legacy two-level one repeats the element itself.
+                string repeated = path + PathSep + kids[0];
+                string element = kids[0] == "list" && fm.Nodes.Children.TryGetValue(repeated, out var ek) && ek.Count == 1
+                    ? repeated + PathSep + ek[0]
+                    : repeated;
+                return $"list_transform({src}, lambda {v}: {NestedUtcExpr(a.ElementType, v, element, fm, depth + 1)})";
+            }
+            case DeltaSchema.MapType m when kids.Count == 1
+                                            && fm.Nodes.Children.TryGetValue(path + PathSep + kids[0], out var kv)
+                                            && kv.Count == 2:
+            {
+                string entry = path + PathSep + kids[0];
+                string key = NestedUtcExpr(m.KeyType, $"{v}.key", entry + PathSep + kv[0], fm, depth + 1);
+                string value = NestedUtcExpr(m.ValueType, $"{v}.value", entry + PathSep + kv[1], fm, depth + 1);
+                return $"map_from_entries(list_transform(map_entries({src}), lambda {v}: {{'key': {key}, 'value': {value}}}))";
+            }
+            case DeltaSchema.StructType st:
+            {
+                var parts = new List<string>(kids.Count);
+                foreach (var name in kids)
+                {
+                    var member = st.Fields.FirstOrDefault(f => string.Equals(StoredChildName(f, fm), name, StringComparison.Ordinal));
+                    string child = $"({src}).{Quote(name)}";
+                    parts.Add($"{Quote(name)} := "
+                              + (member is null ? child : NestedUtcExpr(member.Type, child, path + PathSep + name, fm, depth)));
+                }
+                return $"CASE WHEN {src} IS NULL THEN NULL ELSE struct_pack({string.Join(", ", parts)}) END";
+            }
+            default:
+                return src;
+        }
     }
 
     /// <summary>One file's partition value as a typed SQL literal. A Delta <c>timestamp</c> value without an

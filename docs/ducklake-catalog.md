@@ -633,6 +633,12 @@ uncommitted change. A refusal throws, and DuckLake's whole commit rolls back. Ga
   rewrites (measured: `merge_adjacent_files` and `rewrite_data_files` both copy the old name), so after a rename with
   live data no further write could be mirrored. The guard refuses the rename itself, which leaves a way back
   (recreate the table with CREATE TABLE … AS SELECT).
+- **Partitioning (2026-11-04):** the marker records the declared partition columns (`partition_column_ids`, DuckLake
+  column ids, `''` for none; a marker from before gets the column at the next sync). Every SET and RESET PARTITIONED BY
+  inserts a `ducklake_partition_info` row (measured), so that insert triggers the check: the new partitioning must keep
+  every declared column as an identity key. Adding a key passes (the sync leaves it undeclared); dropping or replacing
+  one is refused, naming `rebuild := true, partitioning := false` as the way out. Gate
+  `verify_ducklake_mirror_guard_mssql` §4b (38 -> 60), mutant "check off" killed at the first refusal.
 - Not refused: anything on an unmirrored table, anything before the first sync.
 - **FOUND ON THE WAY, a silent wrong answer in the sync, fixed:** it inferred a file's physical column names from the
   metadata at the file's `begin_snapshot`. `ducklake_rewrite_data_files` gives a rewritten file a begin snapshot AFTER
@@ -667,8 +673,8 @@ records each file's values in `ducklake_file_partition_value` (text: `5`, `a b/c
   changes the logical name): the current partitioning's identity keys that every live file carries. A key with an
   empty string in some file stays undeclared — DuckLake keeps `''` apart from NULL, Delta reads an empty partition
   value as NULL. A later sync whose file lacks a value for a declared column (the partitioning changed) is REFUSED,
-  naming the file and the column: Delta cannot change a table's partition columns. ⚠ The catalog guard (§11.11)
-  does not check this yet; the sync does.
+  naming the file and the column: Delta cannot change a table's partition columns. The catalog guard (§11.11)
+  refuses the partitioning change itself since 2026-11-04.
 - **MEASURED 2026-11-04: DuckLake's compaction does NOT move files into a changed partitioning.** After
   `SET PARTITIONED BY (region)` → two inserts → `SET PARTITIONED BY (k)` → one insert, `ducklake_merge_adjacent_files`
   merged the `region=eu` files into ONE `region=eu` file under the OLD `partition_id`, and
@@ -732,7 +738,10 @@ converted type without a logical type read as naive `TIMESTAMP` too.
   the file stores naive from the footer probe it already runs, and converts exactly those with
   `timezone('UTC', CAST(x AS TIMESTAMP))` — zone-free, unlike `CAST(x AS TIMESTAMPTZ)`, so a COPY in a non-UTC
   session cannot rewrite values shifted. A UTC-adjusted file is not touched, so its filter pushdown is unchanged.
-  Struct members are converted too; a timestamp inside a list or map still keeps the file's type (loud, not wrong).
+  Struct members are converted too, and since the evening of 2026-11-04 timestamps inside lists and maps as well
+  (`list_transform` / `map_entries`, struct members inside keep the file's names for the per-batch rename). Before,
+  such a file failed the per-file read with a misleading "the table was changed outside this session"; the batched
+  read was already right. Gate §15 (`lake6.tn`: a list, a map and a list of structs, batched and pruned to one file).
 - A timestamp PARTITION value without an offset (what engineered-wood writes) is UTC by the spec; the per-file path
   cast it in the machine's zone as well. Same fix.
 - Gate `verify_ducklake_delta_sync` §15 (556), under `SET GLOBAL TimeZone = 'Asia/Kathmandu'`, which is what reaches

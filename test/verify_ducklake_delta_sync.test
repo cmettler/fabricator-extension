@@ -1101,10 +1101,24 @@ ALTER TABLE lake6.tp SET PARTITIONED BY (k);
 statement ok
 INSERT INTO lake6.tp VALUES (1, 10, TIMESTAMP '2025-01-01 00:00:00'), (2, 20, TIMESTAMP '2024-07-01 12:00:00');
 
+# Naive timestamps inside a list, a map and a list of structs (2026-11-04: the per-file path used to fail the scan's
+# type check on them; the batched path was already right).
+statement ok
+CREATE TABLE lake6.tn (id INTEGER, k INTEGER, tl TIMESTAMP[], tm MAP(VARCHAR, TIMESTAMP), ls STRUCT(a TIMESTAMP, b INTEGER)[]);
+
+statement ok
+ALTER TABLE lake6.tn SET PARTITIONED BY (k);
+
+statement ok
+INSERT INTO lake6.tn VALUES
+  (1, 10, [TIMESTAMP '2025-01-01 00:00:00'], MAP {'x': TIMESTAMP '2025-01-01 00:00:00'}, [{'a': TIMESTAMP '2025-01-01 00:00:00', 'b': 1}]),
+  (2, 20, [TIMESTAMP '2024-07-01 12:00:00', NULL], MAP {'x': TIMESTAMP '2024-07-01 12:00:00'}, [{'a': TIMESTAMP '2024-07-01 12:00:00', 'b': 2}, NULL]);
+
 query TI
 SELECT table_name, delta_version FROM ducklake_delta_sync('lake6') ORDER BY 1;
 ----
 t1	0
+tn	0
 tp	0
 
 statement ok
@@ -1129,6 +1143,23 @@ query II
 SELECT id, epoch_us(ts) FROM d6.main.tp WHERE k = 20;
 ----
 2	1719835200000000
+
+# Lists, maps and structs in lists: batched (two files), then per file (pruned to one).
+query IIIIII
+SELECT id, epoch_us(tl[1]), len(tl), epoch_us(tm['x']), epoch_us(ls[1].a), ls[1].b FROM d6.main.tn ORDER BY id;
+----
+1	1735689600000000	1	1735689600000000	1735689600000000	1
+2	1719835200000000	2	1719835200000000	1719835200000000	2
+
+query IIIIIII
+SELECT id, epoch_us(tl[1]), tl[2] IS NULL, epoch_us(tm['x']), epoch_us(ls[1].a), ls[1].b, ls[2] IS NULL FROM d6.main.tn WHERE k = 20;
+----
+2	1719835200000000	true	1719835200000000	1719835200000000	2	true
+
+query T
+SELECT typeof(ls) FROM d6.main.tn WHERE k = 20;
+----
+STRUCT(a TIMESTAMP WITH TIME ZONE, b INTEGER)[]
 
 query II
 SELECT id, epoch_us(ts) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl6/main/t1') ORDER BY id;
