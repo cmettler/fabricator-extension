@@ -4388,7 +4388,7 @@ principal wins even if `PROVIDER` says something else:
 | **Liquid clustering**: `SORTED BY (cols)`, `bucket()` / `hilbert_index()`, clustered `OPTIMIZE` (incremental ZCube), `ALTER … SET SORTED BY` | ✅ |
 | Per-table `WITH (…)` — Delta properties / feature-flag overrides / write tuning stamped in the CREATE commit | ✅ |
 | `native_write` / `native_read` — DuckDB's own Parquet reader/writer for data files (EW keeps the `_delta_log`) | ✅ |
-| VARIANT columns; `set_tblproperties` / `tblproperties`; `OPTIMIZE` / `VACUUM` maintenance | ✅ |
+| VARIANT columns (⚠ written shredded on this line, which the table does not declare — see [known-limitations.md](docs/known-limitations.md) 1.31); `set_tblproperties` / `tblproperties`; `OPTIMIZE` / `VACUUM` maintenance | ✅ |
 | Concurrent writers: OCC retry (a blind append / CTAS — an append that READ the table surfaces the conflict instead, see below) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
 | Concurrent writers on **OneLake**, many processes appending to ONE table — no lost writes (measured: 96 concurrent commits, all landed), but a losing writer can occasionally surface an error rather than retrying transparently, so retry the statement | ⚠ |
 

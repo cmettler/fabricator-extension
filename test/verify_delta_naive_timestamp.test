@@ -1,0 +1,109 @@
+# name: test/verify_delta_naive_timestamp.test
+# description: A Delta `timestamp` column stored NAIVE in Parquet (isAdjustedToUTC = 0 — Spark's INT96, a legacy
+#              converted type, DuckDB-written files) reads as the UTC instant it holds, in every read path and in any
+#              time zone. Before the fix the batched read cast it in the reader connection's zone (silently shifted)
+#              and the per-file read raised an INTERNAL error that invalidated the database; a timestamp PARTITION
+#              value without an offset (what engineered-wood writes) was shifted on both paths. `SET GLOBAL` is what
+#              reaches the reader's own connection, so this runs the same on a UTC machine. epoch_us is zone-free:
+#              2025-01-01 00:00Z = 1735689600000000, 2024-07-01 12:00Z = 1719835200000000.
+#              The naive data files are written next to the table and added by a hand-written commit — the shape a
+#              foreign writer's table has. Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require icu
+
+require json
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+SET GLOBAL TimeZone = 'Asia/Kathmandu';
+
+statement ok
+SET TimeZone = 'Asia/Kathmandu';
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nlake' AS e (TYPE fabricator, PROVIDER 'engineeredwooddelta', column_mapping 'none', row_tracking false, deletion_vectors false, READ_ONLY false);
+
+statement ok
+CREATE TABLE e.main.nv (id INTEGER, ts TIMESTAMPTZ);
+
+statement ok
+COPY (SELECT 1::INTEGER AS id, TIMESTAMP '2025-01-01 00:00:00' AS ts) TO '${FABRICATOR_DELTA_WRITE_DIR}/nlake/nv/n1.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT 2::INTEGER AS id, TIMESTAMP '2024-07-01 12:00:00' AS ts) TO '${FABRICATOR_DELTA_WRITE_DIR}/nlake/nv/n2.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/nlake/nv/n*.parquet')
+WHERE name = 'ts' AND logical_type LIKE 'TimestampType(isAdjustedToUTC=0%';
+----
+2
+
+# Version 1 adds both files, with id statistics so `WHERE id = 2` prunes to one file (the per-file path).
+statement ok
+COPY (
+  SELECT '{"add":{"path":"' || f || '","partitionValues":{},"size":' || b.size
+         || ',"modificationTime":0,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"id\":' || i
+         || '},\"maxValues\":{\"id\":' || i || '},\"nullCount\":{\"id\":0,\"ts\":0}}"}}'
+  FROM (VALUES ('n1.parquet', 1), ('n2.parquet', 2)) t(f, i)
+  JOIN read_blob('${FABRICATOR_DELTA_WRITE_DIR}/nlake/nv/n*.parquet') b ON b.filename LIKE '%' || t.f
+) TO '${FABRICATOR_DELTA_WRITE_DIR}/nlake/nv/_delta_log/00000000000000000001.json' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nlake' AS d (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
+
+# Two files: the batched form.
+query II
+SELECT id, epoch_us(ts) FROM d.main.nv ORDER BY id;
+----
+1	1735689600000000
+2	1719835200000000
+
+# One file after pruning: the per-file path.
+query II
+SELECT id, epoch_us(ts) FROM d.main.nv WHERE id = 2;
+----
+2	1719835200000000
+
+query II
+SELECT id, epoch_us(ts) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/nlake/nv') ORDER BY id;
+----
+1	1735689600000000
+2	1719835200000000
+
+# A timestamp partition column written by engineered-wood, whose partition values carry no offset (UTC by the spec).
+statement ok
+CREATE TABLE e.main.pt (v INTEGER, ts TIMESTAMPTZ) PARTITIONED BY (ts);
+
+statement ok
+INSERT INTO e.main.pt VALUES (1, TIMESTAMPTZ '2025-01-01 00:00:00+00'), (2, TIMESTAMPTZ '2024-07-01 12:00:00.5+00');
+
+query I
+SELECT count(*) FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/nlake/pt/_delta_log/*.json') WHERE content LIKE '%"2024-07-01 12:00:00.500000"%';
+----
+1
+
+statement ok
+DETACH d;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nlake' AS d (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
+
+query II
+SELECT v, epoch_us(ts) FROM d.main.pt ORDER BY v;
+----
+1	1735689600000000
+2	1719835200500000
+
+query II
+SELECT v, epoch_us(ts) FROM d.main.pt WHERE v = 2;
+----
+2	1719835200500000
+
+statement ok
+SET GLOBAL TimeZone = 'UTC';

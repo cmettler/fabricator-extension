@@ -313,6 +313,33 @@ correct bound). Gate `verify_delta_statistics` §9: the counts, the bound as the
 that pruning still WORKS (an all-`true` file is rightly skipped for `= false`). The reverted fix dies at the first
 row with `0 15`, the original symptom.
 
+### ~~1.30~~ FIXED 2026-11-04 — a NAIVE Parquet timestamp in a Delta `timestamp` column was misread off UTC
+
+**What went wrong.** A data file may store a Delta `timestamp` without `isAdjustedToUTC` — Spark's INT96, a legacy
+converted type, any DuckDB-written file — and DuckDB reads it as a naive `TIMESTAMP` holding the UTC wall clock. The
+`PROVIDER 'delta'` reader handled it three ways, all wrong unless the machine runs in UTC (measured on DuckDB 1.5.6
+under `SET GLOBAL TimeZone='Asia/Kathmandu'`): the batched read cast it in the reader connection's zone (**silently
+shifted** by the offset); the per-file read raised an `INTERNAL Error` (*"Vector::Reference used on vector of
+different type"*) that **invalidated the database**; and a timestamp PARTITION value without an offset — what
+engineered-wood writes, UTC by the spec — was shifted on both paths. The reader's own connection takes the MACHINE's
+zone, which is why a UTC Linux box never showed it.
+
+**Fix.** The batched statement runs with `TimeZone='UTC'` (when ICU is loaded; without it the cast is UTC-based
+already); the per-file read converts exactly the leaves the file stores naive (from the footer probe it already
+runs) with `timezone('UTC', CAST(x AS TIMESTAMP))`, which is zone-free; a partition value without an offset is read
+as UTC. Gate `verify_delta_naive_timestamp` (31): the reverted fix dies at the batched row. On 2.0 the same fix
+landed with a wider rework (every internal host query runs in UTC).
+
+### 1.31 VARIANT data files written on 1.5 are SHREDDED, while the table declares only `variantType`
+
+DuckDB's Parquet writer shreds a variant (`typed_value` columns), and on this line the codec engine does too (our
+variant transport calls engineered-wood's `TryShred`). The Delta protocol allows a shredded variant only when the table
+enables `variantShredding` (`delta.enableVariantShredding = true`), so a strict reader may refuse such a file. Spark
+and delta-kernel have read them so far, but that is not a guarantee. **Not fixable on 1.5**: DuckDB 1.5.6's writer
+ignores both `SHREDDING {col: 'VARIANT'}` and `variant_minimum_shredding_size = -1` (measured; 2.0's writer honours the
+former, and the 2.0 line writes unshredded since 2026-11-04). Use the 2.0 line for tables other engines must read
+strictly; engineered-wood cannot declare `variantShredding` yet either (clast-project/engineered-wood#671).
+
 ## 2. Claimed but NOT measured — treat as unproven
 
 | # | claim | why it is unproven, and what would settle it |
