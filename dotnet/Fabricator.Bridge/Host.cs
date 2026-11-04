@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 
@@ -23,7 +24,10 @@ public static class Host
     public static bool CanQuery => HostFs.CanQuery;
 
     /// <summary>Runs <paramref name="sql"/> on a fresh host connection; the caller owns + disposes the stream.</summary>
-    public static IArrowArrayStream Query(string sql) => HostFs.Query(sql);
+    /// <param name="session">Which session the query runs in — see <see cref="HostSession"/>. Required on
+    /// every overload, so each caller decides.</param>
+    public static IArrowArrayStream Query(string sql, HostSession session) =>
+        HostFs.Query(sql, clientSession: SessionHandle(session));
 
     /// <summary>
     /// Runs <paramref name="sql"/> binding a 1-row <paramref name="parameters"/> batch to the statement's
@@ -36,7 +40,8 @@ public static class Host
     /// an empty batch binds all-NULL, and a parameterised call is limited to ONE statement (Prepare, not
     /// SendQuery).
     /// </remarks>
-    public static IArrowArrayStream Query(string sql, RecordBatch parameters) => HostFs.Query(sql, parameters);
+    public static IArrowArrayStream Query(string sql, RecordBatch parameters, HostSession session) =>
+        HostFs.Query(sql, parameters, clientSession: SessionHandle(session));
 
     /// <summary>
     /// Runs <paramref name="sql"/> on a fresh host connection with C#-provided named Arrow <paramref name="inputs"/>
@@ -44,49 +49,48 @@ public static class Host
     /// consumes the input streams during the query. Lets a managed component push data into the host engine
     /// (join/filter/aggregate it with DuckDB) over Arrow. See docs/host-query.md.
     /// </summary>
-    public static IArrowArrayStream Query(string sql, IReadOnlyList<(string Name, IArrowArrayStream Stream)> inputs)
-        => HostFs.Query(sql, inputs: inputs);
-
-    /// <summary>Runs <paramref name="sql"/> with both positional <paramref name="parameters"/> and named Arrow
-    /// <paramref name="inputs"/> on a fresh host connection.</summary>
-    public static IArrowArrayStream Query(string sql, RecordBatch? parameters,
-                                          IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs)
-        => HostFs.Query(sql, parameters, inputs);
+    public static IArrowArrayStream Query(string sql, IReadOnlyList<(string Name, IArrowArrayStream Stream)> inputs,
+                                          HostSession session)
+        => HostFs.Query(sql, inputs: inputs, clientSession: SessionHandle(session));
 
     /// <summary>
-    /// Runs <paramref name="sql"/> on a fresh host connection, optionally AS THE CALLER'S SESSION WOULD:
-    /// pass the calling operator's <c>ClientContext</c> handle as <paramref name="clientSession"/> and the
-    /// fresh connection inherits its <c>TimeZone</c> and catalog SEARCH PATH before the statement runs.
+    /// Runs <paramref name="sql"/> with both positional <paramref name="parameters"/> and named Arrow
+    /// <paramref name="inputs"/> on a fresh host connection, in the given <paramref name="session"/>.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// ⚠ <b>The search path is one thing, not three.</b> <c>current_catalog()</c>, <c>current_schema()</c>
-    /// and <c>search_path</c> all read the same <c>CatalogSearchPath</c>, so copying it carries all three —
-    /// which is why an unqualified <c>FROM t</c> resolves the way the caller's statement would.
+    /// ⚠ <b><see cref="HostSession.Inherit"/> is a CHOICE, never a default.</b> A template rendering the
+    /// caller's statement wants it; a provider doing its own bookkeeping wants
+    /// <see cref="HostSession.Neutral"/>, a session that cannot depend on who called it. Inherit reads the
+    /// ambient client context of the current crossing; a plugin gets the same through <see cref="IHostQuery"/>,
+    /// whose members inherit by default.
     /// </para>
     /// <para>
-    /// ⚠ <b>It is opt-in, and that is the design rather than caution.</b> Inheriting is a CHOICE: a template
-    /// rendering the caller's statement wants it, while a provider doing its own bookkeeping wants a session
-    /// that cannot depend on who called it. 0 (the default) is exactly the behaviour every caller had before
-    /// ABI v83. Inside an ABI crossing the handle to pass is <c>AmbientOpener.Current</c>; a plugin gets it
-    /// automatically through <see cref="IHostQuery"/>, whose implementation passes the ambient for you.
+    /// ⚠ <b>Neither makes the query part of the caller's transaction.</b> The connection is still fresh and
+    /// still reads COMMITTED state, so a caller inside <c>BEGIN; INSERT …;</c> does not see its own
+    /// uncommitted rows.
     /// </para>
     /// <para>
-    /// ⚠ <b>It does NOT make the query part of the caller's transaction.</b> The connection is still fresh
-    /// and still reads COMMITTED state, so a caller inside <c>BEGIN; INSERT …;</c> does not see its own
-    /// uncommitted rows — that is a property of opening a separate connection and is unchanged. What is
-    /// copied is name and time RESOLUTION, nothing else; "copy the session" has no principled boundary, so
-    /// each addition is deliberate.
-    /// </para>
-    /// <para>
-    /// ⚠ The handle is valid only for the duration of this synchronous call — the host captures the session
-    /// immediately and does not keep the pointer.
+    /// ⚠ The session is captured immediately, during this synchronous call; the host does not keep the
+    /// client-context pointer.
     /// </para>
     /// </remarks>
     public static IArrowArrayStream Query(string sql, RecordBatch? parameters,
                                           IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs,
-                                          nint clientSession)
-        => HostFs.Query(sql, parameters, inputs, clientSession: clientSession);
+                                          HostSession session, CancellationToken ct = default)
+        => HostFs.Query(sql, parameters, inputs, ct, clientSession: SessionHandle(session));
+
+    /// <summary>
+    /// The client-context handle the ABI takes for <paramref name="session"/>: the ambient one for
+    /// <see cref="HostSession.Inherit"/> (0 when there is none, which the host reads as neutral), 0 for
+    /// <see cref="HostSession.Neutral"/>.
+    /// </summary>
+    private static nint SessionHandle(HostSession session) => session switch
+    {
+        HostSession.Neutral => 0,
+        HostSession.Inherit => AmbientOpener.Current,
+        _ => throw new ArgumentOutOfRangeException(nameof(session), session, null),
+    };
 
     /// <summary>
     /// Runs a non-query statement (DDL / DML) on a fresh host connection and returns the affected-row count
@@ -141,7 +145,7 @@ public static class Host
     /// several threads opens one connection per thread.
     /// </para>
     /// <para>
-    /// ⚠ <paramref name="clientSession"/> is applied ONCE at open rather than per query, so a <c>SET</c>
+    /// ⚠ <paramref name="session"/> is applied ONCE at open rather than per query, so a <c>SET</c>
     /// performed THROUGH the pin sticks — which is part of the point. It still does NOT join the caller's
     /// transaction: reads are of COMMITTED state, exactly as for a fresh connection.
     /// </para>
@@ -150,7 +154,8 @@ public static class Host
     /// connection-scoped, so it would outlive the call and collide with the next one using that name.
     /// </para>
     /// </remarks>
-    public static HostConnection OpenConnection(nint clientSession = 0) => new(HostFs.OpenConnection(clientSession));
+    public static HostConnection OpenConnection(HostSession session) =>
+        new(HostFs.OpenConnection(SessionHandle(session)));
 
     /// <summary>
     /// A pinned host DuckDB connection (see <see cref="Host.OpenConnection"/>): several statements on ONE
@@ -218,9 +223,9 @@ public static class Host
         }
     }
 
-    public static long ExecuteNonQuery(string sql)
+    public static long ExecuteNonQuery(string sql, HostSession session)
     {
-        using var stream = Query(sql);
+        using var stream = Query(sql, session);
         return ReadCount(stream);
     }
 

@@ -50,7 +50,7 @@ public static class HostParquetStaging
         var sql = $"COPY (SELECT * FROM \"{inputView}\") TO '{directory.Replace("'", "''")}' "
                   + "(FORMAT parquet, PER_THREAD_OUTPUT true)";
         Log.LogDebug("stage parquet: {Sql}", sql);
-        using var result = Host.Query(sql, new (string, IArrowArrayStream)[] { (inputView, data) });
+        using var result = Host.Query(sql, new (string, IArrowArrayStream)[] { (inputView, data) }, HostSession.Neutral);
         var batch = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
         long rows = batch is { ColumnCount: > 0, Length: > 0 } && batch.Column(0) is Int64Array c
                     && c.GetValue(0) is long v ? v : 0;

@@ -164,7 +164,7 @@ internal static class PluginInstall
                 "fabricator_install_plugin: the host did not register host_query, so DuckDB's platform string " +
                 "cannot be read. This function is only callable from SQL, where it always is.");
         }
-        using var stream = Host.Query("SELECT p.platform FROM pragma_platform() p");
+        using var stream = Host.Query("SELECT p.platform FROM pragma_platform() p", HostSession.Neutral);
         using var batch = await stream.ReadNextRecordBatchAsync().ConfigureAwait(false);
         if (batch is null || batch.Length == 0 || batch.Column(0) is not StringArray platforms)
         {

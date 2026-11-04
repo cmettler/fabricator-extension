@@ -46,7 +46,7 @@ internal static class HostBatchFilter
                 continue;
             }
             using var input = new InMemoryArrayStream(schema, new[] { batch });
-            using var filtered = Host.Query(sql, new (string, IArrowArrayStream)[] { (InputView, input) });
+            using var filtered = Host.Query(sql, new (string, IArrowArrayStream)[] { (InputView, input) }, HostSession.Neutral);
             while (true)
             {
                 var rb = await filtered.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);

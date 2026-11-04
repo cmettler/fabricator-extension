@@ -333,7 +333,7 @@ The two modes below (2026-07-30, ABI v83) stay; what each one MEANS changed, bec
 
 | mode | who | before | since 2026-11-04 |
 |---|---|---|---|
-| **inherit** | `fabricator_host_query` / `_exec`, Fluid's pin, plugins through `IHostQuery` (default `inheritSession: true`), the C# `Host.Query(…, clientSession)` | `TimeZone` + search path, two hand-picked items | every setting the caller **set** for its session, the search path, and its variables (`SET VARIABLE`) |
+| **inherit** | `fabricator_host_query` / `_exec`, Fluid's pin, plugins through `IHostQuery` (default `inheritSession: true`), the C# `Host.*(…, HostSession.Inherit)` | `TimeZone` + search path, two hand-picked items | every setting the caller **set** for its session, the search path, and its variables (`SET VARIABLE`) |
 | **neutral** | every other managed host query: the Delta reader and writer, the DuckLake sync, provider SQL | DuckDB defaults — i.e. the **machine's** zone | DuckDB defaults with **`TimeZone = 'UTC'`** |
 
 - **"Set" is measured, not listed.** A setting is copied when its lookup reports the SESSION scope, which for a
@@ -349,6 +349,12 @@ The two modes below (2026-07-30, ABI v83) stay; what each one MEANS changed, bec
   timestamp cast to `TIMESTAMPTZ` moved by the zone's offset with no error (docs/ducklake-catalog.md §11.12). It
   costs a `SET` statement only where the default is not UTC already (Linux servers and Fabric skip it); without
   ICU there is no `TimeZone`, and casts are UTC-based anyway.
+- **The managed `Host` API has no default (since the follow-up commit).** `Host.Query`, `Host.ExecuteNonQuery`
+  and `Host.OpenConnection` each REQUIRE a `HostSession` (`Neutral` / `Inherit`), so every call site states
+  which session it means and a new one cannot pick a mode by accident. The switch was behaviour-neutral: every
+  in-tree internal caller says `Neutral`, which is what it got before. `IHostQuery` (plugins) keeps its
+  `inheritSession: true` default, now on `ExecuteNonQuery` too: it had no such parameter and always ran
+  neutral, so a plugin's query and its statement resolved names differently (gate `verify_plugin`, `plug_host_exec`).
 - **Fluid owns `params`.** With variables inherited, a caller's own `params` would read as the template's bag, so
   a render without a bag now RESETs the name on its pin (gate `verify_plugin_fluid`).
 - Gates: `verify_host_query` (a non-time setting and a STRUCT variable reach the inner query, an unset setting

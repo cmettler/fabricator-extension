@@ -269,7 +269,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         Log.LogInformation("delta native copy {Uri}", uri);
         Log.LogDebug("delta native copy sql: {Sql}", sql);
         var input = new (string, IArrowArrayStream)[] { (InputView, src) };
-        using var result = Host.Query(sql, input);
+        using var result = Host.Query(sql, input, HostSession.Neutral);
         var files = ReadFileStats(result, ct, statsSchema, writableRoot);
         long rows = 0, size = 0;
         foreach (var f in files) { rows += f.Rows; size += f.Size; }
@@ -299,7 +299,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native clustered copy {Uri}", uri);
         Log.LogDebug("delta native copy sql: {Sql}", sql);
-        using var result = Host.Query(sql);
+        using var result = Host.Query(sql, HostSession.Neutral);
         return ReadFileStats(result, ct, statsSchema, writableRoot);
     }
 
@@ -331,7 +331,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
         Log.LogDebug("delta native copy sql: {Sql}", sql);
         var input = new (string, IArrowArrayStream)[] { (InputView, src) };
-        using var result = Host.Query(sql, input);
+        using var result = Host.Query(sql, input, HostSession.Neutral);
         return ReadFileStats(result, ct, statsSchema, writableRoot);
     }
 

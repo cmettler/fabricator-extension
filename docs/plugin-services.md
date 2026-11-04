@@ -619,7 +619,7 @@ service **54/54 — 3272** = 3257 + exactly this suite's 15, which is what shows
 | `Fabricator.Abstractions/FabricatorServices.cs` | the registry: `Register<T>` / `Get<T>` / `GetRequired<T>` / `IsAvailable<T>`, plus `Provider` as a BCL `System.IServiceProvider` |
 | `Fabricator.Abstractions/IHostFileSystem.cs` | `ReadAllBytes(path, maxBytes)` + `Glob(pattern)`, with `HostFileEntry(Path, Size)` |
 | `Fabricator.Abstractions/IHostHttp.cs` | `Send(method, url, headersJson, body)` — the shape `DuckDbHttpHandler` already consumed |
-| `Fabricator.Abstractions/IHostQuery.cs` | `Query(sql, parameters?, inheritSession?)` + `ExecuteNonQuery(sql)` |
+| `Fabricator.Abstractions/IHostQuery.cs` | `Query(sql, parameters?, inheritSession?)` + `ExecuteNonQuery(sql, inheritSession?)` (the second parameter since 2026-11-04) |
 | `Fabricator.Bridge/HostServices.cs` | the three implementations + `Publish()` |
 | *(later the same day)* `IHostLog.cs` | a FOURTH service — §10 |
 | DELETED | `HostHttpTransport.cs`, `HostQueryTransport.cs` |
@@ -664,6 +664,10 @@ template provider was NOT switched onto the filesystem now that one exists (docs
 gives all four measured reasons). `IHostFileSystem` is for a path you expect to exist.
 
 ### 8.2a ⚠ `IHostQuery.ExecuteNonQuery` IS UNGATED, and the suite does not pretend otherwise
+
+> **Since 2026-11-04 it is gated directly**: the sample plugin's `plug_host_exec(sql, inherit)` calls it, and
+> `verify_plugin` asserts that the member's new `inheritSession` (default `true`, as on `Query`) carries the
+> caller's variables and zone, while `false` gives the neutral UTC session. The text below is the earlier state.
 
 The member is in scope (the user's words were "host query/**exec**") and `Host.ExecuteNonQuery` behind it is
 long-standing and used internally — but **no in-tree plugin calls it**, so nothing exercises it through the

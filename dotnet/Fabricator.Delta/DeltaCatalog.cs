@@ -1714,7 +1714,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             }
             sb.Append('"').Append(cols[i].Replace("\"", "\"\"")).Append('"');
         }
-        return Host.Query(sb.ToString(), new (string, IArrowArrayStream)[] { (sortInput, data) });
+        return Host.Query(sb.ToString(), new (string, IArrowArrayStream)[] { (sortInput, data) }, HostSession.Neutral);
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a

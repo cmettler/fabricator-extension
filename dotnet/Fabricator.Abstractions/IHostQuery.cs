@@ -45,10 +45,11 @@ public interface IHostQuery
     /// <param name="parameters">An optional 1-row batch of parameter values; only row 0 is read, and an empty
     /// batch binds all-NULL rather than erroring.</param>
     /// <param name="inheritSession">
-    /// <see langword="true"/> (the default) runs AS the calling session — its <c>TimeZone</c> and catalog
-    /// search path are copied onto the fresh connection, so names resolve and timestamps read the way they do
-    /// in the statement that reached us. <see langword="false"/> asks for a clean session, which is what a
-    /// caller wants when the SQL must mean the same thing regardless of who invoked it.
+    /// <see langword="true"/> (the default) runs AS the calling session — every setting it SET, its catalog
+    /// search path and its variables are copied onto the fresh connection, so names resolve and values read the
+    /// way they do in the statement that reached us. <see langword="false"/> asks for a neutral session
+    /// (DuckDB's defaults, <c>TimeZone = 'UTC'</c>), which is what a caller wants when the SQL must mean the
+    /// same thing regardless of who invoked it.
     /// </param>
     /// <remarks>
     /// ⚠ <b>The STATEMENT decides how the batch binds.</b> When the batch's column names are all parameter
@@ -82,8 +83,11 @@ public interface IHostQuery
     /// that matters must refuse a SELECT before calling — with DuckDB's parser, not a prefix test.
     /// </para>
     /// <para>For several statements the count is the LAST one's.</para>
+    /// <para>⚠ <paramref name="inheritSession"/> means what it means on <see cref="Query"/>, with the same
+    /// default. Until 2026-11-04 this member had no such parameter and always ran in a neutral session, so a
+    /// plugin's query and its statement resolved names differently.</para>
     /// </remarks>
-    long ExecuteNonQuery(string sql);
+    long ExecuteNonQuery(string sql, bool inheritSession = true);
 
     /// <summary>
     /// Opens a connection that OUTLIVES a single call, so several statements share one DuckDB connection —

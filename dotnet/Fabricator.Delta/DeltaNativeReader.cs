@@ -527,7 +527,7 @@ internal static class DeltaNativeReader
         internal IArrowArrayStream Query(string? suffix = null)
         {
             string sql = Statement(suffix);
-            return Inputs is null ? Host.Query(sql) : Host.Query(sql, Inputs());
+            return Inputs is null ? Host.Query(sql, HostSession.Neutral) : Host.Query(sql, Inputs(), HostSession.Neutral);
         }
 
         /// <summary>Files below this count are not worth batching — kept on the proven per-file path.
@@ -1966,7 +1966,7 @@ internal static class DeltaNativeReader
 
     /// <summary>
     /// The name of the connection-scoped Arrow input a per-file SELECT anti-joins its deletion vector from.
-    /// One input per QUERY: the streaming scan issues one <see cref="Host.Query(string)"/> per file, so this
+    /// One input per QUERY: the streaming scan issues one <see cref="Host.Query(string, HostSession)"/> per file, so this
     /// view is scanned exactly once and a single-use Arrow stream is safe. (<see cref="FullTableSql"/> unions
     /// many files into ONE query and therefore does NOT use it — see its remarks.)
     /// </summary>
@@ -2121,7 +2121,7 @@ internal static class DeltaNativeReader
     }
 
     /// <summary>This file's deletion-vector positions as a one-column Arrow stream for
-    /// <see cref="Host.Query(string, IReadOnlyList{ValueTuple{string, IArrowArrayStream}})"/>.
+    /// <see cref="Host.Query(string, IReadOnlyList{ValueTuple{string, IArrowArrayStream}}, HostSession)"/>.
     /// <para>⚠ The column is NON-NULLABLE by construction and that matters: we chose <c>NOT EXISTS</c> over
     /// <c>NOT IN (SELECT …)</c> precisely because a single NULL position in an IN-subquery makes the predicate
     /// NULL for every row and silently returns an EMPTY table. NOT EXISTS is null-safe regardless, so the two
@@ -2144,8 +2144,8 @@ internal static class DeltaNativeReader
     private static IArrowArrayStream QueryFile(string sql, DeltaReader.NativeScanFile f, string dvView)
         => BindDv(f.Dv)
             ? Host.Query(sql, new (string, IArrowArrayStream)[]
-                              { (dvView, new SingleScanArrowStream(DvStream(f.Dv), dvView)) })
-            : Host.Query(sql);
+                              { (dvView, new SingleScanArrowStream(DvStream(f.Dv), dvView)) }, HostSession.Neutral)
+            : Host.Query(sql, HostSession.Neutral);
 
     /// <summary>The WHOLE table as one SQL text: the per-file SELECTs (logical names, DV exclusion, column
     /// mapping, schema-evolution backfill, partition literals, row-tracking expressions for
@@ -2213,7 +2213,7 @@ internal static class DeltaNativeReader
             var sql = FileSql(dataCols, wantRowId, where: null, probeFile,
                               ResolveFileMapping(listing, probe), listing.TableSchema,
                               listing.PartitionColumns) + " LIMIT 0";
-            using var s = Host.Query(sql);
+            using var s = Host.Query(sql, HostSession.Neutral);
             // Nested mapped fields: the probed schema carries physical struct-child names — rename to logical
             // (top level is already logical via the SELECT alias; the transform passes it through).
             return listing.MappedSchema is { } ms
@@ -2563,7 +2563,7 @@ internal static class DeltaNativeReader
         {
             return true;
         }
-        using var s = Host.Query("SELECT count(*) FROM duckdb_settings() WHERE name = 'TimeZone'");
+        using var s = Host.Query("SELECT count(*) FROM duckdb_settings() WHERE name = 'TimeZone'", HostSession.Neutral);
         bool loaded = false;
         while (s.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
         {
@@ -2681,7 +2681,7 @@ internal static class DeltaNativeReader
                   + "OR logical_type LIKE 'TimestampType(%') "
                   + "AND coalesce(logical_type NOT LIKE 'TimestampType(isAdjustedToUTC=1%', true) "
                   + $"FROM parquet_schema('{uri.Replace("'", "''")}')";
-        using var s = Host.Query(sql);
+        using var s = Host.Query(sql, HostSession.Neutral);
         var stack = new Stack<(string Path, long Remaining)>();
         bool sawRoot = false;
         while (true)

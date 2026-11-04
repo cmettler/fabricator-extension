@@ -30,7 +30,7 @@ public sealed class SamplePluginBackend : IProvider
         {
             new PlugGreetFunction(), new PlugSleepFunction(),
             new PlugReadFileFunction(), new PlugGlobCountFunction(), new PlugLogFunction(),
-            new PlugSupportFunction(),
+            new PlugSupportFunction(), new PlugHostExecFunction(),
         };
 
     public IEnumerable<ITableFunction> GlobalTableFunctions =>
@@ -439,6 +439,43 @@ internal sealed class PlugLatFieldsFunction : ILateralFunction
         }
 
         public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// <c>plug_host_exec(sql, inherit) -&gt; BIGINT</c> — runs <c>sql</c> through
+/// <see cref="IHostQuery.ExecuteNonQuery"/> and returns its count. The gate for that member's
+/// <c>inheritSession</c>: a statement reading the caller's variable (<c>SELECT getvariable('n')::BIGINT</c>,
+/// whose single BIGINT is reported as the "count") answers the caller's value when inherited and 0 when not.
+/// </summary>
+internal sealed class PlugHostExecFunction : IScalarFunction
+{
+    public string Name => "plug_host_exec";
+
+    public Schema Parameters => new(new[]
+    {
+        new Field("sql", StringType.Default, nullable: true),
+        new Field("inherit", BooleanType.Default, nullable: true),
+    }, metadata: null);
+
+    public Field Result => new("affected", Int64Type.Default, nullable: true);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var sqls = (StringArray)args.Column(0);
+        var inherit = (BooleanArray)args.Column(1);
+        var host = FabricatorServices.GetRequired<IHostQuery>();
+        var b = new Int64Array.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (sqls.IsNull(i))
+            {
+                b.AppendNull();
+                continue;
+            }
+            b.Append(host.ExecuteNonQuery(sqls.GetString(i), inherit.GetValue(i) ?? true));
+        }
+        return b.Build();
     }
 }
 

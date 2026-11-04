@@ -2133,7 +2133,7 @@ internal sealed class DuckLakeDeltaSync
     private static List<object?[]> Drain(string sql)
     {
         var rows = new List<object?[]>();
-        using var stream = Host.Query(sql);
+        using var stream = Host.Query(sql, HostSession.Neutral);
         while (true)
         {
             using var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();

@@ -68,7 +68,7 @@ internal sealed class NativeParquetDataFileReader : IDataFileReader
                   + "ORDER BY file_row_number";
         Log.LogDebug("delta native file read: {Sql}", sql);
 
-        using var stream = Host.Query(sql);
+        using var stream = Host.Query(sql, HostSession.Neutral);
         // Batch sizes at this seam are worth tracing: the RecordBatch coming out of the host query is BOTH
         // the morsel a parallel scan hands one thread AND — because engineered-wood writes one parquet file
         // per input batch — the file granularity of anything that writes what it reads (compaction). One
@@ -101,7 +101,7 @@ internal sealed class NativeParquetDataFileReader : IDataFileReader
 
     private static IReadOnlyList<string> ProbeColumns(string uri)
     {
-        using var s = Host.Query($"SELECT * FROM read_parquet('{uri.Replace("'", "''")}') LIMIT 0");
+        using var s = Host.Query($"SELECT * FROM read_parquet('{uri.Replace("'", "''")}') LIMIT 0", HostSession.Neutral);
         return s.Schema.FieldsList.Select(f => f.Name).ToList();
     }
 

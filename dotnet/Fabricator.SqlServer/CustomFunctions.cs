@@ -835,7 +835,7 @@ internal sealed class CfHostAnswerFunction : ICatalogScalarFunction
     public IArrowArray Invoke(RecordBatch args)
     {
         long answer;
-        using (var stream = Host.Query("SELECT 40::BIGINT + 2 AS answer"))
+        using (var stream = Host.Query("SELECT 40::BIGINT + 2 AS answer", HostSession.Neutral))
         {
             var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
                         ?? throw new InvalidOperationException("host_query returned no result");
@@ -872,7 +872,7 @@ internal sealed class CfHostSumFunction : ICatalogScalarFunction
 
         long sum;
         using (var result = Host.Query("SELECT sum(v)::BIGINT AS s FROM in0",
-                                       new[] { ("in0", (IArrowArrayStream)inputStream) }))
+                                       new[] { ("in0", (IArrowArrayStream)inputStream) }, HostSession.Neutral))
         {
             var b = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
                     ?? throw new InvalidOperationException("host_query returned no result");
@@ -909,7 +909,7 @@ internal sealed class CfHostParamFunction : ICatalogScalarFunction
         var paramBatch = new RecordBatch(pschema, new IArrowArray[] { p0, p1 }, 1);
 
         long answer;
-        using (var result = Host.Query("SELECT (?::BIGINT) + (?::BIGINT) AS s", paramBatch))
+        using (var result = Host.Query("SELECT (?::BIGINT) + (?::BIGINT) AS s", paramBatch, HostSession.Neutral))
         {
             var b = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
                     ?? throw new InvalidOperationException("host_query returned no result");

@@ -2791,7 +2791,7 @@ internal static class DeltaReader
             else
             {
                 long rowsPerFile = Math.Max(1024, (long)((double)targetBytes * estRows / estBytes));
-                using var src = HostFs.Query(source, ct: token);
+                using var src = Host.Query(source, null, null, HostSession.Neutral, token);
                 // The next file's first batch: the tail the previous file's budget cut off, or a fresh pull
                 // when the cut fell on a batch boundary. Threading it through the loop rather than pulling
                 // unconditionally is what lets a file end mid-batch — see BudgetedStream's remarks.

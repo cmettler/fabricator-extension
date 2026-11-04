@@ -163,12 +163,13 @@ internal sealed class HostHttpService : IHostHttp
 internal sealed class HostQueryService : IHostQuery
 {
     public IArrowArrayStream Query(string sql, RecordBatch? parameters = null, bool inheritSession = true) =>
-        // ⚠ The ambient ClientContext is passed as the caller's SESSION (ABI v83), so a plugin's query
-        // resolves names and times the way the statement that reached it does. 0 = a clean session, which is
-        // also what an absent ambient degrades to.
-        Host.Query(sql, parameters, null, clientSession: inheritSession ? AmbientOpener.Current : 0);
+        // ⚠ Inherit passes the ambient ClientContext as the caller's SESSION, so a plugin's query resolves
+        // names, settings and variables the way the statement that reached it does. Without an ambient it
+        // degrades to neutral.
+        Host.Query(sql, parameters, null, inheritSession ? HostSession.Inherit : HostSession.Neutral);
 
-    public long ExecuteNonQuery(string sql) => Host.ExecuteNonQuery(sql);
+    public long ExecuteNonQuery(string sql, bool inheritSession = true) =>
+        Host.ExecuteNonQuery(sql, inheritSession ? HostSession.Inherit : HostSession.Neutral);
 
 
     // ⚠ The session is read HERE, at open, and NOT per query — which is what the ABI does too. The ambient
@@ -177,7 +178,7 @@ internal sealed class HostQueryService : IHostQuery
     // operation happened to be running. Capturing once, on the caller's live context, is the same rule the
     // table function's CaptureSession follows.
     public IHostConnection OpenConnection(bool inheritSession = true) =>
-        new PinnedHostConnection(Host.OpenConnection(inheritSession ? AmbientOpener.Current : 0));
+        new PinnedHostConnection(Host.OpenConnection(inheritSession ? HostSession.Inherit : HostSession.Neutral));
 
     // ⚠⚠ BORROWED, and the whole contract turns on it: the factory hands out a reader over the CALLER's
     // batch and nothing here copies or disposes it. That is what makes this usable from a collector, whose

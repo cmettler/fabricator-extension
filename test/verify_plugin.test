@@ -13,6 +13,8 @@ require fabricator
 # catalog". Measured, not anticipated: that is exactly how this suite failed the first time.
 require parquet
 
+require icu
+
 require-env FABRICATOR_PLUGIN_DIR
 
 require-env FABRICATOR_DELTA_WRITE_DIR
@@ -750,3 +752,41 @@ SELECT function_name, return_type FROM duckdb_functions()
 WHERE function_name = 'plug_log';
 ----
 plug_log	BOOLEAN
+
+# ============================================================================
+# IHostQuery.ExecuteNonQuery takes inheritSession like Query (2026-11-04). It used to have no such
+# parameter and always ran neutral, so a plugin's query saw the caller's session and its statement did not.
+# plug_host_exec reports the statement's single BIGINT as the "count", which makes the session observable.
+# ============================================================================
+
+statement ok
+SET VARIABLE plug_n = 7;
+
+statement ok
+SET TimeZone = 'Asia/Kathmandu';
+
+# Inherited: the caller's variable and zone reach the statement.
+query II
+SELECT plug_host_exec('SELECT getvariable(''plug_n'')::BIGINT', true),
+       plug_host_exec('SELECT hour(TIMESTAMPTZ ''2025-01-01 00:00:00+00'')::BIGINT', true);
+----
+7	5
+
+# Neutral: no variable, and the zone is UTC rather than the caller's or the machine's.
+query II
+SELECT plug_host_exec('SELECT getvariable(''plug_n'')::BIGINT', false),
+       plug_host_exec('SELECT hour(TIMESTAMPTZ ''2025-01-01 00:00:00+00'')::BIGINT', false);
+----
+0	0
+
+# The default is to inherit, as for Query.
+query I
+SELECT plug_host_exec('SELECT getvariable(''plug_n'')::BIGINT', NULL);
+----
+7
+
+statement ok
+RESET TimeZone;
+
+statement ok
+RESET VARIABLE plug_n;

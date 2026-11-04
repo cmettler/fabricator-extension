@@ -9,7 +9,7 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// Wraps a bound host-query input so a SECOND scan of it is LOUD instead of empty.
-/// <para>Why it exists: an input registered with <see cref="Host.Query(string, System.Collections.Generic.IReadOnlyList{System.ValueTuple{string, IArrowArrayStream}})"/>
+/// <para>Why it exists: an input registered with <see cref="Host.Query(string, System.Collections.Generic.IReadOnlyList{System.ValueTuple{string, IArrowArrayStream}}, HostSession)"/>
 /// is a connection-scoped view over a single-use stream. <see cref="InMemoryArrayStream"/> returns
 /// <c>null</c> once drained, so if a plan ever scans that view twice the second scan sees ZERO ROWS and
 /// succeeds. For a deletion-vector anti-join that is not a degraded result, it is DELETED ROWS COMING BACK —
