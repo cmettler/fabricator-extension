@@ -669,6 +669,12 @@ records each file's values in `ducklake_file_partition_value` (text: `5`, `a b/c
   value as NULL. A later sync whose file lacks a value for a declared column (the partitioning changed) is REFUSED,
   naming the file and the column: Delta cannot change a table's partition columns. ⚠ The catalog guard (§11.11)
   does not check this yet; the sync does.
+- **MEASURED 2026-11-04: DuckLake's compaction does NOT move files into a changed partitioning.** After
+  `SET PARTITIONED BY (region)` → two inserts → `SET PARTITIONED BY (k)` → one insert, `ducklake_merge_adjacent_files`
+  merged the `region=eu` files into ONE `region=eu` file under the OLD `partition_id`, and
+  `ducklake_rewrite_data_files` touched no file without deletes. So after a change the live files carry neither key
+  in full, and a first sync with `partitioning := true` declares neither — the mirror is unpartitioned until no file
+  of the old partitioning is live (delete + re-insert, or recreate the table).
 - MEASURED LIVE on Fabric (data on `LH/Tables/dbo`, metadata on box): `PARTITIONED BY (region, d, year(ts))`, an
   UPDATE moving a row to another region, a DELETE of the NULL partition's row — the SQL endpoint read the exact rows
   after 190 s, `WHERE region = 'eu'` 1, with `region` and `d` declared AND present in the files.
@@ -704,14 +710,32 @@ FIELD_IDS like our data files; one file per partition value, with its `partition
   change files under logical names (dies at the field-id check), the reader fix reverted (dies at §13).
 - Not measured: Spark's `table_changes` over these files; Fabric's SQL endpoint has no change feed.
 
-⚠⚠ **FOUND, NOT FIXED — our own Delta catalog cannot read a `timestamp_mapping := 'utc'` column of a mirror.** The
-files hold DuckDB's naive `TIMESTAMP` (Parquet `isAdjustedToUTC = false`) and the mirror declares Delta `timestamp`.
-Fabric reads that as UTC (measured, §11.6), `fabricator_delta_scan` too; the `PROVIDER 'delta'` catalog's native
-reader fails a plain scan (*"column 'ts' … is TIMESTAMP on the provider but TIMESTAMP WITH TIME ZONE in the
-catalog"*) and, on the per-file path of a partitioned table, CASTs it in the SESSION time zone — a wrong instant
-(`2025-01-01 00:00+01` for `2025-01-01 00:00Z`). The same holds for any writer that puts unadjusted timestamps into
-a Delta `timestamp` column. The fix belongs in the reader (read such a column as UTC: `timezone('UTC', col)`), which
-needs the file's own type, not the table's.
+**FIXED 2026-11-04 — our own Delta catalog misread a `timestamp_mapping := 'utc'` column of a mirror.** The files
+hold DuckDB's naive `TIMESTAMP` (Parquet `isAdjustedToUTC = false`) and the mirror declares Delta `timestamp`. Fabric
+reads that as UTC (measured, §11.6), `fabricator_delta_scan` too. The `PROVIDER 'delta'` catalog did not, and off UTC
+every read path was wrong in its own way (measured on a Berlin machine, `2025-01-01 00:00Z`): the per-file path refused
+it (*"column 'ts' … is TIMESTAMP on the provider but TIMESTAMP WITH TIME ZONE in the catalog"*), and the batched form
+returned `00:00+01` — its `schema` map declares `TIMESTAMPTZ`, so DuckDB cast the naive value in the zone of the
+reader's own connection, which is the MACHINE's. It was never mirror-specific: Spark's INT96 files and a legacy
+converted type without a logical type read as naive `TIMESTAMP` too.
+- The batched statement now runs with `SET SESSION TimeZone='UTC'`, which makes that cast right.
+- The per-file path (and with it the clustered OPTIMIZE, which runs the same SQL inside its COPY) reads which leaves
+  the file stores naive from the footer probe it already runs, and converts exactly those with
+  `timezone('UTC', CAST(x AS TIMESTAMP))` — zone-free, unlike `CAST(x AS TIMESTAMPTZ)`, so a COPY in a non-UTC
+  session cannot rewrite values shifted. A UTC-adjusted file is not touched, so its filter pushdown is unchanged.
+  Struct members are converted too; a timestamp inside a list or map still keeps the file's type (loud, not wrong).
+- A timestamp PARTITION value without an offset (what engineered-wood writes) is UTC by the spec; the per-file path
+  cast it in the machine's zone as well. Same fix.
+- Gate `verify_ducklake_delta_sync` §15 (556), under `SET GLOBAL TimeZone = 'Asia/Kathmandu'`, which is what reaches
+  the reader's own connection — the old §6 ran under `UTC`, and so does a Linux CI machine, which is why none of
+  this ever showed. Comparisons by `epoch_us`, which no zone changes.
+- ⚠ The `TimeZone` setting and `timezone()` both exist only once ICU is loaded. A stock 2.0 build (shell, Python
+  wheel) links ICU statically and loads it at startup (measured), but the sqllogictest runner loads it only on
+  `require icu`, and a custom build may leave it out; the first version set it unconditionally and failed every
+  Delta read in the 55 hermetic suites that do not load ICU. Without ICU the cast to
+  `TIMESTAMPTZ` is UTC-based, so the reader asks once (`duckdb_settings()`) and uses the plain cast there. Gate
+  `verify_delta_naive_timestamp_noicu` (27), which checks ICU stays unloaded — a `timezone()` call autoloads it in
+  this build, so that check is what catches the wrong branch.
 
 ## 12. SQL Server reading DuckLake directly: PolyBase over the DuckDB ODBC driver (experiment, 2026-10-27)
 

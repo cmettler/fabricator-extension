@@ -1,0 +1,74 @@
+# name: test/verify_delta_naive_timestamp_noicu.test
+# description: A Delta timestamp stored naive (Parquet isAdjustedToUTC = 0 — here a DuckLake 'utc' mirror) reads as
+#              its UTC instant through the PROVIDER 'delta' catalog in a database WITHOUT ICU. The reader converts
+#              with ICU's timezone() and sets the session TimeZone only when ICU is loaded; without it the plain
+#              cast to TIMESTAMPTZ is UTC-based. The ICU leg is verify_ducklake_delta_sync §15. Deliberately no
+#              `require icu`: the first assertion checks ICU really is absent, or every row below would be
+#              testing the other leg. Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require ducklake
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+query I
+SELECT count(*) FROM duckdb_settings() WHERE name = 'TimeZone';
+----
+0
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta.ducklake' AS lake (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake.t1 (id INTEGER, ts TIMESTAMP, s STRUCT(a TIMESTAMP, b INTEGER));
+
+statement ok
+INSERT INTO lake.t1 VALUES (1, TIMESTAMP '2025-01-01 00:00:00', {'a': TIMESTAMP '2025-01-01 00:00:00', 'b': 1}), (2, TIMESTAMP '2024-07-01 12:00:00', {'a': TIMESTAMP '2024-07-01 12:00:00', 'b': 2});
+
+statement ok
+CREATE TABLE lake.tp (id INTEGER, k INTEGER, ts TIMESTAMP);
+
+statement ok
+ALTER TABLE lake.tp SET PARTITIONED BY (k);
+
+statement ok
+INSERT INTO lake.tp VALUES (1, 10, TIMESTAMP '2025-01-01 00:00:00'), (2, 20, TIMESTAMP '2024-07-01 12:00:00');
+
+query TI
+SELECT table_name, delta_version FROM ducklake_delta_sync('lake') ORDER BY 1;
+----
+t1	0
+tp	0
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl' AS d (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+# One file: the per-file path, a top-level column and a struct member.
+query IIII
+SELECT id, epoch_us(ts), epoch_us(s.a), s.b FROM d.main.t1 ORDER BY id;
+----
+1	1735689600000000	1735689600000000	1
+2	1719835200000000	1719835200000000	2
+
+# Two files: the batched form.
+query II
+SELECT id, epoch_us(ts) FROM d.main.tp ORDER BY id;
+----
+1	1735689600000000
+2	1719835200000000
+
+# Pruned to one file: the per-file path again.
+query II
+SELECT id, epoch_us(ts) FROM d.main.tp WHERE k = 20;
+----
+2	1719835200000000
+
+# ICU was not loaded by any of the reads above.
+query I
+SELECT count(*) FROM duckdb_settings() WHERE name = 'TimeZone';
+----
+0

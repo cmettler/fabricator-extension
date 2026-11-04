@@ -527,6 +527,14 @@ in a string. Rather than turn a working call into a bind error, the bind falls b
 a multi-statement call keeps its PRE-EXISTING behaviour — double execution included. Pinned in
 `verify_host_query` as the value it really produces (two rows from one call).
 
+⚠⚠ **On DuckDB 2.0 there is no `SendQuery`, and the obvious replacement MATERIALISES (fixed 2026-11-04).** 2.0
+split it into `Submit` (streams, ONE statement) and `Query` (several statements, but `ClientContext::Query` runs
+every one through `CompleteInternal`, i.e. buffers the last result). The port routed several statements to
+`Query`, and the Delta reader sends EVERY batched read as `SET SESSION …; SELECT …` — so every batched Delta read
+buffered its whole result. `MakeHostQueryStream` now runs the leading statements with `Query` one by one and
+`Submit`s the last, which is what 1.5's `SendQuery` did. Measured, the same 6M-row SELECT through
+`fabricator_host_query` as two statements: 1.70 s before, 1.37 s after, equal to the single statement (1.33 s).
+
 ⚠⚠ **"Still works" is too kind, and the gate says so.** Double execution means a NON-IDEMPOTENT prefix
 FAILS: `fabricator_host_query('CREATE TABLE mk …; SELECT * FROM mk')` creates `mk` on the describe run and
 then collides with itself on the data run — measured, *"Table with name mk already exists!"*. That is

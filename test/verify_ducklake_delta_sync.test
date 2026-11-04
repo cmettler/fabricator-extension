@@ -1066,3 +1066,106 @@ DETACH d5;
 
 statement ok
 DETACH lake5;
+
+# ============================================================================
+# 15. A DELTA TIMESTAMP STORED NAIVE READS AS ITS UTC INSTANT IN EVERY READ PATH, IN ANY TIME ZONE. A 'utc'
+#     mirror's files hold DuckDB's naive TIMESTAMP (Parquet isAdjustedToUTC = 0), as do Spark's INT96 files.
+#     The batched `schema` map cast it in the reader connection's zone and the per-file path refused it; both
+#     only showed off UTC. `SET GLOBAL` is what reaches the reader's own connection, so this runs the same on a
+#     UTC machine. epoch_us is zone-free: 2025-01-01 00:00Z = 1735689600000000, 2024-07-01 12:00Z =
+#     1719835200000000. The last table is written by engineered-wood, which stores a timestamp PARTITION value
+#     without an offset — UTC by the spec — and is read through the native reader.
+# ============================================================================
+
+statement ok
+SET GLOBAL TimeZone = 'Asia/Kathmandu';
+
+statement ok
+SET TimeZone = 'Asia/Kathmandu';
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/meta6.ducklake' AS lake6 (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl6/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake6.t1 (id INTEGER, ts TIMESTAMP, s STRUCT(a TIMESTAMP, b INTEGER));
+
+statement ok
+INSERT INTO lake6.t1 VALUES (1, TIMESTAMP '2025-01-01 00:00:00', {'a': TIMESTAMP '2025-01-01 00:00:00', 'b': 1}), (2, TIMESTAMP '2024-07-01 12:00:00', {'a': TIMESTAMP '2024-07-01 12:00:00', 'b': 2});
+
+statement ok
+CREATE TABLE lake6.tp (id INTEGER, k INTEGER, ts TIMESTAMP);
+
+statement ok
+ALTER TABLE lake6.tp SET PARTITIONED BY (k);
+
+statement ok
+INSERT INTO lake6.tp VALUES (1, 10, TIMESTAMP '2025-01-01 00:00:00'), (2, 20, TIMESTAMP '2024-07-01 12:00:00');
+
+query TI
+SELECT table_name, delta_version FROM ducklake_delta_sync('lake6') ORDER BY 1;
+----
+t1	0
+tp	0
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl6' AS d6 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+# One file: the per-file path, a top-level column and a struct member.
+query IIII
+SELECT id, epoch_us(ts), epoch_us(s.a), s.b FROM d6.main.t1 ORDER BY id;
+----
+1	1735689600000000	1735689600000000	1
+2	1719835200000000	1719835200000000	2
+
+# Two files: the batched form.
+query II
+SELECT id, epoch_us(ts) FROM d6.main.tp ORDER BY id;
+----
+1	1735689600000000
+2	1719835200000000
+
+# Pruned to one file: the per-file path again.
+query II
+SELECT id, epoch_us(ts) FROM d6.main.tp WHERE k = 20;
+----
+2	1719835200000000
+
+query II
+SELECT id, epoch_us(ts) FROM fabricator_delta_scan('{FABRICATOR_DELTA_WRITE_DIR}/dl6/main/t1') ORDER BY id;
+----
+1	1735689600000000
+2	1719835200000000
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/ew6' AS ew6 (TYPE fabricator, PROVIDER 'engineeredwooddelta', READ_ONLY false);
+
+statement ok
+CREATE TABLE ew6.main.pt (v INTEGER, ts TIMESTAMPTZ) PARTITIONED BY (ts);
+
+statement ok
+INSERT INTO ew6.main.pt VALUES (1, TIMESTAMPTZ '2025-01-01 00:00:00+00'), (2, TIMESTAMPTZ '2024-07-01 12:00:00.5+00');
+
+statement ok
+DETACH ew6;
+
+query I
+SELECT count(*) FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/ew6/pt/_delta_log/*.json') WHERE content LIKE '%"2024-07-01 12:00:00.500000"%';
+----
+1
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/ew6' AS r6 (TYPE fabricator, PROVIDER 'delta');
+
+query II
+SELECT v, epoch_us(ts) FROM r6.main.pt ORDER BY v;
+----
+1	1735689600000000
+2	1719835200500000
+
+query II
+SELECT v, epoch_us(ts) FROM r6.main.pt WHERE v = 2;
+----
+2	1719835200500000
+
+statement ok
+SET GLOBAL TimeZone = 'UTC';

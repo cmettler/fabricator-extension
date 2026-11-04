@@ -8,6 +8,7 @@ using System.Globalization;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -512,9 +513,20 @@ internal static class DeltaNativeReader
         /// table function (whose caller's result order is theirs, not ours) and with the sort/COPY paths.
         /// Those are unaffected in any case — an explicit <c>ORDER BY</c> yields <c>FIXED_ORDER</c>, which
         /// short-circuits before the setting is read — but narrow is the point.</para>
+        /// <para>⚠ <b><c>TimeZone='UTC'</c> is a CORRECTNESS setting, unlike the first.</b> The <c>schema</c> map
+        /// declares a Delta <c>timestamp</c> column <c>TIMESTAMPTZ</c>, and a file storing it naive (a DuckLake
+        /// mirror, Spark's INT96, a legacy converted type) is cast by DuckDB in the SESSION zone — which on a fresh
+        /// host-query connection is the MACHINE's, so off UTC every value moved by the zone's offset with no error
+        /// (measured: <c>00:00+01</c> for <c>00:00Z</c> on a Berlin machine). Delta's timestamps are UTC, and so
+        /// are timestamp partition values written without an offset, which this statement also casts.</para>
+        /// <para>⚠ The setting exists only once ICU is loaded (*"Setting with name TimeZone is not in the catalog,
+        /// but it exists in the icu extension"* otherwise — measured, it failed every read in a suite without
+        /// <c>require icu</c>). Without ICU, DuckDB casts <c>TIMESTAMP</c> to <c>TIMESTAMPTZ</c> as UTC anyway, so
+        /// the setting is only needed where it can be set: see <see cref="IcuLoaded"/>.</para>
         /// </summary>
         internal string Statement(string? suffix = null)
-            => "SET SESSION preserve_insertion_order=false; " + (suffix is null ? Sql : Sql + suffix);
+            => "SET SESSION preserve_insertion_order=false; " + (IcuLoaded() ? "SET SESSION TimeZone='UTC'; " : "")
+               + (suffix is null ? Sql : Sql + suffix);
 
         /// <summary>Runs this plan, binding its inputs.</summary>
         internal IArrowArrayStream Query(string? suffix = null)
@@ -1856,7 +1868,7 @@ internal static class DeltaNativeReader
                              ?? LookupPartitionValue(f.PartitionValues, c, stored);
                 expr = pv is null
                     ? $"CAST(NULL AS {TypeText(field.Type)})"
-                    : $"CAST('{pv.Replace("'", "''")}' AS {TypeText(field.Type)})";
+                    : PartitionLiteralExpr(pv, field.Type);
                 needsInner = true;
             }
             else if (field is not null && !Present(field, stored, fm))
@@ -1864,9 +1876,17 @@ internal static class DeltaNativeReader
                 expr = $"CAST(NULL AS {TypeText(field.Type)})";
                 needsInner = true;
             }
-            else if (field?.Type is DeltaSchema.StructType st && StructShapeDiffers(st, stored, fm))
+            else if (field?.Type is DeltaSchema.StructType st
+                     && (StructShapeDiffers(st, stored, fm) || HasNaiveTimestamp(st, stored, fm)))
             {
                 expr = RebuildExpr(field.Type, Quote(stored), stored, fm);
+                needsInner = true;
+            }
+            else if (IsDeltaTimestamp(field?.Type) && fm.Nodes.NaiveTimestamps.Contains(stored))
+            {
+                // A Delta timestamp stored without isAdjustedToUTC (DuckLake's mirror, INT96, a legacy
+                // converted type) reads as a naive TIMESTAMP holding the UTC wall clock.
+                expr = UtcInstantExpr(Quote(stored));
                 needsInner = true;
             }
             else
@@ -2508,6 +2528,10 @@ internal static class DeltaNativeReader
     // and no StructFilter can reach inside a list/map).
     private static string RebuildExpr(DeltaSchema.DeltaDataType type, string src, string srcPath, FileMapping fm)
     {
+        if (IsDeltaTimestamp(type) && fm.Nodes.NaiveTimestamps.Contains(srcPath))
+        {
+            return UtcInstantExpr(src);
+        }
         if (type is not DeltaSchema.StructType st || st.Fields.Count == 0)
         {
             return src;
@@ -2531,6 +2555,73 @@ internal static class DeltaNativeReader
             parts.Add($"{Quote(ch.Name)} := {expr}");
         }
         return $"CASE WHEN {src} IS NULL THEN NULL ELSE struct_pack({string.Join(", ", parts)}) END";
+    }
+
+    private static volatile bool _icuLoaded;
+
+    /// <summary>Whether ICU is loaded, i.e. whether the <c>TimeZone</c> setting exists. Cached once true — an
+    /// extension cannot be unloaded — and asked again while false, since ICU may be loaded later in the
+    /// session.</summary>
+    private static bool IcuLoaded()
+    {
+        if (_icuLoaded)
+        {
+            return true;
+        }
+        using var s = Host.Query("SELECT count(*) FROM duckdb_settings() WHERE name = 'TimeZone'");
+        bool loaded = false;
+        while (s.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+        {
+            using (batch)
+            {
+                loaded |= batch.Length > 0 && ((Int64Array)batch.Column(0)).GetValue(0) > 0;
+            }
+        }
+        _icuLoaded = loaded;
+        return loaded;
+    }
+
+    private static bool IsDeltaTimestamp(DeltaSchema.DeltaDataType? type)
+        => type is DeltaSchema.PrimitiveType { TypeName: "timestamp" };
+
+    /// <summary>A naive file timestamp as the UTC instant it holds. ⚠ Deliberately NOT
+    /// <c>CAST(x AS TIMESTAMPTZ)</c>: that cast reads the value in the SESSION time zone, and this SQL also
+    /// runs inside the clustered OPTIMIZE's COPY (<see cref="FullTableSql"/>), whose session is not ours, so a
+    /// session-dependent cast there would rewrite stored values shifted. The CAST to TIMESTAMP covers the
+    /// _MS / _NS variants and is zone-free. ⚠ <c>timezone()</c> is ICU's; without ICU the cast to TIMESTAMPTZ
+    /// is UTC-based, so it is the zone-free form there.</summary>
+    private static string UtcInstantExpr(string src) => IcuLoaded()
+        ? $"timezone('UTC', CAST({src} AS TIMESTAMP))"
+        : $"CAST(CAST({src} AS TIMESTAMP) AS TIMESTAMPTZ)";
+
+    // Whether a struct holds a Delta timestamp member this file stores naive (lists/maps are not looked into: a
+    // member there keeps the file's type and the scan's type check names it).
+    private static bool HasNaiveTimestamp(DeltaSchema.StructType st, string path, FileMapping fm)
+    {
+        foreach (var ch in st.Fields)
+        {
+            var childPath = path + PathSep + StoredChildName(ch, fm);
+            if (IsDeltaTimestamp(ch.Type) ? fm.Nodes.NaiveTimestamps.Contains(childPath)
+                : ch.Type is DeltaSchema.StructType inner && HasNaiveTimestamp(inner, childPath, fm))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>One file's partition value as a typed SQL literal. A Delta <c>timestamp</c> value without an
+    /// offset is UTC (the spec; engineered-wood writes it that way and reads it with AssumeUniversal), so it is
+    /// rendered without depending on the session's zone; one that carries <c>Z</c> or an offset casts as
+    /// written.</summary>
+    private static string PartitionLiteralExpr(string value, DeltaSchema.DeltaDataType type)
+    {
+        string lit = "'" + value.Replace("'", "''") + "'";
+        if (IsDeltaTimestamp(type) && !Regex.IsMatch(value, @"\d{2}:\d{2}(:\d{2}(\.\d+)?)?\s*(Z|[+-]\d{2}(:?\d{2})?)$"))
+        {
+            return UtcInstantExpr(lit);
+        }
+        return $"CAST({lit} AS {TypeText(type)})";
     }
 
     // The DuckDB type text for a Delta type — the CAST target for schema-evolution NULL backfill. Struct
@@ -2576,6 +2667,13 @@ internal static class DeltaNativeReader
         public HashSet<string> Paths { get; } = new(StringComparer.Ordinal);
         public Dictionary<int, string> FieldIdToName { get; } = new();
         public Dictionary<string, List<string>> Children { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>The leaves DuckDB reads as a NAIVE timestamp (<c>TIMESTAMP</c>/<c>_MS</c>/<c>_NS</c>): every
+        /// timestamp leaf except one whose logical type says <c>isAdjustedToUTC=1</c> — i.e. a logical
+        /// <c>isAdjustedToUTC=0</c>, a legacy converted type alone, and INT96 (Spark's old encoding), which is
+        /// how DuckDB's parquet reader types them. In a Delta <c>timestamp</c> column all three hold UTC
+        /// instants, so the per-file read converts them with <see cref="UtcInstantExpr"/>.</summary>
+        public HashSet<string> NaiveTimestamps { get; } = new(StringComparer.Ordinal);
     }
 
     private static FileNodes ProbeFileNodes(string uri)
@@ -2583,7 +2681,10 @@ internal static class DeltaNativeReader
         var nodes = new FileNodes();
         // parquet_schema emits the footer's flat DFS pre-order (name, num_children); reconstruct each
         // node's path with a stack. The first row is the schema root (skipped; its children are depth 1).
-        var sql = "SELECT name, CAST(num_children AS BIGINT), CAST(field_id AS BIGINT) "
+        var sql = "SELECT name, CAST(num_children AS BIGINT), CAST(field_id AS BIGINT), "
+                  + "(type = 'INT96' OR converted_type IN ('TIMESTAMP_MICROS', 'TIMESTAMP_MILLIS') "
+                  + "OR logical_type LIKE 'TimestampType(%') "
+                  + "AND coalesce(logical_type NOT LIKE 'TimestampType(isAdjustedToUTC=1%', true) "
                   + $"FROM parquet_schema('{uri.Replace("'", "''")}')";
         using var s = Host.Query(sql);
         var stack = new Stack<(string Path, long Remaining)>();
@@ -2600,6 +2701,7 @@ internal static class DeltaNativeReader
                 var names = (StringArray)batch.Column(0);
                 var childCounts = (Int64Array)batch.Column(1);
                 var fids = (Int64Array)batch.Column(2);
+                var naive = (BooleanArray)batch.Column(3);
                 for (int i = 0; i < batch.Length; i++)
                 {
                     string name = names.GetString(i);
@@ -2626,6 +2728,10 @@ internal static class DeltaNativeReader
                     if (fids.IsValid(i))
                     {
                         nodes.FieldIdToName[(int)fids.GetValue(i)!.Value] = name;
+                    }
+                    if (naive.GetValue(i) == true)
+                    {
+                        nodes.NaiveTimestamps.Add(path);
                     }
                     if (children > 0)
                     {

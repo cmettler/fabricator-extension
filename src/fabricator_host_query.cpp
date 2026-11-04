@@ -929,18 +929,23 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		// scan holds a raw pointer into the caller's struct, and bounded memory for large results is the
 		// whole point), so that case takes `Submit`.
 		//
-		// ⚠ The multi-statement case is the DOCUMENTED FALLBACK pinned by verify_host_query (the same shape
-		// the bind's describe falls back on, double execution included). `Submit` would turn it into a LOUD
-		// `Cannot prepare multiple statements at once!` — a working call becoming an error, which is the one
-		// outcome the fallback exists to avoid. It takes `Query`, i.e. it now MATERIALISES. That is a real
-		// cost and it is bounded to this shape: a multi-statement call could never be described, so nothing
-		// streams it by design, and only the LAST statement's result is returned either way.
+		// The multi-statement case is the DOCUMENTED FALLBACK pinned by verify_host_query (the same shape the
+		// bind's describe falls back on, double execution included), and it is also how the Delta reader sends
+		// every batched read: `SET SESSION …; SELECT …`. 1.5's SendQuery ran the leading statements and
+		// STREAMED the last; that is rebuilt here statement by statement. ⚠ `conn->Query(sql)` would accept the
+		// whole text but runs EVERY statement to completion (ClientContext::Query → CompleteInternal), i.e. it
+		// materialises the last one — which on 2.0 made every batched Delta read buffer its whole result.
 		auto statements = conn->ExtractStatements(sql); // throws on a parse error, as the execution would
-		if (statements.size() > 1) {
-			result = conn->Query(sql); // several statements: materialises, returns the last one's result
-		} else {
-			result = conn->Submit(sql); // streaming (lazy Fetch) — bounded memory for large results
+		if (statements.empty()) {
+			throw IOException("fabricator_host_query: no statement to run");
 		}
+		for (idx_t i = 0; i + 1 < statements.size(); i++) {
+			auto leading = conn->Query(std::move(statements[i]));
+			if (leading->HasError()) {
+				throw IOException("fabricator_host_query: " + leading->GetError());
+			}
+		}
+		result = conn->Submit(std::move(statements.back())); // streaming (lazy Fetch) — bounded memory
 	}
 	if (result->HasError()) { // bind/plan errors surface here; runtime errors surface during Fetch (get_next)
 		throw IOException("fabricator_host_query: " + result->GetError());
