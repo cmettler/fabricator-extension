@@ -3219,6 +3219,43 @@ blind claims where one is true.
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
 
+## THE 2026-11-04 BUMP — `957d24d → b644f50`, twenty-five commits, zero patches (a fast-forward)
+
+- **Compile cost: one line.** `DeletionVectorWriter.CreateAsync(positions, cardinality)` is gone; the cardinality
+  now comes from the vector itself (`CreateAsync(DeletionVectorBitmap)` / `CreateAsync(IEnumerable<long>)`).
+  Our one caller was `DuckLakeDeltaSync.CreateDv`.
+- **#648 / #649 — constraints (gate `verify_delta_tblproperties` §8, 150 → 158).** A DELETE on a table declaring
+  `delta.constraints.*` / invariants / generated columns is no longer refused (it writes no new values), on both
+  table shapes. `UpdateRowsAsync` evaluates the post-image, so our COPY-ON-WRITE UPDATE (`deletion_vectors false`)
+  now commits a legal post-image and refuses a violating one by evaluation. Our MERGE-ON-READ UPDATE (the default)
+  is still refused — we write the post-image files ourselves. The old gate died at exactly the DELETE row; on the
+  old payload the new gate dies there too, so it pins the change. known-limitations 1.19 and the README rewritten.
+- **#616 — deletion vectors are written container by container, WITH RUN CONTAINERS** (cookie 12347). A range
+  delete of 249001 rows is now a 77-byte INLINE vector. ⚠ The question a bump cannot answer by itself is whether
+  every reader takes them. MEASURED LIVE on Fabric (workspace Test / LH, schema `ewdv`): three tables of 300k rows
+  written by us to OneLake, the DV checked in the log, then read by Fabric's own SQL analytics endpoint —
+  `dv_range` (inline, runs), `dv_mix` (DV FILE of 32835 bytes, runs + bitmap containers) and the control `dv_sparse`
+  (inline, no runs) all returned count / sum / max IDENTICAL to our read (endpoint sync up to 128 s). Spark and
+  delta-kernel-rs read them per upstream; SQL Server PolyBase is moot (it refuses any materialized DV, 19726).
+  Harness: session scratchpad `ewbump/fabric_dv.py`.
+- **#629 / #630 / #631 — a file's row groups are read IN PARALLEL** (`MaxConcurrentRowGroups`, default
+  min(4, cores)), and a scan is split by (file, row group). ⇒ one `IRandomAccessFile` handle now sees CONCURRENT
+  reads. Ours tolerate it: reads are positional (pread / overlapped IO locally, stateless ranged GETs in httpfs and
+  ADLS), and the lazy small-file buffer only ever goes null → complete copy. The `DuckDbRandomAccessFile` comment
+  that said "a handle is used by one reader" was false now and is rewritten; the buffer is read into a local once.
+  Applies to EW's own reader — the codec engine, log/checkpoint replay, DV reads; the default native read is
+  DuckDB's `read_parquet`.
+- **#639 / #640 — `delta.minReaderVersion` / `minWriterVersion` / `delta.feature.<name>` are now a protocol
+  floor**, not stored text — what Spark does. Reaches our `CREATE … WITH ("delta.…")`.
+- **#645 — `delta.enableTypeWidening` declares the `typeWidening` feature at create**, which `DuckLakeDeltaSync`
+  sets on a type change. #637 declares `generatedColumns` for a generated column.
+- **#650 / #621 — OPTIMIZE joins row groups and rolls files on WRITTEN size**, and skips row groups no row can come
+  from. Our OPTIMIZE suites unchanged.
+- The rest: DV reads in place / only the DV's byte range (#615, #628), row groups a DV deletes in full are skipped
+  (#620), batched page fetches (#622–#627), expression kernels (#643), ORC fixes (we do not use ORC).
+- Gates: hermetic 93/93 (`verify_delta_tblproperties` +8) and service **91/91 — 137659**, IDENTICAL to the
+  previous pin (PolyBase 297, S3 222 per engine leg).
+
 ## THE 2026-11-02 BUMP — `805c91b → 957d24d`, five commits, zero patches (a fast-forward)
 
 - **#613 `957d24d` — a deletion vector with RUN containers was misread.** The portable roaring format writes an

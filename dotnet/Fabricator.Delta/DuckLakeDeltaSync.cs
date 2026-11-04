@@ -1200,7 +1200,7 @@ internal sealed class DuckLakeDeltaSync
                     deleted.Add(i);
                 }
             }
-            return writer.CreateAsync(deleted, deleted.Count, ct).AsTask().GetAwaiter().GetResult();
+            return writer.CreateAsync(deleted, ct).AsTask().GetAwaiter().GetResult();
         }
 
         // Delta file statistics from DuckLake's per-file column stats, keyed by PHYSICAL name. Only types whose

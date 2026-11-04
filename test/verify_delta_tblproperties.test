@@ -449,33 +449,35 @@ SELECT count(*) FROM lr.main.t;
 statement ok
 DETACH lr;
 
-# ---- Slice 8: delta.constraints.* — a constrained table is INSERT-ONLY, and the INSERT is ENFORCED ----
+# ---- Slice 8: delta.constraints.* — INSERT and copy-on-write UPDATE are ENFORCED, DELETE is free ----
 #
-# NEW BEHAVIOUR, arrived with the 2026-08-12 engineered-wood pin onto upstream (#136/#138/#139/#140), and
-# gated here because it arrived SILENTLY — nothing on our side asked for it, so nothing on our side would
-# notice it regressing. engineered-wood used to REFUSE EVERY write to a table declaring delta.constraints.*
-# or delta.invariants ("which this writer cannot evaluate; write rejected"); it now parses and evaluates
-# them. What that buys US is narrower than "such tables are writable", and the boundary is the point:
+# Arrived with engineered-wood, never asked for by us, so gated here: nothing on our side would notice it
+# regressing. engineered-wood used to REFUSE EVERY write to a table declaring delta.constraints.* or
+# delta.invariants; since the 2026-08-12 pin (#136/#138/#139/#140) it evaluates them, and since the
+# 2026-11-04 pin (#648/#649) a DELETE is no longer refused and its copy-on-write UPDATE checks the post-image.
+# What that buys US, by path:
 #
-#     INSERT   works, and a violating row is refused by EVALUATION
-#     UPDATE   REFUSED outright — even when the post-image would satisfy the constraint
-#     DELETE   REFUSED outright — even though a delete has no post-image to check at all
+#     INSERT                    works, and a violating row is refused by EVALUATION
+#     DELETE                    works on both table shapes — a delete writes no new values
+#     UPDATE, copy-on-write     works, and a violating post-image is refused by EVALUATION
+#     UPDATE, merge-on-read     REFUSED outright — even when the post-image would satisfy the constraint
 #
 # ⚠ THE MECHANISM IS NOT "our code checks constraints". `SupportsExternalDataFileCommit` reports false for a
 # constrained table, which steers an INSERT off the streaming external-commit path onto engineered-wood's
 # WriteAsync, where the rows exist to be checked. Our UPDATE/DELETE are COMPOSED from file-level staging
 # APIs (StageDataFilesAsync / CommitDataFilesAsync) which are handed finished files and have no rows to
 # check, so engineered-wood refuses them rather than commit unvalidated — the honest answer, and the safe
-# direction. Lifting it needs either `constraintsEnforcedByCaller` (a claim we cannot honestly make today)
-# or a public way to evaluate a table's constraints against batches we hold.
+# direction. That still holds for the merge-on-read UPDATE (the default, DV tables): lifting it needs either
+# `constraintsEnforcedByCaller` (a claim we cannot honestly make today) or a public way to evaluate a table's
+# constraints against batches we hold. The copy-on-write UPDATE goes through engineered-wood's UpdateRowsAsync,
+# which now evaluates the post-image itself — so on a `deletion_vectors false` table it is enforced, not refused.
 #
 # ⚠ WE CANNOT CREATE A CHECK CONSTRAINT — `CREATE TABLE … CHECK (…)` is deliberately unsupported — so the
 # declaration goes in the way DELTA ITSELF stores one: a `delta.constraints.<name>` property holding the SQL
 # expression. That is exactly the shape a Spark-authored table arrives with, which is the case this serves.
 #
-# ⚠ MEASURED ON BOTH TABLE SHAPES, pinned on ONE: identical results with deletion vectors ON (the default,
-# used here) and with `deletion_vectors false, column_mapping 'none'` — so the copy-on-write and
-# merge-on-read DML paths are refused alike, and this is not a property of the DV configuration.
+# ⚠ THE TABLE SHAPE NOW MATTERS: the main table below takes the default (deletion vectors on, so UPDATE is
+# merge-on-read and refused); a second attach with `deletion_vectors false` pins the copy-on-write half.
 #
 # ⚠ WHAT THIS DOES *NOT* ASSERT: which write path served the insert. That divergence is visible only in the
 # Debug log (`delta stream-write … deferred` vs `delta write … mode=Append`). The parquet `created_by` does
@@ -547,16 +549,15 @@ SELECT count(*) FILTER (WHERE id = 10), count(*) FILTER (WHERE id = 11) FROM ck.
 ----
 1	0
 
-# DELETE: refused too, though a delete has no post-image a constraint could be checked against.
-statement error
+# DELETE: allowed — it writes no new values, so there is nothing to check (engineered-wood #648; until the
+# 2026-11-04 pin it was refused like the UPDATE above).
+statement ok
 DELETE FROM ck.main.t WHERE id = 1;
-----
-cannot evaluate it against the rows
 
 query I
 SELECT count(*) FROM ck.main.t;
 ----
-6
+5
 
 # The control's UPDATE and DELETE both work, which is what makes the two refusals attributable.
 statement ok
@@ -589,7 +590,7 @@ statement ok
 UPDATE ck.main.t SET id = 11 WHERE id = 10;
 
 statement ok
-DELETE FROM ck.main.t WHERE id = 1;
+DELETE FROM ck.main.t WHERE id = 2;
 
 statement ok
 INSERT INTO ck.main.t VALUES (-5);
@@ -597,10 +598,42 @@ INSERT INTO ck.main.t VALUES (-5);
 query III
 SELECT count(*), count(*) FILTER (WHERE id = 11), count(*) FILTER (WHERE id < 0) FROM ck.main.t;
 ----
-6	1	1
+5	1	1
 
 statement ok
 DETACH ck;
+
+# ---- The copy-on-write UPDATE (deletion_vectors false) is ENFORCED on its post-image (engineered-wood #649).
+# A legal post-image commits; a violating one is refused by EVALUATION and commits nothing. DELETE works here
+# too, which pins #648 on the copy-on-write path as well as on the deletion-vector one above.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/ckcow' AS ckc (TYPE fabricator, PROVIDER 'delta', deletion_vectors false, column_mapping 'none');
+
+statement ok
+CREATE TABLE ckc.main.t AS SELECT i AS id FROM range(1, 6) t(i);
+
+statement ok
+SELECT * FROM ckc.delta.set_tblproperties('main.t', '{"delta.constraints.pos":"id > 0"}');
+
+statement ok
+UPDATE ckc.main.t SET id = 11 WHERE id = 5;
+
+statement error
+UPDATE ckc.main.t SET id = -3 WHERE id = 4;
+----
+is violated by a row being written
+
+statement ok
+DELETE FROM ckc.main.t WHERE id = 1;
+
+query I
+SELECT list(id ORDER BY id) FROM ckc.main.t;
+----
+[2, 3, 4, 11]
+
+statement ok
+DETACH ckc;
 
 # ============================================================================
 # 9. MANUAL CHECKPOINT — cat.delta.checkpoint('schema.table') writes one for the CURRENT version NOW

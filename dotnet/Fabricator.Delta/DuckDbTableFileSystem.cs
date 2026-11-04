@@ -820,10 +820,14 @@ internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
     {
         if (_bufferSmallFiles && _buffer is null && Eligible())
         {
-            // A benign race in principle (two first reads would download twice, last assignment wins, both
-            // correct) — and unreachable in practice: a handle is used by one reader. The objects read through
-            // this handle are Delta log/checkpoint/data files, which are never overwritten in place;
-            // `_last_checkpoint`, the one exception, is read via ReadAllBytesAsync rather than a handle.
+            // ⚠ CONCURRENT READS ON ONE HANDLE ARE REAL: since engineered-wood b644f50 its parquet reader reads
+            // the row groups of ONE file in parallel (MaxConcurrentRowGroups, default min(4, cores)). The race is
+            // benign: two first reads both download, the last assignment wins, and both buffers are the same
+            // bytes — the objects read through this handle are Delta log/checkpoint/data files, which are never
+            // overwritten in place (`_last_checkpoint`, the exception, is read via ReadAllBytesAsync). `_buffer`
+            // only ever goes from null to a complete copy, and the read below takes it into a local once. The
+            // unbuffered path is a positional read with no shared cursor (pread / overlapped IO locally, a stateless
+            // ranged GET in httpfs).
             if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
             {
                 Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
@@ -839,15 +843,15 @@ internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
             }
             _buffer = whole;
         }
-        if (_buffer is not null)
+        if (_buffer is { } buffer)
         {
             // Served from memory: no host call, no log line — the buffered download above is the one IO, and
             // logging these too would make an IO timeline show traffic that never happened.
-            int avail = (int)Math.Min(range.Length, Math.Max(0, _buffer.Length - range.Offset));
+            int avail = (int)Math.Min(range.Length, Math.Max(0, buffer.Length - range.Offset));
             var hit = new ExactMemoryOwner(avail);
             if (avail > 0)
             {
-                Array.Copy(_buffer, range.Offset, hit.Array, 0, avail);
+                Array.Copy(buffer, range.Offset, hit.Array, 0, avail);
             }
             return new ValueTask<IMemoryOwner<byte>>(hit);
         }

@@ -4712,11 +4712,11 @@ principal wins even if `PROVIDER` says something else:
 > `s3://` with a named secret (above), or a POSIX filesystem — Linux/macOS local paths get a real `O_EXCL`
 > and are multi-process safe.
 
-> ### ⚠ A table with CHECK constraints is INSERT-only here
+> ### ⚠ A table with CHECK constraints: UPDATE needs `deletion_vectors false`
 >
 > Delta stores a CHECK constraint as a `delta.constraints.<name>` table property, and Spark writes them with
-> `ALTER TABLE … ADD CONSTRAINT`. fabricator can **append** to such a table, and the constraint is genuinely
-> enforced — a violating row is rejected and nothing is committed:
+> `ALTER TABLE … ADD CONSTRAINT`. fabricator **enforces** it on an `INSERT` — a violating row is rejected and
+> nothing is committed:
 >
 > ```
 > INSERT INTO lake.main.t VALUES (-5);
@@ -4724,11 +4724,17 @@ principal wins even if `PROVIDER` says something else:
 > --   No data was committed.
 > ```
 >
-> But `UPDATE` and `DELETE` on such a table are **refused** ("this write path cannot evaluate it against the
-> rows"), including an `UPDATE` whose result would satisfy the constraint and a `DELETE`, which cannot
-> violate one at all. The reason is that those two are built from a lower-level Delta API that is handed
-> finished files rather than rows, so the engine has nothing to check and declines rather than commit
-> unchecked data. Do those statements from Spark, or drop the constraint first:
+> `DELETE` works: it writes no new values, so there is nothing to check. `UPDATE` depends on how the table
+> is written:
+>
+> | table | `UPDATE` |
+> |---|---|
+> | deletion vectors **off** (`deletion_vectors false` on the ATTACH) | works, and a result that violates the constraint is rejected like an `INSERT` |
+> | deletion vectors **on** (the default) | **refused** ("this write path cannot evaluate it against the rows"), even when the result would satisfy the constraint |
+>
+> With deletion vectors on, fabricator writes the new rows itself and hands the Delta engine finished files,
+> so the engine has nothing to check and declines rather than commit unchecked data. Run that `UPDATE` from
+> Spark, attach with `deletion_vectors false`, or drop the constraint first:
 >
 > ```sql
 > SELECT * FROM lake.delta.set_tblproperties('main.t', '{"delta.constraints.pos":null}');
