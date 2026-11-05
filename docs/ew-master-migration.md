@@ -3219,6 +3219,27 @@ blind claims where one is true.
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
 
+## THE 2026-11-05 BUMP — `3d3be76 → 5165c13`, two commits, zero patches (a fast-forward)
+
+- **#676 (`f0f90fd`, issue #675): per-path variant min/max for files EW shreds itself**, derived from the footer it
+  just wrote as delta-spark 4.3 does, plus a Variant group for variant bounds in a checkpoint's `stats_parsed` on
+  tables that support shredding. ⚠ **Only files EW's own writer wrote**: a host's `IDataFileWriter` returns no
+  footer and files committed with `StageDataFilesAsync`/`CommitDataFilesAsync` carry the host's stats, so OUR
+  DuckDB-written files keep `nullCount` only for a variant (measured on a 12-commit shredded table: the checkpoint has
+  the `stats_parsed.minValues.<v>.{metadata,value}` group, empty for our files). Upstream ask drafted:
+  `scratchpad/upstream/ew_variant_stats_host_files.md` (public encoder for the staged path from DuckDB's
+  `RETURN_STATS`, footer-derived bounds for `IDataFileWriter` files). No engine prunes on these bounds yet (#677).
+- **#678 (`5165c13`): a shredded write without the VARIANT annotation is refused** (`EmitVariantLogicalType = false`
+  with `ShredVariants`). Not reachable from us: we set neither.
+- From the thread: delta-spark 4.3.1 declares `variantShredding-preview` again by default
+  (`forceUsePreviewTableFeature`), while EW (and we) declare the GA `variantShredding`. Both valid; a reader knowing
+  only one name refuses the other's tables. Fabric Spark reads ours (user-confirmed 2026-11-05).
+- Sweep: no change to the public option records; `known-issues.md` read (variant section rewritten, matches the above).
+- Gates: compile zero; EW `DeltaLake.Tests` **823/823 × 3 TFMs**; `DeltaLake.Table.Tests` **2273 passed / 219 skipped /
+  0 failed** (net10.0, net8.0; net472 2271/219), all 219 skips under `Tests.Interop` (counted); hermetic
+  **94/94 — 12599** and service **91/91 — 137706**, both identical to the previous pin; a shredded table across a
+  checkpoint reads exactly on both engines.
+
 ## THE 2026-11-04 EVENING BUMP — `b644f50 → 3d3be76`, fourteen commits, zero patches (a fast-forward)
 
 - **Why now: #672 implements our issue #671** (`variantShredding` / `-preview` as reader and writer features;
