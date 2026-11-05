@@ -67,6 +67,54 @@ The provider changes no answer by itself: every difference is the driver's trans
 With our emitter ported into the driver (branch below): **139/139 agree, 51 pushed** — exactly the 51 our own
 SqlServer provider pushes, none fewer.
 
+## Limitations (2026-11-05)
+
+What works: everything the host pushes as a plain query plan — aggregates, joins, windows, set operations, and the
+correlated subqueries and laterals DuckDB turns into joins before translation (the scalar subquery as `OUTER APPLY`,
+CTEs inlined). The driver translates those with the same emitter as our SqlServer provider.
+
+What does not, and why. The driver turns a plan into T-SQL with `SqlServerSubstrait.Translate`
+(`SqlServerStatement.cs`), while our SqlServer provider calls `TranslatePushdown` and hands it what it knows about the
+server. Everything in that hand-over is missing on the ADBC path:
+
+| # | gap | effect |
+|---|---|---|
+| 1 | **⚠ the plan hint `fabricator.repeated_reads` is ignored** | **wrong answers possible.** When DuckDB inlines a CTE at two places, the server reads the same rows twice; under READ COMMITTED with concurrent writers the two reads can differ (measured: 28 wrong NULLs in 8 runs, docs/duckdb-2.0-remote-execution.md §4.16). The SqlServer provider declines such a plan unless the reads are consistent (RCSI, snapshot); the ADBC path runs it. No suite catches it — the edge cases have no concurrent writer. Fix belongs in the provider: it sees the hint and can decline in `TranslateRemotePlan` |
+| 2 | **catalog functions** (scalar UDFs, TVFs, a TVF per row in a `CROSS APPLY`) | stay local, or do not bind at all: the provider declares no functions (ADBC `GetObjects` lists none), so `a.dbo.f(x)` is unknown to DuckDB; and the driver's emitter has no callback saying a function runs on the server, so it refuses `extension:fabricator:catalog_function`. Possible: the provider reads the routines through the driver with SQL, and since every catalog function of an ADBC catalog is a server function, the driver could write `[schema].[name](…)` directly |
+| 3 | the plan hint `fabricator.single_join_any_row` is ignored | with `scalar_subquery_error_on_multiple_rows = false` a scalar subquery with several rows fails instead of taking one. Loud, not wrong |
+| 4 | no declared lengths of string columns | equality keys are `varchar(max)`, which SQL Server cannot hash: string joins and GROUP BY are slower, answers unchanged |
+| 5 | server features assumed | IGNORE NULLS, DATETRUNC, LTRIM/RTRIM with characters (SQL Server 2022) and OPENJSON (compatibility level 130) are taken as present; an older server fails when the query runs, not at Prepare |
+| 6 | columns the emitter must not compare (`sql_variant` and similar) are unknown | the driver may translate a plan the SqlServer provider declines |
+| 7 | a TVF per row (`FROM t, a.dbo.tvf(t.a)`) | not a Substrait path at all — it is the lateral session (ABI v79), which this provider does not implement |
+| 8 | writes | the provider is read-only: INSERT / UPDATE / DELETE / MERGE / CTAS are refused |
+| 9 | long IN lists | sent as a list up to `max_in_list` (default 1000), else as a range or not at all; a driver that writes a list as literals fails on a large one only when it runs |
+| 10 | per-statement cost outside the server | a scan with 28 572 keys took 2.8 s where the SqlServer provider took 1.5 s (see above); not investigated |
+
+### The way to close them
+
+Our SqlServer provider has its own copy of the same code (`dotnet/Fabricator.SqlServer/Substrait/`, namespace
+`Clast.Drivers.SqlServer.Substrait`) and calls `SqlServerSubstrait.TranslatePushdown` in-process
+(`SqlServerBackend.cs`), answering its callbacks from what it knows about the server. The mssql-adbc port carries
+`TranslatePushdown` too, but `SqlServerStatement` calls `Translate`, and the ADBC C interface cannot carry callbacks.
+
+So the driver calls `TranslatePushdown` itself and answers the callbacks over its own connection — it can look up
+nearly all of it:
+
+| callback / fact | the driver's source | closes |
+|---|---|---|
+| consistent reads (`fabricator.repeated_reads`) | `sys.databases` (`is_read_committed_snapshot_on`, `snapshot_isolation_state`) and the session's isolation level; without them the plan is refused at Prepare | 1 |
+| `fabricator.single_join_any_row` | read by `TranslatePushdown` from the plan itself | 3 |
+| declared string lengths, column SQL types, uncollatable columns | `sys.columns` / `sys.types` for the tables the plan reads | 4, 6 |
+| SQL Server 2022 functions, OPENJSON | `SERVERPROPERTY('ProductMajorVersion')`, `compatibility_level` | 5 |
+| catalog functions | every function of an ADBC catalog is a server function: answer `[schema].[name]` once the routine exists (`sys.objects`) | 2 (driver half) |
+
+The provider only switches it on: a statement option meaning "translate this plan as a DuckDB pushdown" — needed
+because `TranslatePushdown` reads our `fabricator.*` hints and follows the pushdown's conventions (result columns
+`c0…`, ORDER BY through hidden key columns), which a plain ADBC client does not expect.
+
+What stays for the provider: declaring the server's routines to DuckDB (gap 2, host half), read through the driver
+with an SQL query. Gaps 7–10 are outside this.
+
 ## The mssql-adbc side (branch `fabricator-tsql` in `D:/repos/mssql-adbc`, local only)
 
 Our T-SQL emitter started as a copy of mssql-adbc's at `677676c`; upstream has not changed those files since.
