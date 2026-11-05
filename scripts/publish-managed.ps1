@@ -45,10 +45,10 @@ param(
     # doesn't require the delta-dotnet sibling repo + its Rust build. Without it, BackendRegistry simply
     # skips the (absent) Fabricator.DeltaRs assembly.
     [switch]$IncludeDeltaRs,
-    # Opt-in: also publish the EXPERIMENTAL adbc provider (Fabricator.Adbc, docs/adbc-provider.md), which loads a native
-    # ADBC driver. Off by default: no automated gate runs it (every test needs a driver and a server), so it does not
-    # ship in a release payload. ProviderRegistry discovers it by the Fabricator*.dll glob when it is there.
-    [switch]$IncludeAdbc,
+    # Leave out the EXPERIMENTAL adbc provider (Fabricator.Adbc, docs/adbc-provider.md), which loads a native ADBC
+    # driver. Published by default for now, so it can be tried without a separate step; no automated gate runs it
+    # (every test needs a driver and a server). ProviderRegistry discovers it by the Fabricator*.dll glob.
+    [switch]$ExcludeAdbc,
     # Wipe the output dir first. Needed after MOVING a PackageReference between assemblies that publish into
     # it — see the clean block below for the measurement; the failure is silent and only the service tier
     # catches it.
@@ -147,8 +147,8 @@ Publish-Project $fluidProj "Fabricator.FluidPlugin"
 $functionsProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Functions/Fabricator.Functions.csproj" | Resolve-Path
 Publish-Project $functionsProj "Fabricator.Functions"
 
-# The experimental adbc provider (opt-in, see the parameter): nothing else references it, so this is what ships it.
-if ($IncludeAdbc) {
+# The experimental adbc provider (see -ExcludeAdbc): nothing else references it, so this is what ships it.
+if (-not $ExcludeAdbc) {
     $adbcProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Adbc/Fabricator.Adbc.csproj" | Resolve-Path
     Publish-Project $adbcProj "Fabricator.Adbc"
 }

@@ -1,4 +1,4 @@
-# The `adbc` provider (experimental, opt-in)
+# The `adbc` provider (experimental)
 
 A provider that loads a **native ADBC driver** through the ADBC C interface and talks to it in Arrow and
 Substrait, so the remote pushdown built for SQL Server (docs/duckdb-2.0-remote-execution.md §3–§5) can serve any
@@ -13,10 +13,10 @@ ATTACH 'driver=D:/repos/mssql-adbc/artifacts/native-win-x64/adbc_driver_sqlserve
 `driver` names the library (`entrypoint`, default `AdbcDriverInit`, its init function); every other key is a
 database option handed to the driver unchanged.
 
-**Status: experimental, not in a release payload.** `scripts/publish-managed.ps1 -IncludeAdbc` publishes it; CI only
-compiles it (`.github/actions/build-extension`), because every test needs a native driver and a server. There is no
-known use case yet; it is kept in main so a change to the contract it implements breaks the build rather than an
-unmaintained branch.
+**Status: experimental, published by default for now** (`scripts/publish-managed.ps1`; `-ExcludeAdbc` leaves it
+out), so it can be tried without a separate step. No automated suite runs it, because every test needs a native
+driver and a server. There is no known use case yet; it is kept in main so a change to the contract it implements
+breaks the build rather than an unmaintained branch.
 
 | ATTACH option | default | meaning |
 |---|---|---|
