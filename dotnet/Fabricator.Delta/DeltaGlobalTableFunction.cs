@@ -621,13 +621,18 @@ internal static class DeltaWriter
     /// removing it is a separate, purely mechanical change across ~6 signatures rather than a behaviour edit
     /// buried in this one; it is inert until then.
     /// </param>
+    /// <param name="schema">The table's schema — required, so a create site cannot skip the decision. A table with a VARIANT column enables variant shredding
+    /// (<c>delta.enableVariantShredding</c>) unless the caller's properties already say <c>false</c> (the
+    /// <c>variant_shredding</c> WITH key or ATTACH option); engineered-wood then declares the
+    /// <c>variantShredding</c> feature. A table without one never gets the property.</param>
     private static Dictionary<string, string>? CreateConfig(
         bool deletionVectors, bool rowTracking, bool inCommitTimestamps, bool changeDataFeed,
-        bool serializable = false, IReadOnlyList<string>? sortedBy = null,
-        IReadOnlyDictionary<string, string>? extraProperties = null)
+        bool serializable, IReadOnlyList<string>? sortedBy,
+        IReadOnlyDictionary<string, string>? extraProperties, Schema schema)
     {
         _ = serializable; // inert: the isolation level is no longer stamped into the table config
-        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed
+        bool hasVariant = schema.FieldsList.Any(VariantMarker.IsVariantArrowField);
+        if (!deletionVectors && !rowTracking && !inCommitTimestamps && !changeDataFeed && !hasVariant
             && sortedBy is not { Count: > 0 } && extraProperties is not { Count: > 0 })
         {
             return null;
@@ -702,7 +707,19 @@ internal static class DeltaWriter
                 config[kv.Key] = kv.Value;
             }
         }
-        return config;
+        // VARIANT SHREDDING ON BY DEFAULT: a shredded variant stores its common fields as typed columns, which
+        // DuckDB reads and prunes like any other column. The opt-out arrives as an explicit "false" above; a
+        // table without a variant column gets no property at all, since the feature it declares raises the
+        // reader requirement for nothing.
+        if (hasVariant)
+        {
+            config.TryAdd(EngineeredWood.DeltaLake.VariantShreddingConfig.EnableKey, "true");
+        }
+        else
+        {
+            config.Remove(EngineeredWood.DeltaLake.VariantShreddingConfig.EnableKey);
+        }
+        return config.Count > 0 ? config : null;
     }
 
     // Optimistic-concurrency retry bound for commits. A concurrent writer that commits our target version
@@ -783,12 +800,16 @@ internal static class DeltaWriter
             var fs = TableFileSystems.Create(opener, path);
             var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec, dataFileWriter),
                                                      partitionColumns: spec?.PartitionColumns,
-                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties),
+                                                     configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties, schema),
                                                      columnMappingMode: columnMapping,
                                                      cancellationToken: ct,
                                                      clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
             try
             {
+                if (dataFileWriter is not null)
+                {
+                    dataFileWriter.ShredVariants = NativeParquetDataFileWriter.AllowsShredding(table);
+                }
                 // NOT NULL enforcement: an APPEND into an existing table must honor its declared nullability
                 // (incl. nested struct/list/map constraints on external tables). Overwrite/replace adopts the
                 // INPUT schema (nullable), matching drop+recreate semantics — nothing to enforce there.
@@ -893,7 +914,8 @@ internal static class DeltaWriter
         nint opener, string path, IArrowArrayStream data,
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
         out long rowsWritten, out EngineeredWood.DeltaLake.Schema.StructType? assignedSchema,
-        IReadOnlyList<string>? partitionColumns = null, DeltaWriteSpec? spec = null)
+        IReadOnlyList<string>? partitionColumns = null, DeltaWriteSpec? spec = null,
+        bool shredVariants = false)
     {
         rowsWritten = 0;
         assignedSchema = null;
@@ -955,7 +977,7 @@ internal static class DeltaWriter
             // commit — and into the pending-file read-back's typed literals.
             var copied = NativeParquetDataFileWriter.RunCopyPartitioned(
                 writableRoot, copyPartCols, copySource, default, statsSchema: statsSchema,
-                fieldIdsSpec: fieldIdsSpec, spec: spec);
+                fieldIdsSpec: fieldIdsSpec, spec: spec, shredVariants: shredVariants);
             var pfiles = new List<WrittenDataFile>(copied.Count);
             long ptotal = 0;
             foreach (var cf in copied)
@@ -970,7 +992,7 @@ internal static class DeltaWriter
         string fileRel = $"{System.Guid.NewGuid():N}.parquet";
         var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
             writableRoot, fileRel, copySource, default, statsSchema: statsSchema, fieldIdsSpec: fieldIdsSpec,
-            spec: spec);
+            spec: spec, shredVariants: shredVariants);
         rowsWritten = rows;
         return rows > 0
             ? new List<WrittenDataFile> { new(fileRel, size, rows, null, stats) }
@@ -1034,7 +1056,7 @@ internal static class DeltaWriter
         // STREAM stays transport all the way to DuckDB's COPY inside TryStreamCreateFiles.
         var ewSchema = VariantMarker.ToCanonicalSchema(data.Schema);
         var config = CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed,
-                                  serializable, sortedBy, spec?.CreateProperties);
+                                  serializable, sortedBy, spec?.CreateProperties, ewSchema);
         // The table this create WOULD produce must be one engineered-wood lets an outside writer commit files
         // into. The open-table path answers that from `table.SupportsExternalDataFileCommit` AFTER opening;
         // here there is no table yet, so the same three conditions are evaluated on the exact inputs the create
@@ -1043,8 +1065,11 @@ internal static class DeltaWriter
         {
             return null;
         }
+        // The table does not exist yet, so its config decides: engineered-wood declares the feature from it at
+        // the create below. CreateAndCommitFilesAsync re-checks against the table it actually opened.
+        bool shred = EngineeredWood.DeltaLake.VariantShreddingConfig.IsEnabled(config);
         var files = TryStreamCreateFiles(opener, path, data, columnMapping, out rowsWritten,
-                                         out var assigned, spec?.PartitionColumns, spec);
+                                         out var assigned, spec?.PartitionColumns, spec, shred);
         if (files is null)
         {
             return null;   // streaming unavailable — `data` untouched for the caller's fallback
@@ -1053,7 +1078,7 @@ internal static class DeltaWriter
         // throw, never return null (a null would send the caller down a second write path over an exhausted
         // stream, silently producing an empty table).
         return CreateAndCommitFilesAsync(opener, path, ewSchema, config, files, assigned, mode, spec,
-                                         columnMapping, sortedBy).GetAwaiter().GetResult();
+                                         columnMapping, sortedBy, shred).GetAwaiter().GetResult();
     }
 
     /// <summary>
@@ -1065,7 +1090,7 @@ internal static class DeltaWriter
         List<WrittenDataFile> files, EngineeredWood.DeltaLake.Schema.StructType? assigned,
         DeltaWriteMode mode, DeltaWriteSpec? spec,
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
-        IReadOnlyList<string>? sortedBy)
+        IReadOnlyList<string>? sortedBy, bool shredded)
     {
         var fs = TableFileSystems.Create(opener, path);
         var table = await DeltaTable.OpenOrCreateAsync(
@@ -1079,6 +1104,14 @@ internal static class DeltaWriter
         try
         {
             EnsurePreAssignedLayoutAdopted(table, assigned, path);
+            // OpenOrCreate OPENS a table another writer created in the meantime, with ITS config. Files shredded
+            // for the table we meant to create must not land in one that forbids shredding.
+            if (shredded && !NativeParquetDataFileWriter.AllowsShredding(table))
+            {
+                throw new EngineeredWood.DeltaLake.DeltaConflictException(
+                    $"delta create {path}: another writer created the table without variant shredding while this "
+                    + "statement was writing shredded files — retry the statement.");
+            }
             // The SAME mode the ordinary path would have committed, so the commitInfo this statement records is
             // unchanged by the reorder. On a table this call just created an Overwrite removes nothing (there
             // are no active files), so the two readings agree.
@@ -1297,7 +1330,7 @@ internal static class DeltaWriter
         var table = await DeltaTable.OpenOrCreateAsync(
             fs, ewSchema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
-            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties),
+            configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties, ewSchema),
             columnMappingMode: columnMapping,
             cancellationToken: default,
             clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
@@ -1448,7 +1481,8 @@ internal static class DeltaWriter
                 // names, so dirs + partitionValues keys are physical (Delta spec) and FIELD_IDS stamp the files.
                 var copied = NativeParquetDataFileWriter.RunCopyPartitioned(
                     writableRoot, copyPartCols, copySource, default, statsSchema: statsSchema,
-                    fieldIdsSpec: fieldIdsSpec, spec: spec);
+                    fieldIdsSpec: fieldIdsSpec, spec: spec,
+                    shredVariants: NativeParquetDataFileWriter.AllowsShredding(table));
                 files = new List<WrittenDataFile>(copied.Count);
                 long total = 0;
                 foreach (var cf in copied)
@@ -1466,7 +1500,8 @@ internal static class DeltaWriter
                 string fileRel = $"{System.Guid.NewGuid():N}.parquet";
                 var (rows, size, stats) = NativeParquetDataFileWriter.RunCopy(
                     writableRoot, fileRel, copySource, default, statsSchema: statsSchema,
-                    fieldIdsSpec: fieldIdsSpec, spec: spec);
+                    fieldIdsSpec: fieldIdsSpec, spec: spec,
+                    shredVariants: NativeParquetDataFileWriter.AllowsShredding(table));
                 rowsWritten = rows;
                 // 0 rows → reference no file (an empty COPY output would be an unreferenced orphan); an Overwrite
                 // still commits its removes (clears the table), an Append commits an empty version.
@@ -1738,7 +1773,7 @@ internal static class DeltaWriter
                 // OpenOrCreate writes commit-0 for a new table (or opens an existing one — no commit, no conflict).
                 var table = await DeltaTable.OpenOrCreateAsync(fs, schema, Options(spec),
                                                          partitionColumns: spec?.PartitionColumns,
-                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties),
+                                                         configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties, schema),
                                                          columnMappingMode: columnMapping,
                                                          preAssignedSchema: preAssignedSchema,
                                                          cancellationToken: ct,

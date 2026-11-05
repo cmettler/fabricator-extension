@@ -19,7 +19,7 @@ namespace Fabricator.Bridge;
 /// on an empty CREATE (there is no write to tune; persist a property or use the setting instead).</para>
 ///
 /// <para><b>Per-table create-flag overrides</b> — <c>deletion_vectors</c>, <c>column_mapping</c>,
-/// <c>row_tracking</c>, <c>change_data_feed</c>, <c>in_commit_timestamps</c>: the same values as the
+/// <c>row_tracking</c>, <c>change_data_feed</c>, <c>in_commit_timestamps</c>, <c>variant_shredding</c>: the same values as the
 /// ATTACH options, overriding the catalog default for THIS table's creation (e.g. the
 /// protocol-1.0 recipe <c>WITH (deletion_vectors=false, column_mapping='none')</c> without a dedicated
 /// ATTACH).</para>
@@ -72,6 +72,10 @@ internal sealed record DeltaWithOptions
     public bool? ChangeDataFeed { get; init; }
     public bool? InCommitTimestamps { get; init; }
 
+    /// <summary>Whether a table with a VARIANT column enables shredded variant files
+    /// (<c>delta.enableVariantShredding</c>). Null = the catalog default, which is on.</summary>
+    public bool? VariantShredding { get; init; }
+
     /// <summary>delta.* / fabricator.* extras, original key case, merged into the CREATE config LAST
     /// (a WITH property wins over a derived key, e.g. delta.isolationLevel).</summary>
     public IReadOnlyDictionary<string, string>? Properties { get; init; }
@@ -85,7 +89,7 @@ internal sealed record DeltaWithOptions
 
     public bool HasCreateFlagOverride => DeletionVectors is not null || ColumnMapping is not null
                                          || RowTracking is not null || ChangeDataFeed is not null
-                                         || InCommitTimestamps is not null;
+                                         || InCommitTimestamps is not null || VariantShredding is not null;
 
     /// <summary>Parses + validates the WITH-options JSON; null for absent/empty. Throws a clear error for
     /// unknown keys, guarded keys, and malformed values.</summary>
@@ -102,7 +106,7 @@ internal sealed record DeltaWithOptions
         double? bloomFpp = null;
         DeltaParquetVersion parquetVersion = DeltaParquetVersion.Default;
         IReadOnlyList<string>? bloom = null;
-        bool? dv = null, rt = null, cdf = null, ict = null;
+        bool? dv = null, rt = null, cdf = null, ict = null, vs = null;
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode? cm = null;
         Dictionary<string, string>? props = null;
 
@@ -172,6 +176,9 @@ internal sealed record DeltaWithOptions
                 case "in_commit_timestamps":
                     ict = ParseBoolValue(key, value);
                     break;
+                case "variant_shredding":
+                    vs = ParseBoolValue(key, value);
+                    break;
                 case "column_mapping":
                     cm = value.Trim().ToLowerInvariant() switch
                     {
@@ -231,7 +238,7 @@ internal sealed record DeltaWithOptions
                         + "parquet_file_size_bytes, parquet_version, parquet_compression_level, "
                         + "parquet_bloom_filter_false_positive_ratio, parquet_bloom_filter_columns, "
                         + "deletion_vectors, column_mapping, row_tracking, change_data_feed, "
-                        + "in_commit_timestamps, table_type, format, and quoted delta.*/fabricator.* "
+                        + "in_commit_timestamps, variant_shredding, table_type, format, and quoted delta.*/fabricator.* "
                         + "table properties).");
             }
         }
@@ -252,6 +259,7 @@ internal sealed record DeltaWithOptions
             RowTracking = rt,
             ChangeDataFeed = cdf,
             InCommitTimestamps = ict,
+            VariantShredding = vs,
             Properties = props,
         };
     }
@@ -304,7 +312,7 @@ internal sealed record DeltaWithOptions
             throw new ArgumentException(
                 $"WITH \"{key}\": feature-enabling properties need a protocol declaration — use the "
                 + "explicit WITH keys instead (deletion_vectors / row_tracking / change_data_feed / "
-                + "in_commit_timestamps).");
+                + "in_commit_timestamps / variant_shredding).");
         }
         if (key.StartsWith("delta.columnMapping", StringComparison.OrdinalIgnoreCase))
         {

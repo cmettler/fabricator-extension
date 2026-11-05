@@ -4827,12 +4827,18 @@ principal wins even if `PROVIDER` says something else:
 > new writes record the right bounds. Partition columns were never affected. Details:
 > [docs/known-limitations.md](docs/known-limitations.md).
 
-> ⚠ **VARIANT data files written by `PROVIDER 'delta'` before 2026-11-04 are SHREDDED** (`typed_value` columns —
-> DuckDB's Parquet writer does that by default), while the table declares only `variantType`. The Delta protocol
-> allows shredded files only with the `variantShredding` feature, so a strict reader may refuse them. New writes are
-> unshredded; rewrite an older table once (`CREATE OR REPLACE TABLE t AS SELECT * FROM t`) to bring it in line. A column whose name has
-> upper-case letters in a table with `column_mapping 'none'` is still written shredded (a DuckDB defect, see
-> [docs/variant-support.md](docs/variant-support.md)). Shredding as an opt-in comes once the feature can be declared.
+> **VARIANT columns are shredded by default.** A table created with a VARIANT column declares the
+> `variantShredding` feature (`delta.enableVariantShredding = true`), and `PROVIDER 'delta'` then writes the
+> variant's common fields as typed Parquet columns, which DuckDB reads and prunes like any other column. Fabric
+> Spark reads such tables; Delta readers older than delta-spark 4.1 do not know the feature and refuse the whole
+> table. Opt out per table with `WITH (variant_shredding = false)` or per catalog with the ATTACH option
+> `variant_shredding false`; the choice is made at CREATE and cannot be changed later.
+>
+> ⚠ **VARIANT data files written by `PROVIDER 'delta'` before 2026-11-04 are shredded** while the table declares
+> only `variantType`, which a strict reader may refuse. Rewrite such a table once
+> (`CREATE OR REPLACE TABLE t AS SELECT * FROM t`). On a table that opted out, a column whose name has upper-case
+> letters under `column_mapping 'none'` is still written shredded (a DuckDB defect, see
+> [docs/variant-support.md](docs/variant-support.md)).
 
 > **Partition values are escaped the way Spark escapes them**, so a value containing `/ : = % ? * " ' #` or a
 > backslash or a control character becomes `%XX` in the directory name (`region=a/b` → `region=a%2Fb`). The
@@ -5206,7 +5212,8 @@ ALTER TABLE lake.events RESET (parquet_compression);
 - A **list literal** (`['a','b']`) is accepted wherever a comma-separated list is, in `WITH` and `SET`
   alike.
 - An **unknown option is refused**, never ignored. So are the create-only feature flags
-  (`deletion_vectors`, `row_tracking`, `change_data_feed`, `in_commit_timestamps`, `column_mapping`):
+  (`deletion_vectors`, `row_tracking`, `change_data_feed`, `in_commit_timestamps`, `column_mapping`,
+  `variant_shredding`):
   they enable a table feature that needs a protocol upgrade, and the error says so.
 - A raw property name passes through (`SET ("fabricator.parquet.compression" = 'gzip')`), which is the
   escape hatch for anything the vocabulary above does not spell — the same surface
@@ -5267,6 +5274,7 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
 | `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible. ⚠ An `'id'` table is **not exposed by the Fabric SQL endpoint at all** — it is silently skipped ([known limitations](docs/known-limitations.md#3-interop-constraints-that-are-permanent-not-bugs)) |
 | `native_read`, `native_write` | **from the PROVIDER name** | `PROVIDER 'delta'` ⇒ both **on** (DuckDB's Parquet reader/writer — the production path); `PROVIDER 'engineeredwooddelta'` ⇒ both **off** (pure-EW codec). Either is still settable explicitly on either spelling |
 | `change_data_feed`, `in_commit_timestamps`, `row_tracking` | `false` / off | opt-in |
+| `variant_shredding` | **`true`** | a table created with a VARIANT column declares `variantShredding` and gets shredded variant files; tables without one are unaffected |
 | `schemas` | `'none'` | flat layout; `'onelevel'` / `'nested'` opt in |
 | `isolation_level` | **`write_serializable`** | Concurrent **disjoint-row DML on one file composes** instead of conflicting — row-level concurrency is a `write_serializable`-only relaxation, and it is why this is the default. ⚠ **It does NOT match Fabric Spark**, which commits at `Serializable` and whose DDL will not even set `WriteSerializable`: on a table that declares no `delta.isolationLevel` we are the more permissive writer, so the effective guarantee depends on which engine wrote last. Attach `isolation_level 'serializable'` to align. (Was `serializable` between 2026-08-01 and 2026-08-11.) |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
@@ -5436,7 +5444,7 @@ CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='Serializable', "fabricato
 > named is exactly the state at that version, and failing to write one never fails the commit.
 
 Keys: `parquet_compression` / `parquet_row_group_size` / `parquet_bloom_filter_columns`; `deletion_vectors`
-/ `column_mapping` / `row_tracking` / `change_data_feed` / `in_commit_timestamps`; any quoted `delta.*` /
+/ `column_mapping` / `row_tracking` / `change_data_feed` / `in_commit_timestamps` / `variant_shredding`; any quoted `delta.*` /
 `fabricator.*` property; and `table_type='DELTA'` / `format='parquet'` (validated no-ops, for the
 Iceberg-style DDL shape). The SQL Server provider's `WITH` keys drive external tables (next section); DAX
 and deltars reject options.

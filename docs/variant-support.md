@@ -47,13 +47,32 @@ Other findings from the build:
   clast-project/engineered-wood#671). Every native COPY now passes `SHREDDING {'<col>': 'VARIANT'}` per top-level
   variant column, which writes it unshredded (measured; reads back exactly). The pure-codec engine never shredded.
   - ⚠ DuckDB 2.0 defect: `SHREDDING` lowercases the name and then silently misses a column with upper-case letters,
-    so under `column_mapping 'none'` such a column stays shredded (pinned in `verify_delta_catalog_variant`). Under
+    so on an OPTED-OUT table under `column_mapping 'none'` such a column stays shredded (pinned in
+    `verify_delta_catalog_variant`). Under
     column mapping the physical names are `col-<guid>`, lower-case.
   - Variants below the root cannot be written by DuckDB at all, and the clustered OPTIMIZE declines a variant table
     (it bin-packs), so the three top-level COPY paths are the whole surface.
   - The DuckLake sync refuses a variant column, so a mirror cannot carry DuckLake's (shredded) variant files either.
-  - Next, once engineered-wood has the feature: shredding as a per-table opt-in that declares it, then Spark's
-    footer-derived path statistics (delta-spark `VariantStats.scala`).
+  - **SHREDDING IS THE DEFAULT SINCE 2026-11-05** (engineered-wood 3d3be76 brought the feature, #672). A table
+    CREATED with a top-level VARIANT column gets `delta.enableVariantShredding = true`, and engineered-wood declares
+    `variantShredding` + `variantType` (reader 3 / writer 7). Opt out with `WITH (variant_shredding = false)` or the
+    ATTACH option `variant_shredding false` (an explicit `false` is stored); a table without a variant column gets no
+    property. A CREATE flag: ALTER SET and `set_tblproperties` refuse it.
+  - ⚠ engineered-wood checks shredding only for its OWN writer, so we decide for DuckDB's COPY: every native write
+    path asks the opened table (`NativeParquetDataFileWriter.AllowsShredding` = property AND protocol feature) and
+    drops the `SHREDDING` clause only then — collect, stream, create-before-commit, copy-on-write DELETE, UPDATE
+    post-images (autocommit and buffered) and OPTIMIZE. The create-before-commit path decides from the config it is
+    about to create with, and refuses (as a conflict, retry the statement) when a racing writer created the table
+    without the feature in between.
+  - Cost: readers older than delta-spark 4.1 do not know the GA feature and refuse the whole table. Fabric Spark reads
+    shredded tables (user-confirmed 2026-11-05); the Fabric SQL endpoint rejects VARIANT regardless. The codec engine
+    still writes unshredded files (valid in a shredding table) and reads shredded ones; ⚠ its reassembly loses the
+    trailing zeros of a shredded DECIMAL of precision <= 18 (engineered-wood known-issues), which the default
+    `delta` provider does not hit because DuckDB reads its files.
+  - Gate `verify_delta_catalog_variant` §default engine shreds (both catalogs run CTAS / INSERT / UPDATE / OPTIMIZE /
+    partitioned / SORTED BY; 257 assertions), three mutants: no default, opt-out ignored on rewrites, writer flag
+    never set.
+  - Next: Spark's footer-derived variant path statistics (delta-spark `VariantStats.scala`, engineered-wood #675).
 - `PARQUET_VARIANT` (the transform's return alias) blocks `struct_extract`/dot access on its result — the
   alias prevents the STRUCT function match. Irrelevant to the blob transport, but a trap for SQL-side use.
 

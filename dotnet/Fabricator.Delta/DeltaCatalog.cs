@@ -268,6 +268,10 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     // ATTACH option `change_data_feed true`: tables CREATED here enable delta.enableChangeDataFeed, so DELETE/UPDATE
     // write _change_data files and delta.changes(...) returns a correct row-level change feed.
     private readonly bool _changeDataFeedOnCreate;
+    // ATTACH option `variant_shredding` (default TRUE): tables CREATED here with a VARIANT column enable
+    // delta.enableVariantShredding, so DuckDB may shred their variant files. `false` opts the catalog out; the
+    // per-table WITH (variant_shredding = …) overrides either way.
+    private readonly bool _variantShreddingOnCreate;
     // ⚠ BOTH FLAGS BELOW COME FROM ONE ATTACH OPTION, `schemas` = 'none' | 'onelevel' | 'nested' (see
     // ParseSchemasOption). It used to be two booleans, `schemas` and `nested_schemas`, which spelled three
     // states with four combinations — `nested` silently won when both were set. They stay two fields because
@@ -550,6 +554,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         _rowTrackingOnCreate = ParseBoolOption(optionsJson, "row_tracking");
         _inCommitTimestampsOnCreate = ParseBoolOption(optionsJson, "in_commit_timestamps");
         _changeDataFeedOnCreate = ParseBoolOption(optionsJson, "change_data_feed");
+        _variantShreddingOnCreate = ParseBoolOption(optionsJson, "variant_shredding", defaultValue: true);
         var schemaMode = ParseSchemasOption(optionsJson);
         _schemas = schemaMode == SchemaMode.OneLevel;
         _nestedSchemas = schemaMode == SchemaMode.Nested;
@@ -1585,6 +1590,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     {
         "delta.enableDeletionVectors", "delta.enableChangeDataFeed", "delta.enableRowTracking",
         "delta.enableInCommitTimestamps", "delta.columnMapping.mode",
+        EngineeredWood.DeltaLake.VariantShreddingConfig.EnableKey,
     };
 
     // cat.delta.set_tblproperties('schema.table', properties): SET/UNSET delta.* properties via ONE metaData
@@ -3305,9 +3311,13 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     /// write spec (WITH wins per key — the strongest layer above delta_write_options and the ATTACH defaults).</summary>
     private DeltaWriteSpec? ApplyWithOptions(DeltaWriteSpec? spec, DeltaWithOptions? w)
     {
+        // Variant shredding is on unless opted out. The opt-out travels as an explicit "false" in the create
+        // properties; CreateConfig turns an absent key into "true" for a table with a VARIANT column, and drops
+        // the key for a table without one.
+        bool shreddingOff = !(w?.VariantShredding ?? _variantShreddingOnCreate);
         if (w is null || (!w.HasWriteTuning && w.Properties is not { Count: > 0 }))
         {
-            return spec;
+            return shreddingOff ? WithVariantShreddingOff(spec) : spec;
         }
         spec ??= new DeltaWriteSpec(null, null, null, null);
         if (w.Compression is { } comp)
@@ -3407,7 +3417,17 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             }
             spec = spec with { CreateProperties = props };
         }
-        return ValidateSpecForEngine(spec);
+        return ValidateSpecForEngine(shreddingOff ? WithVariantShreddingOff(spec) : spec);
+    }
+
+    private static DeltaWriteSpec WithVariantShreddingOff(DeltaWriteSpec? spec)
+    {
+        spec ??= new DeltaWriteSpec(null, null, null, null);
+        var props = spec.CreateProperties is { } existing
+            ? new Dictionary<string, string>(existing, System.StringComparer.Ordinal)
+            : new Dictionary<string, string>(System.StringComparer.Ordinal);
+        props[EngineeredWood.DeltaLake.VariantShreddingConfig.EnableKey] = "false";
+        return spec with { CreateProperties = props };
     }
 
     /// <summary>Creates an empty Delta table (commit 0 with the schema). Idempotent (OpenOrCreate), so
@@ -5037,6 +5057,10 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         pending.HeldTable = await EngineeredWood.DeltaLake.Table.DeltaTable
             .OpenAsync(fs, DeltaWriter.Options(spec, dataFileWriter), token)
             .ConfigureAwait(false);
+        if (dataFileWriter is not null)
+        {
+            dataFileWriter.ShredVariants = NativeParquetDataFileWriter.AllowsShredding(pending.HeldTable);
+        }
         return pending.HeldTable;
     }
 
@@ -5999,7 +6023,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     /// written one way while every later INSERT writes it another, and nothing says so until someone reads
     /// the files.</para>
     /// <para>⚠ The CREATE-ONLY flags (deletion_vectors / row_tracking / change_data_feed /
-    /// in_commit_timestamps / column_mapping) are refused BY NAME with the reason, because they are real
+    /// in_commit_timestamps / column_mapping / variant_shredding) are refused BY NAME with the reason, because they are real
     /// WITH options and the natural assumption is that SET can change them. They enable a table FEATURE
     /// and need a protocol upgrade, which is what <c>delta.set_tblproperties</c> refuses them for too.</para>
     /// <para>⚠ A raw <c>fabricator.*</c> or <c>delta.*</c> property name passes through unchanged, which
@@ -6044,6 +6068,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             case "change_data_feed":
             case "in_commit_timestamps":
             case "column_mapping":
+            case "variant_shredding":
                 throw new NotSupportedException(
                     $"ALTER TABLE {verb} ({name}): that enables a table FEATURE and needs a protocol "
                     + "upgrade — set it at CREATE, via the ATTACH option or CREATE TABLE … WITH (…). "

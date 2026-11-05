@@ -1045,6 +1045,10 @@ internal static class DeltaReader
             .ConfigureAwait(false);
         try
         {
+            if (writer is not null)
+            {
+                writer.ShredVariants = NativeParquetDataFileWriter.AllowsShredding(table);
+            }
             long deleted = (await table.DeleteRowsAsync(
                     await PinnedSelectionAsync(table, atVersion, rowIds, "copy-on-write DELETE", token)
                         .ConfigureAwait(false),
@@ -2357,6 +2361,10 @@ internal static class DeltaReader
             .ConfigureAwait(false);
         try
         {
+            if (writer is not null)
+            {
+                writer.ShredVariants = NativeParquetDataFileWriter.AllowsShredding(table);
+            }
             // A clustering-declared table (the delta.clustering domain, else the fabricator.sortedBy property)
             // RECLUSTERS instead of bin-packing when the native writer is available: ONE host query reads every
             // active file (DV rows excluded), globally re-orders — hilbert_index over ntile range-buckets for
@@ -3167,6 +3175,10 @@ internal static class DeltaReader
             .ConfigureAwait(false);
         try
         {
+            if (writer is not null)
+            {
+                writer.ShredVariants = NativeParquetDataFileWriter.AllowsShredding(table);
+            }
             // MERGE-ON-READ on deletion-vector tables (the fork's UpdateViaVectorsAsync, now COMPOSED from
             // master's primitives per the pr4-to-master guide §2): DV-delete the old rows + append a small
             // post-image file + optional CDF pre/post-image capture, fused into ONE commit — no full-file

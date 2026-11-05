@@ -51,6 +51,22 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         _spec = spec;
     }
 
+    /// <summary>
+    /// Whether DuckDB may shred the VARIANT columns of the files this writer produces. Off until the caller has
+    /// opened the table and set it from <see cref="AllowsShredding"/>: engineered-wood hands a data-file writer
+    /// no table, and an unshredded variant is valid in every table, so off is the safe state.
+    /// </summary>
+    internal bool ShredVariants { get; set; }
+
+    /// <summary>
+    /// True when the table lets a writer shred its variant columns: <c>delta.enableVariantShredding</c> is set
+    /// AND the protocol declares the feature. engineered-wood checks this for its OWN writer only; a file
+    /// written by DuckDB and committed by the host is not inspected, so we must ask.
+    /// </summary>
+    internal static bool AllowsShredding(DeltaTable table) =>
+        EngineeredWood.DeltaLake.VariantShreddingConfig.AllowsShreddedWrites(
+            table.CurrentSnapshot.Protocol, table.CurrentSnapshot.Metadata.Configuration);
+
     /// <summary>True when native write is usable (the host registered host_query). Falls back to the built-in
     /// engineered-wood writer otherwise.</summary>
     internal static bool Available => Host.CanQuery;
@@ -97,7 +113,8 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         }
         var src = new AsyncEnumerableArrowStream(first.Schema, FirstThenRest(first, e));
         var (_, size, _) = RunCopy(_writableRoot, relativePath, src, cancellationToken,
-                                   fieldIdsSpec: FieldIdsSpecFromArrow(first.Schema), spec: _spec);
+                                   fieldIdsSpec: FieldIdsSpecFromArrow(first.Schema), spec: _spec,
+                                   shredVariants: ShredVariants);
         return size;
     }
 
@@ -247,7 +264,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         string writableRoot, string relativePath, IArrowArrayStream src, CancellationToken ct,
         Schema? statsSchema = null,
         IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null,
-        DeltaWriteSpec? spec = null)
+        DeltaWriteSpec? spec = null, bool shredVariants = false)
     {
         var rel = relativePath.Replace('\\', '/').TrimStart('/');
         var uri = writableRoot + "/" + rel;
@@ -264,7 +281,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         var sql =
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
-            + NoShredding(src.Schema, renameToPhysical)
+            + (shredVariants ? "" : NoShredding(src.Schema, renameToPhysical))
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native copy {Uri}", uri);
         Log.LogDebug("delta native copy sql: {Sql}", sql);
@@ -317,7 +334,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         string writableRoot, IReadOnlyList<string> partitionColumns, IArrowArrayStream src,
         CancellationToken ct, Schema? statsSchema,
         IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null,
-        DeltaWriteSpec? spec = null)
+        DeltaWriteSpec? spec = null, bool shredVariants = false)
     {
         // Under column mapping the input stream was renamed to physical names, so `partitionColumns` must
         // already be the PHYSICAL (output) names — dirs, RETURN_STATS.partition_keys, and FIELD_IDS key by them.
@@ -326,7 +343,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
             "WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
-            + NoShredding(src.Schema, renameToPhysical)
+            + (shredVariants ? "" : NoShredding(src.Schema, renameToPhysical))
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
         Log.LogDebug("delta native copy sql: {Sql}", sql);
@@ -602,8 +619,9 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     /// The COPY option that writes every top-level VARIANT column UNSHREDDED: <c>, SHREDDING {'col': 'VARIANT'}</c>,
     /// or empty without one. DuckDB's parquet writer shreds variants by default (<c>typed_value</c> columns), and the
     /// Delta protocol forbids a shredded variant unless the table enables <c>variantShredding</c>
-    /// (<c>delta.enableVariantShredding</c>), which engineered-wood cannot declare yet
-    /// (clast-project/engineered-wood#671) — so every such file we wrote broke the protocol it declared. MEASURED:
+    /// (<c>delta.enableVariantShredding</c>). Tables we create with a variant column enable it by default, and a
+    /// writer that knows the table allows it skips this clause (<see cref="ShredVariants"/>); every other table
+    /// gets unshredded files, which are valid in all of them. MEASURED:
     /// <c>SHREDDING {v: 'VARIANT'}</c> leaves <c>metadata</c>/<c>value</c> only and reads back exactly; the
     /// global <c>variant_minimum_shredding_size = -1</c> would do it too, but is GLOBAL_ONLY and would change the
     /// user's own parquet writes.
