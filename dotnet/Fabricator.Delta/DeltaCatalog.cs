@@ -4239,11 +4239,15 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 $"delta: {op} inside an explicit transaction is not supported on an identity/IcebergCompat "
                 + "Change-Data-Feed table yet — run it in autocommit (full CDF capture applies there).");
         }
-        if (forUpdate && !p.SupportsExternalCommit)
+        // An identity table is fine: the post-images keep their identity values, so the buffered UPDATE writes
+        // them itself and declares them pre-generated (TryEagerWriteBatches). What stays refused is a table that
+        // needs engineered-wood to process every written row — IcebergCompat, CHECK constraints, invariants and
+        // generated columns — since a buffered UPDATE writes its files before engineered-wood sees them.
+        if (forUpdate && !p.SupportsExternalCommit && !p.IdentityUpdatable)
         {
             throw new System.NotSupportedException(
-                "delta: UPDATE inside an explicit transaction is not supported on identity/IcebergCompat "
-                + "tables — run it in autocommit.");
+                "delta: UPDATE inside an explicit transaction is not supported on IcebergCompat tables or tables "
+                + "with CHECK constraints, invariants or generated columns — run it in autocommit.");
         }
         // Materialized row tracking (implied by row tracking) × partitioned UPDATE: supported since the
         // WriteDataFilesAsync partition
@@ -4352,6 +4356,14 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         var opener = Opener();
         var profile = DeltaReader.GetTxnDmlProfile(opener, path);
         EnsureBufferedDmlEligible(profile, "UPDATE", forUpdate: true);
+        for (int c = 0; c < setSlotByColumn.Length; c++)
+        {
+            if (setSlotByColumn[c] >= 0)
+            {
+                DeltaReader.RefuseIdentitySet(profile.IdentityColumns, userSchema.FieldsList[c].Name);
+            }
+        }
+        bool keepIdentity = profile.IdentityColumns.Count > 0;
         foreach (var rid in updates.RowByRid.Keys)
         {
             if ((TransientRowAddress.FileOrdinal(rid)) >= PendingOrdinalBase)
@@ -4468,13 +4480,21 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             // next to the read-back it bounds, and removable: the pair already holds an open table
             // (EnsureHeldTableAsync) that this helper predates and could use instead.
             eager = TryEagerWriteBatches(opener, path, pending, postGroup, tableName,
-                                         materializedRowIds: stableIds);
+                                         materializedRowIds: stableIds, keepIdentityValues: keepIdentity);
             if (eager == true)
             {
                 foreach (var b in postGroup)
                 {
                     b.Dispose();
                 }
+            }
+            else if (keepIdentity)
+            {
+                // Parking would hand the post-images to engineered-wood's WriteAsync at COMMIT, which generates
+                // NEW identity values for them — the rows would change identity. Refuse instead.
+                throw new System.NotSupportedException(
+                    "delta: UPDATE of an identity table cannot follow an ALTER TABLE in the same transaction — "
+                    + "COMMIT the ALTER first.");
             }
             else if (stableIds is not null)
             {
@@ -4646,15 +4666,19 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     // behavior, and what the flush's own WriteDataFilesAsync batch path already produces); the
     // materialized column is an override for rows whose ORIGINAL ids must survive a rewrite
     // (compaction / merge-on-read post-images), not a requirement for new rows.
+    /// <param name="keepIdentityValues">The batches are UPDATE post-images: their identity values are the rows'
+    /// existing ones and must be written as they are, not regenerated.</param>
     private bool TryEagerWriteBatches(nint opener, string tablePath, DeltaTableBinding pending,
                                       IReadOnlyList<RecordBatch> batches, string tableName,
-                                      IReadOnlyList<long?>? materializedRowIds = null)
-        => TryEagerWriteBatchesAsync(opener, tablePath, pending, batches, tableName, materializedRowIds)
+                                      IReadOnlyList<long?>? materializedRowIds = null,
+                                      bool keepIdentityValues = false)
+        => TryEagerWriteBatchesAsync(opener, tablePath, pending, batches, tableName, materializedRowIds,
+                                     keepIdentityValues)
             .GetAwaiter().GetResult();
 
     private async Task<bool> TryEagerWriteBatchesAsync(nint opener, string tablePath, DeltaTableBinding pending,
                                       IReadOnlyList<RecordBatch> batches, string tableName,
-                                      IReadOnlyList<long?>? materializedRowIds)
+                                      IReadOnlyList<long?>? materializedRowIds, bool keepIdentityValues)
     {
         if (batches.Count == 0)
         {
@@ -4687,12 +4711,21 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     return false;
                 }
                 identity = true;
-                var (gen, marks) = table.GenerateIdentityValues(batches,
-                    pending.PendingIdentityHwm.Count > 0 ? pending.PendingIdentityHwm : null);
-                toWrite = gen;
-                foreach (var kv in marks)
+                if (keepIdentityValues)
                 {
-                    pending.PendingIdentityHwm[kv.Key] = kv.Value;
+                    // UPDATE post-images: the rows keep their identity values (an UPDATE of the identity column
+                    // itself was refused), so nothing is generated and no high-water mark moves.
+                    pending.IdentityValuesKept = true;
+                }
+                else
+                {
+                    var (gen, marks) = table.GenerateIdentityValues(batches,
+                        pending.PendingIdentityHwm.Count > 0 ? pending.PendingIdentityHwm : null);
+                    toWrite = gen;
+                    foreach (var kv in marks)
+                    {
+                        pending.PendingIdentityHwm[kv.Key] = kv.Value;
+                    }
                 }
                 pending.PinnedVersion ??= table.CurrentSnapshot.Version; // the flush's rebase base
             }
@@ -4863,7 +4896,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 // at commit — since EW #530 it fills in any staged operation not declared covered, which would put
                 // each row in the feed TWICE.
                 await txn.StageDataFilesAsync(files, bornDeleted,
-                        identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0,
+                        identityValuesPreGenerated: pending.PendingIdentityHwm.Count > 0
+                                                    || pending.IdentityValuesKept,
                         changeDataStagedByCaller: true,
                         cancellationToken: token)
                     .ConfigureAwait(false);

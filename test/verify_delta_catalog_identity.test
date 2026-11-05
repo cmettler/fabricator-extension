@@ -153,3 +153,141 @@ statement ok
 DETACH upd;
 
 endloop
+
+# DML on an identity table INSIDE an explicit transaction (2026-11-05). UPDATE used to be refused there ("run it in
+# autocommit"), and with it every MERGE that has a WHEN MATCHED UPDATE. The buffered UPDATE now writes its
+# post-images itself with their existing identity values; the flush declares them pre-generated. DELETE was already
+# buffered. Each case also checks the next INSERT continues the identity sequence, i.e. no high-water mark moved
+# for an UPDATE and the one an INSERT consumed is kept.
+statement ok
+CREATE TABLE idsrc AS SELECT * FROM (VALUES (2, 'B2'), (99, 'new')) s(id, v);
+
+foreach dv true false
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/idtxn_${dv}' AS itx (TYPE fabricator, PROVIDER 'delta', deletion_vectors ${dv});
+
+statement ok
+CREATE TABLE itx.main.t (id BIGINT AS (0), v VARCHAR);
+
+statement ok
+INSERT INTO itx.main.t (v) VALUES ('a'), ('b'), ('c'), ('d');
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM itx.main.t WHERE v = 'a';
+
+statement ok
+UPDATE itx.main.t SET v = 'x' WHERE v = 'b';
+
+# Read-your-writes inside the transaction: the post-image keeps id 2.
+query IT
+SELECT id, v FROM itx.main.t ORDER BY id;
+----
+2	x
+3	c
+4	d
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, v FROM itx.main.t ORDER BY id;
+----
+2	x
+3	c
+4	d
+
+# MERGE: the matched row is updated in place (id 2 stays 2), the unmatched one is inserted with the next value.
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO itx.main.t USING idsrc ON itx.main.t.id = idsrc.id
+  WHEN MATCHED THEN UPDATE SET v = idsrc.v
+  WHEN NOT MATCHED THEN INSERT (v) VALUES (idsrc.v);
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, v FROM itx.main.t ORDER BY id;
+----
+2	B2
+3	c
+4	d
+5	new
+
+# MERGE with a DELETE action, and an UPDATE of a row the same MERGE does not insert.
+statement ok
+BEGIN;
+
+statement ok
+MERGE INTO itx.main.t USING (VALUES (3, 'del'), (4, 'D4')) s(id, v) ON itx.main.t.id = s.id
+  WHEN MATCHED AND s.v = 'del' THEN DELETE
+  WHEN MATCHED THEN UPDATE SET v = s.v;
+
+statement ok
+COMMIT;
+
+# Changing the identity column is refused inside a transaction too.
+statement ok
+BEGIN;
+
+statement error
+UPDATE itx.main.t SET id = 500 WHERE v = 'D4';
+----
+UPDATE cannot change the IDENTITY column 'id'
+
+statement ok
+ROLLBACK;
+
+# ROLLBACK of a buffered UPDATE leaves the table as it was.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE itx.main.t SET v = 'gone' WHERE id = 2;
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO itx.main.t (v) VALUES ('after');
+
+query IT
+SELECT id, v FROM itx.main.t ORDER BY id;
+----
+2	B2
+4	D4
+5	new
+6	after
+
+statement ok
+DETACH itx;
+
+endloop
+
+# An UPDATE of a row inserted earlier in the SAME transaction stays refused, for every table (the inserted rows
+# are not on storage under a committed file yet), with a message that says what to do.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/idtxn_same' AS itxs (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE itxs.main.t (id BIGINT AS (0), v VARCHAR);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO itxs.main.t (v) VALUES ('new');
+
+statement error
+UPDATE itxs.main.t SET v = 'changed' WHERE v = 'new';
+----
+UPDATE of rows inserted in the same transaction is not supported yet
+
+statement ok
+ROLLBACK;

@@ -1120,9 +1120,14 @@ internal static class DeltaReader
     /// precondition for writing its post-images in groups instead of accumulating them
     /// (see <c>UpdateGroupBytes</c>). ⚠ It describes <paramref name="Version"/> and nothing else — a consumer
     /// reading back at a DIFFERENT pinned version must not trust it, because the file set differs.</para></summary>
+    /// <param name="IdentityColumns">The table's identity columns (empty when it has none).</param>
+    /// <param name="IdentityUpdatable">An identity table whose ONLY reason to refuse externally written files is
+    /// the identity column: no IcebergCompat, no CHECK constraint, invariant or generated column. A buffered
+    /// UPDATE can write its post-images itself there, since they keep their identity values.</param>
     public readonly record struct TxnDmlProfile(
         bool DvEnabled, bool CdfEnabled, bool SupportsExternalCommit, long Version, bool Partitioned,
-        bool MaterializeRowIds, bool AllFilesRowTracked);
+        bool MaterializeRowIds, bool AllFilesRowTracked, IReadOnlyList<string> IdentityColumns,
+        bool IdentityUpdatable);
 
     /// <summary>The active files' baseRowIds in transient-rowid ordinal order (see
     /// <see cref="DeltaTable.OrderedActiveBaseRowIds"/>) — resolves a matched row's ORIGINAL stable id
@@ -1170,10 +1175,13 @@ internal static class DeltaReader
             {
                 if (add.BaseRowId is null) { allTracked = false; break; }
             }
+            var identityColumns = IdentityColumnNames(table);
             return new TxnDmlProfile(dv, cdf, table.SupportsExternalDataFileCommit,
                                      table.CurrentSnapshot.Version,
                                      table.CurrentSnapshot.Metadata.PartitionColumns.Count > 0,
-                                     matIds, allTracked);
+                                     matIds, allTracked, identityColumns,
+                                     identityColumns.Count > 0 && !table.IsIcebergCompat
+                                     && !DeclaresWriteTimeExpressions(table.CurrentSnapshot));
         }
         finally
         {
@@ -3231,21 +3239,67 @@ internal static class DeltaReader
     /// </summary>
     private static void RefuseIdentityUpdate(DeltaTable table, RecordBatch updates)
     {
+        var identity = IdentityColumnNames(table);
         foreach (var set in updates.Schema.FieldsList)
         {
-            if (set.Name == DeltaCatalog.RowIdColumn)
+            if (set.Name != DeltaCatalog.RowIdColumn)
             {
-                continue;
+                RefuseIdentitySet(identity, set.Name);
             }
-            var column = table.CurrentSnapshot.Schema.Fields.FirstOrDefault(
-                f => string.Equals(f.Name, set.Name, StringComparison.OrdinalIgnoreCase));
-            if (column is not null && EngineeredWood.DeltaLake.Schema.IdentityColumn.GetConfig(column) is not null)
+        }
+    }
+
+    /// <summary>Throws when <paramref name="setColumn"/> is one of the table's identity columns (see
+    /// <see cref="RefuseIdentityUpdate"/>). Shared by the autocommit and the buffered UPDATE.</summary>
+    internal static void RefuseIdentitySet(IReadOnlyList<string> identityColumns, string setColumn)
+    {
+        foreach (var name in identityColumns)
+        {
+            if (string.Equals(name, setColumn, StringComparison.OrdinalIgnoreCase))
             {
                 throw new NotSupportedException(
-                    $"UPDATE cannot change the IDENTITY column '{column.Name}': the table assigns its values, and a "
+                    $"UPDATE cannot change the IDENTITY column '{name}': the table assigns its values, and a "
                     + "changed one would be issued again by a later INSERT.");
             }
         }
+    }
+
+    private static IReadOnlyList<string> IdentityColumnNames(DeltaTable table)
+    {
+        var names = new List<string>();
+        foreach (var f in table.CurrentSnapshot.Schema.Fields)
+        {
+            if (EngineeredWood.DeltaLake.Schema.IdentityColumn.GetConfig(f) is not null)
+            {
+                names.Add(f.Name);
+            }
+        }
+        return names;
+    }
+
+    /// <summary>
+    /// engineered-wood's <c>WriteTimeExpressions.Declares</c>, which is internal there: a CHECK constraint
+    /// (<c>delta.constraints.*</c>), an invariant or a generated column. Such a table needs engineered-wood to
+    /// evaluate every written row, so files we write ourselves cannot be committed into it.
+    /// </summary>
+    private static bool DeclaresWriteTimeExpressions(EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot)
+    {
+        foreach (var key in snapshot.Metadata.Configuration?.Keys ?? Enumerable.Empty<string>())
+        {
+            if (key.StartsWith("delta.constraints.", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        foreach (var field in snapshot.ArrowSchema.FieldsList)
+        {
+            if (field.Metadata is { } md
+                && (md.ContainsKey("delta.invariants") || md.ContainsKey("delta.generationExpression")))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     // The split is engineered-wood's, not ours: TransientRowAddress owns the encoding its

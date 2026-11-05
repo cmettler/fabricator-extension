@@ -124,7 +124,7 @@ equivalent):
 | CREATE + identity marker | buffered; INSERTs generate real ids at statement time from the parked schema, marks chain; flush bakes final HWM into commit-0 | |
 | DELETE | rowids decoded to (pinned ordinal → positions), parked in `DeletedByOrdinal`; flush emits DV remove/add pairs | requires **deletion vectors enabled** on the table |
 | DELETE of rows inserted in the same txn | works — positions keyed on the pending file's ordinal (≥ `0x780000`); flush builds an **inline DV born on our own add** | in-memory batch rows (`0x700000..0x77ffff`) rejected |
-| UPDATE | old rows parked as delete positions + post-image rows **eagerly written** as a file; read-back is version-pinned (`atVersion: PinnedVersion`) | requires DV + `SupportsExternalCommit` (not identity/IcebergCompat); on row-tracking tables the post-images bake the ORIGINAL stable ids (materialization is implied by row tracking; partitioned works) |
+| UPDATE | old rows parked as delete positions + post-image rows **eagerly written** as a file; read-back is version-pinned (`atVersion: PinnedVersion`) | requires DV + `SupportsExternalCommit`, except on an IDENTITY table (since 2026-11-05): the post-images keep their identity values and are written as pre-generated, so UPDATE and MERGE work there; still refused on IcebergCompat and on tables with CHECK constraints / invariants / generated columns, and SET of the identity column is refused; on row-tracking tables the post-images bake the ORIGINAL stable ids (materialization is implied by row tracking; partitioned works) |
 | UPDATE of same-txn rows | **rejected** ("COMMIT the inserts first") | |
 | MERGE INTO | each action runs its own operator (rowid UPDATE / DELETE + bulk INSERT) and parks exactly as the standalone statements do, so the flush **fuses them into ONE commit**. ⚠ A merge carrying **>= 2 `UPDATE`/`DELETE` actions is FORCED to buffer even in AUTOCOMMIT** — `PlanMergeInto` marks the statement's transaction buffered at execution time | Requires a **rowid**; `RETURNING` rejected. **The forcing is a CORRECTNESS requirement, not atomicity polish:** those actions address rows located by ONE join scan, and while they committed separately a copy-on-write DELETE renumbered the rows the other had already addressed — measured DESTROYING a row on a one-file non-DV table ([known-limitations.md](known-limitations.md) 1.13). Consequence: such a merge needs **deletion vectors** and is refused without them. ⚠ The count excludes `INSERT` (it addresses no existing rows and commits last), so a merge with at most ONE `UPDATE`/`DELETE` — including the common `UPDATE` + `INSERT` — keeps the direct path and still works on a non-DV table. The same-transaction guards do not bite: matched/not-matched are disjoint AND those guards key on the ordinal's pending-vs-committed range |
 | ALTER ADD/RENAME/DROP COLUMN, nested ADD/DROP FIELD | metaData (+ protocol upgrade) computed at statement time, parked; joins the fused commit; overlays serve the pending schema mid-txn | ALTERs must precede the txn's data changes; nested RENAME FIELD stays immediate; RENAME of a partition column rejected in a txn |
@@ -141,7 +141,10 @@ discarded on rollback.
 From `EnsureBufferedDmlEligible` + the buffering gates:
 
 - Buffered DELETE/UPDATE ⇒ table must have **deletion vectors** (else: autocommit copy-on-write).
-- Buffered UPDATE ⇒ additionally not identity/IcebergCompat.
+- Buffered UPDATE ⇒ additionally not IcebergCompat and no CHECK constraint / invariant / generated column
+  (an identity table is fine since 2026-11-05; SET of the identity column itself is refused).
+- Buffered UPDATE of an identity table after a buffered ALTER ⇒ rejected ("COMMIT the ALTER first"): parking the
+  post-images would let engineered-wood assign them NEW identity values at COMMIT.
 - CDF + identity/IcebergCompat ⇒ buffered DML rejected (partitioned CDF works).
 - DML on a CDF table after a buffered ALTER ⇒ rejected (cdc files would be pre-ALTER-shaped).
 - DML/ALTER on a **pending-created** table ⇒ rejected ("COMMIT the CREATE first"); a later INSERT

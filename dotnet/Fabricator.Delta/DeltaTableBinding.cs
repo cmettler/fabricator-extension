@@ -215,6 +215,11 @@ internal sealed class DeltaTableBinding : ITableBinding, IDeleteWhereShape
     // (Spark's concurrent-identity policy), so baked values never land on a moved HWM.
     public Dictionary<string, long> PendingIdentityHwm { get; } = new(StringComparer.Ordinal);
 
+    // True once a buffered UPDATE wrote post-images of an identity table: those files carry the rows'
+    // EXISTING identity values (no new ones, so no high-water mark moves), and the flush must still tell
+    // engineered-wood the values are already in the files.
+    public bool IdentityValuesKept;
+
     // ---- APPLICATION TRANSACTION versions (Delta `txn` action — idempotent appends) ----
     // appId -> (version to commit, expected previous version — null = "must not exist yet").
     // Parked by delta.set_transaction_version; the flush validates the CAS against the LATEST

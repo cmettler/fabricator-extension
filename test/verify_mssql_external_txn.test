@@ -9,8 +9,8 @@
 #              invisible through the external table until COMMIT (§1, §4 pin that). For the same reason a DELETE
 #              whose rows come from SQL Server's read (an identity-keyed one) is refused once the transaction has
 #              written to that table (§5). Still refused: deleting a row inserted in the same transaction (no
-#              deletion vectors), an UPDATE (every external UPDATE is identity-keyed, and the Delta layer does not
-#              buffer an UPDATE on an identity table), and an INSERT into a parquet external table (a file is
+#              deletion vectors), a second UPDATE/DELETE keyed by SQL Server's read after the transaction wrote the
+#              table (§5), and an INSERT into a parquet external table (a file is
 #              visible the moment it exists). Needs the docker SQL Server + MinIO (service tier).
 # group: [fabricator]
 
@@ -421,15 +421,29 @@ SELECT id, v FROM sqldb.dbo.s3_exttxn3 ORDER BY id;
 1	z1
 4	z4
 
-# UPDATE stays refused inside a transaction: every external UPDATE is identity-keyed, and the Delta layer does not
-# buffer an UPDATE on an identity table.
+# UPDATE works inside a transaction too (since 2026-11-05: the Delta layer buffers an UPDATE on an identity table,
+# the post-images keeping their identity values). Like the DELETE, it is invisible through the external table until
+# COMMIT, and the commit is copy-on-write, so SQL Server keeps reading the table.
 statement ok
 BEGIN;
 
-statement error
+query I
 UPDATE sqldb.dbo.s3_exttxn3 SET v = 'u1' WHERE id = 1;
 ----
-identity/IcebergCompat
+1
+
+query IT
+SELECT id, v FROM sqldb.dbo.s3_exttxn3 ORDER BY id;
+----
+1	z1
+4	z4
+
+# A second UPDATE of the same table in this transaction is refused: its rows would come from SQL Server's read,
+# which does not see the first one.
+statement error
+UPDATE sqldb.dbo.s3_exttxn3 SET v = 'u4' WHERE id = 4;
+----
+after this transaction already wrote to it
 
 statement ok
 ROLLBACK;
@@ -438,6 +452,30 @@ query IT
 SELECT id, v FROM sqldb.dbo.s3_exttxn3 ORDER BY id;
 ----
 1	z1
+4	z4
+
+statement ok
+BEGIN;
+
+query I
+UPDATE sqldb.dbo.s3_exttxn3 SET v = 'u1' WHERE id = 1;
+----
+1
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, v FROM sqldb.dbo.s3_exttxn3 ORDER BY id;
+----
+1	u1
+4	z4
+
+query IT
+SELECT * FROM fabricator_query('sqldb',
+  'SELECT id, v FROM OPENROWSET(BULK ''/fabricator/exttxn/e3'', FORMAT = ''DELTA'', DATA_SOURCE = ''s3_ds'') AS r ORDER BY id');
+----
+1	u1
 4	z4
 
 # ═══ §6  Autocommit INSERT is unchanged: one statement, one commit ════════════════════════════════════════

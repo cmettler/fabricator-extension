@@ -5485,7 +5485,7 @@ and PolyBase-visible, unlike Delta's off-schema `_metadata.row_id`. `DROP TABLE`
 emits `DROP EXTERNAL TABLE` (metadata-only; the storage data stays).
 
 **Transactions.** Inside `BEGIN … COMMIT`, an `INSERT` into an external **Delta** table writes its data files
-right away and a `DELETE` is buffered; the Delta commit happens at `COMMIT`, one commit per table, and `ROLLBACK`
+right away and a `DELETE` or `UPDATE` is buffered; the Delta commit happens at `COMMIT`, one commit per table, and `ROLLBACK`
 discards everything. The deletes are applied copy-on-write (the affected files are rewritten), so the table never
 gets a deletion vector that SQL Server's Delta reader would refuse. Four things to know:
 
@@ -5493,12 +5493,12 @@ gets a deletion vector that SQL Server's Delta reader would refuse. Four things 
   until `COMMIT`.
 - A `DELETE` whose predicate fabricator can evaluate exactly (`WHERE id = 3`, `WHERE p = 'a'`) reads the Delta table
   itself and so does see the transaction's writes. One that needs SQL Server's scan to find the rows (an
-  identity-keyed DELETE such as `WHERE lower(v) = 'x'`) is refused once the transaction has written to that table,
-  because that scan would miss the new rows.
+  identity-keyed DELETE such as `WHERE lower(v) = 'x'`, and every `UPDATE`) is refused once the transaction has
+  written to that table, because that scan would miss the new rows.
 - The Delta side commits first, then SQL Server. If the Delta commit fails, both roll back; if SQL Server's commit
   fails after that, the Delta rows stay. Several external tables commit one after the other, not atomically.
 - Still refused inside a transaction: deleting a row inserted in the same transaction (that needs a deletion
-  vector), `UPDATE` on an external table, an `INSERT` into a **parquet** external table (a parquet file is visible
+  vector), an `INSERT` into a **parquet** external table (a parquet file is visible
   the moment it exists) and `CREATE TABLE … WITH (location=…)`.
 
 Full design:

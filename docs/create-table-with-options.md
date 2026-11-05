@@ -288,8 +288,9 @@ the Delta log** — so it is a cross-system key both sides can see and the Delta
 - No identity column on the Delta target → UPDATE/DELETE stay rejected (slice C's error, now
   pointing at "declare an IDENTITY column or use a direct Delta ATTACH").
 - Statement-atomic in autocommit (slice C semantics). Inside an explicit transaction (since 2026-10-26) the
-  DELETE is buffered until COMMIT and refused once the transaction has written to the table; the UPDATE is refused
-  — see §DELETE inside an explicit transaction.
+  DELETE is buffered until COMMIT and refused once the transaction has written to the table; the UPDATE likewise
+  since 2026-11-05 (it was refused until the Delta layer could buffer an UPDATE on an identity table) — see §DELETE
+  inside an explicit transaction.
 - Trust assumption: identity uniqueness relies on all writers honoring the HWM (Spark + us do); a
   rogue writer's duplicate would make the DML affect all duplicates — documented, same trust class
   as any engine-assigned key.
@@ -511,6 +512,7 @@ is gone, `SqlServerBackend.ExternalSession(txnId)` hands out the session (null i
 Gate `verify_mssql_external_txn` (62 → 111): a predicate DELETE invisible to SQL Server before COMMIT and undone by
 ROLLBACK; an INSERT plus two DELETEs as ONE commit with no `deletionVector` in the log and OPENROWSET agreeing; the
 same-transaction delete refused; identity-keyed DELETE inside a transaction, refused after an INSERT, and the UPDATE
-refusal pinned. Two mutants: a predicate DELETE that commits at once dies at the no-read-your-writes row; dropping
+refusal pinned. Since 2026-11-05 (-> 127) the UPDATE works inside a transaction: invisible before COMMIT, a second
+SQL-Server-keyed UPDATE refused, ROLLBACK undoing it, and OPENROWSET agreeing after COMMIT. Two mutants: a predicate DELETE that commits at once dies at the no-read-your-writes row; dropping
 the after-write refusal dies at its row. `verify_mssql_external_delete` (43 → 45) and `verify_mssql_s3_polybase`
 (267 → 268) assert a ROLLBACK where they pinned the old refusal.
