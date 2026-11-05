@@ -1,4 +1,4 @@
-# The `adbc` provider (experimental, branch `feat/adbc-provider`)
+# The `adbc` provider (experimental, opt-in)
 
 A provider that loads a **native ADBC driver** through the ADBC C interface and talks to it in Arrow and
 Substrait, so the remote pushdown built for SQL Server (docs/duckdb-2.0-remote-execution.md §3–§5) can serve any
@@ -12,6 +12,23 @@ ATTACH 'driver=D:/repos/mssql-adbc/artifacts/native-win-x64/adbc_driver_sqlserve
 
 `driver` names the library (`entrypoint`, default `AdbcDriverInit`, its init function); every other key is a
 database option handed to the driver unchanged.
+
+**Status: experimental, not in a release payload.** `scripts/publish-managed.ps1 -IncludeAdbc` publishes it; CI only
+compiles it (`.github/actions/build-extension`), because every test needs a native driver and a server. There is no
+known use case yet; it is kept in main so a change to the contract it implements breaks the build rather than an
+unmaintained branch.
+
+| ATTACH option | default | meaning |
+|---|---|---|
+| `max_in_list` | 1000 | longest IN list a filter sends as a list; longer goes as a range (integers, temporals) or not at all |
+| `consistent_reads` | false | the user's promise that one statement reads the same rows alike twice (RCSI / snapshot, or no concurrent writers); without it a plan carrying `fabricator.repeated_reads` is declined |
+
+Drivers tried (both forks, branches pushed, no PR):
+
+| driver | fork / branch | notes |
+|---|---|---|
+| mssql-adbc | [cmettler/mssql-adbc](https://github.com/cmettler/mssql-adbc) `fabricator-tsql` | our T-SQL emitter ported in; `artifacts/native-port-win-x64` |
+| Kusto (Fabric eventhouse, ADX) | [cmettler/kusto_adbc](https://github.com/cmettler/kusto_adbc) `fabricator` | Arrow 23 / ADBC 1.0, `Prepare` + `ExecuteSchema`, a NativeAOT project `KustoAdbc.Native`, `GetStatistics` (row counts from `.show tables details`); options `adbc.kusto.endpoint`, `adbc.kusto.database`, `adbc.kusto.access_token` (a bearer token, not refreshed) |
 
 ## How it works
 
@@ -79,9 +96,9 @@ server. Everything in that hand-over is missing on the ADBC path:
 
 | # | gap | effect |
 |---|---|---|
-| 1 | **⚠ the plan hint `fabricator.repeated_reads` is ignored** | **wrong answers possible.** When DuckDB inlines a CTE at two places, the server reads the same rows twice; under READ COMMITTED with concurrent writers the two reads can differ (measured: 28 wrong NULLs in 8 runs, docs/duckdb-2.0-remote-execution.md §4.16). The SqlServer provider declines such a plan unless the reads are consistent (RCSI, snapshot); the ADBC path runs it. No suite catches it — the edge cases have no concurrent writer. Fix belongs in the provider: it sees the hint and can decline in `TranslateRemotePlan` |
+| 1 | **the plan hint `fabricator.repeated_reads` is ignored by the driver — the PROVIDER now declines such a plan** (unless `consistent_reads`) | without that, **wrong answers were possible.** When DuckDB inlines a CTE at two places, the server reads the same rows twice; under READ COMMITTED with concurrent writers the two reads can differ (measured: 28 wrong NULLs in 8 runs, docs/duckdb-2.0-remote-execution.md §4.16). The SqlServer provider declines such a plan unless the reads are consistent (RCSI, snapshot); the ADBC path runs it. No suite catches it — the edge cases have no concurrent writer. Fix belongs in the provider: it sees the hint and can decline in `TranslateRemotePlan` |
 | 2 | **catalog functions** (scalar UDFs, TVFs, a TVF per row in a `CROSS APPLY`) | stay local, or do not bind at all: the provider declares no functions (ADBC `GetObjects` lists none), so `a.dbo.f(x)` is unknown to DuckDB; and the driver's emitter has no callback saying a function runs on the server, so it refuses `extension:fabricator:catalog_function`. Possible: the provider reads the routines through the driver with SQL, and since every catalog function of an ADBC catalog is a server function, the driver could write `[schema].[name](…)` directly |
-| 3 | the plan hint `fabricator.single_join_any_row` is ignored | with `scalar_subquery_error_on_multiple_rows = false` a scalar subquery with several rows fails instead of taking one. Loud, not wrong |
+| 3 | the plan hint `fabricator.single_join_any_row` is ignored by the driver — the provider now declines such a plan | DuckDB takes any row itself; before, the driver failed where DuckDB answers |
 | 4 | no declared lengths of string columns | equality keys are `varchar(max)`, which SQL Server cannot hash: string joins and GROUP BY are slower, answers unchanged |
 | 5 | server features assumed | IGNORE NULLS, DATETRUNC, LTRIM/RTRIM with characters (SQL Server 2022) and OPENJSON (compatibility level 130) are taken as present; an older server fails when the query runs, not at Prepare |
 | 6 | columns the emitter must not compare (`sql_variant` and similar) are unknown | the driver may translate a plan the SqlServer provider declines |
@@ -114,6 +131,21 @@ because `TranslatePushdown` reads our `fabricator.*` hints and follows the pushd
 
 What stays for the provider: declaring the server's routines to DuckDB (gap 2, host half), read through the driver
 with an SQL query. Gaps 7–10 are outside this.
+
+## Kusto (Fabric eventhouse), measured 2026-11-05
+
+Eventhouse with two tables (`Stocks` 749 597 rows, `Logs` 214 769), the Fabric service principal's token. Schema =
+the database (a GUID in Fabric): `k."93181802-…".Stocks`. Eleven queries, each compared with a local copy both ways:
+all equal. Pushed as KQL: GROUP BY with count/sum/min/max, `LIKE 'A%'` (a range plus `matches regex`), ORDER BY …
+LIMIT (`sort … | take`), `count(DISTINCT)`, a scalar subquery, a self-join, a TIMESTAMPTZ bound (converted to UTC). A
+filtered scan sends its filter (`| where ((['Ticker'] == 'MSFT') and (['Close'] > real(50.0)))`), and with
+`GetStatistics` a join with three local keys sends them (`| where (['Ticker'] in ('KO', 'IBM', 'PEP'))`). Local:
+`date_trunc` on TIMESTAMPTZ (our producer declines it), and inline `VALUES` (the Kusto translator has no virtual table).
+
+What the Kusto driver needed, all on the fork branch: ADBC 1.0 (the 0.22 exporter failed to load under our 1.0
+importer, "Undefined error"), `Prepare` / `ExecuteSchema`, source-generated JSON for the request (reflection is off
+under NativeAOT), a stream that knows its schema before the first batch, quoted column names from `cslschema`
+(`['1mbin']`), and `notruncation` (Kusto cuts a result at 500 000 rows and puts the error inside the rows).
 
 ## The mssql-adbc side (branch `fabricator-tsql` in `D:/repos/mssql-adbc`, local only)
 

@@ -51,6 +51,14 @@ internal sealed class AdbcCatalog : IProviderCatalog
     /// </summary>
     internal int MaxInList { get; } = 1000;
 
+    /// <summary>
+    /// ATTACH option <c>consistent_reads</c> (default false): the user's promise that one statement reads the same rows
+    /// the same way twice (SQL Server with READ_COMMITTED_SNAPSHOT, a store without concurrent writers). Without it a
+    /// plan that reads the same rows more than once is declined: the host inlined a CTE into two reads, and under
+    /// concurrent writes they can differ (docs/duckdb-2.0-remote-execution.md §4.16). A driver cannot say so itself.
+    /// </summary>
+    internal bool ConsistentReads { get; }
+
     public AdbcCatalog(string connectionString, string? optionsJson = null)
     {
         if (!string.IsNullOrWhiteSpace(optionsJson))
@@ -64,6 +72,15 @@ internal sealed class AdbcCatalog : IProviderCatalog
                     System.Globalization.CultureInfo.InvariantCulture, out int n) && n > 0
                     ? n
                     : throw new ArgumentException($"adbc: max_in_list must be a positive integer, not '{text}'");
+            }
+            if (attach.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                && attach.RootElement.TryGetProperty("consistent_reads", out var consistent))
+            {
+                string text = consistent.ValueKind == System.Text.Json.JsonValueKind.String
+                    ? consistent.GetString()! : consistent.GetRawText();
+                ConsistentReads = text.Equals("true", StringComparison.OrdinalIgnoreCase) ? true
+                    : text.Equals("false", StringComparison.OrdinalIgnoreCase) ? false
+                    : throw new ArgumentException($"adbc: consistent_reads must be true or false, not '{text}'");
             }
         }
         var builder = new DbConnectionStringBuilder { ConnectionString = connectionString };
@@ -426,6 +443,14 @@ internal sealed class AdbcCatalog : IProviderCatalog
 
     public RemoteQuery? TranslateRemotePlan(byte[] substraitPlan)
     {
+        // hints the plan needs honoured and a driver does not read: DuckDB computes such a query itself
+        var hints = SubstraitPlanFilter.Optimizations(substraitPlan);
+        if (hints.Contains("fabricator.repeated_reads") && !ConsistentReads)
+            return RemoteQuery.Declined("adbc: the query reads the same rows more than once, and the driver cannot "
+                                        + "promise one statement reads them alike (ATTACH option consistent_reads)");
+        if (hints.Contains("fabricator.single_join_any_row"))
+            return RemoteQuery.Declined("adbc: a scalar subquery may take any of several rows here, which the driver "
+                                        + "would refuse instead");
         Schema schema;
         try
         {

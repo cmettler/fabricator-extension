@@ -169,3 +169,9 @@ runs:
     - name: Publish the managed bridge
       shell: bash
       run: pwsh -NoProfile -File scripts/publish-managed.ps1 -Mode ${{ inputs.managed-mode }}
+
+    # The experimental adbc provider is not in the payload (publish-managed.ps1 -IncludeAdbc). Compiled here so a change to
+    # the contract it implements breaks the build rather than the branch nobody runs; it has no test that runs it.
+    - name: Compile the experimental adbc provider (not shipped)
+      shell: bash
+      run: dotnet build dotnet/Fabricator.Adbc -c Release --nologo

@@ -16,6 +16,39 @@ internal static class SubstraitPlanFilter
     private const int PlanRelations = 3;
     private const int PlanExtensionUrns = 8;
 
+    /// <summary>The type URLs of the plan's optimization hints (<c>advanced_extensions.optimization</c>).</summary>
+    public static HashSet<string> Optimizations(byte[] plan)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        var reader = new ProtoReader(plan);
+        while (reader.Next(out int field, out int wire, out _))
+        {
+            if (field != 4 || wire != 2) // Plan.advanced_extensions
+            {
+                reader.Skip(wire);
+                continue;
+            }
+            var extension = reader.Message();
+            while (extension.Next(out int ef, out int ew, out _))
+            {
+                if (ef != 1 || ew != 2) // AdvancedExtension.optimization (google.protobuf.Any)
+                {
+                    extension.Skip(ew);
+                    continue;
+                }
+                var any = extension.Message();
+                while (any.Next(out int af, out int aw, out _))
+                {
+                    if (af == 1 && aw == 2) // Any.type_url
+                        result.Add(System.Text.Encoding.UTF8.GetString(any.Payload().ToArray()));
+                    else
+                        any.Skip(aw);
+                }
+            }
+        }
+        return result;
+    }
+
     /// <summary>A function registry whose anchors start above every anchor <paramref name="plan"/> uses.</summary>
     public static SubstraitFunctions FunctionsFor(byte[] plan)
     {
