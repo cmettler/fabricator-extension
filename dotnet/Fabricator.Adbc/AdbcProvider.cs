@@ -221,7 +221,16 @@ internal sealed class AdbcCatalog : IProviderCatalog
     internal Schema TableSchema(string schemaName, string tableName)
     {
         using var connection = Connect();
-        return connection.GetTableSchema(_catalogName, schemaName, tableName);
+        try
+        {
+            return connection.GetTableSchema(_catalogName, schemaName, tableName);
+        }
+        catch (AdbcException ex) when (ex.Status == AdbcStatusCode.NotFound)
+        {
+            // the driver says the table is not there (DuckDB also asks for spellings the server does not have: its
+            // names are case-insensitive, Kusto's are not) — absence, not a failure
+            throw new ObjectNotFoundException("table", schemaName + "." + tableName, ex);
+        }
     }
 
     private const short RowCountStatistic = 6; // ADBC_STATISTIC_ROW_COUNT_KEY
@@ -648,6 +657,11 @@ internal sealed class AdbcTableBinding : ITableBinding
     {
         using var values = AdbcCatalog.ReadValues(filterValues);
         var spec = ScanSpec.Parse(specJson);
+        if (spec?.SchemaOnly == true)
+        {
+            // the bind's describe: the schema is known (GetTableSchema) — running the scan would read the table
+            return new InMemoryArrayStream(Schema, System.Array.Empty<RecordBatch>());
+        }
         var projection = spec?.Columns is { Count: > 0 } columns
             ? columns.Select(c => Schema.GetFieldIndex(c)).ToList()
             : Enumerable.Range(0, Schema.FieldsList.Count).ToList();
