@@ -3751,7 +3751,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
                 substraitPlan, HasIgnoreNulls, out columnCount, out orderDescending, out write,
                 names => names.Count == 2 && special.TryGetValue(ExternalKey(names[0], names[1]), out var c) ? c : null,
                 ServerFunctionName, ServerTableFunctionName, ConsistentReads,
-                names => names.Count == 2 && bounded.TryGetValue(ExternalKey(names[0], names[1]), out var b) ? b : null);
+                names => names.Count == 2 && bounded.TryGetValue(ExternalKey(names[0], names[1]), out var b) ? b : null,
+                Profile.SupportsOpenJson);
         }
         catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
         {

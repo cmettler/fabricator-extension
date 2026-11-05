@@ -2015,6 +2015,39 @@ off (line 1353), power exponent check off (line 1384). The producer half is unmu
 that sent ERROR under IEEE would be caught by the same rows. Harness: session scratchpad `math/` (probe2.py,
 wide.py, domain.py).
 
+### 4.31 Long IN lists as one OPENJSON array — BUILT (2026-11-05)
+
+User-asked, out of the adbc provider's filter work (docs/adbc-provider.md): a long IN list in a PUSHED plan went to the
+server as literals (`IN (CAST(1 AS int), …)`), one per constant. `FilterWhereBuilder` already sent long integer lists
+of a SCAN as OPENJSON (§5.3); the emitter had nothing like it, and an adbc driver translating our plans has only the
+emitter. Now `TSqlEmitter.OpenJsonList`: a `SingularOrList` of more than 50 integer or string constants (`CAST` around
+a literal allowed — the producer casts every option) is one JSON array.
+
+| where the list is | T-SQL |
+|---|---|
+| a WHERE conjunct of its own (`FilterPredicate`, also a read's `filter` / `best_effort_filter`) | integers `x IN (SELECT v FROM OPENJSON(…) WITH ([v] int '$') … WHERE v IS NOT NULL)`; strings the same as an indexable superset on the column (`varchar(8000)` for ASCII, `COLLATE DATABASE_DEFAULT`) AND the exact key `IN (…)` |
+| anywhere else, as a condition (under NOT, in an OR) | `(EXISTS (SELECT 1 FROM OPENJSON(…) … WHERE v = x) OR (x IS NULL AND 1 = NULL))` — `OR (1 = NULL)` alone when the list holds a NULL |
+| as a value (a projection) | the literal list, as before |
+
+Why each, all MEASURED on 200 000 rows (docker box, server-side elapsed / client-side incl. compile):
+- the plain `IN (SELECT …)` under NOT: SQL Server's NOT IN reads the subquery ONCE PER ROW looking for a NULL — the JSON
+  parsed 200 000 times, 1.8 s. We know at translation whether the list holds a NULL, so the EXISTS form is exact
+  three-valued (TRUE on a match, UNKNOWN when the value or a list entry is NULL, else FALSE) and its NOT is a hashed
+  anti join: 0.10 s (literals 0.16 s).
+- two subqueries ANDed (prefilter + exact key) under NOT become an OR — again per row (2.0 s). The prefilter only helps a
+  positive conjunct anyway (it is what lets an index seek), so it goes there only.
+- the JSON side's key is `varchar(8000)` when every value fits (≤ 2666 characters): SQL Server cannot hash a
+  `varchar(max)`.
+- as a value, a CASE WHEN EXISTS was joined row by row: 5.3 s against 2.1 s for the literals, so the value form keeps
+  the literals (`SqlExpr` carries the two forms separately).
+- client-side (compile included): 28 572 integers 0.75 s vs 10.9 s; varchar 0.05 vs 0.21 s; nvarchar 0.25 vs 0.66 s;
+  NOT IN 0.13 vs 0.46 s; a WHERE conjunct of 60 integers unchanged.
+
+Gated on `ServerProfile.SupportsOpenJson` (compatibility level 130, Fabric). The mssql-adbc port (`fabricator-tsql`)
+has the same code and no server facts, so it assumes OPENJSON. Gate: verify_remote_select_mssql §24 (851 → 891), two
+mutants killed at their own rows (no unknown tail: the NOT IN over NULL rows; prefilter without the exact key: the
+`'k7  '` / `'K7'` rows); guide S20. Harness: session scratchpad `adbcf/inlist.py`.
+
 ## 5. Dynamic join filters for SQL Server scans — BUILT (2026-10-30, step 4 way A)
 
 **As built.** The record below (2026-10-27) took the scan's T-SQL to have to be EXACT for `filter_pushdown = true`.

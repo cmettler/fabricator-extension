@@ -91,7 +91,8 @@ public static class SqlServerSubstrait
                                              Func<IReadOnlyList<string>, string?>? catalogFunctions = null,
                                              Func<IReadOnlyList<string>, string?>? catalogTableFunctions = null,
                                              Func<bool>? consistentReads = null,
-                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, (int Bytes, bool Unicode)>?>? columnByteLengths = null)
+                                             Func<IReadOnlyList<string>, IReadOnlyDictionary<string, (int Bytes, bool Unicode)>?>? columnByteLengths = null,
+                                             bool openJson = true)
     {
         if (plan == null || plan.Length == 0)
         {
@@ -110,7 +111,7 @@ public static class SqlServerSubstrait
         {
             SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls, SupportsTrimCharacters = ignoreNulls,
             SingleJoinAnyRow = decoder.PlanOptimizations.Contains("fabricator.single_join_any_row"), CatalogFunctions = catalogFunctions,
-            CatalogTableFunctions = catalogTableFunctions, ColumnByteLengths = columnByteLengths
+            CatalogTableFunctions = catalogTableFunctions, ColumnByteLengths = columnByteLengths, SupportsOpenJson = openJson
         };
         if (root.Input is WriteRel writeRel)
         {

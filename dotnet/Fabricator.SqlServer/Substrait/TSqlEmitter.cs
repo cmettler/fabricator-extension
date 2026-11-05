@@ -77,6 +77,13 @@ internal sealed class TSqlEmitter
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] LTRIM / RTRIM take the characters to remove (SQL Server 2022+).</summary>
     public bool SupportsTrimCharacters { get; init; } = true;
 
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The server has OPENJSON (compatibility level 130+, Fabric).</summary>
+    public bool SupportsOpenJson { get; init; } = true;
+
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] An IN list of more integer or string constants than this goes as one
+    /// JSON array read by OPENJSON (see <see cref="OpenJsonList"/>).</summary>
+    internal const int JsonListThreshold = 50;
+
     /// <summary>
     /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A single join takes any one of several matching rows instead of failing
     /// (DuckDB's scalar_subquery_error_on_multiple_rows = false; the plan says so).
@@ -538,11 +545,11 @@ internal sealed class TSqlEmitter
         // The filters apply to the base schema, before the projection.
         if (rel.Filter != null)
         {
-            block.Where.Add(Predicate(rel.Filter, block.Columns));
+            block.Where.Add(FilterPredicate(rel.Filter, block.Columns));
         }
         if (rel.BestEffortFilter != null)
         {
-            block.Where.Add(Predicate(rel.BestEffortFilter, block.Columns));
+            block.Where.Add(FilterPredicate(rel.BestEffortFilter, block.Columns));
         }
         if (rel.Projection != null)
         {
@@ -635,6 +642,11 @@ internal sealed class TSqlEmitter
             && scope[negated.Index].FalseWhen is { } falseWhen)
         {
             return "(" + falseWhen + ")";
+        }
+        // a long IN list that is a conjunct of its own may lead with an indexable superset (see OpenJsonList)
+        if (condition is SingularOrListExpr list && OpenJsonList(list, scope, indexable: true) is { } json)
+        {
+            return json.Predicate;
         }
         return Predicate(condition, scope);
     }
@@ -2031,6 +2043,18 @@ internal sealed class TSqlEmitter
         {
             return SqlExpr.Condition("(1 = 0)", SqlProps.None);
         }
+        if (OpenJsonList(expr, scope, indexable: false) is { } json)
+        {
+            // [FABRICATOR-PATCH: OURS-BY-DESIGN] as a value (a projection) the literal list: there SQL Server joined the
+            // JSON row by row (200 000 rows: 5.3 s, the literals 2.1 s)
+            var literals = LiteralList(expr, scope);
+            return new SqlExpr(literals.Value, json.Predicate, SType.Bool, json.Props | literals.Props);
+        }
+        return LiteralList(expr, scope);
+    }
+
+    private SqlExpr LiteralList(SingularOrListExpr expr, IReadOnlyList<SqlColumn> scope)
+    {
         var value = Render(expr.Value, scope);
         var options = expr.Options.Select(o => Render(o, scope)).ToList();
         var props = options.Aggregate(value.Props, (p, o) => p | o.Props);
@@ -2049,6 +2073,159 @@ internal sealed class TSqlEmitter
             return SqlExpr.Condition(exact, props);
         }
         return SqlExpr.Condition($"({value.Value} IN ({string.Join(", ", options.Select(o => o.Value))}))", props);
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A long IN list of integer or string constants as one JSON array:
+    /// <c>x IN (SELECT [v] FROM OPENJSON(N'[…]') WITH ([v] int '$'))</c>. One statement of any length, where the
+    /// literals would make a statement SQL Server is slow to compile or refuses (a hash join's keys, which the host
+    /// hands a pushed query or a scan). Three-valued like the list: a NULL option is a JSON null and yields NULL, not
+    /// FALSE. Strings compare by their exact key; where the list is a WHERE conjunct of its own
+    /// (<paramref name="indexable"/>), after an indexable superset on the column, as the literal list does. Anywhere else
+    /// (under NOT or OR, in a projection) it is an EXISTS: two subqueries under NOT cannot become joins, and SQL Server
+    /// read the JSON once per row (NOT IN over 200 000 rows, 2.0 s).
+    /// Null when the list is short, not all constants, or of another type.
+    /// </summary>
+    private SqlExpr? OpenJsonList(SingularOrListExpr expr, IReadOnlyList<SqlColumn> scope, bool indexable)
+    {
+        if (!SupportsOpenJson || expr.Options.Count <= JsonListThreshold)
+        {
+            return null;
+        }
+        var literals = expr.Options.Select(ConstantOption).ToList();
+        if (literals.Any(l => l is null))
+        {
+            return null;
+        }
+        var value = Render(expr.Value, scope);
+        bool strings = value.Type.IsStringLike;
+        (string Type, long Min, long Max)? integer = value.Type.Kind switch
+        {
+            TypeKind.I8 or TypeKind.I16 => ("smallint", short.MinValue, short.MaxValue),
+            TypeKind.I32 => ("int", int.MinValue, int.MaxValue),
+            TypeKind.I64 => ("bigint", long.MinValue, long.MaxValue),
+            _ => null,
+        };
+        if (integer is null && !strings)
+        {
+            return null;
+        }
+        var json = new StringBuilder("[");
+        int longest = 0;
+        bool ascii = true;
+        foreach (var literal in literals.Select(l => l!))
+        {
+            if (json.Length > 1)
+            {
+                json.Append(',');
+            }
+            if (literal.IsNull)
+            {
+                json.Append("null");
+            }
+            else if (strings && literal.StringValue is { } text)
+            {
+                AppendJsonString(json, text);
+                longest = Math.Max(longest, text.Length);
+                ascii &= text.All(ch => ch >= 0x20 && ch < 0x7F);
+            }
+            else if (integer is { } range && literal.Type.IsInteger && literal.IntValue >= range.Min && literal.IntValue <= range.Max)
+            {
+                json.Append(literal.IntValue.ToString(CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                return null; // another type, or a value the column's type cannot hold: the literal list renders it
+            }
+        }
+        json.Append(']');
+        string source = "OPENJSON(" + TSql.Unicode(json.ToString()) + ")";
+        var props = value.Props | SqlProps.Subquery;
+        bool hasNull = literals.Any(l => l!.IsNull);
+        // without a NULL option, say so: SQL Server otherwise plans for a NULL it would have to find
+        string NotNull(string alias) => hasNull ? "" : $" WHERE {alias}.[v] IS NOT NULL";
+        // Anywhere but a WHERE conjunct of its own the three-valued result matters (NOT, OR, a projection), and SQL
+        // Server's NOT IN reads the subquery once per row to look for a NULL — the JSON parsed 200 000 times, 1.8 s. The
+        // list's NULL is known here, so IN is written as a match OR an unknown: TRUE on a match, else UNKNOWN when the
+        // value is NULL or the list holds a NULL, else FALSE. Its NOT is an anti join SQL Server hashes.
+        string unknown = hasNull
+            ? " OR (1 = CAST(NULL AS int))"
+            : $" OR ({value.Value} IS NULL AND 1 = CAST(NULL AS int))";
+        if (integer is { } it)
+        {
+            string alias = NewAlias();
+            string from = $"{source} WITH ([v] {it.Type} '$') AS {alias}";
+            return SqlExpr.Condition(indexable
+                ? $"({value.Value} IN (SELECT {alias}.[v] FROM {from}{NotNull(alias)}))"
+                : $"(EXISTS (SELECT 1 FROM {from} WHERE {alias}.[v] = {value.Value}){unknown})", props);
+        }
+        Comparable(value.Type, value.Value);
+        string keys = NewAlias();
+        // the values' keys bounded where they fit: SQL Server cannot hash a varchar(max). 2666 characters are at most
+        // 8000 bytes of UTF-8 with the sentinel.
+        bool bounded = longest <= 2666;
+        string valueKey = bounded
+            ? $"CONVERT(varchar(8000), ({keys}.[v] COLLATE {BinaryCollation} + N'|') COLLATE {BinaryCollation})"
+            : EqualityKey(keys + ".[v] COLLATE " + BinaryCollation);
+        string keyFrom = $"{source} WITH ([v] nvarchar({(bounded ? "4000" : "max")}) '$') AS {keys}";
+        if (!indexable)
+        {
+            return SqlExpr.Condition(
+                $"(EXISTS (SELECT 1 FROM {keyFrom} WHERE {valueKey} = {EqualityKey(value.Value)}){unknown})", props);
+        }
+        string exact = $"({EqualityKey(value.Value)} IN (SELECT {valueKey} FROM {keyFrom}{NotNull(keys)}))";
+        // an indexable superset first, as for the literal list: the values in the column's own comparison, typed so the
+        // column needs no conversion (varchar for ASCII, as the literals are); DATABASE_DEFAULT settles the collation of
+        // the JSON column against the column's, and two binary-equal strings are equal under any collation
+        string? column = IndexableString(value.Value);
+        string? listType = ascii && longest <= 8000 ? "varchar(8000)" : longest <= 4000 ? "nvarchar(4000)" : null;
+        if (IsColumnReference(column) && listType != null)
+        {
+            string values = NewAlias();
+            exact = $"({column} IN (SELECT {values}.[v] COLLATE DATABASE_DEFAULT FROM {source} WITH ([v] {listType} '$') AS {values}{NotNull(values)}) AND {exact})";
+        }
+        return SqlExpr.Condition(exact, props);
+    }
+
+    /// <summary>A list option that is a constant: a literal, under casts that keep it an integer or a string (the producer
+    /// casts each option to the value's type). Null for anything else.</summary>
+    private static LiteralExpr? ConstantOption(Expr option)
+    {
+        while (option is CastExpr cast)
+        {
+            var family = cast.Type.IsInteger ? 1 : cast.Type.IsStringLike ? 2 : 0;
+            var inner = cast.Input is CastExpr c ? c.Type : cast.Input is LiteralExpr l ? l.Type : default;
+            if (family == 0 || (inner.IsInteger ? 1 : inner.IsStringLike ? 2 : 0) != family)
+            {
+                return null;
+            }
+            option = cast.Input;
+        }
+        return option as LiteralExpr;
+    }
+
+    private static void AppendJsonString(StringBuilder json, string text)
+    {
+        json.Append('"');
+        foreach (char ch in text)
+        {
+            switch (ch)
+            {
+                case '"': json.Append("\\\""); break;
+                case '\\': json.Append("\\\\"); break;
+                default:
+                    if (ch < 0x20)
+                    {
+                        json.Append("\\u").Append(((int)ch).ToString("x4", CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        json.Append(ch);
+                    }
+                    break;
+            }
+        }
+        json.Append('"');
     }
 
     private SqlExpr MultiOrList(MultiOrListExpr expr, IReadOnlyList<SqlColumn> scope)

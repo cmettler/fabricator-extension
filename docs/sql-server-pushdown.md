@@ -433,6 +433,21 @@ SELECT name, sum(amount) FROM src WHERE name = 'Europe' GROUP BY name;   -- Euro
 A CTE read more than once is read once from the server and kept, `NOT MATERIALIZED` or not: two server reads of one
 query need not agree. A correlated subquery is no CTE of the statement and is pushed as before (S16).
 
+**S20 — a long IN list is one JSON array, not thousands of literals.** More than 50 integer or string constants
+in an `IN` go to the server as one JSON array, read by `OPENJSON`: one statement of any length, which SQL Server
+compiles as fast as a short one. The answer does not change — strings still compare exactly (`'k7'` does not match
+`'k7  '` or `'K7'`), and `NOT IN` over a NULL still gives NULL:
+
+```sql
+SELECT region, count(*) FROM mssql.dbo.pg_clicks WHERE id IN (1, 2, 3, …, 60) GROUP BY region;   -- AP 20, EU 20, US 20
+-- Fabricator.Remote | remote: SELECT … WHERE ([t0].[id] IN (SELECT [t1].[v] FROM OPENJSON(N'[1,2,3,…,60]') WITH ([v] int '$') …
+```
+
+Measured on 200 000 rows: a list of 28 572 integers 0.75 s instead of 10.9 s, an `nvarchar` list 0.25 s instead of
+0.66 s, `NOT IN` of 160 strings 0.13 s instead of 0.46 s. As a value (`SELECT g IN (…) AS hit`) the literal list
+stays: there SQL Server read the JSON once per row. Other types (dates, decimals) stay literals, and a database below
+compatibility level 130 has no `OPENJSON` and keeps the literals too.
+
 **J1 — a table joined with local data reads only the matching rows.** DuckDB reads the local side of a hash join
 first; its keys (an `IN` list, or their minimum and maximum) go into the WHERE of the scan of the server table, where
 an index can seek on them. The scan checks every row it gets against the same filters again, so a case-insensitive or

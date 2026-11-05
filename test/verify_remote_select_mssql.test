@@ -2590,3 +2590,165 @@ SELECT count(*) FROM (
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_ua; DROP TABLE dbo.rs_ub;', refresh_cache := true);
+
+# ═══ §24  Long IN lists as one OPENJSON array (docs/duckdb-2.0-remote-execution.md §4.31) ═════════════════════════════
+# More than 50 integer or string constants go as one JSON array read by OPENJSON instead of literals. The table
+# carries what the exact semantics must keep apart — 'k7  ' and 'K7' beside 'k7' — and NULL rows, which a NOT IN
+# must drop (NULL IN list is NULL, not FALSE). Each case is a differential against the unpushed attach `db`;
+# the routing rows show the JSON form was taken.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_in;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_in (id INT NOT NULL PRIMARY KEY, k INT NULL, g VARCHAR(20) NULL, n NVARCHAR(20) NULL);
+CREATE INDEX ix_rs_in_g ON dbo.rs_in (g);
+INSERT dbo.rs_in SELECT v, CASE WHEN v % 9 = 0 THEN NULL ELSE v END, CASE WHEN v % 10 = 0 THEN NULL ELSE ''k'' + CAST(v AS VARCHAR(10)) END,
+  N''é'' + CAST(v % 80 AS NVARCHAR(10)) FROM (SELECT TOP (600) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS v FROM sys.all_objects) x;
+INSERT dbo.rs_in VALUES (1001, 7, ''k7  '', N''x''), (1002, 8, ''K7'', NULL), (1003, NULL, NULL, NULL);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+# integers in a pushed aggregate
+query I
+SELECT count(*) FROM ((SELECT g, count(*) FROM rp.dbo.rs_in WHERE id IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393) GROUP BY g) EXCEPT ALL (SELECT g, count(*) FROM db.dbo.rs_in WHERE id IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393) GROUP BY g));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, count(*) FROM db.dbo.rs_in WHERE id IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393) GROUP BY g) EXCEPT ALL (SELECT g, count(*) FROM rp.dbo.rs_in WHERE id IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393) GROUP BY g));
+----
+0
+
+# varchar: exact, not trailing-space or case insensitive
+query I
+SELECT count(*) FROM ((SELECT g, count(*) FROM rp.dbo.rs_in WHERE g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') GROUP BY g) EXCEPT ALL (SELECT g, count(*) FROM db.dbo.rs_in WHERE g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') GROUP BY g));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, count(*) FROM db.dbo.rs_in WHERE g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') GROUP BY g) EXCEPT ALL (SELECT g, count(*) FROM rp.dbo.rs_in WHERE g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') GROUP BY g));
+----
+0
+
+# nvarchar, not ASCII
+query I
+SELECT count(*) FROM ((SELECT n, count(*) FROM rp.dbo.rs_in WHERE n IN ('é0', 'é1', 'é2', 'é3', 'é4', 'é5', 'é6', 'é7', 'é8', 'é9', 'é10', 'é11', 'é12', 'é13', 'é14', 'é15', 'é16', 'é17', 'é18', 'é19', 'é20', 'é21', 'é22', 'é23', 'é24', 'é25', 'é26', 'é27', 'é28', 'é29', 'é30', 'é31', 'é32', 'é33', 'é34', 'é35', 'é36', 'é37', 'é38', 'é39', 'é40', 'é41', 'é42', 'é43', 'é44', 'é45', 'é46', 'é47', 'é48', 'é49', 'é50', 'é51', 'é52', 'é53', 'é54', 'é55', 'é56', 'é57', 'é58', 'é59') GROUP BY n) EXCEPT ALL (SELECT n, count(*) FROM db.dbo.rs_in WHERE n IN ('é0', 'é1', 'é2', 'é3', 'é4', 'é5', 'é6', 'é7', 'é8', 'é9', 'é10', 'é11', 'é12', 'é13', 'é14', 'é15', 'é16', 'é17', 'é18', 'é19', 'é20', 'é21', 'é22', 'é23', 'é24', 'é25', 'é26', 'é27', 'é28', 'é29', 'é30', 'é31', 'é32', 'é33', 'é34', 'é35', 'é36', 'é37', 'é38', 'é39', 'é40', 'é41', 'é42', 'é43', 'é44', 'é45', 'é46', 'é47', 'é48', 'é49', 'é50', 'é51', 'é52', 'é53', 'é54', 'é55', 'é56', 'é57', 'é58', 'é59') GROUP BY n));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT n, count(*) FROM db.dbo.rs_in WHERE n IN ('é0', 'é1', 'é2', 'é3', 'é4', 'é5', 'é6', 'é7', 'é8', 'é9', 'é10', 'é11', 'é12', 'é13', 'é14', 'é15', 'é16', 'é17', 'é18', 'é19', 'é20', 'é21', 'é22', 'é23', 'é24', 'é25', 'é26', 'é27', 'é28', 'é29', 'é30', 'é31', 'é32', 'é33', 'é34', 'é35', 'é36', 'é37', 'é38', 'é39', 'é40', 'é41', 'é42', 'é43', 'é44', 'é45', 'é46', 'é47', 'é48', 'é49', 'é50', 'é51', 'é52', 'é53', 'é54', 'é55', 'é56', 'é57', 'é58', 'é59') GROUP BY n) EXCEPT ALL (SELECT n, count(*) FROM rp.dbo.rs_in WHERE n IN ('é0', 'é1', 'é2', 'é3', 'é4', 'é5', 'é6', 'é7', 'é8', 'é9', 'é10', 'é11', 'é12', 'é13', 'é14', 'é15', 'é16', 'é17', 'é18', 'é19', 'é20', 'é21', 'é22', 'é23', 'é24', 'é25', 'é26', 'é27', 'é28', 'é29', 'é30', 'é31', 'é32', 'é33', 'é34', 'é35', 'é36', 'é37', 'é38', 'é39', 'é40', 'é41', 'é42', 'é43', 'é44', 'é45', 'é46', 'é47', 'é48', 'é49', 'é50', 'é51', 'é52', 'é53', 'é54', 'é55', 'é56', 'é57', 'é58', 'é59') GROUP BY n));
+----
+0
+
+# NOT IN over NULL rows
+query I
+SELECT count(*) FROM ((SELECT count(*), count(g) FROM rp.dbo.rs_in WHERE NOT (g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393'))) EXCEPT ALL (SELECT count(*), count(g) FROM db.dbo.rs_in WHERE NOT (g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393'))));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT count(*), count(g) FROM db.dbo.rs_in WHERE NOT (g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393'))) EXCEPT ALL (SELECT count(*), count(g) FROM rp.dbo.rs_in WHERE NOT (g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393'))));
+----
+0
+
+# NOT IN of integers over NULL rows
+query I
+SELECT count(*) FROM ((SELECT count(*), count(k) FROM rp.dbo.rs_in WHERE NOT (k IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393))) EXCEPT ALL (SELECT count(*), count(k) FROM db.dbo.rs_in WHERE NOT (k IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393))));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT count(*), count(k) FROM db.dbo.rs_in WHERE NOT (k IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393))) EXCEPT ALL (SELECT count(*), count(k) FROM rp.dbo.rs_in WHERE NOT (k IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393))));
+----
+0
+
+# IN as a value, NULL rows giving NULL
+query I
+SELECT count(*) FROM ((SELECT g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') AS hit, count(*) FROM rp.dbo.rs_in GROUP BY 1) EXCEPT ALL (SELECT g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') AS hit, count(*) FROM db.dbo.rs_in GROUP BY 1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') AS hit, count(*) FROM db.dbo.rs_in GROUP BY 1) EXCEPT ALL (SELECT g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') AS hit, count(*) FROM rp.dbo.rs_in GROUP BY 1));
+----
+0
+
+# routing: OPENJSON in the pushed statement where the list is a condition; as a value the literal list, since
+# there SQL Server joined the JSON row by row (200 000 rows: 5.3 s, the literals 2.1 s)
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT * FROM (SELECT g, count(*) FROM rp.dbo.rs_in WHERE id IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393) GROUP BY g);
+
+query II
+SELECT count(*) > 0, bool_or(contains(message, 'OPENJSON')) FROM duckdb_logs
+WHERE type = 'Fabricator.Remote' AND message LIKE 'remote%';
+----
+true	true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT * FROM (SELECT g, count(*) FROM rp.dbo.rs_in WHERE g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') GROUP BY g);
+
+query II
+SELECT count(*) > 0, bool_or(contains(message, 'OPENJSON')) FROM duckdb_logs
+WHERE type = 'Fabricator.Remote' AND message LIKE 'remote%';
+----
+true	true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT * FROM (SELECT count(*), count(g) FROM rp.dbo.rs_in WHERE NOT (g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393')));
+
+query II
+SELECT count(*) > 0, bool_or(contains(message, 'OPENJSON')) FROM duckdb_logs
+WHERE type = 'Fabricator.Remote' AND message LIKE 'remote%';
+----
+true	true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT * FROM (SELECT g IN ('k7', 'k1', 'k8', 'k15', 'k22', 'k29', 'k36', 'k43', 'k50', 'k57', 'k64', 'k71', 'k78', 'k85', 'k92', 'k99', 'k106', 'k113', 'k120', 'k127', 'k134', 'k141', 'k148', 'k155', 'k162', 'k169', 'k176', 'k183', 'k190', 'k197', 'k204', 'k211', 'k218', 'k225', 'k232', 'k239', 'k246', 'k253', 'k260', 'k267', 'k274', 'k281', 'k288', 'k295', 'k302', 'k309', 'k316', 'k323', 'k330', 'k337', 'k344', 'k351', 'k358', 'k365', 'k372', 'k379', 'k386', 'k393') AS hit, count(*) FROM rp.dbo.rs_in GROUP BY 1);
+
+query II
+SELECT count(*) > 0, bool_or(contains(message, 'OPENJSON')) FROM duckdb_logs
+WHERE type = 'Fabricator.Remote' AND message LIKE 'remote%';
+----
+true	false
+
+statement ok
+CALL disable_logging();
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_in;', refresh_cache := true);
