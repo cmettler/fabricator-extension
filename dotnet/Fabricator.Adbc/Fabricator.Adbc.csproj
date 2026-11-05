@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.Adbc</RootNamespace>
+    <AssemblyName>Fabricator.Adbc</AssemblyName>
+    <Description>
+      ADBC provider (provider name "adbc"): loads a native ADBC driver through the ADBC C interface and talks
+      to it in Arrow and Substrait. Scans go to the driver as a Substrait read; the remote pushdown hands the
+      host's Substrait plan to the driver, which translates it to its own dialect or refuses it at Prepare.
+      Experimental (branch feat/adbc-provider, docs/adbc-provider.md).
+    </Description>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <ProjectReference Include="..\Fabricator.Common\Fabricator.Common.csproj" />
+    <PackageReference Include="Apache.Arrow.Adbc" Version="1.0.0" />
+  </ItemGroup>
+
+</Project>

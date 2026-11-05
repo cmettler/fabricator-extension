@@ -143,6 +143,10 @@ Publish-Project $fluidProj "Fabricator.FluidPlugin"
 $functionsProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Functions/Fabricator.Functions.csproj" | Resolve-Path
 Publish-Project $functionsProj "Fabricator.Functions"
 
+# The adbc provider: loads a native ADBC driver; nothing else references it, so this line is what ships it.
+$adbcProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Adbc/Fabricator.Adbc.csproj" | Resolve-Path
+Publish-Project $adbcProj "Fabricator.Adbc"
+
 # Optional third provider: Fabricator.DeltaRs (delta-rs via delta-dotnet). Published into the SAME fabricator/
 # dir so the bridge discovers it by assembly name. Brings DeltaLake.dll + the two native Rust DLLs
 # (delta_rs_bridge.dll / delta_kernel_ffi.dll, ~240 MB) — hence opt-in via -IncludeDeltaRs.

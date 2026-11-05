@@ -216,10 +216,17 @@ def run(con, sql):
 def main():
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{LOADABLE}'")
-    con.execute(f"ATTACH '{DSN}' AS rp (TYPE fabricator, remote_pushdown 'true')")
     con.execute(f"ATTACH '{DSN}' AS db (TYPE fabricator, remote_pushdown 'false')")
     con.execute("SELECT fabricator_exec('db', ?, refresh_cache := true)", [SETUP])
-    con.execute("SELECT fabricator_refresh_cache('rp')")
+    adbc_driver = os.environ.get("EDGE_ADBC_DRIVER")
+    if adbc_driver:
+        # rp through an ADBC driver (e.g. mssql-adbc's native library), which translates the plan itself
+        con.execute(f"ATTACH 'driver={adbc_driver};adbc.mssql.server=localhost,1433;adbc.mssql.database=TestDB;"
+                    "username=sa;password=Arrow_Net_123!;adbc.mssql.trust_server_certificate=true' "
+                    "AS rp (TYPE fabricator, PROVIDER 'adbc')")
+    else:
+        con.execute(f"ATTACH '{DSN}' AS rp (TYPE fabricator, remote_pushdown 'true')")
+        con.execute("SELECT fabricator_refresh_cache('rp')")
     con.execute("CALL enable_logging(['Fabricator.Remote'], storage := 'memory', level := 'debug')")
     only = set(sys.argv[1:])
     bad = 0
