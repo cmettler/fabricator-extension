@@ -173,6 +173,10 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         var pattern = _root + "/" + Normalize(prefix) + "**";
         var json = HostFs.Glob(Opener, pattern);
         var globbed = ParseGlob(json);
+        if (!_root.Contains("://"))
+        {
+            globbed = RelistWhileCommitsAreMissing(pattern, globbed);
+        }
         // The COUNT is the point, not just the call: a Delta open's cost is dominated by how many objects the
         // log listing returns (CLAUDE.md measures ~10 ms per dead commit on S3), and a listing that returns
         // hundreds is the difference between a fast and a slow open. Logged AFTER the parse so the number is
@@ -748,6 +752,76 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     internal static readonly DateTimeOffset UnknownModified = DateTimeOffset.MinValue;
 
     private readonly record struct GlobEntry(string Path, long Size, long ModifiedMs);
+
+    /// <summary>
+    /// A local listing of a Delta log can leave out a commit that exists. POSIX leaves it open whether readdir
+    /// returns a file created after the directory was opened, and APFS (and ext4) read a directory in hash order:
+    /// commit 88 created during the listing can sort before the read position while 89-91, created later, sort after
+    /// it. The snapshot then failed with "version 88 is missing or unreadable … requires every version in [81..91]"
+    /// (macOS CI, verify_delta_concurrent_dml, twice after the temporary file had moved out of _delta_log). Commit
+    /// versions are contiguous by construction, so a hole between the lowest and the highest listed commit means the
+    /// listing is incomplete: the directory is listed again and the listings are merged, a few times at most. A hole
+    /// that stays is returned as listed and engineered-wood reports it.
+    /// <para>A workaround in the file-system layer, which otherwise knows nothing of Delta: the cleaner place is the
+    /// log replay, which could read a missing version by its name before failing. Kept here because only local roots
+    /// (tests, the Fabric FUSE mount) list this way; NTFS and object stores list in name order.</para>
+    /// </summary>
+    private List<GlobEntry> RelistWhileCommitsAreMissing(string pattern, List<GlobEntry> globbed)
+    {
+        const int maxRelists = 5;
+        for (int attempt = 1; attempt <= maxRelists; attempt++)
+        {
+            long? missing = FirstMissingCommit(globbed);
+            if (missing is null)
+            {
+                return globbed;
+            }
+            Microsoft.Extensions.Logging.LoggerExtensions.LogInformation(
+                IoLog, "host list {Pattern}: commit {Version} not listed, listing again ({Attempt}/{Max})",
+                pattern, missing, attempt, maxRelists);
+            var again = ParseGlob(HostFs.Glob(Opener, pattern));
+            var seen = new HashSet<string>(globbed.Select(e => e.Path), StringComparer.Ordinal);
+            foreach (var entry in again)
+            {
+                if (seen.Add(entry.Path))
+                {
+                    globbed.Add(entry);
+                }
+            }
+        }
+        return globbed;
+    }
+
+    /// <summary>The first commit version between the lowest and highest listed commit file that is not listed.</summary>
+    internal static long? FirstMissingCommit(IEnumerable<string> paths)
+    {
+        var versions = new SortedSet<long>();
+        foreach (var raw in paths)
+        {
+            string path = raw.Replace('\\', '/');
+            int slash = path.LastIndexOf('/');
+            string name = slash >= 0 ? path.Substring(slash + 1) : path;
+            if (name.Length == 25 && name.EndsWith(".json", StringComparison.Ordinal)
+                && path.Contains("_delta_log/", StringComparison.Ordinal)
+                && long.TryParse(name.AsSpan(0, 20), System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out long v))
+            {
+                versions.Add(v);
+            }
+        }
+        long expected = -1;
+        foreach (long v in versions)
+        {
+            if (expected >= 0 && v != expected)
+            {
+                return expected;
+            }
+            expected = v + 1;
+        }
+        return null;
+    }
+
+    private static long? FirstMissingCommit(List<GlobEntry> entries) => FirstMissingCommit(entries.Select(e => e.Path));
 
     private static List<GlobEntry> ParseGlob(string json)
     {
