@@ -65,21 +65,21 @@ hosts no catalog
 # ⚠⚠ AND IT PINS THE WHOLE DISCOVERED SET, which is the only assertion anywhere that can see HOW core
 # providers are found. Since 2026-09-02 they are discovered by globbing `Fabricator*.dll` in the managed
 # directory (plugin-services.md §13), so this list is ALPHABETICAL BY ASSEMBLY NAME —
-# AnalysisServices ⇒ dax, Delta ⇒ engineeredwooddelta, SqlServer ⇒ sqlserver — and that ordering is
+# Adbc ⇒ adbc, AnalysisServices ⇒ dax, Delta ⇒ engineeredwooddelta, SqlServer ⇒ sqlserver — and that ordering is
 # exactly why the default provider had to stop being "whichever was found first".
 #
 # What it KILLS: dropping the StubBackend exclusion in RegisterProvidersFrom. StubBackend is public and
 # lives in Fabricator.Bridge, so the glob reaches it and `stub` would appear here — ahead of sqlserver.
-# ⚠ What it does NOT kill, and the suite says so rather than implying coverage: a glob returning nothing
-# falls back to the hardcoded list, which on this payload names the SAME three providers. Only reading
-# the code distinguishes those two routes.
+# It also kills a glob returning nothing, but only while adbc is published: the hardcoded fallback list
+# does not name Fabricator.Adbc, so that route would drop `adbc` here. With `-ExcludeAdbc` both routes name
+# the same three providers again and only reading the code tells them apart.
 # ⚠ `fluid` is deliberately ABSENT: it is registered, and the hint lists ATTACHABLE providers only.
 # ⚠ Depends on the hermetic tier's EMPTY plugin root — with a real one, a plugin's provider joins the
 # list. That is what makes this assertion hermetic-tier-only.
 statement error
 ATTACH 'x' AS f (TYPE fabricator, PROVIDER 'nosuchprovider');
 ----
-<REGEX>:.*unknown provider 'nosuchprovider'\. Registered providers: dax, engineeredwooddelta, sqlserver\..*
+<REGEX>:.*unknown provider 'nosuchprovider'\. Registered providers: adbc, dax, engineeredwooddelta, sqlserver\..*
 
 # Basic render: Liquid substitution from a JSON params bag.
 query I
