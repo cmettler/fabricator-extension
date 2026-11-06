@@ -165,6 +165,21 @@ static string EscapeJson(const string &s) {
 	return out;
 }
 
+// A secret's PROVIDER is not in its secret_map, and `CREATE SECRET (TYPE azure, PROVIDER credential_chain)` has
+// no fields at all — so the backend saw an empty secret and, on an abfss root, fell back to the unguarded
+// duckdb-azure IO although the ATTACH named a secret. Hand it over as the "provider" field, the name the managed
+// credential resolver reads. Foreign secrets only: our own mssql secret is a full connstr.
+static void AppendSecretProvider(string &json, bool first, const KeyValueSecret &kv) {
+	const string provider = kv.GetProvider().GetIdentifierName();
+	if (provider.empty() || kv.secret_map.find("provider") != kv.secret_map.end()) {
+		return;
+	}
+	if (!first) {
+		json += ",";
+	}
+	json += "\"provider\":\"" + EscapeJson(provider) + "\"";
+}
+
 string BuildConnectionStringFromSecret(ClientContext &context, const string &secret_name,
                                        const string &base_connstr, const string &provider) {
 	auto entry = GetSecretEntry(context, secret_name); // owns the secret; keep alive for the reads below
@@ -193,11 +208,14 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 		first = false;
 		json += "\"" + EscapeJson(field.first.GetIdentifierName()) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
 	}
+	auto our = g_secret_types.find(secret_type);
+	if (our == g_secret_types.end()) {
+		AppendSecretProvider(json, first, kv);
+	}
 	json += "}";
 
 	// Our own secret type routes to its declared backend; a foreign secret routes to the ATTACHing provider
 	// (the one consuming it), default backend when unspecified.
-	auto our = g_secret_types.find(secret_type);
 	const string backend_provider = our != g_secret_types.end() ? our->second.provider : provider;
 	return fabricator::BuildConnectionString(backend_provider, secret_type, json, base_connstr);
 }
@@ -226,6 +244,7 @@ string BuildConnectionStringFromScopedSecret(ClientContext &context, const strin
 			first = false;
 			json += "\"" + EscapeJson(field.first.GetIdentifierName()) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
 		}
+		AppendSecretProvider(json, first, kv);
 		json += "}";
 		return fabricator::BuildConnectionString(provider, secret_type, json, path);
 	} catch (...) {
