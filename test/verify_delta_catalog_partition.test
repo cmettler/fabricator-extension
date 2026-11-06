@@ -111,6 +111,43 @@ US	1
 statement ok
 SET delta_write_options='';
 
+# --- A partition TRANSFORM is refused at CREATE, not recorded as garbage ---
+# Iceberg/DuckLake spell `bucket(4, id)`, `year(ts)`, `truncate(2, x)`; Delta partitions by column value only.
+# Until 2026-11-06 the expression's TEXT crossed and was split on the comma, so `bucket(4, id)` became the
+# partition columns "bucket(4" and "id)": the CREATE succeeded and the first INSERT failed with a binder error
+# naming neither (found by the lakehouse_benchmark Iceberg probes).
+statement error
+CREATE TABLE lake.main.pbucket (id BIGINT, x BIGINT) PARTITIONED BY (bucket(4, id));
+----
+<REGEX>:.*PARTITIONED BY accepts plain column names only, not "bucket\(4, id\)".*
+
+statement error
+CREATE TABLE lake.main.pyear (id BIGINT, ts TIMESTAMP) PARTITIONED BY (year(ts));
+----
+<REGEX>:.*PARTITIONED BY accepts plain column names only.*year.*
+
+statement error
+CREATE TABLE lake.main.ptrunc PARTITIONED BY (truncate(2, x)) AS SELECT 1 AS id, 'abc' AS x;
+----
+<REGEX>:.*PARTITIONED BY accepts plain column names only.*
+
+# Nothing was created by the refused statements (the old bug left a table whose every INSERT failed).
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND table_name IN ('pbucket', 'pyear', 'ptrunc');
+----
+0
+
+# The way the message names: compute the derived value as a column and partition by it.
+statement ok
+CREATE TABLE lake.main.pyear PARTITIONED BY (ts_year) AS
+  SELECT id, ts, year(ts) AS ts_year FROM (VALUES (1, TIMESTAMP '2025-03-01'), (2, TIMESTAMP '2026-07-01')) AS t(id, ts);
+
+query II
+SELECT ts_year, count(*) FROM lake.main.pyear GROUP BY ts_year ORDER BY ts_year;
+----
+2025	1
+2026	1
+
 # Partitioned tables survive detach/re-attach (partitionColumns are in the table metadata).
 statement ok
 DETACH lake;

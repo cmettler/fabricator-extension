@@ -29,8 +29,10 @@
 namespace fabricator {
 
 // Joins the PARTITIONED BY column names (comma-separated; empty if none). Only plain column references are
-// emitted — any non-column expression is skipped (the providers partition by column name). A leading/trailing
-// comma is never produced, so an all-skipped list yields "".
+// accepted: the providers partition by column name. A partition TRANSFORM (`bucket(4, id)`, `year(ts)`,
+// `truncate(2, x)` — Iceberg's and DuckLake's spelling) is refused. It used to pass through as its text, which
+// the provider then split on the comma, so `bucket(4, id)` became the partition columns "bucket(4" and "id)":
+// the CREATE succeeded and the first INSERT failed with a binder error naming neither.
 inline std::string PartitionColumnsArg(
     const duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> &keys) {
 	std::string out;
@@ -38,12 +40,14 @@ inline std::string PartitionColumnsArg(
 		if (!k) {
 			continue;
 		}
-		std::string col;
-		if (k->GetExpressionType() == duckdb::ExpressionType::COLUMN_REF) {
-			col = k->Cast<duckdb::ColumnRefExpression>().GetColumnName().GetIdentifierName();
-		} else {
-			col = k->GetName().GetIdentifierName();
+		if (k->GetExpressionType() != duckdb::ExpressionType::COLUMN_REF) {
+			throw duckdb::NotImplementedException(
+			    "fabricator: PARTITIONED BY accepts plain column names only, not \"%s\". Delta partitions by a "
+			    "column's value; to partition by a derived value, compute it as a column (e.g. year(ts) AS ts_year "
+			    "in the SELECT) and partition by that, or cluster with SORTED BY",
+			    k->ToString());
 		}
+		std::string col = k->Cast<duckdb::ColumnRefExpression>().GetColumnName().GetIdentifierName();
 		if (col.empty()) {
 			continue;
 		}
