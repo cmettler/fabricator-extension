@@ -23,7 +23,7 @@ breaks the build rather than an unmaintained branch.
 | `max_in_list` | 1000 | longest IN list a filter sends as a list; longer goes as a range (integers, temporals) or not at all |
 | `consistent_reads` | false | the user's promise that one statement reads the same rows alike twice (RCSI / snapshot, or no concurrent writers); without it a plan carrying `fabricator.repeated_reads` is declined |
 
-Drivers tried (both forks, branches pushed, no PR):
+Drivers tried (both forks, branches pushed; mssql-adbc PRs since 2026-11-06, see below):
 
 | driver | fork / branch | notes |
 |---|---|---|
@@ -65,7 +65,7 @@ did not move with it (2.8 s with the list, 2.8 s with the range): the cost sits 
 takes 0.5 s for the same query, the SQL Server provider 1.5 s. Not chased yet; suspects are the 28 572-column value
 batch the host builds for the constants and the driver translating the plan twice (Prepare, then execute).
 
-All answers equal DuckDB's. The 139 edge cases are unchanged: 139/139 with the ported driver (51 pushed), and the
+All answers equal DuckDB's. The 139 edge cases are unchanged: 139/139 with the ported driver (48 pushed, see below), and the
 same 8 differences as before with `main`. Not measured: the fallback when a driver refuses a conjunct.
 
 ## Measured so far (2026-11-05)
@@ -81,8 +81,10 @@ DuckDB evaluating the same rows. With mssql-adbc unchanged (`main`, `590a2d0`): 
 
 The provider changes no answer by itself: every difference is the driver's translation.
 
-With our emitter ported into the driver (branch below): **139/139 agree, 51 pushed** — exactly the 51 our own
-SqlServer provider pushes, none fewer.
+With our emitter ported into the driver (branch below): **139/139 agree, 48 pushed** (re-measured 2026-11-06 on
+`e2175b7`). Our SqlServer provider pushes 51; the three it pushes and this provider keeps local are declined on
+purpose: `grouping sets dup` reads the same rows twice (gap 1, unless `consistent_reads`), and `scalar sum corr` /
+`scalar count corr` carry the any-row hint the driver does not read (gap 3). Before those declines it was 51.
 
 ## Limitations (2026-11-05)
 
@@ -147,7 +149,7 @@ importer, "Undefined error"), `Prepare` / `ExecuteSchema`, source-generated JSON
 under NativeAOT), a stream that knows its schema before the first batch, quoted column names from `cslschema`
 (`['1mbin']`), and `notruncation` (Kusto cuts a result at 500 000 rows and puts the error inside the rows).
 
-## The mssql-adbc side (branch `fabricator-tsql` in `D:/repos/mssql-adbc`, local only)
+## The mssql-adbc side (branch `fabricator-tsql`, draft PR clast-project/mssql-adbc#32)
 
 Our T-SQL emitter started as a copy of mssql-adbc's at `677676c`; upstream has not changed those files since.
 The branch copies ours back, with what mssql-adbc's build demands that ours never had to: the dialect YAML entry
@@ -168,3 +170,50 @@ Open questions before an upstream PR:
 4. **DuckDB assumptions.** Some refusals follow what DuckDB does rather than what the plan says (e.g. a domain
    error is NaN in DuckDB). A driver for any client should read the plan's function options
    (`on_domain_error`, `on_division_by_zero`, …) instead; our producer would then have to state them.
+
+## Plan for upstream PRs (inventory 2026-11-05)
+
+**Sent 2026-11-06:** #30 (row 1, the empty grouping set kept with a LEFT JOIN from one constant row, not refused) and
+#31 (row 2, code points under `Latin1_General_100_CS_AS_SC_UTF8`), each off upstream `main` with hand-built-plan
+translation tests and execution tests; #32 is the whole port as a DRAFT, a report to take from, not for merge. Small
+PRs for the other rows were dropped for now (user decision): the maintainers can take what they want from #32.
+
+mssql-adbc tests its emitter in three ways: `SubstraitTranslationTests` build a plan by hand (`SubstraitPlanBuilder`)
+and expect the exact T-SQL text, which `AssertParses` also runs through the T-SQL parser (no server);
+`SubstraitExecutionTests` run such plans against a server and check rows; `DataFusionFixtureTests` translate plans
+another producer wrote. The port adds about 1160 lines to the emitter and 600 to the function catalog **and no test of
+its own**: everything it does is covered only by our suites, which go through DuckDB's producer and our host. A
+reviewer can neither run those nor read from them which plan gives which SQL. So every PR below needs, per rule, one
+translation test with a minimal hand-built plan, plus an execution test wherever correctness depends on what the
+server does (those are exactly the places our wrong answers came from).
+
+The port breaks 23 of upstream's tests (16 in fixtures). Each is accounted for below.
+
+| # | change (our commit) | kind | upstream tests it breaks | tests to write | PR |
+|---|---|---|---|---|---|
+| 1 | ROLLUP / CUBE / grouping sets with the empty set refused: SQL Server returns no grand-total row on an empty input (`6326b54`) | **bug fix** | fixtures `grouping_sets`, `rollup`, `cube`; `GroupingSetsAppendTheSetIndex` | execution: empty input, DuckDB's answer has the total row. Better than refusing: emit the total via a separate branch | A |
+| 2 | string positions and lengths in code points, `CHARINDEX` per code point (`24af628`) | **bug fix** (supplementary characters) | `ExpressionsSupportedOnlyByWorkarounds` (expected text) | execution with a surrogate pair | A |
+| 3 | float → integer cast rounds half to even, decimal → integer half away from zero, where T-SQL `CAST` truncates (`24af628`) | **DuckDB semantics** — Substrait leaves a cast's rounding open | — | ask the maintainers whether a plan option should carry it; until then ours | ? |
+| 4 | correlated scalar subquery (single join) as `OUTER APPLY (SELECT TOP (1) …, COUNT_BIG(*) OVER ())` raising error 512 for more than one row (`71dfc4f`, `aeaaf53`) | **wider** (upstream refuses it) | fixture `correlated_scalar_subquery` (expects a refusal) | translation + execution: 0 / 1 / 2 rows | B |
+| 5 | `IN` / `NOT IN` filters as semi / anti joins, three-valued NOT IN (`226ce05`) | wider | — | execution with NULL in the list and in the column | B |
+| 6 | long `IN` lists as one OPENJSON array (`bd367e3`) | wider, needs a server fact (compatibility level ≥ 130) | — | translation (threshold), execution: 1000 keys, NULL | B |
+| 7 | window functions (`f931434`; upstream has none) | wider | — | translation per frame kind, execution for ranking + running sum | C |
+| 8 | `||`, trim (17 space code points), left / right, lpad / rpad, `date_trunc`, `date_diff`, `last_day`, `make_date`, `round_calendar` (`e1cd8c4`, `5d21c06`, `24af628`) | wider | `Dialect_FunctionsMatchTranslatorCatalog` (dialect YAML lacks them) | translation each; execution where a rule is subtle (trim set, date_diff boundaries) | C |
+| 9 | exact string equality / GROUP BY / DISTINCT / join keys (UTF-8 key with sentinel, sized to the column), indexable prefilter, string min / max by code point (`d86252a`, `c246237`) | **contract change**: upstream documents collation-based comparison and offers "the database's collation" | fixtures `aggregates`, `union_distinct`, `string_ordering`, `aggregate_sort_limit`, `case_sensitive_group`, `in_subquery`, `order_limit_offset`, `left_join_extra_condition`, `distinct`, `in_list`; `StringsGetTheCollationUnlessTurnedOff`; `DatabaseCollationIgnoresCase` (**a regression**: the port ignores the database-collation mode) | option, off by default; execution: trailing spaces, case, unpaired surrogates | D |
+| 10 | float math refused when DuckDB's result differs (`sqrt`, `ln`, `log*`, `asin`, `acos`, `power`, division by zero) (`6408792`, `baedf5a`) | **DuckDB assumption** — upstream already reads `on_domain_error` / `on_division_by_zero` from the plan | fixture `math`; dialect test | none upstream: drop from the port, have **our producer** state the options instead (to_substrait) | ours |
+| 11 | `substring` with a non-constant or negative start refused (`24af628`) | DuckDB assumption — upstream reads `negative_start` | `StringFunctions` | as 10 | ours |
+| 11b | further refusals where T-SQL differs from DuckDB: `any_value` (T-SQL MAX), binary `=` / GROUP BY ignoring trailing zero bytes, `reverse` per code unit, `regexp_*`, decimal arithmetic past precision 38 losing scale | documented upstream differences or DuckDB semantics | — | a strict mode could refuse them; otherwise ours | D or ours |
+| 12 | INSERT … SELECT / CTAS, DELETE / UPDATE as a `WriteRel` (`07a4bfc`, `fbb0468`) | wider, standard Substrait | — | translation + execution per op; needs an ADBC entry that executes a write plan | E (ask first) |
+| 13 | MERGE (`fabricator.merge`), the moved CTE (`DELETE … OUTPUT INTO`), catalog UDFs, TVFs and `CROSS APPLY`, the `repeated_reads` / `single_join_any_row` hints, `extension:fabricator:*` URNs (`7e1e77f`, `7938f7a`, `5ddccf6`, `f68912d`, `54fe62f`, `8c03a10`) | **ours** | — | — | stays ours until a neutral encoding exists |
+| 14 | a malformed collation name throws `SubstraitTranslationException` instead of the `AdbcException` the statement API promises | **regression in the port** | `StatementTranslatesAndDescribesPlans` | fix in the port | — |
+| 15 | regexp refusal message no longer names RE2 | wording | `RejectsWhatCannotBeTranslatedFaithfully` | keep upstream's wording | — |
+
+Server facts our emitter gets from the provider and the driver does not have yet: string column byte lengths (9),
+uncollatable columns (9), compatibility level (6), the SQL Server 2022 gate (8, trim with characters). Each PR that
+needs one must also teach the driver to read it (`sys.columns`, `DATABASEPROPERTYEX`, `SERVERPROPERTY`).
+
+`avg` over integers (an integer division inside `AVG`, recorded in duckdb-2.0-remote-execution.md §3.2) is fixed upstream meanwhile (`Widened`); it is not on the list.
+
+Order: **A** first (bug fixes, smallest, no contract question), then B and C (wider translations, each self-contained),
+D as an option once A–C are in, E only after asking the maintainers. 10 and 11 are not upstream work: the port should
+go back to upstream's plan-option reading, and DuckDB's semantics belong in what our producer writes into the plan.
