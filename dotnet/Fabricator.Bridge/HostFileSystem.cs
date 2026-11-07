@@ -78,6 +78,12 @@ internal static unsafe class HostFs
             byte* err = null;
             nint file;
             int rc = _h.FsOpenRead(opener, (byte*)pathPtr, &file, &err);
+            if (rc == FabricatorStatus.NotFound)
+            {
+                // Still an IOException for every caller that catches one; the type says which kind.
+                var msg = HostError("fs_open_read", err).Message;
+                throw new System.IO.FileNotFoundException(msg, path);
+            }
             if (rc != 0)
             {
                 throw HostError("fs_open_read", err);

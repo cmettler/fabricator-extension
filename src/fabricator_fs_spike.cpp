@@ -64,7 +64,18 @@ int32_t HostFsOpenRead(FabricatorHandle opener, const char *path, FabricatorHand
 		// FileOpener (secret resolution for az://, s3://, …) — so we must NOT pass an explicit opener.
 		auto &ctx_ref = OpenerContext(opener, "fs_open_read");
 		auto &fs = FileSystem::GetFileSystem(ctx_ref);
-		auto handle = fs.OpenFile(path, FileOpenFlags::FILE_FLAGS_READ);
+		// NULL_IF_NOT_EXISTS: a missing file comes back as null instead of an exception, which on Windows is not
+		// just cheaper. DuckDB's local file system asks the Restart Manager who holds the file on EVERY failed
+		// open (AdditionalLockInfo), also for "not found": 70-80 ms per missing file, and every Delta table
+		// open looks for _delta_log/_last_checkpoint, which a table without a checkpoint does not have.
+		// httpfs answers a 404 the same way. A file system that ignores the flag still throws, as before.
+		auto handle = fs.OpenFile(path, FileOpenFlags::FILE_FLAGS_READ | FileOpenFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+		if (!handle) {
+			if (err) {
+				*err = DupErr(string("Cannot open file \"") + path + "\": not found");
+			}
+			return FABRICATOR_NOT_FOUND;
+		}
 		*out_file = reinterpret_cast<FabricatorHandle>(handle.release()); // closed via HostFsClose
 		return FABRICATOR_OK;
 	} catch (std::exception &e) {

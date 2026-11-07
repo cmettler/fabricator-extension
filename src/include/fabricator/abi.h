@@ -1278,7 +1278,8 @@ typedef struct FabricatorHostServices {
 	int32_t abi_version;
 	// Open `path` for reading via DuckDB's FileSystem. `opener` is the opaque host FileOpener handle (its
 	// ClientContext resolves secrets for az://, s3://, … ); valid only for the duration of the managed call
-	// that received it. *out_file receives an opaque file handle (close via fs_close).
+	// that received it. *out_file receives an opaque file handle (close via fs_close). A file that does not
+	// exist answers FABRICATOR_NOT_FOUND (where the file system can tell) instead of a generic error.
 	int32_t (*fs_open_read)(FabricatorHandle opener, const char *path, FabricatorHandle *out_file, char **err);
 	// File size in bytes.
 	int32_t (*fs_size)(FabricatorHandle file, int64_t *out_size, char **err);
