@@ -4618,6 +4618,15 @@ one request each. The setting applies to the whole database, so plain local file
 cached too (in buffer-pool memory, which DuckDB evicts under pressure). Measured on TPC-H SF1 in OneLake:
 39 s instead of 81 s for the 22 queries.
 
+**Snapshot cache.** A Delta catalog keeps the last snapshot of each table it has read. The next statement,
+also from a new transaction, does not replay the table's log from the start: it lists `_delta_log` and
+reads only the commits written since. A table dropped and re-created at the same path, by this or another
+process, is recognised and read in full: engineered-wood compares the log files it holds with the listing,
+by ETag on S3 and ADLS and by size and modification time on a local or mounted path.
+Turn it off with the ATTACH option `snapshot_cache false`.
+Measured on TPC-H SF1 in OneLake, together with the file cache: 26–28 s instead of 51–71 s for the 22
+queries.
+
 ### Running inside a Fabric notebook
 
 On Fabric compute the extension authenticates with the **ambient notebook token** — no secret, no service
@@ -5288,6 +5297,7 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
 | `schemas` | `'none'` | flat layout; `'onelevel'` / `'nested'` opt in |
 | `isolation_level` | **`write_serializable`** | Concurrent **disjoint-row DML on one file composes** instead of conflicting — row-level concurrency is a `write_serializable`-only relaxation, and it is why this is the default. ⚠ **It does NOT match Fabric Spark**, which commits at `Serializable` and whose DDL will not even set `WriteSerializable`: on a table that declares no `delta.isolationLevel` we are the more permissive writer, so the effective guarantee depends on which engine wrote last. Attach `isolation_level 'serializable'` to align. (Was `serializable` between 2026-08-01 and 2026-08-11.) |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
+| `snapshot_cache` | **`true`** | the catalog keeps each table's last snapshot and later statements only read the log written since (see below); `false` replays the whole log on every open |
 
 **Concurrent writers from another engine (Spark, Databricks, delta-rs).** A writer records in its commit
 whether its transaction read anything (`commitInfo.isBlindAppend`); under `write_serializable` a commit

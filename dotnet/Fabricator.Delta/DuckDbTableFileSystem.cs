@@ -214,7 +214,32 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             var modified = entry.ModifiedMs >= 0
                 ? DateTimeOffset.FromUnixTimeMilliseconds(entry.ModifiedMs)
                 : UnknownModified;
-            yield return new TableFileInfo(ToRelative(entry.Path), size, modified);
+            if (!_root.Contains("://"))
+            {
+                // A local glob reports whole seconds at best, and a local file has no ETag, so size and time are
+                // all engineered-wood has to recognise a log replaced under a held snapshot (#740). Two same-size
+                // commits written within one second would look identical; the file system's own time does not.
+                try
+                {
+                    var fi = new System.IO.FileInfo(entry.Path);
+                    if (fi.Exists)
+                    {
+                        modified = new DateTimeOffset(fi.LastWriteTimeUtc, TimeSpan.Zero);
+                    }
+                }
+                catch
+                {
+                    // stays as the glob reported it
+                }
+            }
+            // An object store's listing carries the object's ETag (S3 fills it), which identifies the object better
+            // than size and time can. ⚠ NOT for a local root: DuckDB fills a local "etag" too, but it is built from
+            // device, file id, size and modification time, and on Linux that time is whole seconds and the file id
+            // an inode number, which a re-created file can get back at once. A log dropped and re-created within a
+            // second with same-size commits would then read as the same object. Size and the full-resolution time
+            // above tell those apart.
+            var etag = _root.Contains("://") ? entry.ETag : null;
+            yield return new TableFileInfo(ToRelative(entry.Path), size, modified) { ETag = etag };
         }
         await Task.CompletedTask.ConfigureAwait(false);
     }
@@ -788,7 +813,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     /// </summary>
     internal static readonly DateTimeOffset UnknownModified = DateTimeOffset.MinValue;
 
-    private readonly record struct GlobEntry(string Path, long Size, long ModifiedMs);
+    private readonly record struct GlobEntry(string Path, long Size, long ModifiedMs, string? ETag);
 
     /// <summary>
     /// A local listing of a Delta log can leave out a commit that exists. POSIX leaves it open whether readdir
@@ -869,7 +894,9 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             var path = el.GetProperty("path").GetString() ?? string.Empty;
             long size = el.TryGetProperty("size", out var s) ? s.GetInt64() : -1;
             long modified = el.TryGetProperty("modified_ms", out var m) ? m.GetInt64() : -1;
-            result.Add(new GlobEntry(path, size, modified));
+            string? etag = el.TryGetProperty("etag", out var e) && e.ValueKind == JsonValueKind.String
+                ? e.GetString() : null;
+            result.Add(new GlobEntry(path, size, modified, string.IsNullOrEmpty(etag) ? null : etag));
         }
         return result;
     }

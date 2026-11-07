@@ -1,0 +1,163 @@
+# name: test/verify_delta_snapshot_cache.test
+# description: A Delta catalog keeps the last snapshot of each table across transactions and reopens from it
+#              (engineered-wood #740). It must stay exactly as fresh as a full open: new commits are replayed, and
+#              a table dropped and re-created at the same path is recognised and rebuilt. Two ATTACHes of one
+#              root stand in for two processes: each catalog has its own snapshot store.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sc' AS a (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sc' AS b (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE a.main.t AS SELECT i::INTEGER AS id FROM range(1, 4) r(i);
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+# ============================================================================
+# 1. A SECOND STATEMENT OPENS FROM THE STORED SNAPSHOT. Each autocommit statement is its own transaction, so
+#    without the store every one replays the log.
+# ============================================================================
+
+query I
+SELECT sum(id) FROM a.main.t;
+----
+6
+
+query I
+SELECT sum(id) FROM a.main.t;
+----
+6
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta table open %/sc/t from snapshot%';
+----
+true
+
+# ============================================================================
+# 2. A COMMIT FROM ANOTHER CATALOG is replayed onto the stored snapshot.
+# ============================================================================
+
+statement ok
+INSERT INTO b.main.t VALUES (4);
+
+query II
+SELECT count(*), sum(id) FROM a.main.t;
+----
+4	10
+
+# ============================================================================
+# 3. THE TABLE DROPPED AND RE-CREATED BY THE OTHER CATALOG, up to the SAME version and with commits of the same
+#    size but other values. A local file has no ETag, so only the modification time tells the logs apart; a
+#    snapshot continued from the old log would answer 10, or mix the two tables.
+# ============================================================================
+
+statement ok
+DROP TABLE b.main.t;
+
+statement ok
+CREATE TABLE b.main.t AS SELECT i::INTEGER AS id FROM range(6, 9) r(i);
+
+statement ok
+INSERT INTO b.main.t VALUES (5);
+
+query II
+SELECT count(*), sum(id) FROM a.main.t;
+----
+4	26
+
+query II
+SELECT count(*), sum(id) FROM b.main.t;
+----
+4	26
+
+# ============================================================================
+# 4. TIME TRAVEL after the replacement reads the NEW table's history. A CTAS commits twice here: v0 creates the
+#    empty table, v1 adds the rows. The old table's v1 held 1, 2, 3 (sum 6).
+# ============================================================================
+
+query II
+SELECT count(*), sum(id) FROM a.main.t AT (VERSION => 0);
+----
+0	NULL
+
+query II
+SELECT count(*), sum(id) FROM a.main.t AT (VERSION => 1);
+----
+3	21
+
+# ============================================================================
+# 5. READ, WRITE AND READ AGAIN in one explicit transaction, then from a fresh one.
+# ============================================================================
+
+statement ok
+BEGIN;
+
+query I
+SELECT sum(id) FROM a.main.t;
+----
+26
+
+statement ok
+INSERT INTO a.main.t VALUES (100);
+
+query I
+SELECT sum(id) FROM a.main.t;
+----
+126
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(id) FROM a.main.t;
+----
+5	126
+
+query II
+SELECT count(*), sum(id) FROM b.main.t;
+----
+5	126
+
+# ============================================================================
+# 6. snapshot_cache false: every open replays the log, none starts from a stored snapshot.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sc_off' AS c (TYPE fabricator, PROVIDER 'delta', snapshot_cache false);
+
+statement ok
+CREATE TABLE c.main.t AS SELECT i::INTEGER AS id FROM range(1, 4) r(i);
+
+query I
+SELECT sum(id) FROM c.main.t;
+----
+6
+
+query I
+SELECT sum(id) FROM c.main.t;
+----
+6
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta table open %/sc_off/t from snapshot%';
+----
+0
+
+# ...while the first catalog kept using it (the positive control for the zero above).
+query I
+SELECT count(*) > 1 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta table open %/sc/t from snapshot%';
+----
+true

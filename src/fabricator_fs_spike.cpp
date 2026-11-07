@@ -174,11 +174,24 @@ int32_t HostFsGlob(FabricatorHandle opener, const char *pattern, char **out_json
 					}
 				}
 			}
+			// The object's ETag, where the listing has one (httpfs's S3 listing does): it identifies the object
+			// better than size and time, which is what lets a held Delta snapshot be recognised as stale.
+			string etag;
+			if (files[i].extended_info) {
+				auto it = files[i].extended_info->options.find("etag");
+				if (it != files[i].extended_info->options.end() && !it->second.IsNull()) {
+					etag = it->second.ToString();
+				}
+			}
 			if (i) {
 				json += ",";
 			}
 			json += "{\"path\":\"" + JsonEscape(p) + "\",\"size\":" + std::to_string(size) +
-			        ",\"modified_ms\":" + std::to_string(modified_ms) + "}";
+			        ",\"modified_ms\":" + std::to_string(modified_ms);
+			if (!etag.empty()) {
+				json += ",\"etag\":\"" + JsonEscape(etag) + "\"";
+			}
+			json += "}";
 		}
 		json += "]";
 		*out_json = DupErr(json);

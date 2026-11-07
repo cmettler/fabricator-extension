@@ -321,6 +321,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     // falls back to the C# reader (the native path has no DeleteFilter / rowid / snapshot logic — those are
     // follow-ups). Purely a byte-source switch inside ScanTable — no C++/ABI change.
     private readonly bool _nativeRead;
+    // ATTACH `snapshot_cache` (default true): see DeltaCatalog.SnapshotStore.cs.
+    private readonly bool _snapshotCache;
 
     /// <summary>Whether this catalog reads natively (read_parquet) — consulted by the bound table's
     /// virtual-columns answer, which only exists under the native reader.</summary>
@@ -571,6 +573,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                                  ?? DeltaParquetVersion.Default;
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
         _nativeRead = ParseBoolOption(optionsJson, "native_read", nativeDefaults.Read);
+        _snapshotCache = ParseBoolOption(optionsJson, "snapshot_cache", true);
         _nativeWrite = ParseBoolOption(optionsJson, "native_write", nativeDefaults.Write);
         _deleteTrustsStatistics = ParseBoolOption(optionsJson, "delete_trusts_statistics");
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
@@ -5173,6 +5176,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         var schemaName = SchemaLeaf(schemaPath);
         InvalidateReadCache();
         _tableConfigCache.TryRemove(TablePath(schemaPath, tableName), out _);
+        ForgetSnapshot(TablePath(schemaPath, tableName));
         long dropTxn = AmbientTransaction.Current;
         // CREATE + DROP inside one transaction still CANCELS OUT for the buffer — but the table IS on storage
         // now (hoist slice 5), so unlike before, the real drop below must actually run. Discard this

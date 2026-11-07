@@ -572,7 +572,19 @@ internal static class DeltaReader
         DmlLog.LogDebug("delta table open {Path} (txn={Txn}) — cache miss", path, bound?.OwnerId ?? 0);
         // outlivesThisCall: the filesystem must not capture the host opener when it is about to be cached.
         var fs = TableFileSystems.Create(opener, path, outlivesThisCall: retainable);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        // Start from the snapshot an earlier transaction of this catalog saw (DeltaCatalog.SnapshotStore): one
+        // listing when nothing is new. engineered-wood rebuilds wherever continuing from it is not provably right.
+        var catalog = retainable ? bound!.Catalog : null;
+        var stored = catalog?.StoredSnapshot(path);
+        var table = stored is null
+            ? await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false)
+            : await DeltaTable.OpenAsync(fs, stored, DeltaWriter.Options()).ConfigureAwait(false);
+        if (stored is not null)
+        {
+            DmlLog.LogDebug("delta table open {Path} from snapshot v{From} -> v{To}", path, stored.Version,
+                table.CurrentSnapshot.Version);
+        }
+        catalog?.StoreSnapshot(path, table.CurrentSnapshot);
         if (!retainable)
         {
             return (new DeltaTableBinding.OpenTable(table, fs), false);

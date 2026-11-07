@@ -181,10 +181,17 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
                 {
                     continue;
                 }
+                // The ETag is what lets engineered-wood tell, on a later listing, that the object at a log path is
+                // still the one a held snapshot was built from (#740: a table dropped and re-created at the same
+                // path). Without it a snapshot can only be confirmed by size and time.
+                var etag = item.ETag.ToString();
                 yield return new TableFileInfo(
                     ToRelative(name),
                     item.ContentLength ?? 0,
-                    item.LastModified);
+                    item.LastModified)
+                {
+                    ETag = string.IsNullOrEmpty(etag) ? null : etag,
+                };
             }
         }
         finally
