@@ -256,6 +256,12 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     /// </summary>
     private bool ResolvedExists(string resolved)
     {
+        if (IsLocalWindowsRoot)
+        {
+            // An open can fail on an existing file for a moment (LockedLocalFile), and here that would read as
+            // "absent". The name is what the question is about.
+            return System.IO.File.Exists(resolved);
+        }
         try
         {
             nint file = HostFs.OpenRead(Opener, resolved);
@@ -266,6 +272,33 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         {
             return false;
         }
+    }
+
+    private bool IsLocalWindowsRoot => OperatingSystem.IsWindows() && !_root.Contains("://");
+
+    /// <summary>How often an existing local file that cannot be opened is retried (about 2 s in all).</summary>
+    private const int LockedFileRetries = 120;
+
+    /// <summary>
+    /// Whether a failed open is a local Windows file that EXISTS but is held by another handle that does not share
+    /// reading. Our own commit publish cannot cause that (the content is written under a temporary name and moved
+    /// into place, measured: 0 sharing violations in 36,000 opens racing the move, against ~450,000 when the same
+    /// file is created and then written), so the holder is outside the process — an on-access scanner opening the
+    /// new commit (G DATA locally, Defender on the CI runners). It failed verify_delta_concurrent_dml's concurrent
+    /// UPDATEs with "being used by another process" on a commit JSON, about 1 run in 20 on two cores (2026-11-06).
+    /// Decided by existence, not by the error text, which is localized.
+    /// </summary>
+    private bool LockedLocalFile(string path)
+    {
+        if (!IsLocalWindowsRoot || !System.IO.File.Exists(Resolve(path)))
+        {
+            return false;
+        }
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "locked file {Path}: retrying the open", path);
+        }
+        return true;
     }
 
     /// <summary>How often a zero-length commit file is re-read before it is reported (about 2 s in all).</summary>
@@ -356,6 +389,10 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
                                                               StringComparison.OrdinalIgnoreCase))
             {
                 // concurrent in-place overwrite — reopen for a consistent newer copy
+            }
+            catch (Exception) when (attempt < LockedFileRetries && LockedLocalFile(path))
+            {
+                Thread.Sleep(Math.Min(attempt, 20));
             }
         }
     }
