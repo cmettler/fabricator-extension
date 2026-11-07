@@ -249,8 +249,30 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
             Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls read-all {Path}", path);
         }
         var file = ReadFile(path);
-        var content = await file.ReadContentAsync(cancellationToken).ConfigureAwait(false);
-        return content.Value.Content.ToArray();
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            var content = await file.ReadContentAsync(cancellationToken).ConfigureAwait(false);
+            var bytes = content.Value.Content.ToArray();
+            LogReadAll(path, "ok", start);
+            return bytes;
+        }
+        catch (RequestFailedException ex)
+        {
+            LogReadAll(path, ex.Status.ToString(System.Globalization.CultureInfo.InvariantCulture), start);
+            throw;
+        }
+    }
+
+    // How long a whole-file read of a log file took, and how it ended: a stalled request shows up here as a
+    // multiple of the per-try timeout (StorageReadOptions), which is otherwise invisible from SQL.
+    private void LogReadAll(string path, string outcome, long start)
+    {
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls read-all {Path} -> {Outcome} in {Ms} ms",
+                path, outcome, (long)System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds);
+        }
     }
 
     public async ValueTask<ISequentialFile> CreateAsync(
