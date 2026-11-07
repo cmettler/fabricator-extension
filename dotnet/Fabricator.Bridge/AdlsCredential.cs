@@ -91,12 +91,16 @@ public sealed class AdlsCredential
 
     /// <summary>A <c>DataLakeFileSystemClient</c> for <paramref name="fileSystem"/> on <paramref name="host"/>
     /// (the host parsed out of the <c>abfss://</c> path — see the class remarks on why it wins).</summary>
-    public DataLakeFileSystemClient CreateFileSystemClient(string host, string fileSystem)
+    /// <paramref name="options"/>: null = the SDK defaults; <see cref="StorageReadOptions.Create"/> for a client
+    /// that only reads.
+    public DataLakeFileSystemClient CreateFileSystemClient(string host, string fileSystem,
+                                                           DataLakeClientOptions? options = null)
     {
         var uri = new Uri($"https://{host}/{fileSystem}");
+        options ??= new DataLakeClientOptions();
         return _sharedKey is not null
-            ? new DataLakeFileSystemClient(uri, _sharedKey)
-            : new DataLakeFileSystemClient(uri, _token ?? FabricCredentialResolver.AmbientChain());
+            ? new DataLakeFileSystemClient(uri, _sharedKey, options)
+            : new DataLakeFileSystemClient(uri, _token ?? FabricCredentialResolver.AmbientChain(), options);
     }
 
     /// <summary>A <c>DataLakeDirectoryClient</c> for a directory under <paramref name="fileSystem"/> — the

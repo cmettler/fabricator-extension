@@ -51,12 +51,15 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
     private static readonly Microsoft.Extensions.Logging.ILogger IoLog =
         FabricatorLog.CreateLogger("Fabricator.Adls.Fs");
     private readonly DataLakeFileSystemClient _fs;
+    // Reads: short per-try timeout (StorageReadOptions). Writes and commits keep _fs and the SDK defaults.
+    private readonly DataLakeFileSystemClient _readFs;
     private readonly string _rootUnderFs; // path of the table root within the filesystem (e.g. "lh.Lakehouse/Tables/t")
 
     public AdlsGen2TableFileSystem(string rootAbfss, AdlsCredential credential)
     {
         var (host, fileSystem, pathUnderFs) = ParseAbfss(rootAbfss);
         _fs = credential.CreateFileSystemClient(host, fileSystem);
+        _readFs = credential.CreateFileSystemClient(host, fileSystem, StorageReadOptions.Create());
         _rootUnderFs = pathUnderFs.TrimEnd('/');
     }
 
@@ -110,6 +113,7 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
     }
 
     private DataLakeFileClient File(string path) => _fs.GetFileClient(Resolve(path));
+    private DataLakeFileClient ReadFile(string path) => _readFs.GetFileClient(Resolve(path));
 
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix, [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -143,7 +147,7 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         AsyncPageable<PathItem> pages;
         try
         {
-            pages = _fs.GetPathsAsync(dirUnderFs, recursive: true, cancellationToken: cancellationToken);
+            pages = _readFs.GetPathsAsync(dirUnderFs, recursive: true, cancellationToken: cancellationToken);
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
         {
@@ -205,7 +209,7 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         {
             Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls open {Path}", path);
         }
-        var file = File(path);
+        var file = ReadFile(path);
         long length = (await file.GetPropertiesAsync(cancellationToken: cancellationToken).ConfigureAwait(false)).Value.ContentLength;
         return new OneLakeRandomAccessFile(file, length, buffered: length <= BufferedReadMax);
     }
@@ -216,7 +220,7 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         {
             Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls exists {Path}", path);
         }
-        return (await File(path).ExistsAsync(cancellationToken).ConfigureAwait(false)).Value;
+        return (await ReadFile(path).ExistsAsync(cancellationToken).ConfigureAwait(false)).Value;
     }
 
     /// <summary>
@@ -244,7 +248,7 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         {
             Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls read-all {Path}", path);
         }
-        var file = File(path);
+        var file = ReadFile(path);
         var content = await file.ReadContentAsync(cancellationToken).ConfigureAwait(false);
         return content.Value.Content.ToArray();
     }

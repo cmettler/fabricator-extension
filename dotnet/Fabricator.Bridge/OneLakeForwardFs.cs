@@ -76,6 +76,12 @@ internal static class OneLakeForwardFs
     private static DataLakeFileSystemClient FsClient(string fsName, TokenCredential cred)
         => new DataLakeFileSystemClient(new Uri($"https://{OneLakeHost}/{fsName}"), cred);
 
+    // Reads (open, ranged read, listing, exists) take the short per-try timeout; see StorageReadOptions.
+    private static readonly DataLakeClientOptions ReadOptions = StorageReadOptions.Create();
+
+    private static DataLakeFileSystemClient ReadFsClient(string fsName, TokenCredential cred)
+        => new DataLakeFileSystemClient(new Uri($"https://{OneLakeHost}/{fsName}"), cred, ReadOptions);
+
     /// <summary>Open a file for reading: returns the handle + the file length (+ the cache-validation
     /// identity when a properties fetch happened). <paramref name="knownSize"/> &gt;= 0 (from a listing's
     /// extended info) skips the per-file GetProperties round trip — constructing the client itself does no
@@ -85,7 +91,7 @@ internal static class OneLakeForwardFs
         string path, string? credJson, long knownSize = -1)
     {
         var (fs, p) = Parse(path);
-        var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
+        var client = ReadFsClient(fs, Cred(credJson)).GetFileClient(p);
         if (knownSize >= 0)
         {
             if (Log.IsEnabled(LogLevel.Debug))
@@ -216,7 +222,7 @@ internal static class OneLakeForwardFs
         {
             Log.LogDebug("onelake glob {Pattern} (listing {Dir})", p, dir);
         }
-        var client = FsClient(fs, Cred(credJson));
+        var client = ReadFsClient(fs, Cred(credJson));
         var sb = new StringBuilder("[");
         bool firstItem = true;
         try
@@ -289,7 +295,7 @@ internal static class OneLakeForwardFs
         {
             Log.LogDebug("onelake exists {Path}", p);
         }
-        var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
+        var client = ReadFsClient(fs, Cred(credJson)).GetFileClient(p);
         try
         {
             var props = client.GetPropertiesAsync().GetAwaiter().GetResult().Value;
