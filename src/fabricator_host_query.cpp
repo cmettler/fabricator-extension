@@ -14,6 +14,8 @@
 #include "fabricator/clr_host.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_format.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp" // ArrowArrayStreamWrapper (our arrow_scan factory)
 #include "duckdb/function/table/arrow.hpp" // ArrowScanFactory (2.0: arrow_scan takes bind info)
@@ -91,6 +93,9 @@ struct HostQueryStream {
 	shared_ptr<HostConnection> pin;
 	unique_ptr<PreparedStatement> prepared; // kept alive for the param path (the streaming result references it)
 	unique_ptr<QueryResult> result;         // a StreamQueryResult — fetched lazily (bounded memory)
+	//! A reading SELECT submitted in DuckDB's Arrow result format (see SubmitInArrowFormat): each producer thread
+	//! converts its own chunks, get_next pops finished arrays. Null when the chunk path above is used.
+	unique_ptr<QueryResultStream<ArrowFormat>> arrow_stream;
 	vector<LogicalType> types;
 	//! Columns whose declared type was SQLNULL and is reported as INTEGER instead — see
 	//! PromoteNullColumns. Empty on every ordinary query.
@@ -271,12 +276,98 @@ int HostQueryGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
 	return 0;
 }
 
+//! Owns the two buffers of an all-null INT32 Arrow array.
+struct NullIntegersArray {
+	duckdb::vector<uint8_t> validity;
+	duckdb::vector<int32_t> values;
+	const void *buffers[2];
+};
+
+void ReleaseNullIntegers(ArrowArray *array) {
+	delete static_cast<NullIntegersArray *>(array->private_data);
+	array->release = nullptr;
+}
+
+//! The Arrow-format twin of the chunk path's PromoteNullColumns: DuckDB exports a SQLNULL column as an Arrow
+//! null array with null_count 0, which Apache.Arrow refuses, and the schema already declares the column INTEGER.
+//! So the array is swapped for an INT32 array of the same length, every value null. Releasing the old child
+//! in place is safe: a parent's release only calls children whose release is still set.
+void ReplaceWithNullIntegers(ArrowArray &child) {
+	auto length = child.length;
+	if (child.release) {
+		child.release(&child);
+	}
+	auto *holder = new NullIntegersArray();
+	holder->validity.assign((size_t)((length + 7) / 8), 0);
+	holder->values.assign((size_t)length, 0);
+	holder->buffers[0] = holder->validity.data();
+	holder->buffers[1] = holder->values.data();
+	std::memset(&child, 0, sizeof(child));
+	child.length = length;
+	child.null_count = length;
+	child.n_buffers = 2;
+	child.buffers = holder->buffers;
+	child.release = ReleaseNullIntegers;
+	child.private_data = holder;
+}
+
+//! Whether a statement goes out in DuckDB's Arrow result format, converted to Arrow by the producer threads
+//! instead of chunk by chunk on the one thread that drains the stream. That single-threaded conversion was the
+//! cost of every native Delta scan: 6M rows x 3 columns took 0.13 s through the chunk path at 20 threads and
+//! 0.07 s in the Arrow format, against 0.03 s for the query run in place (TPC-H SF1 local 11.6 s -> 9.7 s).
+//! Only for a caller that asked for batches (batch_rows > 0, i.e. a reading scan whose batches are morsels)
+//! and only for a SELECT: the format streams the result, and a stream released before its end aborts the
+//! statement, which would roll back a CREATE TEMP TABLE nobody reads to the end.
+//! FABRICATOR_HOST_QUERY_ARROW_FORMAT=0 turns it off.
+bool UseArrowFormat(const SQLStatement &statement, idx_t rows) {
+	static const bool disabled = []() {
+		const char *env = std::getenv("FABRICATOR_HOST_QUERY_ARROW_FORMAT");
+		return env && std::string(env) == "0";
+	}();
+	return !disabled && rows > 0 && statement.type == StatementType::SELECT_STATEMENT;
+}
+
+//! The Arrow format encodes with the connection's own Arrow settings, while this boundary always speaks plain
+//! Arrow (BoundaryClientProperties). A session that differs is set back here; false if that fails, and the
+//! caller then keeps the chunk path.
+bool AlignArrowSettings(Connection &conn) {
+	auto p = conn.context->GetClientProperties();
+	const char *sets[] = {
+	    p.arrow_offset_size != ArrowOffsetSize::REGULAR ? "SET SESSION arrow_large_buffer_size = false" : nullptr,
+	    p.arrow_use_list_view ? "SET SESSION arrow_output_list_view = false" : nullptr,
+	    p.produce_arrow_string_view ? "SET SESSION produce_arrow_string_view = false" : nullptr,
+	    p.arrow_lossless_conversion ? "SET SESSION arrow_lossless_conversion = false" : nullptr,
+	};
+	for (auto *sql : sets) {
+		if (sql && conn.Query(sql)->HasError()) {
+			return false;
+		}
+	}
+	return true;
+}
+
 int HostQueryGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 	auto *st = static_cast<HostQueryStream *>(stream->private_data);
 	std::memset(out, 0, sizeof(*out));
 	try {
 		if (st->finished) {
 			return 0; // EOF already seen (mid-batch, while accumulating) — never re-Fetch a closed result
+		}
+		if (st->arrow_stream) {
+			auto array = st->arrow_stream->Fetch(); // runs tasks on this thread until an array is buffered
+			if (!array) {
+				if (st->arrow_stream->HasError()) {
+					throw IOException(st->arrow_stream->GetError());
+				}
+				st->finished = true;
+				return 0;
+			}
+			for (auto c : st->promoted_null_columns) {
+				ReplaceWithNullIntegers(*array->arrow_array.children[c]);
+			}
+			*out = array->arrow_array;
+			array->arrow_array.release = nullptr; // ownership moved to the consumer
+			return 0;
 		}
 		auto chunk = st->result->Fetch(); // next DataChunk, lazily; null at end. A streaming result can
 		                                   // surface a RUNTIME error here (vs at SendQuery) — caught below.
@@ -403,6 +494,9 @@ void HostQueryRelease(ArrowArrayStream *stream) {
 	// query runs while a streaming result of ours is alive, so the result must be GONE before the slot is
 	// released. Member destruction would do it in the right order too, but only by accident of declaration
 	// order — doing it explicitly is what keeps that true after the next edit to the struct.
+	if (st) {
+		st->arrow_stream.reset(); // before the connection, which the stream's query runs on
+	}
 	if (st && st->pin) {
 		st->result.reset();
 		st->prepared.reset();
@@ -983,7 +1077,13 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 				throw IOException("fabricator_host_query: " + leading->GetError());
 			}
 		}
-		result = conn->Submit(std::move(statements.back())); // streaming (lazy Fetch) — bounded memory
+		const char *env_rows = std::getenv("FABRICATOR_HOST_QUERY_BATCH_ROWS");
+		idx_t rows = env_rows && *env_rows ? (idx_t)std::max<long long>(std::atoll(env_rows), 0) : batch_rows;
+		if (UseArrowFormat(*statements.back(), rows) && AlignArrowSettings(*conn)) {
+			result = conn->Submit(std::move(statements.back()), make_shared_ptr<ArrowFormat>(rows));
+		} else {
+			result = conn->Submit(std::move(statements.back())); // streaming (lazy Fetch) — bounded memory
+		}
 	}
 	if (result->HasError()) { // bind/plan errors surface here; runtime errors surface during Fetch (get_next)
 		throw IOException("fabricator_host_query: " + result->GetError());
@@ -1004,7 +1104,11 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		st->names.push_back(n.GetIdentifierName());
 	}
 	st->batch_rows = batch_rows; // the caller's morsel-size request (ABI v85); 0 = one DataChunk
-	st->result = std::move(result);
+	if (result->Format().Name() == string(ArrowFormat::NAME)) {
+		st->arrow_stream = make_uniq<QueryResultStream<ArrowFormat>>(std::move(result));
+	} else {
+		st->result = std::move(result);
+	}
 	st->stream.get_schema = HostQueryGetSchema;
 	st->stream.get_next = HostQueryGetNext;
 	st->stream.get_last_error = HostQueryGetLastError;
