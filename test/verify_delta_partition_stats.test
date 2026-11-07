@@ -100,36 +100,39 @@ SET fabricator_partition_stats = true;
 #    column's bounds in that file may belong to a deleted row, so MIN/MAX over it scans.
 # ============================================================================
 
+# Every file of `t` holds one row, and a delete that would hide a file's last live row removes the file
+# instead of writing a vector (engineered-wood #739, as Spark does). So no vector exists after this delete, and
+# the remaining files' bounds are values again: MIN/MAX may come from the log.
 statement ok
 DELETE FROM lake.main.t WHERE id = 2;
 
 query II
-EXPLAIN SELECT count(*) FROM lake.main.t;
+EXPLAIN SELECT count(*), max(id) FROM lake.main.t;
 ----
 physical_plan	<!REGEX>:.*Fabricator Scan.*
-
-query I
-SELECT count(*) FROM lake.main.t;
-----
-3
-
-query II
-EXPLAIN SELECT max(id) FROM lake.main.t;
-----
-physical_plan	<REGEX>:.*Fabricator Scan.*
 
 query III
 SELECT count(*), max(id), max(d) FROM lake.main.t;
 ----
 3	9	2027-01-01
 
-# The row that held a file's max, deleted through a vector: the file's recorded max (10) is now a bound,
-# not a value, and answering from it would return 10.
+# A real vector: one file of ten rows, and the row that held its max deleted. The file's recorded max (10) is
+# now a bound, not a value, and answering from it would return 10, so MAX scans; the count stays metadata.
 statement ok
 CREATE TABLE lake.main.dv AS SELECT i::INTEGER AS id FROM range(1, 11) r(i);
 
 statement ok
 DELETE FROM lake.main.dv WHERE id = 10;
+
+query II
+EXPLAIN SELECT count(*) FROM lake.main.dv;
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query II
+EXPLAIN SELECT max(id) FROM lake.main.dv;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
 
 query II
 SELECT count(*), max(id) FROM lake.main.dv;

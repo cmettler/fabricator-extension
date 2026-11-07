@@ -3219,6 +3219,29 @@ blind claims where one is true.
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
 
+## THE 2026-11-08 BUMP — `089959f → 3dadb69`, twenty commits, zero patches (a fast-forward)
+
+- **#740 is in: #746 (`6a5f0d0`) recognises a log replaced under a held snapshot, #749 (`3dadb69`) opens a
+  `DeltaTable` from a held snapshot** (`DeltaTable.OpenAsync(fs, Snapshot startFrom, …)`: one listing plus the commits
+  after it, a full open wherever continuing is not provably right). Our issue; it is what the snapshot cache builds on.
+  ⚠ The replaced-log check compares the log files' identity: equal ETags, or without them equal size AND a known,
+  equal time (`LogFileIdentity`). `TableFileInfo` gained an optional `ETag` that EW's own Azure/S3/GCS listings fill;
+  OUR file systems must fill it themselves, or every reopen from a snapshot rebuilds.
+- **#739 (`8d2d418`): a vector delete that hides a file's last live row removes the file** instead of re-adding it
+  under a full vector, as Spark does. Broke `verify_delta_partition_stats` §3, whose files held one row each: the
+  delete left no vector, so MAX legitimately came from the log. The vector case moved to a ten-row file.
+- **#722 (`72b90c8`): a parquet data file opens in two round trips** (`ParquetReadOptions.FooterReadSize`, 64 KB
+  default); #717 plans a scan's files concurrently; #720 uploads Azure blocks / S3 parts in the background; #719 a
+  shared `MemoryBudget` (opt-in, null by default); change-feed and MERGE change-file work (#723, #725, #729, #732).
+- **#681: row-level `variant_get`** in DML predicates and CHECK constraints (known-issues lists three refusals and
+  two differences to Spark).
+- Unchanged and still worth an issue: `DeltaTable.OpenAsync(fs)` lists `_delta_log` twice and always reads
+  `_last_checkpoint` (draft `scratchpad/upstream/ew_open_round_trips_issue.md`, not filed).
+- Sweep: option records diffed (`MemoryBudget` x2, `FooterReadSize`, nothing else); `known-issues.md` and the host
+  guide's "Opening a handle per transaction" read.
+- Gates: compile zero; EW `DeltaLake.Tests` **834/834** and `DeltaLake.Table.Tests` **2793 passed / 309 skipped**
+  (net10.0); hermetic **94/94 — 12610**.
+
 ## THE 2026-11-05 BUMP — `3d3be76 → 5165c13`, two commits, zero patches (a fast-forward)
 
 - **#676 (`f0f90fd`, issue #675): per-path variant min/max for files EW shreds itself**, derived from the footer it
