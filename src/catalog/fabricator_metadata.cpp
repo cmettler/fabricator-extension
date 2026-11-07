@@ -243,6 +243,7 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 		caps.remote_select = yyjson_get_bool(yyjson_obj_get(root, "remote_select"));
 		caps.bind_schema_cacheable = yyjson_get_bool(yyjson_obj_get(root, "bind_schema_cacheable"));
 		caps.dml_returning = yyjson_get_bool(yyjson_obj_get(root, "dml_returning"));
+		caps.cache_local_files = yyjson_get_bool(yyjson_obj_get(root, "cache_local_files"));
 		caps.schema_by_name = yyjson_get_bool(yyjson_obj_get(root, "schema_by_name"));
 		// Absent or not a string reads as "no default schema of its own" — DuckDB's `main` then stands, which
 		// is what every catalog reported before this key existed.

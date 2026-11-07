@@ -8,6 +8,8 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp" // 2.0: DUCKDB_LOG_* macros live here
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_partition_util.hpp"
 
@@ -198,6 +200,20 @@ void FabricatorCatalog::RegisterDeclarationsLocked() {
 	}
 }
 
+//! Turns on DuckDB's GLOBAL `cache_local_files` for a catalog whose provider reads through a filesystem the
+//! ExternalFileCache does not count as remote (capability `cache_local_files`). Since upstream 8ff69049cd0
+//! (DuckDB 2.0) the cache serves only the fixed prefix list in `FileSystem::IsRemoteFile`, so our onelake://
+//! reads were refetched on every query. A value the user set, either way, is left alone. Process-wide by
+//! nature: it also caches plain local files, in evictable buffer-pool memory.
+static void EnableLocalFileCache(ClientContext &context) {
+	auto &config = DBConfig::GetConfig(context);
+	if (config.user_settings.IsSet(CacheLocalFilesSetting::SettingIndex)) {
+		return;
+	}
+	config.SetOption(CacheLocalFilesSetting::SettingIndex, Value::BOOLEAN(true));
+	DUCKDB_LOG_INFO(context, "fabricator: cache_local_files enabled for this catalog's files");
+}
+
 void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 
@@ -238,6 +254,9 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		schema_by_name_ = caps.schema_by_name;
 		default_schema_ = caps.default_schema;
 		pushdown_boundary_ = caps.pushdown_boundary;
+		if (caps.cache_local_files) {
+			EnableLocalFileCache(context);
+		}
 	} catch (std::exception &ex) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;

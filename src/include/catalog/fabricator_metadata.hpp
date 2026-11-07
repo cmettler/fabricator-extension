@@ -76,6 +76,10 @@ struct FabricatorCapabilities {
 	bool bind_schema_cacheable = false;
 	//! DELETE / UPDATE / MERGE … RETURNING: the provider returns the rows a rowid DML changed (ABI v98).
 	bool dml_returning = false;
+	//! The provider reads files through a filesystem DuckDB 2.0's ExternalFileCache does not treat as remote
+	//! (it caches only its own fixed prefix list), so the host turns on the GLOBAL `cache_local_files` at
+	//! ATTACH unless the user set it. Delta on OneLake (onelake://) reports it.
+	bool cache_local_files = false;
 	//! A discovery filter left schemas out, and the provider answers catalog_schema_exists (ABI v100) for a
 	//! schema a statement names: a filter bounds enumeration, never access by name.
 	bool schema_by_name = false;

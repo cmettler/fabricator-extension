@@ -1324,6 +1324,16 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             }
             // DELETE / UPDATE / MERGE … RETURNING (DeltaCatalog.Returning.cs)
             caps += ",\"dml_returning\":true";
+            // `cache_local_files`: the native reader opens a OneLake table through our onelake:// filesystem,
+            // and DuckDB 2.0's file cache only caches the remote prefixes it knows (upstream 8ff69049cd0), so
+            // without this every read refetches every byte (TPC-H SF1 on OneLake: 81 s -> 39 s). The host sets
+            // the GLOBAL setting unless the user set it. Not for the codec engine, which reads through the
+            // Azure SDK and never touches DuckDB's cache.
+            if (_nativeRead && (FabricLakehouse.IsOneLake(_root)
+                                || _root.StartsWith("onelake://", StringComparison.OrdinalIgnoreCase)))
+            {
+                caps += ",\"cache_local_files\":true";
+            }
             return "{" + caps + "}";
         }
     }
