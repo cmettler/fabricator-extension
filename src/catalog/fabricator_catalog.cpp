@@ -200,18 +200,26 @@ void FabricatorCatalog::RegisterDeclarationsLocked() {
 	}
 }
 
-//! Turns on DuckDB's GLOBAL `cache_local_files` for a catalog whose provider reads through a filesystem the
-//! ExternalFileCache does not count as remote (capability `cache_local_files`). Since upstream 8ff69049cd0
-//! (DuckDB 2.0) the cache serves only the fixed prefix list in `FileSystem::IsRemoteFile`, so our onelake://
-//! reads were refetched on every query. A value the user set, either way, is left alone. Process-wide by
-//! nature: it also caches plain local files, in evictable buffer-pool memory.
+//! Makes DuckDB's file cache serve a catalog whose provider reads through a filesystem the ExternalFileCache does
+//! not count as remote (capability `cache_local_files`): our onelake://. Since upstream 8ff69049cd0 (DuckDB 2.0) the
+//! cache serves only the fixed prefix list in `FileSystem::IsRemoteFile`, so those reads were refetched on every
+//! query. Two GLOBAL settings, each left alone if the user set it:
+//!   * `cache_local_files` = true, which lets the cache take such files at all;
+//!   * `external_file_cache_local_max_block_size` = the remote maximum (2 MB by default). A "local" file is split
+//!     into blocks of 16 KB, each fetched on its own, which for an object store means one request per 16 KB:
+//!     TPC-H Q1 on OneLake sent 2509 requests for lineitem and took 6-17 s, with 2 MB blocks 30 requests and
+//!     2.9-3.6 s. Plain local files only see large reads split less finely; the minimum stays one byte.
+//! Process-wide by nature: plain local files are cached too, in buffer-pool memory DuckDB evicts under pressure.
 static void EnableLocalFileCache(ClientContext &context) {
 	auto &config = DBConfig::GetConfig(context);
-	if (config.user_settings.IsSet(CacheLocalFilesSetting::SettingIndex)) {
-		return;
+	if (!config.user_settings.IsSet(CacheLocalFilesSetting::SettingIndex)) {
+		config.SetOption(CacheLocalFilesSetting::SettingIndex, Value::BOOLEAN(true));
+		DUCKDB_LOG_INFO(context, "fabricator: cache_local_files enabled for this catalog's files");
 	}
-	config.SetOption(CacheLocalFilesSetting::SettingIndex, Value::BOOLEAN(true));
-	DUCKDB_LOG_INFO(context, "fabricator: cache_local_files enabled for this catalog's files");
+	if (!config.user_settings.IsSet(ExternalFileCacheLocalMaxBlockSizeSetting::SettingIndex)) {
+		auto remote_max = Settings::Get<ExternalFileCacheRemoteMaxBlockSizeSetting>(DatabaseInstance::GetDatabase(context));
+		config.SetOption(ExternalFileCacheLocalMaxBlockSizeSetting::SettingIndex, Value::UBIGINT(remote_max));
+	}
 }
 
 void FabricatorCatalog::LoadCatalog(ClientContext &context) {

@@ -4612,7 +4612,9 @@ SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-g
 read through the extension's own `onelake://` filesystem. DuckDB 2.0's external file cache caches only the
 remote schemes it knows itself, so such reads would be refetched on every query. A OneLake ATTACH therefore
 turns on the global setting `cache_local_files` unless you set it yourself; `SET GLOBAL cache_local_files =
-false` before the ATTACH keeps it off. The setting applies to the whole database, so plain local files are then
+false` before the ATTACH keeps it off. It also raises `external_file_cache_local_max_block_size` to the size used
+for remote files (2 MB), again unless you set it, because DuckDB otherwise fetches such a file in 16 KB pieces,
+one request each. The setting applies to the whole database, so plain local files are then
 cached too (in buffer-pool memory, which DuckDB evicts under pressure). Measured on TPC-H SF1 in OneLake:
 39 s instead of 81 s for the 22 queries.
 
