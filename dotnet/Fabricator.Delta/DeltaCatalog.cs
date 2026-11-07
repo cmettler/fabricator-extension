@@ -2684,6 +2684,16 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     // Native read (native_read true): resolve the snapshot (explicit AT > per-transaction pinned version >
     // latest), then let DuckDB's read_parquet decode the files via DeltaNativeReader. Pinning gives a consistent
     // cut across a multi-table query (all implicit-AT scans in one DuckDB transaction pin to the same instant).
+    /// <summary>
+    /// Rows per batch the native catalog scan asks its host queries for (ABI v85 <c>batch_rows</c>): one parquet
+    /// row group instead of one 2048-row DuckDB chunk. The scan's batches are morsels for DuckDB, never files,
+    /// so a large one costs nothing downstream; each batch still crosses into C# and back, and that crossing is
+    /// what the default size multiplied (a 6M-row lineitem scan 0.30 s -> 0.20 s, TPC-H Q21 1.0 s -> 0.7 s).
+    /// ⚠ Only this READING scan: OPTIMIZE and the DML read-back write one file per batch (docs/scan-concurrency.md
+    /// §3) and keep the default.
+    /// </summary>
+    internal const long ScanBatchRows = 122880;
+
     private IArrowArrayStream ScanNative(nint opener, string path, ScanSpec? spec, IReadOnlyList<object?> filterVals)
     {
         string? unit = null, value = null;
@@ -2766,7 +2776,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                                             pendingFiles: pendingNative?.Files,
                                             pendingDeletes: pendingNative?.DeletedByOrdinal,
                                             pendingSchema: pendingNative?.PendingDeltaSchema,
-                                            bound: ReadBound(path));
+                                            bound: ReadBound(path),
+                                            batchRows: ScanBatchRows);
         ProbeSchemaSelfCheck(path, native.Schema, userSchema, spec);
         if (pendingNative is not { Batches.Count: > 0 })
         {

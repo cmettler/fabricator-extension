@@ -26,8 +26,10 @@ public static class Host
     /// <summary>Runs <paramref name="sql"/> on a fresh host connection; the caller owns + disposes the stream.</summary>
     /// <param name="session">Which session the query runs in — see <see cref="HostSession"/>. Required on
     /// every overload, so each caller decides.</param>
-    public static IArrowArrayStream Query(string sql, HostSession session) =>
-        HostFs.Query(sql, clientSession: SessionHandle(session));
+    /// <param name="batchRows">Rows per exported Arrow batch (ABI v85); 0 = one DuckDB chunk (2048). Only a
+    /// READING caller may raise it: where a consumer writes one file per batch, a batch is a file.</param>
+    public static IArrowArrayStream Query(string sql, HostSession session, long batchRows = 0) =>
+        HostFs.Query(sql, clientSession: SessionHandle(session), batchRows: batchRows);
 
     /// <summary>
     /// Runs <paramref name="sql"/> binding a 1-row <paramref name="parameters"/> batch to the statement's
@@ -50,8 +52,8 @@ public static class Host
     /// (join/filter/aggregate it with DuckDB) over Arrow. See docs/host-query.md.
     /// </summary>
     public static IArrowArrayStream Query(string sql, IReadOnlyList<(string Name, IArrowArrayStream Stream)> inputs,
-                                          HostSession session)
-        => HostFs.Query(sql, inputs: inputs, clientSession: SessionHandle(session));
+                                          HostSession session, long batchRows = 0)
+        => HostFs.Query(sql, inputs: inputs, clientSession: SessionHandle(session), batchRows: batchRows);
 
     /// <summary>
     /// Runs <paramref name="sql"/> with both positional <paramref name="parameters"/> and named Arrow

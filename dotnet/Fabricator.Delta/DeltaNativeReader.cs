@@ -89,7 +89,8 @@ internal static class DeltaNativeReader
         IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile>? pendingFiles = null,
         IReadOnlyDictionary<int, HashSet<long>>? pendingDeletes = null,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
-        DeltaTableBinding? bound = null)
+        DeltaTableBinding? bound = null,
+        long batchRows = 0)
     {
         bool wantRowId = spec?.Columns is { } c0 && c0.Contains(RowIdColumn);
         var dataCols = spec?.Columns is { Count: > 0 } cols
@@ -248,12 +249,13 @@ internal static class DeltaNativeReader
         // That reason is now gone; the factory is kept because it is harmless, not because it is still needed.
         // ⚠ The open is no longer gated by the pump's prefetch semaphore, only the DRAIN is. Immaterial: the
         // result is lazy, so opening it starts a bind, not a read.
+        batchRows = MorselRows(batchRows, listing.Files);
         IArrowArrayStream? batchStream = null;
         BatchQueryOwner? batchOwner = null;
         if (batch is not null)
         {
             Log.LogDebug("delta native batch: {Sql}", batch.Statement(topSuffix));
-            batchStream = batch.Query(topSuffix);
+            batchStream = batch.Query(topSuffix, batchRows);
             batchOwner = new BatchQueryOwner(batchStream);
         }
 
@@ -290,7 +292,7 @@ internal static class DeltaNativeReader
         return new AsyncEnumerableArrowStream(
             schema,
             StreamFiles(listing, loopFiles, batch, batchStream, batchOwner, dataCols, wantRowId, where,
-                        prefetch, rowIdFilter, trackingFilter, topSuffix),
+                        prefetch, rowIdFilter, trackingFilter, topSuffix, batchRows),
             owner: batchOwner);
     }
 
@@ -524,10 +526,12 @@ internal static class DeltaNativeReader
             => "SET SESSION preserve_insertion_order=false; " + (suffix is null ? Sql : Sql + suffix);
 
         /// <summary>Runs this plan, binding its inputs.</summary>
-        internal IArrowArrayStream Query(string? suffix = null)
+        internal IArrowArrayStream Query(string? suffix = null, long batchRows = 0)
         {
             string sql = Statement(suffix);
-            return Inputs is null ? Host.Query(sql, HostSession.Neutral) : Host.Query(sql, Inputs(), HostSession.Neutral);
+            return Inputs is null
+                ? Host.Query(sql, HostSession.Neutral, batchRows)
+                : Host.Query(sql, Inputs(), HostSession.Neutral, batchRows);
         }
 
         /// <summary>Files below this count are not worth batching — kept on the proven per-file path.
@@ -2144,13 +2148,40 @@ internal static class DeltaNativeReader
             schema, new[] { new RecordBatch(schema, new IArrowArray[] { builder.Build() }, dv.Length) });
     }
 
+    /// <summary>
+    /// The batch size a scan actually asks for, given the most it may (<paramref name="maxRows"/>) and the files it
+    /// will read. A batch is the unit DuckDB hands to a thread, so a big one helps a big table (fewer crossings)
+    /// and starves a mid-size one: 800k rows at 122880 are 7 batches for 20 threads, and an md5 over partsupp
+    /// went 0.36 s -> 0.48 s. So aim for about two batches per core, in whole 2048-row chunks, capped at
+    /// <paramref name="maxRows"/>. A file without <c>numRecords</c> makes the size unknown and keeps the default.
+    /// </summary>
+    internal static long MorselRows(long maxRows, IReadOnlyList<DeltaReader.NativeScanFile> files)
+    {
+        if (maxRows <= 0)
+        {
+            return 0;
+        }
+        long rows = 0;
+        foreach (var f in files)
+        {
+            if (f.NumRecords is not { } n)
+            {
+                return 0;
+            }
+            rows += n;
+        }
+        long perBatch = rows / (2L * Environment.ProcessorCount) / 2048 * 2048;
+        return perBatch <= 2048 ? 0 : Math.Min(perBatch, maxRows);
+    }
+
     /// <summary>Runs a per-file SELECT, binding the file's deletion vector as an Arrow input when it is large
     /// enough that inlining it would be pathological (<see cref="DvLiteralMax"/>).</summary>
-    private static IArrowArrayStream QueryFile(string sql, DeltaReader.NativeScanFile f, string dvView)
+    private static IArrowArrayStream QueryFile(string sql, DeltaReader.NativeScanFile f, string dvView, long batchRows)
         => BindDv(f.Dv)
             ? Host.Query(sql, new (string, IArrowArrayStream)[]
-                              { (dvView, new SingleScanArrowStream(DvStream(f.Dv), dvView)) }, HostSession.Neutral)
-            : Host.Query(sql, HostSession.Neutral);
+                              { (dvView, new SingleScanArrowStream(DvStream(f.Dv), dvView)) }, HostSession.Neutral,
+                         batchRows)
+            : Host.Query(sql, HostSession.Neutral, batchRows);
 
     /// <summary>The WHOLE table as one SQL text: the per-file SELECTs (logical names, DV exclusion, column
     /// mapping, schema-evolution backfill, partition literals, row-tracking expressions for
@@ -2253,7 +2284,7 @@ internal static class DeltaNativeReader
         BatchPlan? batch, IArrowArrayStream? batchStream, BatchQueryOwner? batchOwner,
         IReadOnlyList<string> dataCols, bool wantRowId, string? where,
         int prefetch, DeltaRowIdFilter? rowIdFilter = null, DeltaRowTrackingFilter? trackingFilter = null,
-        string? topSuffix = null, [EnumeratorCancellation] CancellationToken ct = default)
+        string? topSuffix = null, long batchRows = 0, [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (loopFiles.Count == 0 && batchStream is null)
         {
@@ -2363,7 +2394,7 @@ internal static class DeltaNativeReader
                             // A per-file query owns its own stream — created and released right here. Its
                             // bound view is TEMPORARY on that query's own connection, so it needs no cleanup
                             // and cannot collide with the sibling files scanning in parallel.
-                            var fs = QueryFile(sql, file, DvViewName);
+                            var fs = QueryFile(sql, file, DvViewName, batchRows);
                             await DrainAsync(fs, fs).ConfigureAwait(false);
                         }
                         finally
