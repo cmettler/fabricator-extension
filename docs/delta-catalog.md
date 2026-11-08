@@ -439,7 +439,8 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      filesystem-relative without the workspace prefix). **local/S3 RENAME — DONE (ABI v50)** via a new host
      `fs_move_dir` → `FileSystem::MoveFile` (atomic dir rename on local; object stores throw cleanly if MoveFile
      is unimplemented). Validated live on `LH` + local (`verify_delta_catalog_schemas.test`). DROP/RENAME COLUMN + ALTER COLUMN TYPE stay unsupported (column mapping /
-     rewrite). **Multi-schema for local/S3 — `schemas true` ATTACH option (DONE)**: default is a FLAT main-only
+     rewrite). *(Superseded: RENAME/DROP COLUMN work on column-mapped tables, and since 2026-11-08 ALTER COLUMN TYPE
+     is Delta type widening — metadata-only, `type_widening = true`; gate `verify_delta_type_widening`.)* **Multi-schema for local/S3 — `schemas true` ATTACH option (DONE)**: default is a FLAT main-only
      catalog (schema ignored → `db.staging.t` and `db.main.t` would collide at `<root>/t`); `schemas true` switches
      to the two-level `<root>/<schema>/<table>` layout (`SchemaLayout` drives `TablePath`/discovery/`CreateSchema`/
      `DropSchema`; globs `<root>/*/*/_delta_log/*.json`). OneLake ignores it (layout from the lakehouse flag). No

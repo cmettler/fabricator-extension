@@ -5208,8 +5208,34 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &ct = table_info.Cast<ChangeColumnTypeInfo>();
+		// Only the TYPE crosses to the provider, so a USING expression would be dropped without a word: the
+		// column would be converted with a plain cast, not with what the user wrote. Without USING the binder
+		// fills in CAST(<column> AS <type>) (bind_alter.cpp); that, and the bare column, mean the plain cast.
+		if (ct.expression) {
+			CastExpression plain(ct.target_type, make_uniq<ColumnRefExpression>(ct.column_path));
+			bool plain_cast = ct.expression->Equals(plain);
+			if (!plain_cast && ct.expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				auto &ref = ct.expression->Cast<ColumnRefExpression>();
+				plain_cast = ref.GetColumnName() == ct.GetColumnName();
+			}
+			if (!plain_cast) {
+				throw NotImplementedException(
+				    "Fabricator: ALTER COLUMN %s TYPE … USING <expression> is not supported; the column can only "
+				    "be converted with a plain cast (omit USING), or rewritten with an UPDATE into a new column",
+				    ct.GetColumnName().GetIdentifierName());
+			}
+		}
 		request.kind = "column_type";
-		request.column = ct.GetColumnName().GetIdentifierName();
+		// A struct member (ALTER COLUMN s.f TYPE …) travels as the whole `path` and WITHOUT `column`, so a
+		// provider that reads only the column fails instead of changing `s` itself.
+		request.path.clear();
+		if (ct.column_path.size() > 1) {
+			for (auto &p : ct.column_path) {
+				request.path.push_back(p.GetIdentifierName());
+			}
+		} else {
+			request.column = ct.GetColumnName().GetIdentifierName();
+		}
 		carry_type(ct.target_type, ct.GetColumnName().GetIdentifierName());
 		break;
 	}

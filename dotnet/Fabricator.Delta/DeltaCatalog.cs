@@ -6122,6 +6122,10 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             case "parquet_bloom_filter_false_positive_ratio":
             case "bloom_filter_false_positive_ratio":
                 return ParquetTuning.BloomFilterFppKey;
+            case "type_widening":
+                // Unlike the features below, this one can be switched on later: the property commit declares
+                // the typeWidening feature in the same commit (DeltaReader.TypeWideningProtocol), as Spark does.
+                return EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey;
             case "deletion_vectors":
             case "row_tracking":
             case "change_data_feed":
@@ -6354,6 +6358,18 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 _tableConfigCache.TryRemove(TablePath(schemaPath, t), out _); // the config changed — re-read on next write
                 return;
             }
+            case AlterTableKind.ColumnType:
+            {
+                // Type widening, metadata-only (see DeltaReader.ChangeColumnType). `path` is set for a struct
+                // member (ALTER COLUMN s.f TYPE …), else the column alone; `c` carries the new type.
+                var target = c ?? throw new System.InvalidOperationException(
+                    "delta ALTER COLUMN TYPE requires the new type.");
+                IReadOnlyList<string> columnPath = spec.Path is { Count: > 0 } p ? p : new[] { spec.RequireColumn() };
+                var typePath = TablePath(schemaPath, t);
+                DeltaReader.ChangeColumnType(Opener(), typePath, columnPath, target, default);
+                _tableConfigCache.TryRemove(typePath, out _);
+                return;
+            }
             case AlterTableKind.SetPartitionedBy:
                 throw Unsupported(
                     "SET/RESET PARTITIONED BY — changing a Delta table's partitioning requires a full "
@@ -6399,8 +6415,19 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     // RESET is SET with a null value — the UNSET spelling SetTableProperties already takes,
                     // which is why removing an override needs no second mechanism.
                     var property = TableOptionProperty(name, reset ? "RESET" : "SET");
-                    updates.Add(new KeyValuePair<string, string?>(
-                        property, reset ? null : spec.RequireOptions()[name]));
+                    string? value = reset ? null : spec.RequireOptions()[name];
+                    if (value is not null && string.Equals(property, EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey,
+                                                           StringComparison.Ordinal))
+                    {
+                        value = value.Trim().ToLowerInvariant() switch
+                        {
+                            "true" => "true",
+                            "false" => "false",
+                            _ => throw new ArgumentException(
+                                $"ALTER TABLE SET ({name}): expected true or false, got '{value}'."),
+                        };
+                    }
+                    updates.Add(new KeyValuePair<string, string?>(property, value));
                 }
                 if (updates.Count == 0)
                 {

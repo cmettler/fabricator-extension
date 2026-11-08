@@ -117,11 +117,12 @@ SELECT id, label, score FROM lake2.main.t ORDER BY id;
 4	a4	40
 5	a5	50
 
-# ALTER COLUMN TYPE is still cleanly unsupported on Delta.
+# ALTER COLUMN TYPE is Delta type widening (2026-11-08), which a table must enable first; this one did not, so
+# the change is refused by that reason. The feature itself is gated in verify_delta_type_widening.
 statement error
 ALTER TABLE lake2.main.t ALTER COLUMN score TYPE BIGINT;
 ----
-not supported
+type widening is not enabled on this table
 
 statement ok
 DETACH lake2;

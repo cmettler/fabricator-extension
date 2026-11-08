@@ -179,6 +179,12 @@ internal sealed record DeltaWithOptions
                 case "variant_shredding":
                     vs = ParseBoolValue(key, value);
                     break;
+                case "type_widening":
+                    // A plain property: engineered-wood declares the typeWidening feature at create from it.
+                    props ??= new Dictionary<string, string>(StringComparer.Ordinal);
+                    props[EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey] =
+                        ParseBoolValue(key, value) ? "true" : "false";
+                    break;
                 case "column_mapping":
                     cm = value.Trim().ToLowerInvariant() switch
                     {
@@ -238,7 +244,7 @@ internal sealed record DeltaWithOptions
                         + "parquet_file_size_bytes, parquet_version, parquet_compression_level, "
                         + "parquet_bloom_filter_false_positive_ratio, parquet_bloom_filter_columns, "
                         + "deletion_vectors, column_mapping, row_tracking, change_data_feed, "
-                        + "in_commit_timestamps, variant_shredding, table_type, format, and quoted delta.*/fabricator.* "
+                        + "in_commit_timestamps, variant_shredding, type_widening, table_type, format, and quoted delta.*/fabricator.* "
                         + "table properties).");
             }
         }
@@ -312,7 +318,7 @@ internal sealed record DeltaWithOptions
             throw new ArgumentException(
                 $"WITH \"{key}\": feature-enabling properties need a protocol declaration — use the "
                 + "explicit WITH keys instead (deletion_vectors / row_tracking / change_data_feed / "
-                + "in_commit_timestamps / variant_shredding).");
+                + "in_commit_timestamps / variant_shredding / type_widening).");
         }
         if (key.StartsWith("delta.columnMapping", StringComparison.OrdinalIgnoreCase))
         {

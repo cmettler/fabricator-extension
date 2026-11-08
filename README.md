@@ -4822,6 +4822,7 @@ principal wins even if `PROVIDER` says something else:
 | `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
 | `DELETE` on partition columns (or, with `delete_trusts_statistics`, any column) removes whole files **without reading them** | ✅ |
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
+| **Type widening**: `ALTER TABLE … ALTER COLUMN c TYPE <wider type>` (also `s.f` inside a struct), metadata-only; older files are read at the new type | ✅ (needs `type_widening = true`; see below) |
 | **Table options in DDL**: `CREATE … WITH (…)`, `ALTER TABLE … SET (…)`, `ALTER TABLE … RESET (…)` — persisted write tuning that governs every later write | ✅ |
 | Multi-schema: `schemas 'onelevel'` (= `schemas true`; local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
 | **Nested** schemas (DuckDB 2.0): `schemas 'nested'` — the directory tree under a local/S3/ADLS root IS the schema tree, so `<root>/a/b/t` is `cat.a.b.t`, for reads and writes alike | ✅ (except `COMMENT ON`, which DuckDB's parser caps at three qualifications) |
@@ -4838,6 +4839,29 @@ principal wins even if `PROVIDER` says something else:
 | VARIANT columns; `set_tblproperties` / `tblproperties`; `OPTIMIZE` / `VACUUM` maintenance | ✅ |
 | Concurrent writers: OCC retry (a blind append / CTAS — an append that READ the table surfaces the conflict instead, see below) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
 | Concurrent writers on **OneLake**, many processes appending to ONE table — no lost writes (measured: 96 concurrent commits, all landed), but a losing writer can occasionally surface an error rather than retrying transparently, so retry the statement | ⚠ |
+
+**Type widening.** A column can change to a wider type without rewriting any data: the change is one log
+commit, files written before it keep the narrower type, and every read casts them (the same table-feature as
+Spark/Delta 4: `delta.typeChanges` on the column, the `typeWidening` reader-writer feature).
+
+```sql
+CREATE TABLE lake.main.t (id INTEGER, v INTEGER, d DATE, s STRUCT(a INTEGER)) WITH (type_widening = true);
+-- or, on an existing table (declares the feature in the same commit):
+ALTER TABLE lake.main.t SET (type_widening = true);
+
+ALTER TABLE lake.main.t ALTER COLUMN v TYPE BIGINT;
+ALTER TABLE lake.main.t ALTER COLUMN d TYPE TIMESTAMP;   -- date -> timestamp_ntz
+ALTER TABLE lake.main.t ALTER COLUMN s.a TYPE BIGINT;    -- a struct member
+```
+
+- Supported: a wider integer (`TINYINT` → `SMALLINT` → `INTEGER` → `BIGINT`), `FLOAT` → `DOUBLE`, `DATE` →
+  `TIMESTAMP`, and a `DECIMAL` with at least as many integer and fractional digits (`DECIMAL(5,2)` →
+  `DECIMAL(10,4)`). Anything else is refused by name — a narrowing, `INTEGER` → `DOUBLE`/`DECIMAL` (which Spark
+  allows on an explicit ALTER), a partition column, `… USING <expression>`, and an ALTER in a transaction that
+  has already written the table.
+- ⚠ Readers need the `typeWidening` feature: delta-spark 3.3+/4.0, engineered-wood, this extension. An older
+  reader refuses the whole table once the feature is declared, so enable it only where every reader has it.
+- Like the other metadata ALTERs it commits immediately, even inside `BEGIN … COMMIT`.
 
 > ⚠ **Tables with a BOOLEAN column written before 2026-10-26 by `PROVIDER 'delta'`** recorded the column's maximum
 > as `false` in the Delta log, so `WHERE flag = true` (here, and in any reader that prunes on Delta statistics) can

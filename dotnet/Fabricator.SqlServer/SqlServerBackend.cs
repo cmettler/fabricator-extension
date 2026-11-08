@@ -5178,6 +5178,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
             {
                 // SQL Server defaults an ALTER COLUMN with no NULL/NOT NULL to NULLable,
                 // so restate the column's current nullability explicitly.
+                if (spec.Path is { Count: > 0 })
+                {
+                    throw new NotSupportedException(
+                        $"ALTER COLUMN {string.Join(".", spec.Path)} TYPE: SQL Server tables have no struct "
+                        + "columns, so a nested column path cannot be altered.");
+                }
                 string col = spec.RequireColumn();
                 bool nullable = ColumnIsNullable(schemaName, tableName, col);
                 ExecuteNonQuery($"ALTER TABLE {qualified} ALTER COLUMN {Quote(col)} " +

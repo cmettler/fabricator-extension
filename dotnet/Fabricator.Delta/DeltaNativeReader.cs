@@ -1876,7 +1876,7 @@ internal static class DeltaNativeReader
                 needsInner = true;
             }
             else if (field?.Type is DeltaSchema.StructType st
-                     && (StructShapeDiffers(st, stored, fm) || HasNaiveTimestamp(stored, fm)))
+                     && (StructShapeDiffers(st, stored, fm) || HasNaiveTimestamp(stored, fm) || HasTypeChanges(st)))
             {
                 expr = RebuildExpr(field.Type, Quote(stored), stored, fm);
                 needsInner = true;
@@ -1900,6 +1900,15 @@ internal static class DeltaNativeReader
                 {
                     needsInner = true;
                 }
+            }
+            if (field is not null && field.Type is not DeltaSchema.StructType && IsWidened(field)
+                && !(partitionCols is not null && ContainsName(partitionCols, c)) && Present(field, stored, fm))
+            {
+                // Type widening: a file written before the column was widened stores the narrower type, while the
+                // table (and the scan) declares the wider one. The batched forms get this cast from their schema
+                // map; here it is explicit. Only widened columns are cast, so every other table keeps its SQL.
+                expr = WidenExpr(field.Type, expr);
+                needsInner = true;
             }
             inner.Add(string.Equals(expr, Quote(c), StringComparison.Ordinal)
                 ? Quote(c)
@@ -2586,11 +2595,47 @@ internal static class DeltaNativeReader
             {
                 var childSrc = $"({src}).{Quote(stored)}";
                 expr = RebuildExpr(ch.Type, childSrc, childPath, fm);
+                if (ch.Type is not DeltaSchema.StructType && IsWidened(ch))
+                {
+                    expr = WidenExpr(ch.Type, expr);
+                }
             }
             parts.Add($"{Quote(ch.Name)} := {expr}");
         }
         return $"CASE WHEN {src} IS NULL THEN NULL ELSE struct_pack({string.Join(", ", parts)}) END";
     }
+
+    /// <summary>Whether the field, or anything inside its list/map/struct type, records a type change
+    /// (<c>delta.typeChanges</c>, written by every type-widening writer: delta-spark, engineered-wood). Only then
+    /// can an older data file store a narrower type than the table declares.</summary>
+    private static bool IsWidened(DeltaSchema.StructField field)
+        => field.Metadata?.ContainsKey(DeltaSchema.TypeWidening.TypeChangesKey) == true || HasTypeChanges(field.Type);
+
+    private static bool HasTypeChanges(DeltaSchema.DeltaDataType type) => type switch
+    {
+        DeltaSchema.StructType st => st.Fields.Any(IsWidened),
+        DeltaSchema.ArrayType a => HasTypeChanges(a.ElementType),
+        DeltaSchema.MapType m => HasTypeChanges(m.KeyType) || HasTypeChanges(m.ValueType),
+        _ => false,
+    };
+
+    private static bool ContainsStruct(DeltaSchema.DeltaDataType type) => type switch
+    {
+        DeltaSchema.StructType => true,
+        DeltaSchema.ArrayType a => ContainsStruct(a.ElementType),
+        DeltaSchema.MapType m => ContainsStruct(m.KeyType) || ContainsStruct(m.ValueType),
+        _ => false,
+    };
+
+    /// <summary>A widened column or struct member read from a file that may store the narrower type, cast to the
+    /// table's type. Every Delta widening (integer, float, decimal, date → timestamp_ntz) is a lossless DuckDB
+    /// cast, and casting a value that already has the type is free. ⚠ A list or map holding a struct is not
+    /// cast here: its members keep the FILE's names (physical under column mapping, renamed per batch later), so
+    /// a cast to the logical type would not bind. The scan's type check then refuses it by name.</summary>
+    private static string WidenExpr(DeltaSchema.DeltaDataType type, string expr)
+        => type is DeltaSchema.ArrayType or DeltaSchema.MapType && ContainsStruct(type)
+            ? expr
+            : $"CAST({expr} AS {TypeText(type)})";
 
     private static volatile bool _icuLoaded;
 

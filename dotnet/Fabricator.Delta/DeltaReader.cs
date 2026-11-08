@@ -295,9 +295,15 @@ internal static class DeltaReader
                 }
             }
             var metaData = snapshot.Metadata with { Configuration = merged };
+            var actions = new List<DeltaAction>(2);
+            if (TypeWideningProtocol(snapshot.Protocol, merged) is { } protocol)
+            {
+                actions.Add(protocol);
+            }
+            actions.Add(metaData);
             return await table.CommitDataFilesAsync(
                 System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
-                extraActions: new DeltaAction[] { metaData },
+                extraActions: actions,
                 expectedVersion: snapshot.Version, operation: "SET TBLPROPERTIES",
                 // ⚠ VACUOUSLY TRUE, AND THAT IS THE WHOLE JUSTIFICATION — the file list is
                 // Array.Empty, so this commit writes NO ROWS and there is nothing a CHECK constraint,
@@ -316,6 +322,62 @@ internal static class DeltaReader
         {
             await table.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// The protocol a commit enabling <c>delta.enableTypeWidening</c> must carry, or null when none is needed
+    /// (not enabled, or the feature is already declared). Spark declares the feature in the same commit that sets
+    /// the property; a table with the property and without the feature is one strict readers refuse
+    /// (<c>DELTA_FEATURES_PROTOCOL_METADATA_MISMATCH</c>). engineered-wood consumes feature properties only at
+    /// CREATE and asks a host committing <c>metaData</c> for the protocol action itself.
+    /// </summary>
+    /// <remarks><c>typeWidening</c> is a reader-writer feature, so the result is always the table-features
+    /// protocol (3, 7): the features a legacy version implied are listed explicitly (the Delta spec's upgrade
+    /// table, as engineered-wood and Spark derive them; <c>columnMapping</c> only from reader 2 on), then
+    /// <c>typeWidening</c> is added to both sides. Enabling never removes a feature, and disabling leaves it, as
+    /// in Spark: files written while it was on may still need it to be read.</remarks>
+    internal static EngineeredWood.DeltaLake.Actions.ProtocolAction? TypeWideningProtocol(
+        EngineeredWood.DeltaLake.Actions.ProtocolAction protocol, IReadOnlyDictionary<string, string>? config)
+    {
+        const string feature = "typeWidening";
+        if (!EngineeredWood.DeltaLake.Schema.TypeWidening.IsEnabled(config)
+            || (protocol.ReaderFeatures?.Contains(feature) == true && protocol.WriterFeatures?.Contains(feature) == true))
+        {
+            return null;
+        }
+        List<string> writer;
+        if (protocol.MinWriterVersion >= 7)
+        {
+            writer = new List<string>(protocol.WriterFeatures ?? System.Array.Empty<string>());
+        }
+        else
+        {
+            int w = protocol.MinWriterVersion;
+            writer = new List<string>();
+            if (w >= 2) { writer.Add("appendOnly"); writer.Add("invariants"); }
+            if (w >= 3) { writer.Add("checkConstraints"); }
+            if (w >= 4) { writer.Add("changeDataFeed"); writer.Add("generatedColumns"); }
+            if (w >= 5 && protocol.MinReaderVersion >= 2) { writer.Add("columnMapping"); }
+            if (w >= 6) { writer.Add("identityColumns"); }
+        }
+        var reader = protocol.MinReaderVersion >= 3
+            ? new List<string>(protocol.ReaderFeatures ?? System.Array.Empty<string>())
+            : protocol.MinReaderVersion >= 2 ? new List<string> { "columnMapping" } : new List<string>();
+        if (!writer.Contains(feature))
+        {
+            writer.Add(feature);
+        }
+        if (!reader.Contains(feature))
+        {
+            reader.Add(feature);
+        }
+        return new EngineeredWood.DeltaLake.Actions.ProtocolAction
+        {
+            MinReaderVersion = 3,
+            MinWriterVersion = 7,
+            ReaderFeatures = reader,
+            WriterFeatures = writer,
+        };
     }
 
     /// <summary>ALTER TABLE … SET SORTED BY (cols) / RESET SORTED BY (<paramref name="cols"/> empty):
@@ -2203,6 +2265,197 @@ internal static class DeltaReader
         {
             await table.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// <c>ALTER TABLE t ALTER COLUMN c TYPE &lt;wider type&gt;</c> (or <c>s.f</c> inside a struct) — Delta type
+    /// widening: a metadata-only commit, no file is rewritten. Older files keep the narrower type; readers cast
+    /// them (engineered-wood itself; the native reader from the <c>delta.typeChanges</c> the commit records).
+    /// </summary>
+    /// <remarks>
+    /// <para>Committed as an empty write with <c>mergeSchema</c>: engineered-wood then widens the column the way
+    /// delta-spark's schema evolution does — it records <c>delta.typeChanges</c>, adds the <c>typeWidening</c>
+    /// table feature to the protocol, and refuses partition columns, columns a constraint or a generated column
+    /// depends on, and on an IcebergCompat table every change Iceberg cannot follow. The table must have
+    /// <c>delta.enableTypeWidening = true</c>.</para>
+    /// <para>⚠ Only the changes Spark's schema evolution makes are possible this way: a wider integer, float to
+    /// double, date to timestamp_ntz, and a decimal at least as wide in both its integer and fractional digits.
+    /// Spark also allows integer to double or decimal on an explicit ALTER; those are refused here by name.</para>
+    /// <para>⚠ The type is checked BEFORE the write and the result AFTER it: an empty batch carrying a narrower
+    /// type is a valid append into the wider column, so a narrowing would otherwise commit and change nothing.</para>
+    /// </remarks>
+    public static void ChangeColumnType(
+        nint opener, string path, IReadOnlyList<string> columnPath, Field target, CancellationToken ct)
+        => ChangeColumnTypeAsync(opener, path, columnPath, target, ct).GetAwaiter().GetResult();
+
+    private static async Task ChangeColumnTypeAsync(
+        nint opener, string path, IReadOnlyList<string> columnPath, Field target, CancellationToken ct)
+    {
+        string display = string.Join(".", columnPath);
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options(), ct).ConfigureAwait(false);
+        try
+        {
+            var snap = table.CurrentSnapshot;
+            var field = FindSchemaField(snap.Schema, columnPath, display);
+            var to = EngineeredWood.DeltaLake.Schema.SchemaConverter
+                .FromArrowSchema(new Schema(new[] { new Field("t", target.DataType, true) }, null)).Fields[0].Type;
+            if (field.Type is not EngineeredWood.DeltaLake.Schema.PrimitiveType fromType
+                || to is not EngineeredWood.DeltaLake.Schema.PrimitiveType toType)
+            {
+                throw new System.NotSupportedException(
+                    $"delta ALTER COLUMN {display} TYPE: only a column of a primitive type can change its type "
+                    + "(a struct changes through its members: ALTER COLUMN s.f TYPE …).");
+            }
+            if (string.Equals(fromType.TypeName, toType.TypeName, System.StringComparison.Ordinal))
+            {
+                return; // already that type: nothing to commit
+            }
+            if (!IsSchemaEvolutionWidening(fromType.TypeName, toType.TypeName))
+            {
+                throw new System.NotSupportedException(
+                    $"delta ALTER COLUMN {display} TYPE: {fromType.TypeName} to {toType.TypeName} is not a type "
+                    + "widening this provider can apply without rewriting the data. Supported: a wider integer "
+                    + "(byte, short, integer, long), float to double, date to timestamp_ntz (TIMESTAMP), and a "
+                    + "decimal with at least as many integer and fractional digits. Otherwise add a new column "
+                    + "and fill it with an UPDATE.");
+            }
+            if (columnPath.Count == 1 && snap.Metadata.PartitionColumns.Any(pc =>
+                    string.Equals(pc, field.Name, System.StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new System.NotSupportedException(
+                    $"delta ALTER COLUMN {display} TYPE: '{field.Name}' is a partition column, and a partition "
+                    + "column's type cannot be widened (engineered-wood does not; its values are stored in the "
+                    + "log, not in the data files). Rewrite the table into a new one with the wider type.");
+            }
+            if (!EngineeredWood.DeltaLake.Schema.TypeWidening.IsEnabled(snap.Metadata.Configuration))
+            {
+                throw new System.NotSupportedException(
+                    $"delta ALTER COLUMN {display} TYPE: type widening is not enabled on this table. Enable it "
+                    + "with ALTER TABLE … SET (type_widening = true); readers then need the Delta typeWidening "
+                    + "feature (delta-spark 3.3+/4.0, engineered-wood, Fabric runtime 2.0).");
+            }
+
+            // One column, empty: the other columns are not part of the write, so they cannot change.
+            var top = snap.ArrowSchema.FieldsList.First(f =>
+                string.Equals(f.Name, columnPath[0], System.StringComparison.OrdinalIgnoreCase));
+            var widened = new Field(top.Name, ReplaceType(top.DataType, columnPath, 1, target.DataType),
+                                    top.IsNullable, top.Metadata);
+            var schema = new Schema(new[] { widened }, null);
+            var batch = new RecordBatch(schema, new[] { EmptyArray(widened.DataType) }, 0);
+            try
+            {
+                await table.WriteAsync(new[] { batch }, cancellationToken: ct, mergeSchema: true).ConfigureAwait(false);
+            }
+            catch (DeltaConflictException)
+            {
+                throw ConcurrentModification("ALTER COLUMN TYPE");
+            }
+
+            var after = FindSchemaField(table.CurrentSnapshot.Schema, columnPath, display);
+            if (after.Type is not EngineeredWood.DeltaLake.Schema.PrimitiveType p
+                || !string.Equals(p.TypeName, toType.TypeName, System.StringComparison.Ordinal))
+            {
+                throw new System.InvalidOperationException(
+                    $"delta ALTER COLUMN {display} TYPE: the commit did not change the column to "
+                    + $"{toType.TypeName} (it is {after.Type}).");
+            }
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    // The schema evolution widenings (engineered-wood's IsSchemaEvolutionWidening, internal there; delta-spark
+    // TypeWidening.isTypeChangeSupportedForSchemaEvolution): what an empty mergeSchema write can apply. The
+    // IcebergCompat restriction is left to engineered-wood, which refuses with its own message.
+    private static bool IsSchemaEvolutionWidening(string from, string to)
+    {
+        static int? Width(string t) => t switch { "byte" => 1, "short" => 2, "integer" => 4, "long" => 8, _ => null };
+        static bool Dec(string t, out int p, out int s)
+        {
+            p = s = 0;
+            if (!t.StartsWith("decimal(", System.StringComparison.Ordinal) || !t.EndsWith(")", System.StringComparison.Ordinal))
+            {
+                return false;
+            }
+            var parts = t.Substring(8, t.Length - 9).Split(',');
+            return parts.Length == 2
+                   && int.TryParse(parts[0].Trim(), System.Globalization.NumberStyles.Integer,
+                                   System.Globalization.CultureInfo.InvariantCulture, out p)
+                   && int.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Integer,
+                                   System.Globalization.CultureInfo.InvariantCulture, out s);
+        }
+        if (Width(from) is int fw && Width(to) is int tw)
+        {
+            return tw > fw;
+        }
+        if ((from, to) is ("float", "double") or ("date", "timestamp_ntz"))
+        {
+            return true;
+        }
+        return Dec(from, out int p1, out int s1) && Dec(to, out int p2, out int s2)
+               && p2 - s2 >= p1 - s1 && s2 >= s1 && (p2, s2) != (p1, s1);
+    }
+
+    private static EngineeredWood.DeltaLake.Schema.StructField FindSchemaField(
+        EngineeredWood.DeltaLake.Schema.StructType schema, IReadOnlyList<string> columnPath, string display)
+    {
+        var container = schema;
+        EngineeredWood.DeltaLake.Schema.StructField? field = null;
+        for (int i = 0; i < columnPath.Count; i++)
+        {
+            if (container is null)
+            {
+                throw new System.InvalidOperationException(
+                    $"delta ALTER COLUMN {display} TYPE: '{columnPath[i - 1]}' is not a struct.");
+            }
+            field = container.Fields.FirstOrDefault(f =>
+                        string.Equals(f.Name, columnPath[i], System.StringComparison.OrdinalIgnoreCase))
+                    ?? throw new System.InvalidOperationException(
+                        $"delta ALTER COLUMN {display} TYPE: column '{columnPath[i]}' does not exist.");
+            container = field.Type as EngineeredWood.DeltaLake.Schema.StructType;
+        }
+        return field!;
+    }
+
+    private static IArrowType ReplaceType(IArrowType type, IReadOnlyList<string> path, int depth, IArrowType target)
+    {
+        if (depth == path.Count)
+        {
+            return target;
+        }
+        var st = (StructType)type;
+        return new StructType(st.Fields.Select(f =>
+            string.Equals(f.Name, path[depth], System.StringComparison.OrdinalIgnoreCase)
+                ? new Field(f.Name, ReplaceType(f.DataType, path, depth + 1, target), f.IsNullable, f.Metadata)
+                : f).ToList());
+    }
+
+    // A length-0 array of any Arrow type, nested ones included (the shared InOutExchange helper is flat).
+    private static IArrowArray EmptyArray(IArrowType type) => ArrowArrayFactory.BuildArray(EmptyData(type));
+
+    private static ArrayData EmptyData(IArrowType type)
+    {
+        var offset32 = new ArrowBuffer(new byte[4]);
+        var offset64 = new ArrowBuffer(new byte[8]);
+        return type switch
+        {
+            StructType st => new ArrayData(type, 0, 0, 0, new[] { ArrowBuffer.Empty },
+                                           st.Fields.Select(f => EmptyData(f.DataType)).ToArray()),
+            MapType mt => new ArrayData(type, 0, 0, 0, new[] { ArrowBuffer.Empty, offset32 },
+                                        new[] { EmptyData(mt.KeyValueType) }),
+            ListType lt => new ArrayData(type, 0, 0, 0, new[] { ArrowBuffer.Empty, offset32 },
+                                         new[] { EmptyData(lt.ValueDataType) }),
+            LargeListType ll => new ArrayData(type, 0, 0, 0, new[] { ArrowBuffer.Empty, offset64 },
+                                              new[] { EmptyData(ll.ValueDataType) }),
+            StringType or BinaryType => new ArrayData(type, 0, 0, 0,
+                                                      new[] { ArrowBuffer.Empty, offset32, ArrowBuffer.Empty }),
+            LargeStringType or LargeBinaryType => new ArrayData(type, 0, 0, 0,
+                                                                new[] { ArrowBuffer.Empty, offset64, ArrowBuffer.Empty }),
+            _ => new ArrayData(type, 0, 0, 0, new[] { ArrowBuffer.Empty, ArrowBuffer.Empty }),
+        };
     }
 
     /// <summary>Adds a field INSIDE a nested struct (metadata-only; <paramref name="containerPath"/> names

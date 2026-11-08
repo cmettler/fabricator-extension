@@ -90,3 +90,8 @@ docker/certs/CAs/
 
 # staged ODBC side of the PolyBase/DuckLake experiment (docker/polybase/stage.sh)
 docker/polybase/stage/
+
+# Test-tier logs (scripts/run-suites.sh output, redirected here) and the unittest scratch directory
+# unittest.exe creates in the directory it runs from.
+/logs/
+/duckdb_unittest_tempdir/

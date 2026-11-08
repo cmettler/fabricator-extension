@@ -1,0 +1,297 @@
+# name: test/verify_delta_type_widening.test
+# description: Delta type widening: ALTER TABLE … ALTER COLUMN c TYPE <wider type> is a metadata-only commit
+#              (delta.typeChanges + the typeWidening table feature, as delta-spark writes them), and every read
+#              path casts files written before the change to the table's type. Runs once per engine
+#              (DELTA_PROVIDER 'delta' = native reads, 'engineeredwooddelta' = engineered-wood's codec).
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require json
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+require-env DELTA_PROVIDER
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/tw' AS l (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+# ============================================================================
+# 1. ONE FILE written before the change. The native reader used to fail here ("column 'v' … is INTEGER on the
+#    provider but BIGINT in the catalog"): a single file takes the per-file SQL, which had no cast, while the
+#    multi-file forms get one from their schema map.
+# ============================================================================
+
+statement ok
+CREATE TABLE l.main.t (id INTEGER, v INTEGER, d DATE, m DECIMAL(5,2), s STRUCT(a INTEGER, b VARCHAR))
+WITH (type_widening = true);
+
+statement ok
+INSERT INTO l.main.t VALUES (1, 10, DATE '2024-01-02', 1.25, {'a': 1, 'b': 'x'}),
+                            (2, 20, DATE '2024-02-03', 2.50, {'a': 2, 'b': 'y'});
+
+statement ok
+ALTER TABLE l.main.t ALTER COLUMN v TYPE BIGINT;
+
+statement ok
+ALTER TABLE l.main.t ALTER COLUMN d TYPE TIMESTAMP;
+
+statement ok
+ALTER TABLE l.main.t ALTER COLUMN m TYPE DECIMAL(10,4);
+
+# A struct member: the per-file SQL rebuilds the struct and casts the member.
+statement ok
+ALTER TABLE l.main.t ALTER COLUMN s.a TYPE BIGINT;
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE l.main.t) ORDER BY column_name;
+----
+d	TIMESTAMP
+id	INTEGER
+m	DECIMAL(10,4)
+s	STRUCT(a BIGINT, b VARCHAR)
+v	BIGINT
+
+# The struct member alone first, so a missing member cast fails HERE rather than in the read below.
+query IT
+SELECT s.a, typeof(s.a) FROM l.main.t ORDER BY s.a;
+----
+1	BIGINT
+2	BIGINT
+
+query IIIII
+SELECT id, v, d, m, s.a FROM l.main.t ORDER BY id;
+----
+1	10	2024-01-02 00:00:00	1.2500	1
+2	20	2024-02-03 00:00:00	2.5000	2
+
+query TTTT
+SELECT DISTINCT typeof(v), typeof(d), typeof(m), typeof(s) FROM l.main.t;
+----
+BIGINT	TIMESTAMP	DECIMAL(10,4)	STRUCT(a BIGINT, b VARCHAR)
+
+query I
+SELECT id FROM l.main.t WHERE v > 15;
+----
+2
+
+query II
+SELECT v, rowid >= 0 FROM l.main.t ORDER BY v;
+----
+10	true
+20	true
+
+# ============================================================================
+# 2. OLD AND NEW FILES together (the multi-file forms), then DML and OPTIMIZE rewrite the old file.
+# ============================================================================
+
+statement ok
+INSERT INTO l.main.t VALUES (3, 5000000000, TIMESTAMP '2024-03-04 05:06:07', 123456.7891, {'a': 6000000000, 'b': 'z'});
+
+query IIIII
+SELECT id, v, d, m, s.a FROM l.main.t ORDER BY id;
+----
+1	10	2024-01-02 00:00:00	1.2500	1
+2	20	2024-02-03 00:00:00	2.5000	2
+3	5000000000	2024-03-04 05:06:07	123456.7891	6000000000
+
+query I
+SELECT id FROM l.main.t WHERE v > 15 ORDER BY id;
+----
+2
+3
+
+query I
+SELECT sum(v) FROM l.main.t;
+----
+5000000030
+
+statement ok
+UPDATE l.main.t SET v = v + 1 WHERE id = 1;
+
+statement ok
+DELETE FROM l.main.t WHERE id = 2;
+
+query II
+SELECT id, v FROM l.main.t ORDER BY id;
+----
+1	11
+3	5000000000
+
+statement ok
+SELECT fabricator_exec('l', 'OPTIMIZE main.t');
+
+query IIII
+SELECT id, v, m, s.a FROM l.main.t ORDER BY id;
+----
+1	11	1.2500	1
+3	5000000000	123456.7891	6000000000
+
+# ============================================================================
+# 3. TIME TRAVEL to before the change reads the table as it was then.
+# ============================================================================
+
+query IT
+SELECT v, typeof(v) FROM l.main.t AT (VERSION => 1) ORDER BY v;
+----
+10	INTEGER
+20	INTEGER
+
+# ============================================================================
+# 4. WHAT THE LOG RECORDS, which is what another engine (Spark, Fabric) reads: the type change on the column,
+#    on the struct member for s.a, and the typeWidening feature on both protocol sides from the CREATE.
+# ============================================================================
+
+query II
+SELECT list_contains(json_extract_string(json, '$.protocol.readerFeatures')::VARCHAR[], 'typeWidening'),
+       list_contains(json_extract_string(json, '$.protocol.writerFeatures')::VARCHAR[], 'typeWidening')
+FROM read_json_objects('${FABRICATOR_DELTA_WRITE_DIR}/tw/t/_delta_log/00000000000000000000.json')
+WHERE json_extract(json, '$.protocol') IS NOT NULL;
+----
+true	true
+
+# v2 widened v (fields[1]); v5 widened the member s.a (fields[4], member 0) — recorded on the member.
+query TT
+SELECT json_extract_string(json_extract_string(json, '$.metaData.schemaString')::JSON,
+                           '$.fields[1].metadata."delta.typeChanges"[0].fromType'),
+       json_extract_string(json_extract_string(json, '$.metaData.schemaString')::JSON,
+                           '$.fields[1].metadata."delta.typeChanges"[0].toType')
+FROM read_json_objects('${FABRICATOR_DELTA_WRITE_DIR}/tw/t/_delta_log/00000000000000000002.json')
+WHERE json_extract(json, '$.metaData') IS NOT NULL;
+----
+integer	long
+
+query TT
+SELECT json_extract_string(json_extract_string(json, '$.metaData.schemaString')::JSON,
+                           '$.fields[4].type.fields[0].metadata."delta.typeChanges"[0].toType'),
+       json_extract_string(json_extract_string(json, '$.metaData.schemaString')::JSON,
+                           '$.fields[4].metadata."delta.typeChanges"')
+FROM read_json_objects('${FABRICATOR_DELTA_WRITE_DIR}/tw/t/_delta_log/00000000000000000005.json')
+WHERE json_extract(json, '$.metaData') IS NOT NULL;
+----
+long	NULL
+
+# ============================================================================
+# 5. ENABLING IT LATER on a table with the legacy protocol (1, 2): the property commit carries the protocol, as
+#    Spark writes it, in the SAME commit. A property without the feature is a table strict readers refuse.
+# ============================================================================
+
+statement ok
+CREATE TABLE l.main.leg (id INTEGER, v INTEGER) WITH (column_mapping = 'none', deletion_vectors = false);
+
+statement ok
+INSERT INTO l.main.leg VALUES (1, 1);
+
+statement error
+ALTER TABLE l.main.leg ALTER COLUMN v TYPE BIGINT;
+----
+type widening is not enabled on this table
+
+statement ok
+ALTER TABLE l.main.leg SET (type_widening = true);
+
+query IITT
+SELECT json_extract(json, '$.protocol.minReaderVersion')::INTEGER,
+       json_extract(json, '$.protocol.minWriterVersion')::INTEGER,
+       json_extract(json, '$.protocol.readerFeatures')::VARCHAR,
+       json_extract(json, '$.protocol.writerFeatures')::VARCHAR
+FROM read_json_objects('${FABRICATOR_DELTA_WRITE_DIR}/tw/leg/_delta_log/00000000000000000002.json')
+WHERE json_extract(json, '$.protocol') IS NOT NULL;
+----
+3	7	["typeWidening"]	["appendOnly","invariants","typeWidening"]
+
+query T
+SELECT json_extract_string(json, '$.metaData.configuration."delta.enableTypeWidening"')
+FROM read_json_objects('${FABRICATOR_DELTA_WRITE_DIR}/tw/leg/_delta_log/00000000000000000002.json')
+WHERE json_extract(json, '$.metaData') IS NOT NULL;
+----
+true
+
+statement ok
+ALTER TABLE l.main.leg ALTER COLUMN v TYPE BIGINT;
+
+query IT
+SELECT v, typeof(v) FROM l.main.leg;
+----
+1	BIGINT
+
+# The same type again changes nothing and commits nothing (still v0..v3).
+statement ok
+ALTER TABLE l.main.leg ALTER COLUMN v TYPE BIGINT;
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/tw/leg/_delta_log/*.json');
+----
+4
+
+# ============================================================================
+# 6. REFUSALS, each by name. A narrowing must be refused BEFORE any commit: an empty batch of the narrower type
+#    is a valid append into the wider column, so it would otherwise "succeed" and change nothing.
+# ============================================================================
+
+statement error
+ALTER TABLE l.main.leg ALTER COLUMN v TYPE INTEGER;
+----
+long to integer is not a type widening
+
+statement error
+ALTER TABLE l.main.leg ALTER COLUMN id TYPE DOUBLE;
+----
+integer to double is not a type widening
+
+statement error
+ALTER TABLE l.main.leg ALTER COLUMN id TYPE VARCHAR;
+----
+integer to string is not a type widening
+
+# USING is refused by the host for every provider: only the type crosses, so the expression would be dropped.
+statement error
+ALTER TABLE l.main.leg ALTER COLUMN id TYPE BIGINT USING id * 2;
+----
+USING <expression> is not supported
+
+statement ok
+CREATE TABLE l.main.p (id INTEGER, k INTEGER) PARTITIONED BY (k) WITH (type_widening = true);
+
+statement error
+ALTER TABLE l.main.p ALTER COLUMN k TYPE BIGINT;
+----
+is a partition column
+
+statement ok
+INSERT INTO l.main.p VALUES (1, 1);
+
+statement ok
+ALTER TABLE l.main.p ALTER COLUMN id TYPE BIGINT;
+
+query IIT
+SELECT id, k, typeof(id) FROM l.main.p;
+----
+1	1	BIGINT
+
+statement error
+ALTER TABLE l.main.leg SET (type_widening = 'maybe');
+----
+expected true or false
+
+# Inside a transaction that already wrote the table, the ALTER is refused (it commits on its own).
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO l.main.p VALUES (2, 2);
+
+statement error
+ALTER TABLE l.main.p ALTER COLUMN id TYPE BIGINT;
+----
+uncommitted buffered changes
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM l.main.p;
+----
+1

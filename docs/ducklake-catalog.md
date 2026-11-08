@@ -388,7 +388,8 @@ Five tables in `LH/Tables/dbo`, visible after ~1.5 min, every answer exact:
 | `twn_probe` | same files, protocol 1/2, no `typeChanges` | none | 100 / 3000004851 ✓ — tolerated, but not spec-conforming; write `typeWidening` |
 
 ⇒ everything §11.4 needs is readable by Fabric in `name` mode. Our own Delta provider cannot WRITE a type change
-(`ALTER COLUMN TYPE` is refused), but it reads `tw_probe` correctly.
+(`ALTER COLUMN TYPE` is refused), but it reads `tw_probe` correctly. *(2026-11-08: no longer refused — the Delta
+provider writes type widening itself, see README §Type widening and `verify_delta_type_widening`.)*
 
 **Cleanup ordering.** If the sync lags and DuckLake compacts and cleans up, the latest Delta version points at
 deleted files; the synchronous post-commit sync rules that out, a manual sync must run before cleanup.
