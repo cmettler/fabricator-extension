@@ -76,6 +76,11 @@ internal static class HostSettings
     /// describes again, which is the reference oracle.</summary>
     public const string BindSchemaCacheName = "fabricator_bind_schema_cache";
 
+    /// <summary>Read a table whose provider can list its data files (capability <c>file_scan</c>, ABI v101) with
+    /// DuckDB's own parquet reader instead of the provider's scan. Off by default while it is being built; the
+    /// environment variable <c>FABRICATOR_FILE_SCAN=1</c> turns it on for a whole process.</summary>
+    public const string FileScanName = "fabricator_file_scan";
+
     public static IEnumerable<ProviderSetting> Settings { get; } = new[]
     {
         new ProviderSetting(
@@ -129,6 +134,13 @@ internal static class HostSettings
             Description: "Answer an ungrouped COUNT(*), MIN or MAX from table metadata (Delta: the log's per-file " +
                          "counts and statistics) instead of scanning. On by default; turn it off to always scan, " +
                          "which is also the reference oracle for it."),
+        new ProviderSetting(
+            FileScanName,
+            ProviderSettingType.Bool,
+            Default: false,
+            Description: "Read a table whose provider lists its data files (Delta with native_read) with DuckDB's own " +
+                         "parquet reader, so no row crosses into the provider. Off by default while it is being built; " +
+                         "off is also the reference oracle for it."),
         new ProviderSetting(
             BindSchemaCacheName,
             ProviderSettingType.Bool,

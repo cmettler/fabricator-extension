@@ -368,8 +368,28 @@ void Trace(const string &message) {
 	}
 }
 
+//! Sets the stored (physical) names of a mapped struct's members as their identifiers, recursively, from the
+//! plan's {"member": {"p": "…", "c": {…}}} tree.
+void ApplyPhysicalMembers(MultiFileColumnDefinition &column, yyjson_val *members) {
+	if (!members) {
+		return;
+	}
+	for (auto &child : column.children) {
+		auto entry = yyjson_obj_get(members, child.name.GetIdentifierName().c_str());
+		if (!entry) {
+			continue;
+		}
+		auto stored = yyjson_get_str(yyjson_obj_get(entry, "p"));
+		if (stored) {
+			child.identifier = Value(stored);
+		}
+		ApplyPhysicalMembers(child, yyjson_obj_get(entry, "c"));
+	}
+}
+
 //! Parses the plan JSON; false (with the reason traced) when the provider declined or the plan is empty.
-//! `physical` receives the name each column is stored under, where it differs (Delta column mapping 'name').
+//! `physical` receives the name each column is stored under, where it differs (Delta column mapping 'name');
+//! `members` the stored names of struct members, as JSON (owned by the returned doc, freed by the caller).
 bool ParsePlan(const string &json, FileScanPlan &plan, case_insensitive_map_t<string> &physical) {
 	auto doc = yyjson_read(json.data(), json.size(), 0);
 	if (!doc) {
@@ -471,7 +491,12 @@ TableCatalogEntry &FileScanTable(const FunctionData &bind_data, std::string &at_
 	return *plan.table;
 }
 
-bool FileScanEnabled() {
+bool FileScanEnabled(ClientContext &context) {
+	Value enabled;
+	if (context.TryGetCurrentSetting("fabricator_file_scan", enabled) && !enabled.IsNull() &&
+	    enabled.GetValue<bool>()) {
+		return true;
+	}
 	auto env = getenv("FABRICATOR_FILE_SCAN");
 	return env && string(env) == "1";
 }
@@ -481,7 +506,8 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
                       TableFunction &result) {
 	auto plan = make_shared_ptr<FileScanPlan>();
 	case_insensitive_map_t<string> physical;
-	if (!ParsePlan(TableFilePlan(table_handle, at_unit, at_value), *plan, physical)) {
+	auto plan_json = TableFilePlan(table_handle, at_unit, at_value);
+	if (!ParsePlan(plan_json, *plan, physical)) {
 		return false;
 	}
 
@@ -503,6 +529,8 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	plan->table = &table;
 	plan->at_unit = at_unit;
 	plan->at_value = at_value;
+	auto members_doc = yyjson_read(plan_json.data(), plan_json.size(), 0);
+	auto members = members_doc ? yyjson_obj_get(yyjson_doc_get_root(members_doc), "physical_members") : nullptr;
 	for (auto &column : table.GetColumns().Logical()) {
 		auto definition = MultiFileColumnDefinition::CreateFromNameAndType(column.Name(), column.Type());
 		SetNullDefaults(definition);
@@ -511,7 +539,13 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 		if (stored != physical.end()) {
 			definition.identifier = Value(stored->second);
 		}
+		if (members) {
+			ApplyPhysicalMembers(definition, yyjson_obj_get(members, column.Name().GetIdentifierName().c_str()));
+		}
 		plan->columns.push_back(std::move(definition));
+	}
+	if (members_doc) {
+		yyjson_doc_free(members_doc);
 	}
 	// partition values, typed: the log's text cast to the column type, as the native reader's literals are
 	auto &logical_columns = table.GetColumns();

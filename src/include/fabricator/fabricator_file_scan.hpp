@@ -22,8 +22,8 @@ bool TryBuildFileScan(duckdb::ClientContext &context, duckdb::TableCatalogEntry 
                       const std::string &at_unit, const std::string &at_value,
                       duckdb::unique_ptr<duckdb::FunctionData> &bind_data, duckdb::TableFunction &result);
 
-//! Whether the file scan is switched on (FABRICATOR_FILE_SCAN=1).
-bool FileScanEnabled();
+//! Whether the file scan is switched on: the setting fabricator_file_scan, or FABRICATOR_FILE_SCAN=1.
+bool FileScanEnabled(duckdb::ClientContext &context);
 
 //! The table a file scan's bind data reads, and the AT clause it was bound with — what a plan copy needs to rebuild
 //! the scan (FabricatorTableEntry's file-scan serialize/deserialize).

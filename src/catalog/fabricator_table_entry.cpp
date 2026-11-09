@@ -1340,7 +1340,7 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	// ⚠ Asked only where a plan can come back: the crossing binds the table in the transaction, which an explicit
 	// transaction's later reads depend on (verify_delta_partition_stats:288), and in an explicit transaction the plan
 	// would read the whole table where the scan records its pushed predicate (verify_delta_catalog_transactions:517).
-	if (fabricator::FileScanEnabled() && catalog.Cast<FabricatorCatalog>().FileScan() &&
+	if (fabricator::FileScanEnabled(context) && catalog.Cast<FabricatorCatalog>().FileScan() &&
 	    context.transaction.IsAutoCommit()) {
 		FabricatorSetActiveTxn(catalog.Cast<FabricatorCatalog>().GetHandle(), context);
 		TableFunction file_scan;

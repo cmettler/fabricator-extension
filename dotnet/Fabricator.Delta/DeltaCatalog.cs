@@ -465,9 +465,10 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         {
             return Declined("column mapping 'id'");
         }
-        if (listing.MappedSchema is not null)
+        if (listing.MappedSchema is { } mapped && mapped.Fields.Any(f => MappedInsideCollection(f.Type, false)))
         {
-            return Declined("column mapping with nested fields");
+            // a struct member inside a list or map is stored under its physical name too; the plan does not say yet
+            return Declined("column mapping with a struct inside a list or map");
         }
         // partition columns are not in the data files: each file's values come from the log (as text; the host casts
         // them to the column type). A binary partition value's text form is not its bytes.
@@ -504,6 +505,20 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 foreach (var pair in physical)
                 {
                     json.WriteString(pair.Key, pair.Value);
+                }
+                json.WriteEndObject();
+            }
+            if (listing.MappedSchema is { } mappedSchema)
+            {
+                // struct members are stored under physical names as well: {"col": {"member": {"p": "col-…", "c": {…}}}}
+                json.WriteStartObject("physical_members");
+                foreach (var field in mappedSchema.Fields)
+                {
+                    if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
+                    {
+                        json.WritePropertyName(field.Name);
+                        WritePhysicalMembers(json, s);
+                    }
                 }
                 json.WriteEndObject();
             }
@@ -583,6 +598,38 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         }
         _log.LogDebug("delta file plan {Path} v{Version}: {Count} files", path, listing.Version, listing.Files.Count);
         return System.Text.Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    /// <summary>Whether a struct sits inside a list or map anywhere under <paramref name="type"/>.</summary>
+    private static bool MappedInsideCollection(EngineeredWood.DeltaLake.Schema.DeltaDataType type, bool inCollection) =>
+        type switch
+        {
+            EngineeredWood.DeltaLake.Schema.StructType s => inCollection
+                || s.Fields.Any(f => MappedInsideCollection(f.Type, false)),
+            EngineeredWood.DeltaLake.Schema.ArrayType a => MappedInsideCollection(a.ElementType, true),
+            EngineeredWood.DeltaLake.Schema.MapType m => MappedInsideCollection(m.KeyType, true)
+                || MappedInsideCollection(m.ValueType, true),
+            _ => false,
+        };
+
+    private static void WritePhysicalMembers(Utf8JsonWriter json, EngineeredWood.DeltaLake.Schema.StructType type)
+    {
+        json.WriteStartObject();
+        foreach (var field in type.Fields)
+        {
+            json.WriteStartObject(field.Name);
+            if (field.Metadata?.GetValueOrDefault("delta.columnMapping.physicalName") is { Length: > 0 } stored)
+            {
+                json.WriteString("p", stored);
+            }
+            if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
+            {
+                json.WritePropertyName("c");
+                WritePhysicalMembers(json, s);
+            }
+            json.WriteEndObject();
+        }
+        json.WriteEndObject();
     }
 
     /// <summary>The first column type a file plan cannot read faithfully yet, or null. A top-level timestamp is
