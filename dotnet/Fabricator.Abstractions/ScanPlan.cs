@@ -30,8 +30,9 @@ public sealed record ScanPlan
     /// <summary>The live rows across all parts, for the optimizer; null = unknown.</summary>
     public long? RowCount { get; init; }
 
-    /// <summary>Columns stored under another name than the table's (Delta column mapping), by table column name.
-    /// A column not listed is stored under its own name.</summary>
+    /// <summary>Columns stored under another name than the table's, or identified by a field id (Delta column mapping),
+    /// by table column name. A column not listed is stored under its own name. When any column has a
+    /// <see cref="StoredColumn.FieldId"/>, the parts are matched BY FIELD ID and every column must have one.</summary>
     public IReadOnlyDictionary<string, StoredColumn>? StoredColumns { get; init; }
 
     /// <summary>How the virtual columns the table declares (e.g. <c>rowid</c>) are computed, by name.</summary>
@@ -46,8 +47,11 @@ public sealed record ScanPlan
 
 /// <summary>Where a column (and, for a struct, each member) is stored in the parts.</summary>
 /// <param name="StoredName">The name in the parts; null = the column's own name.</param>
-/// <param name="Members">A struct's members stored under other names, by member name.</param>
-public sealed record StoredColumn(string? StoredName, IReadOnlyDictionary<string, StoredColumn>? Members = null);
+/// <param name="Members">A struct's members stored under other names or with field ids, by member name.</param>
+/// <param name="FieldId">The parquet field id the parts store the column under; matching then goes by id, which
+/// survives a rename and a foreign writer's own names.</param>
+public sealed record StoredColumn(string? StoredName, IReadOnlyDictionary<string, StoredColumn>? Members = null,
+                                  int? FieldId = null);
 
 /// <summary>
 /// How a virtual column is computed for a row: the part's own column <paramref name="StoredColumn"/> where the part

@@ -78,7 +78,9 @@ struct FileScanPlan : public TableFunctionInfo {
 	//! the virtual columns the plan computes, by name
 	case_insensitive_map_t<VirtualColumnSpec> virtual_specs;
 	//! the table's columns, in order — the scan's schema; files are mapped onto it BY NAME (identifier = stored name)
+	//! or, when the plan gives field ids, BY FIELD ID (identifier = the id)
 	vector<MultiFileColumnDefinition> columns;
+	bool by_field_id = false;
 	optional_ptr<TableCatalogEntry> table;
 	//! the table's virtual columns plus the reader's own (filename, file_row_number)
 	virtual_column_map_t virtual_columns;
@@ -368,8 +370,14 @@ private:
 		return row_number_column.IsValid() && local == row_number_column.GetIndex();
 	}
 
+	//! The part's own column for a table column: what the mapper matches — the stored name, or the field id the part
+	//! stores it under (then the part keeps the table's name).
 	static MultiFileColumnDefinition LocalColumn(const MultiFileColumnDefinition &global) {
-		MultiFileColumnDefinition local(global.GetIdentifierName(), global.type);
+		bool by_id = !global.identifier.IsNull() && global.identifier.type().id() == LogicalTypeId::INTEGER;
+		MultiFileColumnDefinition local(by_id ? global.name.GetIdentifierName() : global.GetIdentifierName(), global.type);
+		if (by_id) {
+			local.identifier = global.identifier;
+		}
 		for (auto &child : global.children) {
 			local.children.push_back(LocalColumn(child));
 		}
@@ -430,7 +438,7 @@ struct FabricatorFileScanReader : public MultiFileReader {
 			return_types.push_back(column.type);
 			bind_data.schema.push_back(column);
 		}
-		bind_data.mapping = MultiFileColumnMappingMode::BY_NAME;
+		bind_data.mapping = plan->by_field_id ? MultiFileColumnMappingMode::BY_FIELD_ID : MultiFileColumnMappingMode::BY_NAME;
 		return true;
 	}
 
@@ -688,6 +696,14 @@ void ApplyStoredNames(MultiFileColumnDefinition &column, yyjson_val *spec) {
 	if (stored) {
 		column.identifier = Value(stored);
 	}
+	auto field_id = yyjson_obj_get(spec, "field_id");
+	if (field_id) {
+		auto id = PlanInteger(field_id, where + ".field_id", true);
+		if (id > NumericLimits<int32_t>::Maximum()) {
+			PlanError(where + ".field_id is out of range");
+		}
+		column.identifier = Value::INTEGER(int32_t(id)); // matched by field id (the plan says so for every column)
+	}
 	auto members = PlanObject(spec, "members", where);
 	if (!members) {
 		return;
@@ -697,10 +713,14 @@ void ApplyStoredNames(MultiFileColumnDefinition &column, yyjson_val *spec) {
 	}
 }
 
-//! A column a file lacks (added later) reads NULL. Only the column itself: a struct MEMBER a file lacks reads NULL
-//! from the mapper already.
+//! A column or struct member a file lacks (added later) reads NULL, at every depth. By name the mapper would supply a
+//! member's NULL itself; by field id it refuses a member without a default ("Field … is missing from the file schema
+//! and has no default expression").
 void SetNullDefaults(MultiFileColumnDefinition &column) {
 	column.default_expression = ConstantExpression::FromValue(Value(column.type));
+	for (auto &child : column.children) {
+		SetNullDefaults(child);
+	}
 }
 
 //! Frees a yyjson document at scope exit.
@@ -935,6 +955,15 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 		}
 		plan->columns.push_back(std::move(definition));
 	}
+	// field ids or names, never a mix: a column without an id would match nothing by id and read NULL
+	idx_t with_id = 0;
+	for (auto &column : plan->columns) {
+		with_id += !column.identifier.IsNull() && column.identifier.type().id() == LogicalTypeId::INTEGER;
+	}
+	if (with_id > 0 && with_id < plan->columns.size()) {
+		PlanError("some columns have a field id and some do not");
+	}
+	plan->by_field_id = with_id > 0;
 	// the per-file constants, typed: the plan's text cast to the column type
 	auto &logical_columns = table.GetColumns();
 	for (auto &file_constants : plan->constant_text) {

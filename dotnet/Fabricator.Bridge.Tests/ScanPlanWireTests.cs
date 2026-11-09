@@ -171,6 +171,24 @@ public class ScanPlanWireTests
     }
 
     [Fact]
+    public void Field_ids_travel_with_the_columns_and_their_members()
+    {
+        var columns = Wire(new ScanPlan
+        {
+            StoredColumns = new Dictionary<string, StoredColumn>
+            {
+                ["id"] = new(null, FieldId: 1),
+                ["st"] = new(null, new Dictionary<string, StoredColumn> { ["a"] = new(null, FieldId: 3) }, FieldId: 2),
+            },
+            Parts = new ScanPart[] { new FilePart("f") },
+        }).GetProperty("columns");
+        Assert.Equal(1, columns.GetProperty("id").GetProperty("field_id").GetInt32());
+        Assert.False(columns.GetProperty("id").TryGetProperty("stored", out _));
+        Assert.Equal(2, columns.GetProperty("st").GetProperty("field_id").GetInt32());
+        Assert.Equal(3, columns.GetProperty("st").GetProperty("members").GetProperty("a").GetProperty("field_id").GetInt32());
+    }
+
+    [Fact]
     public void Names_with_quotes_and_control_characters_survive()
     {
         var root = Wire(new ScanPlan

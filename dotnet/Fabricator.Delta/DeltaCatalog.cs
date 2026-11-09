@@ -437,7 +437,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     /// <see cref="PartitionStatistics"/> does.
     /// </summary>
     /// <remarks>Declines (the host then scans as before) for what the plan cannot express yet: a pending write in
-    /// the transaction, the codec engine, column mapping 'id' or with nested fields, a binary partition column, nested timestamps (a naive file timestamp
+    /// the transaction, the codec engine, a mapped struct inside a list or map, a binary partition column, nested timestamps (a naive file timestamp
     /// would be cast in the session zone) and VARIANT.</remarks>
     internal ScanPlan PlanScan(string path, TableAt? at)
     {
@@ -460,12 +460,6 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         }
         var listing = DeltaReader.ListNativeScanFiles(Opener(), path, unit, value, prune: null, _log,
                                                       bound: ReadBound(path));
-        // name mode: each column is found in the files under its physical name (top level; a mapped struct's members
-        // are renamed too, which the plan cannot say yet). id mode would map by field id — not yet.
-        if (listing.LogicalToFieldId is not null)
-        {
-            return Declined("column mapping 'id'");
-        }
         if (listing.MappedSchema is { } mapped && mapped.Fields.Any(f => MappedInsideCollection(f.Type, false)))
         {
             // a struct member inside a list or map is stored under its physical name too; the plan does not say yet
@@ -493,7 +487,17 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         }
         // where each column is stored, when it is not under its own name (column mapping 'name'), struct members too
         Dictionary<string, StoredColumn>? stored = null;
-        if (listing.LogicalToPhysical is not null || listing.MappedSchema is not null)
+        if (listing.LogicalToFieldId is not null && listing.TableSchema is { } idSchema)
+        {
+            // id mode: the parts are matched by field id, members included — what survives a rename and a foreign
+            // writer's own physical names (as the native reader's id-keyed map)
+            stored = new Dictionary<string, StoredColumn>(StringComparer.Ordinal);
+            foreach (var field in idSchema.Fields)
+            {
+                stored[field.Name] = FieldIds(field);
+            }
+        }
+        else if (listing.LogicalToPhysical is not null || listing.MappedSchema is not null)
         {
             stored = new Dictionary<string, StoredColumn>(StringComparer.Ordinal);
             foreach (var field in (listing.MappedSchema ?? listing.TableSchema)?.Fields
@@ -511,6 +515,15 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             [DeltaNativeReader.RowTrackingIdColumn] = new ScanVirtualColumn(listing.MaterializedRowIdName, AddRowNumber: true),
             [DeltaNativeReader.RowTrackingVersionColumn] = new ScanVirtualColumn(listing.MaterializedRowCommitVersionName),
         };
+        // the key a partition value is stored under in the log: the PHYSICAL name under column mapping — in id mode too,
+        // where LogicalToPhysical is not set (a NULL for every partition, measured, until it came from the schema)
+        var partitionKeys = listing.PartitionColumns.ToDictionary(
+            c => c,
+            c => listing.LogicalToPhysical?.GetValueOrDefault(c)
+                 ?? listing.TableSchema?.Fields.FirstOrDefault(f => f.Name == c)?.Metadata
+                     ?.GetValueOrDefault("delta.columnMapping.physicalName")
+                 ?? c,
+            StringComparer.Ordinal);
         var parts = new List<ScanPart>(listing.Files.Count);
         long rows = 0;
         bool rowsKnown = true;
@@ -536,8 +549,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 constants = new Dictionary<string, string?>(StringComparer.Ordinal);
                 foreach (var column in listing.PartitionColumns)
                 {
-                    string storedName = listing.LogicalToPhysical?.GetValueOrDefault(column) ?? column;
-                    constants[column] = DeltaNativeReader.LookupPartitionValue(f.PartitionValues, column, storedName);
+                    constants[column] = DeltaNativeReader.LookupPartitionValue(f.PartitionValues, column,
+                                                                                partitionKeys[column]);
                 }
             }
             var values = new Dictionary<string, long?>(StringComparer.Ordinal)
@@ -590,6 +603,30 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 || MappedInsideCollection(m.ValueType, true),
             _ => false,
         };
+
+    /// <summary>A column's field id and, for a struct, its members' (column mapping 'id').</summary>
+    private static StoredColumn FieldIds(EngineeredWood.DeltaLake.Schema.StructField field)
+    {
+        int? id = field.Metadata?.GetValueOrDefault("delta.columnMapping.id") is { } text
+                  && int.TryParse(text, System.Globalization.NumberStyles.Integer,
+                                  System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
+        if (id is null)
+        {
+            throw new InvalidOperationException($"delta scan plan: column mapping 'id' but '{field.Name}' has no id");
+        }
+        Dictionary<string, StoredColumn>? members = null;
+        if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
+        {
+            members = new Dictionary<string, StoredColumn>(StringComparer.Ordinal);
+            foreach (var member in s.Fields)
+            {
+                members[member.Name] = FieldIds(member);
+            }
+        }
+        return new StoredColumn(null, members, id);
+    }
 
     /// <summary>A column's stored name and, for a struct, its members' (column mapping 'name').</summary>
     private static StoredColumn StoredNames(EngineeredWood.DeltaLake.Schema.StructField field, string? stored)

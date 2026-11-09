@@ -132,6 +132,10 @@ internal static class ScanPlanWire
             {
                 json.WriteString("stored", storedName);
             }
+            if (column.FieldId is { } fieldId)
+            {
+                json.WriteNumber("field_id", fieldId);
+            }
             if (column.Members is { Count: > 0 } members)
             {
                 json.WritePropertyName("members");

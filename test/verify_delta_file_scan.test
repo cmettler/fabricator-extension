@@ -8,7 +8,8 @@
 #              Covered: deletion vectors, schema evolution (a column and a struct member added later), column
 #              mapping 'name' and 'none', partition columns incl. a NULL partition, row tracking columns, the row id
 #              (DELETE / UPDATE through the file scan), timestamps under a non-UTC session zone, an inlined CTE (a plan
-#              copy), COUNT(*) from metadata, and the declines (explicit transaction, column mapping 'id').
+#              copy), COUNT(*) from metadata, column mapping 'id' (by field id, partition keys), and the decline of
+#              an explicit transaction.
 # group: [fabricator]
 
 require fabricator
@@ -203,7 +204,7 @@ SELECT count(*) FROM l.main.t;
 3365
 
 # ============================================================================
-# 7. DECLINES: an explicit transaction, column mapping 'id' — the provider's scan, same answers
+# 7. DECLINED: an explicit transaction — the provider's scan, same answers
 # ============================================================================
 statement ok
 BEGIN;
@@ -221,15 +222,56 @@ SELECT count(*) FROM l.main.t WHERE s = 'upd';
 statement ok
 COMMIT;
 
+# ============================================================================
+# 8. COLUMN MAPPING 'id': the parts are matched by field id (a renamed column, an added struct member), partition
+#    values are found under their PHYSICAL key — differential, on one table
+# ============================================================================
 statement ok
-CREATE TABLE i.main.m AS SELECT r AS id, 'v' || r AS v FROM range(10) x(r);
+CREATE TABLE i.main.m (id INTEGER, s VARCHAR, st STRUCT(a INTEGER, b VARCHAR), k VARCHAR) PARTITIONED BY (k);
+
+statement ok
+INSERT INTO i.main.m SELECT r, 'v' || (r % 5), {'a': r, 'b': 'x' || r}, 'k' || (r % 3) FROM range(3000) x(r);
+
+statement ok
+ALTER TABLE i.main.m RENAME COLUMN s TO s2;
+
+statement ok
+ALTER TABLE i.main.m ADD COLUMN st.c DOUBLE;
+
+statement ok
+INSERT INTO i.main.m VALUES (9001, 'new', {'a': 1, 'b': 'y', 'c': 2.5}, 'k9');
+
+statement ok
+SET fabricator_file_scan = false;
+
+statement ok
+CREATE TEMP TABLE ref3 AS SELECT id, s2, st, k, __delta_row_id, rowid FROM i.main.m;
+
+statement ok
+SET fabricator_file_scan = true;
 
 query II
 EXPLAIN SELECT count(*) FROM i.main.m WHERE id > 5;
 ----
-physical_plan	<!REGEX>:.*Fabricator File Scan.*
+physical_plan	<REGEX>:.*Fabricator File Scan.*
 
 query I
-SELECT count(*) FROM i.main.m WHERE id > 5;
+SELECT count(*) FROM ((SELECT id, s2, st, k, __delta_row_id, rowid FROM i.main.m) EXCEPT ALL (SELECT * FROM ref3));
 ----
-4
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ref3) EXCEPT ALL (SELECT id, s2, st, k, __delta_row_id, rowid FROM i.main.m));
+----
+0
+
+# a partition filter with a struct member filter: every k must come from the log under the physical key
+query I
+SELECT count(*) FROM i.main.m WHERE (st).b LIKE 'x1%' AND k = 'k1';
+----
+373
+
+query II
+SELECT count(*), count(k) FROM ref3;
+----
+3001	3001
