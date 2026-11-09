@@ -1275,6 +1275,13 @@ typedef struct FabricatorVTable {
 	// The host still applies the part's constants, stored names, defaults and virtual columns.
 	int32_t (*table_part_scan)(FabricatorHandle table, const char *request_json, struct ArrowArrayStream *out,
 	                           char **err);
+	// Which of a plan's parts may hold a row matching the scan's filters — ABI v101, asked when the scan starts.
+	// filter_json = one filter node (the table scan's spec "filter" shape), its constants in *filter_values
+	// (CONSUMED). *out_json (host frees via free_error) = {"keep": ["<part path>", …]}: the host skips every other
+	// part unopened; {} = the provider cannot tell, every part is read. at_unit / at_value as for table_file_plan.
+	int32_t (*table_parts_matching)(FabricatorHandle table, const char *at_unit, const char *at_value,
+	                                const char *filter_json, struct ArrowArrayStream *filter_values, char **out_json,
+	                                char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------

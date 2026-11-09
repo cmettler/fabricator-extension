@@ -15,6 +15,10 @@
 #include "fabricator/fabricator_file_scan.hpp"
 
 #include "fabricator/clr_host.hpp"
+#include "fabricator/arrow_ingest.hpp"
+#include "fabricator/arrow_produce.hpp"
+#include "catalog/fabricator_catalog.hpp"
+#include "catalog/fabricator_txn_util.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -93,7 +97,14 @@ struct FileScanPlan : public TableFunctionInfo {
 	vector<string> stream_parts;
 	//! the table session the stream parts are asked from
 	FabricatorHandle table_handle = 0;
+	//! the catalog's handle (the ambient transaction for a crossing at scan start) and whether a string range filter
+	//! may be sent to it
+	FabricatorHandle catalog_handle = 0;
+	bool string_order_pushable = false;
 };
+
+unique_ptr<MultiFileList> KeepMatchingParts(const FileScanPlan &plan, const MultiFileList &files,
+                                            MultiFileDynamicPushdownInfo &info);
 
 //! Excludes a file's deleted rows from DuckDB's parquet read (called per row range; returns the KEPT rows).
 class DeletedRowsFilter : public DeleteFilter {
@@ -437,6 +448,14 @@ struct FabricatorFileScanReader : public MultiFileReader {
 
 	shared_ptr<MultiFileList> CreateFileList(ClientContext &, const vector<string> &, const FileGlobInput &) override {
 		return make_shared_ptr<SimpleMultiFileList>(plan->files);
+	}
+
+	//! At scan start: the provider names the parts that may hold a row matching the filters (partition values and its
+	//! statistics, by its own rules); the rest are skipped unopened — no footer read. DuckDB's pre-open skip knows only
+	//! hive and file-name constants, so without this every part was opened.
+	unique_ptr<MultiFileList> DynamicFilterPushdown(const MultiFileList &files,
+	                                                MultiFileDynamicPushdownInfo &info) override {
+		return KeepMatchingParts(*plan, files, info);
 	}
 
 	//! The table's own schema, files mapped onto it by name; a column a file lacks (added later) reads NULL.
@@ -796,6 +815,57 @@ struct YyjsonDoc {
 	yyjson_doc *doc;
 };
 
+unique_ptr<MultiFileList> KeepMatchingParts(const FileScanPlan &plan, const MultiFileList &files,
+                                            MultiFileDynamicPushdownInfo &info) {
+	if (!info.filters.HasFilters() || files.GetTotalFileCount() == 0) {
+		return nullptr;
+	}
+	vector<string> names;
+	for (auto &name : info.column_names) {
+		names.push_back(name.GetIdentifierName());
+	}
+	vector<Value> constants;
+	auto filter = SerializeColumnFilters(info.filters, info.column_indexes, names, info.column_types,
+	                                     plan.string_order_pushable, constants);
+	if (filter.empty()) {
+		return nullptr;
+	}
+	// the producer outlives the call that hands its stream over (abi.h: the BuildFilterValues use-after-free)
+	auto values = constants.empty() ? nullptr : FilterValueProducer(info.context, constants);
+	FabricatorSetActiveTxn(plan.catalog_handle, info.context);
+	auto answer = TablePartsMatching(plan.table_handle, plan.at_unit, plan.at_value, filter,
+	                                 values ? values->Stream() : nullptr);
+	YyjsonDoc doc(answer);
+	auto keep = yyjson_obj_get(doc.Root(), "keep");
+	if (!keep) {
+		return nullptr; // the provider cannot tell
+	}
+	if (!yyjson_is_arr(keep)) {
+		throw IOException("fabricator file scan: the provider's \"keep\" is not a list");
+	}
+	unordered_set<string> kept;
+	size_t i, n;
+	yyjson_val *name;
+	yyjson_arr_foreach(keep, i, n, name) {
+		if (!yyjson_is_str(name)) {
+			throw IOException("fabricator file scan: the provider's \"keep\" names a part that is not a string");
+		}
+		kept.insert(string(yyjson_get_str(name), yyjson_get_len(name)));
+	}
+	vector<OpenFileInfo> result;
+	auto all = files.GetAllFiles();
+	for (auto &file : all) {
+		if (kept.count(file.path)) {
+			result.push_back(file);
+		}
+	}
+	Trace("parts " + std::to_string(all.size()) + " -> " + std::to_string(result.size()) + " by " + filter);
+	if (result.size() == all.size()) {
+		return nullptr;
+	}
+	return make_uniq<SimpleMultiFileList>(std::move(result));
+}
+
 //! Reads the plan (see abi.h table_file_plan) into `plan`: the table's half from the JSON doc, the parts from the
 //! Arrow batch. False (with the reason traced) when the provider declined or listed no parts.
 bool ParsePlan(ClientContext &context, const YyjsonDoc &doc, ArrowArrayStream &parts, FileScanPlan &plan) {
@@ -1001,6 +1071,9 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 
 	plan->table = &table;
 	plan->table_handle = table_handle;
+	auto &catalog = table.ParentCatalog().Cast<FabricatorCatalog>();
+	plan->catalog_handle = catalog.GetHandle();
+	plan->string_order_pushable = catalog.StringOrderPushable();
 	plan->at_unit = at_unit;
 	plan->at_value = at_value;
 	auto column_specs = PlanObject(doc.Root(), "columns", "plan");

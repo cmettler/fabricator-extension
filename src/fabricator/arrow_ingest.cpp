@@ -1900,6 +1900,37 @@ static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFu
 	return json;
 }
 
+string SerializeColumnFilters(const TableFilterSet &filters, const vector<ColumnIndex> &column_indexes,
+                              const vector<string> &names, const vector<LogicalType> &types,
+                              bool string_order_pushable, vector<Value> &constants) {
+	JoinFilterIdsScope ids_scope(nullptr);
+	PrefixRangeScope expand_scope(false);
+	vector<string> parts;
+	for (auto entry : filters) {
+		idx_t key = entry.GetIndex();
+		if (key >= column_indexes.size() || column_indexes[key].HasChildren()) {
+			continue;
+		}
+		auto id = column_indexes[key].GetPrimaryIndex();
+		if (id >= names.size() || id >= types.size()) {
+			continue; // a virtual column: no statistics
+		}
+		vector<string> path {names[id]};
+		string node;
+		if (LiveFilterNode(entry.Filter(), path, types[id], constants, string_order_pushable, node) && !node.empty()) {
+			parts.push_back(std::move(node));
+		}
+	}
+	if (parts.size() <= 1) {
+		return parts.empty() ? string() : parts[0];
+	}
+	string json = "{\"op\":\"and\",\"children\":[";
+	for (idx_t i = 0; i < parts.size(); i++) {
+		json += (i ? "," : "") + parts[i];
+	}
+	return json + "]}";
+}
+
 // Render the scan's LIVE TableFilterSet (static WHERE constants that DuckDB erased from the plan under
 // filter_pushdown=true, PLUS any runtime dynamic/join filters) into one DuckDB SQL predicate for the native
 // (read_parquet) path. Column keys map through the scanned column list to provider names (exactly as

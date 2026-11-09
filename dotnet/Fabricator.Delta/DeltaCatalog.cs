@@ -577,6 +577,41 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         };
     }
 
+    /// <summary>The parts of <see cref="PlanScan"/> that may hold a row matching <paramref name="filter"/>
+    /// (<see cref="ITableBinding.PartsMatching"/>): the same snapshot, listed with the filter as engineered-wood's file
+    /// pruner — the log's statistics and partition values, with the native reader's rules (a millisecond Spark
+    /// timestamp max widened, a column widened from float unbounded). Null when it cannot tell.</summary>
+    internal IReadOnlyCollection<string>? PartsMatching(string path, TableAt? at, FilterNode filter,
+                                                        IArrowArrayStream? filterValues)
+    {
+        if (!_nativeRead || IsExplicitTxn(AmbientTransaction.Current))
+        {
+            return null;
+        }
+        EngineeredWood.Expressions.Predicate? prune;
+        try
+        {
+            prune = new DeltaFilterBuilder(ReadFilterValues(filterValues)).Build(filter);
+        }
+        catch
+        {
+            return null; // a shape the pruner cannot take: read every part
+        }
+        if (prune is null)
+        {
+            return null;
+        }
+        // the version the plan was made at: its pin (an autocommit statement pins at bind) or the AT clause
+        if (!TryResolveMetadataRead(path, at, "file prune", out var unit, out var value, out _) || unit is null)
+        {
+            return null;
+        }
+        var listing = DeltaReader.ListNativeScanFiles(Opener(), path, unit, value, prune, _log, bound: ReadBound(path));
+        _log.LogDebug("delta file prune {Path} v{Version}: {Count} files may match", path, listing.Version,
+                      listing.Files.Count);
+        return listing.Files.Select(f => f.Uri).ToList();
+    }
+
     private static readonly bool StreamPartsSpike =
         Environment.GetEnvironmentVariable("FABRICATOR_FILE_SCAN_STREAM_PARTS") == "1";
 

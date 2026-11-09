@@ -359,6 +359,8 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte**, CArrowArrayStream*, byte**, int> TableFilePlan;
     // ABI v101: the rows of a plan's stream part (table_part_scan).
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> TablePartScan;
+    // table_parts_matching(table, at_unit, at_value, filter_json, filter_values, out_json, err) — ABI v101
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, CArrowArrayStream*, byte**, byte**, int> TablePartsMatching;
 }
 
 /// <summary>

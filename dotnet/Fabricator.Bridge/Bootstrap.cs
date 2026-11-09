@@ -182,6 +182,7 @@ public static unsafe class Bootstrap
         vtable->CatalogSchemaExists = &CatalogSchemaExists;
         vtable->TableFilePlan = &TableFilePlan;
         vtable->TablePartScan = &TablePartScan;
+        vtable->TablePartsMatching = &TablePartsMatching;
         return FabricatorStatus.Ok;
     }
 
@@ -803,6 +804,33 @@ public static unsafe class Bootstrap
             {
                 CArrowArrayStreamExporter.ExportArrayStream(parts, outParts); // a declined plan leaves it unset
             }
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TablePartsMatching(nint table, byte* atUnit, byte* atValue, byte* filterJson,
+                                          CArrowArrayStream* filterValues, byte** outJson, byte** err)
+    {
+        try
+        {
+            if (outJson is null || filterJson is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            string unit = atUnit is null ? "" : Marshal.PtrToStringUTF8((nint)atUnit) ?? "";
+            string value = atValue is null ? "" : Marshal.PtrToStringUTF8((nint)atValue) ?? "";
+            TableAt? at = unit.Length == 0 ? null : new TableAt(unit, value);
+            using IArrowArrayStream? values = filterValues is null
+                ? null
+                : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+            string json = session.PartsMatchingJson(at, Marshal.PtrToStringUTF8((nint)filterJson) ?? "null", values);
             *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
             return FabricatorStatus.Ok;
         }

@@ -214,6 +214,14 @@ public interface ITableBinding : IDisposable
     IArrowArrayStream ReadPart(string name, IReadOnlyList<string?> columns) =>
         throw new NotSupportedException($"{GetType().Name} plans no stream parts");
 
+    /// <summary>The names of the parts of this binding's <see cref="PlanScan"/> that may hold a row matching
+    /// <paramref name="filter"/> (a <see cref="ScanSpec.Filter"/>, its constants in <paramref name="filterValues"/>, as
+    /// for <see cref="Scan"/>); the host skips every other part, unopened. Null — the default — means the provider
+    /// cannot tell and every part is read. Asked when the scan starts, with the filters it has then.</summary>
+    /// <remarks>⚠ Leaving out a part that holds a match LOSES ROWS: name every part the provider is unsure about.
+    /// The filter is the scan's own, so a part it rules out cannot contribute a row the query keeps.</remarks>
+    IReadOnlyCollection<string>? PartsMatching(FilterNode filter, IArrowArrayStream? filterValues) => null;
+
     /// <summary>Whether <see cref="DeleteWhere"/> can run a DELETE on this table as ONE predicate statement
     /// (ABI v93). False by default, so a provider that does not implement it keeps the rowid path. Asked
     /// when a DELETE is PLANNED, never during enumeration, so it may probe.</summary>

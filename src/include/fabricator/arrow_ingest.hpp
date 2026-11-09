@@ -364,4 +364,13 @@ class ArrowProducer;
 duckdb::unique_ptr<ArrowProducer> FilterValueProducer(duckdb::ClientContext &context,
                                                       const duckdb::vector<duckdb::Value> &consts);
 
+//! A filter set on plain columns as ONE filter node (the scan spec's "filter" shape; empty = nothing to say), its
+//! constants appended to `constants`. Key i of `filters` is column_indexes[i], whose primary index names a column
+//! of `names`/`types`; a virtual column or a struct field is skipped (dropping a conjunct only widens).
+duckdb::string SerializeColumnFilters(const duckdb::TableFilterSet &filters,
+                                      const duckdb::vector<duckdb::ColumnIndex> &column_indexes,
+                                      const duckdb::vector<duckdb::string> &names,
+                                      const duckdb::vector<duckdb::LogicalType> &types, bool string_order_pushable,
+                                      duckdb::vector<duckdb::Value> &constants);
+
 } // namespace fabricator

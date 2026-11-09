@@ -270,6 +270,10 @@ std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, co
                           ArrowArrayStream &parts);
 //! ABI v101: the rows of a plan's stream part (abi.h table_part_scan) into `out`.
 void TablePartScan(FabricatorHandle table, const std::string &request_json, ArrowArrayStream &out);
+// The parts that may match (table_parts_matching, ABI v101): the provider's JSON answer, "{}" from an older bridge.
+// filter_values is consumed.
+std::string TablePartsMatching(FabricatorHandle table, const std::string &at_unit, const std::string &at_value,
+                               const std::string &filter_json, ArrowArrayStream *filter_values);
 
 //! remote_translate (ABI v96): a Substrait plan to the provider's query, as the JSON doc in abi.h ("{}" = declined).
 std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan);

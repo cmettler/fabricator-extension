@@ -379,3 +379,53 @@ SELECT list(id ORDER BY id) FROM d10.main.tz WHERE ts >= TIMESTAMPTZ '2025-01-01
 
 statement ok
 SET TimeZone = 'UTC';
+
+# ============================================================================
+# 11. PARTS THE FILTER RULES OUT ARE NEVER OPENED. At scan start the provider names the parts that may hold a match
+#     (partition values and the log's statistics); DuckDB's own pre-open skip knows only hive and file-name constants.
+#     The y partition's data file is overwritten with garbage: a read that opens it fails (the control), a read whose
+#     filter rules it out succeeds — by partition value, by statistics, and when no part can match.
+# ============================================================================
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/fs11' AS l11 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE TABLE l11.main.p (id INTEGER, k VARCHAR) PARTITIONED BY (k);
+
+statement ok
+INSERT INTO l11.main.p SELECT r, 'x' FROM range(0, 100) t(r);
+
+statement ok
+INSERT INTO l11.main.p SELECT r, 'y' FROM range(100, 200) t(r);
+
+query I
+SELECT sum(fabricator_host_exec('COPY (SELECT 1 AS garbage) TO ''{FABRICATOR_DELTA_WRITE_DIR}/fs11/p/' || add.path || ''' (FORMAT csv)'))
+FROM read_json('{FABRICATOR_DELTA_WRITE_DIR}/fs11/p/_delta_log/*.json') WHERE add IS NOT NULL AND contains(to_json(add.partitionValues), '"y"');
+----
+1
+
+statement ok
+SET fabricator_file_scan = true;
+
+statement error
+SELECT sum(id) FROM l11.main.p;
+----
+Invalid Input Error
+
+query I
+SELECT sum(id) FROM l11.main.p WHERE k = 'x';
+----
+4950
+
+query I
+SELECT sum(id) FROM l11.main.p WHERE id < 50;
+----
+1225
+
+query I
+SELECT sum(id) FROM l11.main.p WHERE id > 1000;
+----
+NULL
+
+statement ok
+DETACH l11;

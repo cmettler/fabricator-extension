@@ -232,6 +232,30 @@ internal sealed class TableSession
         return (ScanPlanWire.ToJson(plan), plan.DeclinedReason is null ? ScanPartsArrow.ToStream(plan) : null);
     }, at ?? _at);
 
+    /// <summary>The <c>table_parts_matching</c> answer (ABI v101): <c>{"keep": [names]}</c>, or <c>{}</c> when the
+    /// provider cannot tell (every part is read).</summary>
+    internal string PartsMatchingJson(TableAt? at, string filterJson, IArrowArrayStream? values) => With(t =>
+    {
+        var filter = ScanSpec.Parse("{\"filter\":" + filterJson + "}")?.Filter;
+        var keep = filter is null ? null : t.PartsMatching(filter, values);
+        using var buffer = new MemoryStream();
+        using (var json = new Utf8JsonWriter(buffer))
+        {
+            json.WriteStartObject();
+            if (keep is not null)
+            {
+                json.WriteStartArray("keep");
+                foreach (var name in keep)
+                {
+                    json.WriteStringValue(name);
+                }
+                json.WriteEndArray();
+            }
+            json.WriteEndObject();
+        }
+        return System.Text.Encoding.UTF8.GetString(buffer.ToArray());
+    }, at ?? _at);
+
     /// <summary>The <c>table_part_scan</c> answer (ABI v101): the rows of a stream part the plan named.</summary>
     internal IArrowArrayStream PartScan(string part, IReadOnlyList<string?> columns) =>
         With(t => t.ReadPart(part, columns));

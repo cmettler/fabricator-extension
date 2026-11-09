@@ -932,6 +932,29 @@ void TablePartScan(FabricatorHandle table, const std::string &request_json, Arro
 	}
 }
 
+std::string TablePartsMatching(FabricatorHandle table, const std::string &at_unit, const std::string &at_value,
+                               const std::string &filter_json, ArrowArrayStream *filter_values) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_parts_matching) {
+		if (filter_values && filter_values->release) {
+			filter_values->release(filter_values);
+		}
+		return "{}";
+	}
+	char *out_json = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.table_parts_matching(table, at_unit.c_str(), at_value.c_str(), filter_json.c_str(), filter_values,
+	                                     &out_json, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_parts_matching failed");
+	}
+	std::string result = out_json ? out_json : "{}";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json);
+	}
+	return result;
+}
+
 std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.remote_translate) {
