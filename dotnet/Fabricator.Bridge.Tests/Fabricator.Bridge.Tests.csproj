@@ -132,6 +132,14 @@
     <Compile Include="..\Fabricator.Abstractions\AlterTableSpec.cs"
              Link="Linked\AlterTableSpec.cs" />
     <!--
+      The scan plan (ABI v101 table_file_plan): the typed form a provider answers and its wire form, which
+      src/fabricator/fabricator_file_scan.cpp reads. Both BCL-only by design, so the format is pinned here.
+    -->
+    <Compile Include="..\Fabricator.Abstractions\ScanPlan.cs"
+             Link="Linked\ScanPlan.cs" />
+    <Compile Include="..\Fabricator.Bridge\ScanPlanWire.cs"
+             Link="Linked\ScanPlanWire.cs" />
+    <!--
       The plugin archive's contract: the manifest and the any/ + <platform>/ merge. Admissible because it is
       System.Text.Json plus string work — the file I/O and the registry invalidation live next door in
       PluginInstall.cs, which is exactly why this half exists as its own file. Worth pinning offline rather

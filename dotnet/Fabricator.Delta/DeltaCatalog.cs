@@ -430,17 +430,18 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     }
 
     /// <summary>
-    /// The file plan for <paramref name="path"/> (ABI v101 <c>table_file_plan</c>, <see cref="IFileScanPlan"/>):
-    /// the active data files of the snapshot the scan would read, with each file's deleted positions and the row
-    /// id of its first row, so the host can read them with DuckDB's own parquet reader instead of this provider's
-    /// scan. Resolves and seeds the version exactly as <see cref="PartitionStatistics"/> does.
+    /// The scan plan for <paramref name="path"/> (<see cref="ITableBinding.PlanScan"/>, ABI v101): the active data
+    /// files of the snapshot the scan would read as <see cref="FilePart"/>s — deleted positions, partition values as
+    /// constants, the row id and row tracking as virtual columns — so the host reads them with DuckDB's own parquet
+    /// reader instead of this provider's scan. Resolves and seeds the version exactly as
+    /// <see cref="PartitionStatistics"/> does.
     /// </summary>
     /// <remarks>Declines (the host then scans as before) for what the plan cannot express yet: a pending write in
     /// the transaction, the codec engine, column mapping 'id' or with nested fields, a binary partition column, nested timestamps (a naive file timestamp
     /// would be cast in the session zone) and VARIANT.</remarks>
-    internal string FilePlanJson(string path, TableAt? at)
+    internal ScanPlan PlanScan(string path, TableAt? at)
     {
-        static string Declined(string reason) => JsonSerializer.Serialize(new { declined = reason });
+        static ScanPlan Declined(string reason) => ScanPlan.Decline(reason);
         if (!_nativeRead)
         {
             return Declined("native_read is off");
@@ -490,130 +491,82 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         {
             return Declined("a concurrent reference pinned another version");
         }
-        using var buffer = new MemoryStream();
-        using (var json = new Utf8JsonWriter(buffer))
+        // where each column is stored, when it is not under its own name (column mapping 'name'), struct members too
+        Dictionary<string, StoredColumn>? stored = null;
+        if (listing.LogicalToPhysical is not null || listing.MappedSchema is not null)
         {
-            json.WriteStartObject();
-            json.WriteNumber("version", listing.Version);
-            // where each column is stored, when it is not under its own name (column mapping 'name'), struct members too
-            if (listing.LogicalToPhysical is not null || listing.MappedSchema is not null)
+            stored = new Dictionary<string, StoredColumn>(StringComparer.Ordinal);
+            foreach (var field in (listing.MappedSchema ?? listing.TableSchema)?.Fields
+                                  ?? (IReadOnlyList<EngineeredWood.DeltaLake.Schema.StructField>)System.Array.Empty<EngineeredWood.DeltaLake.Schema.StructField>())
             {
-                json.WriteStartObject("columns");
-                var fields = (listing.MappedSchema ?? listing.TableSchema)?.Fields
-                             ?? (IReadOnlyList<EngineeredWood.DeltaLake.Schema.StructField>)System.Array.Empty<EngineeredWood.DeltaLake.Schema.StructField>();
-                foreach (var field in fields)
-                {
-                    json.WritePropertyName(field.Name);
-                    WriteStoredNames(json, field, listing.LogicalToPhysical?.GetValueOrDefault(field.Name));
-                }
-                json.WriteEndObject();
+                stored[field.Name] = StoredNames(field, listing.LogicalToPhysical?.GetValueOrDefault(field.Name));
             }
-            // the virtual columns the host computes per file: the row id (the file's first row id + file_row_number,
-            // engineered-wood's encoding) and row tracking (the materialized column where a file stores one and the row
-            // has a value, else baseRowId + file_row_number / the default commit version — DeltaNativeReader.RowTrackingExpr)
-            json.WriteStartObject("virtual");
-            json.WriteStartObject("rowid");
-            json.WriteBoolean("add_row_number", true);
-            json.WriteEndObject();
-            json.WriteStartObject(DeltaNativeReader.RowTrackingIdColumn);
-            json.WriteString("stored", listing.MaterializedRowIdName);
-            json.WriteBoolean("add_row_number", true);
-            json.WriteEndObject();
-            json.WriteStartObject(DeltaNativeReader.RowTrackingVersionColumn);
-            json.WriteString("stored", listing.MaterializedRowCommitVersionName);
-            json.WriteEndObject();
-            json.WriteEndObject();
-            // the live row count from the log (records minus deleted), when every file states its records: the
-            // optimizer's cardinality — parquet's own estimate is switched off, it would count deleted rows
-            long rows = 0;
-            bool rowsKnown = true;
-            foreach (var f in listing.Files)
-            {
-                if (f.NumRecords is { } n)
-                {
-                    rows += System.Math.Max(0, n - f.Dv.Length);
-                }
-                else
-                {
-                    rowsKnown = false;
-                }
-            }
-            if (rowsKnown)
-            {
-                json.WriteNumber("row_count", rows);
-            }
-            json.WriteStartArray("files");
-            foreach (var f in listing.Files)
-            {
-                // a file whose deletion vector covers every row contributes nothing (as in the native reader)
-                if (f.NumRecords is { } n && n > 0 && f.Dv.Length >= n)
-                {
-                    continue;
-                }
-                json.WriteStartObject();
-                json.WriteString("path", f.Uri);
-                // ⚠ SPIKE (FABRICATOR_FILE_SCAN_STREAM_PARTS=1): every other DV-free file of an unmapped table is a
-                // stream part, read by this provider (ScanFilePart) instead of by DuckDB — to prove the two mix in one
-                // scan, and to measure what a provider-read part costs
-                if (StreamPartsSpike && f.Dv.Length == 0 && listing.LogicalToPhysical is null && f.Ordinal % 2 == 1)
-                {
-                    json.WriteString("stream", f.Uri);
-                }
-                if (f.SizeBytes is { } size && size > 0)
-                {
-                    json.WriteNumber("size", size);
-                }
-                // partition columns are not in the data files: the file's values from the log, as constants
-                if (listing.PartitionColumns.Count > 0)
-                {
-                    json.WriteStartObject("constants");
-                    foreach (var column in listing.PartitionColumns)
-                    {
-                        string stored = listing.LogicalToPhysical?.GetValueOrDefault(column) ?? column;
-                        if (DeltaNativeReader.LookupPartitionValue(f.PartitionValues, column, stored) is { } v)
-                        {
-                            json.WriteString(column, v);
-                        }
-                        else
-                        {
-                            json.WriteNull(column);
-                        }
-                    }
-                    json.WriteEndObject();
-                }
-                json.WriteStartObject("virtual");
-                json.WriteNumber("rowid", TransientRowAddress.Pack(f.Ordinal, 0));
-                if (f.BaseRowId is { } baseRowId)
-                {
-                    json.WriteNumber(DeltaNativeReader.RowTrackingIdColumn, baseRowId);
-                }
-                if (f.CommitVersion is { } commitVersion)
-                {
-                    json.WriteNumber(DeltaNativeReader.RowTrackingVersionColumn, commitVersion);
-                }
-                json.WriteEndObject();
-                if (f.Dv.Length > 0)
-                {
-                    json.WriteStartArray("dv");
-                    foreach (var p in f.Dv)
-                    {
-                        json.WriteNumberValue(p);
-                    }
-                    json.WriteEndArray();
-                }
-                json.WriteEndObject();
-            }
-            json.WriteEndArray();
-            json.WriteEndObject();
         }
-        _log.LogDebug("delta file plan {Path} v{Version}: {Count} files", path, listing.Version, listing.Files.Count);
-        return System.Text.Encoding.UTF8.GetString(buffer.ToArray());
+        // the row id (the file's first row id + its position, engineered-wood's encoding) and row tracking (the
+        // materialized column where a file stores one and the row has a value, else baseRowId + position / the default
+        // commit version — DeltaNativeReader.RowTrackingExpr)
+        var virtualColumns = new Dictionary<string, ScanVirtualColumn>(StringComparer.Ordinal)
+        {
+            ["rowid"] = new ScanVirtualColumn(AddRowNumber: true),
+            [DeltaNativeReader.RowTrackingIdColumn] = new ScanVirtualColumn(listing.MaterializedRowIdName, AddRowNumber: true),
+            [DeltaNativeReader.RowTrackingVersionColumn] = new ScanVirtualColumn(listing.MaterializedRowCommitVersionName),
+        };
+        var parts = new List<ScanPart>(listing.Files.Count);
+        long rows = 0;
+        bool rowsKnown = true;
+        foreach (var f in listing.Files)
+        {
+            // the live row count from the log (records minus deleted), when every file states its records
+            if (f.NumRecords is { } n)
+            {
+                rows += Math.Max(0, n - f.Dv.Length);
+                if (n > 0 && f.Dv.Length >= n)
+                {
+                    continue; // every row deleted: the file contributes nothing (as in the native reader)
+                }
+            }
+            else
+            {
+                rowsKnown = false;
+            }
+            Dictionary<string, string?>? constants = null;
+            if (listing.PartitionColumns.Count > 0)
+            {
+                // partition columns are not in the data files: the file's values from the log
+                constants = new Dictionary<string, string?>(StringComparer.Ordinal);
+                foreach (var column in listing.PartitionColumns)
+                {
+                    string storedName = listing.LogicalToPhysical?.GetValueOrDefault(column) ?? column;
+                    constants[column] = DeltaNativeReader.LookupPartitionValue(f.PartitionValues, column, storedName);
+                }
+            }
+            var values = new Dictionary<string, long?>(StringComparer.Ordinal)
+            {
+                ["rowid"] = TransientRowAddress.Pack(f.Ordinal, 0),
+                [DeltaNativeReader.RowTrackingIdColumn] = f.BaseRowId,
+                [DeltaNativeReader.RowTrackingVersionColumn] = f.CommitVersion,
+            };
+            // ⚠ SPIKE (FABRICATOR_FILE_SCAN_STREAM_PARTS=1): every other DV-free file of an unmapped table is a stream
+            // part, read by this provider (ReadPart) instead of by DuckDB — the stand-in for a format DuckDB cannot read
+            ScanPart part = StreamPartsSpike && f.Dv.Length == 0 && listing.LogicalToPhysical is null && f.Ordinal % 2 == 1
+                ? new StreamPart(f.Uri)
+                : new FilePart(f.Uri) { Size = f.SizeBytes is > 0 ? f.SizeBytes : null, DeletedRows = f.Dv };
+            parts.Add(part with { Constants = constants, VirtualValues = values });
+        }
+        _log.LogDebug("delta scan plan {Path} v{Version}: {Count} parts", path, listing.Version, parts.Count);
+        return new ScanPlan
+        {
+            Parts = parts,
+            RowCount = rowsKnown ? rows : null,
+            StoredColumns = stored,
+            VirtualColumns = virtualColumns,
+        };
     }
 
     private static readonly bool StreamPartsSpike =
         Environment.GetEnvironmentVariable("FABRICATOR_FILE_SCAN_STREAM_PARTS") == "1";
 
-    /// <summary>The rows of a stream part (<see cref="IFileScanPlan.ScanPart"/>): here a data file read through a
+    /// <summary>The rows of a stream part (<see cref="ITableBinding.ReadPart"/>): here a data file read through a
     /// host query — the spike's stand-in for a format DuckDB cannot read itself.</summary>
     internal IArrowArrayStream ScanFilePart(string part, IReadOnlyList<string> columns)
     {
@@ -637,28 +590,20 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             _ => false,
         };
 
-    /// <summary>A column's stored name and, for a struct, its members' — the plan's
-    /// <c>{"stored": "…", "members": {"m": {…}}}</c>; a name stored as itself is left out.</summary>
-    private static void WriteStoredNames(Utf8JsonWriter json, EngineeredWood.DeltaLake.Schema.StructField field,
-                                         string? stored)
+    /// <summary>A column's stored name and, for a struct, its members' (column mapping 'name').</summary>
+    private static StoredColumn StoredNames(EngineeredWood.DeltaLake.Schema.StructField field, string? stored)
     {
-        json.WriteStartObject();
         stored ??= field.Metadata?.GetValueOrDefault("delta.columnMapping.physicalName");
-        if (stored is { Length: > 0 } && stored != field.Name)
-        {
-            json.WriteString("stored", stored);
-        }
+        Dictionary<string, StoredColumn>? members = null;
         if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
         {
-            json.WriteStartObject("members");
+            members = new Dictionary<string, StoredColumn>(StringComparer.Ordinal);
             foreach (var member in s.Fields)
             {
-                json.WritePropertyName(member.Name);
-                WriteStoredNames(json, member, null);
+                members[member.Name] = StoredNames(member, null);
             }
-            json.WriteEndObject();
         }
-        json.WriteEndObject();
+        return new StoredColumn(stored is { Length: > 0 } && stored != field.Name ? stored : null, members);
     }
 
     /// <summary>The first column type a file plan cannot read faithfully yet, or null. A top-level timestamp is

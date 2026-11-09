@@ -224,16 +224,14 @@ internal sealed class TableSession
         return Encoding.UTF8.GetString(buffer.ToArray());
     }, at ?? _at);
 
-    /// <summary>The <c>table_file_plan</c> answer (ABI v101, <see cref="IFileScanPlan"/>). A binding that
+    /// <summary>The <c>table_file_plan</c> answer (ABI v101, <see cref="ITableBinding.PlanScan"/>). A binding that
     /// cannot plan files declines, and the host scans as before.</summary>
-    internal string FilePlanJson(TableAt? at) => With(t => t is IFileScanPlan plan
-        ? plan.FilePlanJson()
-        : "{\"declined\":\"the provider does not plan files\"}", at ?? _at);
+    internal string FilePlanJson(TableAt? at) => With(
+        t => ScanPlanWire.ToJson(t.PlanScan() ?? ScanPlan.Decline("the provider does not plan scans")), at ?? _at);
 
     /// <summary>The <c>table_part_scan</c> answer (ABI v101): the rows of a stream part the plan named.</summary>
-    internal IArrowArrayStream PartScan(string part, IReadOnlyList<string> columns) => With(t => t is IFileScanPlan plan
-        ? plan.ScanPart(part, columns)
-        : throw new InvalidOperationException("table_part_scan: the provider does not plan files"));
+    internal IArrowArrayStream PartScan(string part, IReadOnlyList<string> columns) =>
+        With(t => t.ReadPart(part, columns));
 
     /// <summary>The <c>table_dml_info</c> answer (ABI v93): <c>{"delete_where": bool, "update_where": bool}</c>,
     /// plus — for a binding that is an <see cref="IDeleteWhereShape"/> — the three keys that narrow when the host

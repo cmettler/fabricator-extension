@@ -199,6 +199,19 @@ public interface ITableBinding : IDisposable
     /// actually present; a bound that is merely an upper or lower limit is not exact.</remarks>
     IReadOnlyList<FileStatistics>? PartitionStatistics() => null;
 
+    /// <summary>The table as a set of parts the host reads in one parallel scan (ABI v101) — DuckDB's own reader for a
+    /// <see cref="FilePart"/>, <see cref="ReadPart"/> for a <see cref="StreamPart"/>. Null — the default — means the
+    /// provider does not plan scans; <see cref="ScanPlan.Decline"/> that it does not for this table or transaction.
+    /// Either way the host calls <see cref="Scan"/>.</summary>
+    /// <remarks>⚠ THE PLAN REPLACES THE SCAN, like <see cref="PartitionStatistics"/>: same snapshot, nothing pending.
+    /// Asked at bind, once per table reference.</remarks>
+    ScanPlan? PlanScan() => null;
+
+    /// <summary>The rows of a <see cref="StreamPart"/> this binding's plan named: <paramref name="columns"/> (the
+    /// table's names, in that order; empty = only the row count matters), the part's deleted rows removed.</summary>
+    IArrowArrayStream ReadPart(string name, IReadOnlyList<string> columns) =>
+        throw new NotSupportedException($"{GetType().Name} plans no stream parts");
+
     /// <summary>Whether <see cref="DeleteWhere"/> can run a DELETE on this table as ONE predicate statement
     /// (ABI v93). False by default, so a provider that does not implement it keeps the rowid path. Asked
     /// when a DELETE is PLANNED, never during enumeration, so it may probe.</summary>
