@@ -150,3 +150,66 @@ SELECT sum(CAST(s.a AS DOUBLE)) FROM c.main.big WHERE s.a < 10;
 
 statement ok
 DETACH c;
+
+# ---- 6. the codec engine with pushdown_filters 'all': its scans take DuckDB's filters and the host RE-APPLIES them
+#      to each chunk (superset_filter_pushdown), so a filter on an extracted field is re-applied on the FIELD the scan
+#      emits, typed by it (after a folded CAST), not on the struct column ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sx' AS ca (TYPE fabricator, PROVIDER 'engineeredwooddelta', pushdown_filters 'all',
+READ_ONLY true);
+
+query II
+SELECT count(*), sum(b.g) FROM ca.main.big b JOIN ca.main.dim d ON b.s.a = d.k;
+----
+1998	6002
+
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '${FABRICATOR_DELTA_WRITE_DIR}/sx_codec_profile.json';
+
+statement ok
+SELECT count(*) FROM ca.main.big b JOIN ca.main.dim d ON b.s.a = d.k;
+
+statement ok
+PRAGMA disable_profiling;
+
+# the join filter, re-applied on the field: big's scan hands the join about 2000 rows, not 400000
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/sx_codec_profile.json'));
+----
+2	true
+
+query II
+SELECT count(*), sum(b.g) FROM ca.main.big b JOIN ca.main.dim d ON b.s.b = d.h;
+----
+2000	6002
+
+# static filters on fields, erased from the plan: the re-application is the only thing applying them
+query II
+SELECT count(*), sum(b.s.a) FROM ca.main.big b WHERE b.s.n.x = 5;
+----
+30763	6144276353
+
+query I
+SELECT sum(CAST(s.a AS DOUBLE)) FROM ca.main.big WHERE s.a < 10;
+----
+45.0
+
+query III
+SELECT s.a, s.n.x, g FROM ca.main.big WHERE s.a BETWEEN 776 AND 779 ORDER BY 2, 1;
+----
+776	9	6
+778	11	1
+779	12	2
+
+query I
+SELECT count(*) FROM ca.main.big WHERE s.a IS NULL;
+----
+594
+
+statement ok
+DETACH ca;

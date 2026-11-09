@@ -348,12 +348,15 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     //   none    — no pushdown at all (pure fallback: DuckDB filters everything above the scan).
     //   static  — the bind-time filter is pushed BEST-EFFORT for engineered-wood file/row-group/bloom
     //             pruning (superset-safe; DuckDB re-applies). The codec default.
-    //   dynamic/all — EXACT mode: the scan declares filter_pushdown=true, DuckDB hands the live
-    //             TableFilterSet (static + dynamic JOIN filters) and ERASES the statics from the plan; the
-    //             host renders it 1:1 to SQL (spec.native_filter). native_read applies it inside
-    //             read_parquet; the codec path applies it EXACTLY per batch via HostBatchFilter. 'dynamic'
-    //             is accepted as an alias of 'all' on this provider (the erasure contract is all-or-nothing).
-    //             The native_read default. Downgrades to 'static' when host queries are unavailable.
+    //   dynamic/all — the scan declares filter_pushdown=true: DuckDB hands the live TableFilterSet (static +
+    //             dynamic JOIN filters) and ERASES the statics from the plan. native_read applies it EXACTLY inside
+    //             read_parquet (spec.native_filter; capability exact_filter_pushdown). The codec engine prunes with
+    //             it (files, row groups, bloom filters) and the HOST re-applies every filter per chunk, natively and
+    //             on every scan thread (capability superset_filter_pushdown, as SQL Server and ADBC) — it used to
+    //             apply the SQL per batch through a host query (HostBatchFilter), which MEASURED 62.2 s against
+    //             43.0 s on TPC-H SF10 on MinIO, the per-batch query alone 10 s of Q1. 'dynamic' is accepted as an
+    //             alias of 'all' on this provider. The native_read default. native_read downgrades to 'static'
+    //             when host queries are unavailable.
     private enum PushdownMode { None, Static, Exact }
 
     /// <summary>The <c>schemas</c> ATTACH option: how the directory tree under a non-OneLake root maps to
@@ -896,8 +899,9 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     $"pushdown_filters: unknown mode '{s}' (expected 'none', 'static', 'dynamic', or 'all')."),
             };
         }
-        // Exact application needs the host engine (read_parquet WHERE / HostBatchFilter).
-        if (mode == PushdownMode.Exact && !Host.CanQuery)
+        // native_read's exact application needs the host engine (read_parquet WHERE); the codec engine's filters
+        // are re-applied by the host's scan itself, which needs nothing more.
+        if (mode == PushdownMode.Exact && nativeRead && !Host.CanQuery)
         {
             mode = PushdownMode.Static;
         }
@@ -1319,7 +1323,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             var caps = "\"is_binary_collation\":true,\"null_order_expressible\":true";
             if (_pushdownMode == PushdownMode.Exact)
             {
-                caps = "\"exact_filter_pushdown\":true," + caps;
+                // native_read applies the filters exactly; the codec engine prunes with them and the host re-applies
+                caps = (_nativeRead ? "\"exact_filter_pushdown\":true," : "\"superset_filter_pushdown\":true,") + caps;
             }
             if (NestedLayout)
             {
@@ -1425,13 +1430,17 @@ public sealed partial class DeltaCatalog : IProviderCatalog
 
     // DIAGNOSTIC capability rows (property, value) for fabricator_server_info() — since ABI v71 the HOST
     // reads CapabilitiesJson instead (same _pushdownMode source, so the two cannot drift).
-    // `exact_filter_pushdown` = whether the host may set filter_pushdown=true on this catalog's scans —
-    // governed by the pushdown_filters mode: EXACT mode applies the erased TableFilterSet 1:1
-    // (read_parquet WHERE under native_read; HostBatchFilter per batch on the codec path); None/Static
-    // keep filter_pushdown=false so DuckDB re-applies everything.
+    // `exact_filter_pushdown` / `superset_filter_pushdown` = which way the host sets filter_pushdown=true on this
+    // catalog's scans, governed by the pushdown_filters mode: native_read applies the erased TableFilterSet 1:1
+    // (read_parquet WHERE), the codec engine prunes with it and the host re-applies it; None/Static keep
+    // filter_pushdown=false so DuckDB re-applies everything above the scan.
     public IArrowArrayStream GetServerInfo() => TwoColumn(
-        "property", new[] { "exact_filter_pushdown" },
-        "value", new[] { _pushdownMode == PushdownMode.Exact ? "true" : "false" });
+        "property", new[] { "exact_filter_pushdown", "superset_filter_pushdown" },
+        "value", new[]
+        {
+            _pushdownMode == PushdownMode.Exact && _nativeRead ? "true" : "false",
+            _pushdownMode == PushdownMode.Exact && !_nativeRead ? "true" : "false",
+        });
 
     /// <summary>Ambient-transaction resolution for a table BIND: GET-OR-CREATE (the <see cref="AmbientTxn"/>
     /// semantics — the first read-path crossing is a legitimate creator, or an autocommit schema open would
@@ -2339,12 +2348,12 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     {
                         new Field(RowIdColumn, Int64Type.Default, nullable: false),
                     }, atProjected.Metadata);
-                return new AsyncEnumerableArrowStream(atSchemaWithRowId, WithExactFilter(atSchemaWithRowId,
-                    DeltaReader.StreamWithRowIdsAt(opener, path, atProjCols, filter, at.Unit, at.Value, default), spec));
+                return new AsyncEnumerableArrowStream(atSchemaWithRowId,
+                    DeltaReader.StreamWithRowIdsAt(opener, path, atProjCols, filter, at.Unit, at.Value, default));
             }
             // Explicit AT = committed history: buffered (uncommitted) appends are deliberately excluded.
-            return new AsyncEnumerableArrowStream(atProjected, WithExactFilter(atProjected,
-                DeltaReader.StreamAt(opener, path, atProjCols, filter, at.Unit, at.Value, default), spec));
+            return new AsyncEnumerableArrowStream(atProjected,
+                DeltaReader.StreamAt(opener, path, atProjCols, filter, at.Unit, at.Value, default));
         }
 
         // Read-your-writes: overlay this transaction's buffered changes onto the scan.
@@ -2475,7 +2484,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             stream = DeltaTxnBuffer.Concat(stream,
                 DeltaTxnBuffer.ProjectPending(pending, outSchema, RowIdColumn, PendingRowIdOrdinal));
         }
-        return new AsyncEnumerableArrowStream(outSchema, WithExactFilter(outSchema, stream, spec));
+        return new AsyncEnumerableArrowStream(outSchema, stream);
     }
 
     // The projected schema with the trailing virtual _metadata.row_id column appended.
@@ -2535,15 +2544,6 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     // The synthetic rowid ordinal for buffered (uncommitted) rows — far above any real file ordinal, and
     // DML against buffered rows is rejected, so the ids only need scan-local uniqueness.
     private const long PendingRowIdOrdinal = 0x700000;
-
-    // EXACT mode on the codec path: the host rendered the erased TableFilterSet to SQL
-    // (spec.native_filter) — apply it per batch via the host engine (see HostBatchFilter). A no-op when
-    // exact mode is off or nothing was rendered (then DuckDB re-applies as usual).
-    private System.Collections.Generic.IAsyncEnumerable<RecordBatch> WithExactFilter(
-        Schema schema, System.Collections.Generic.IAsyncEnumerable<RecordBatch> source, ScanSpec? spec)
-        => _pushdownMode == PushdownMode.Exact && !string.IsNullOrWhiteSpace(spec?.NativeFilter)
-            ? HostBatchFilter.Apply(schema, source, spec!.NativeFilter!)
-            : source;
 
     /// <summary>
     /// PROJECTION into the engineered-wood decode: maps the scan's requested columns to the column list the
@@ -2778,7 +2778,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         }
         // Read-your-writes: overlay this transaction's buffered appends. Streamed pending FILES join the
         // per-file loop (presence probe + WHERE apply per file); collect-path pending BATCHES concatenate
-        // onto the stream (exact-mode WHERE applied via the host, like the codec overlay). An explicit AT
+        // onto the stream (exact-mode WHERE applied per batch through a host query, HostBatchFilter). An explicit AT
         // excludes pending (committed history).
         var native = DeltaNativeReader.Read(opener, path, userSchema, spec, filterVals, unit, value,
                                             pendingFiles: pendingNative?.Files,

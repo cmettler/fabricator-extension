@@ -13,9 +13,9 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// EXACT per-batch filter application through the host engine: each source batch is bound as an Arrow view
 /// and run through <c>SELECT * FROM &lt;batch&gt; WHERE &lt;sql&gt;</c> on the host DuckDB. Used by the Delta
-/// codec path under <c>pushdown_filters 'all'</c>/<c>'dynamic'</c>, where the scan declared
-/// <c>filter_pushdown=true</c>: DuckDB ERASES the pushed static filters from the plan (the scan MUST apply
-/// them exactly — pruning alone would return surplus rows), and the host-rendered
+/// native reader for a transaction's buffered rows (the batches it concatenates after its read_parquet
+/// stream), where the scan declared <c>exact_filter_pushdown</c>: DuckDB ERASES the pushed static filters from
+/// the plan (the scan MUST apply them exactly — pruning alone would return surplus rows), and the host-rendered
 /// <see cref="ScanSpec.NativeFilter"/> SQL is the 1:1 rendering of that TableFilterSet (statics exact,
 /// dynamic join filters resolved as of scan init, exotic filters via their SQL form) — evaluating it on the
 /// host gives full expression coverage with no type-mapping gaps. Column-typed values (variant transport

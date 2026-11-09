@@ -2418,13 +2418,34 @@ the profile row)
 got no join filter at all. Since [duckdb#22266](https://github.com/duckdb/duckdb/pull/22266) a scan can say yes to
 `supports_pushdown_extract`, and DuckDB then hands it `s.a` as a scan column of its own — after which the join filters
 apply as on any column (measured on plain parquet first: `Dynamic Filters: s.a IN PRF(k)`, 2,000 of 4M rows). Our scan
-now declares it for STRUCT columns (not VARIANT, not a scan that re-applies its filters itself). Two conditions:
+now declares it for STRUCT columns (not VARIANT). Two conditions:
 the callback, and statistics through `statistics_extended` — DuckDB switches pushdown extract off for a scan with the
 plain `statistics` callback. The provider still returns the whole column; the ingest takes the field out (the Arrow
 import already marks a field NULL under a NULL struct), applies a CAST DuckDB folds on top, and the filters render
 against `struct_extract("s", 'a')` (SQL) and the path `["s","a"]` (JSON). Measured, 20M rows, 2000 keys:
 0.59–0.61 s against 1.67–1.89 s with it off (`FABRICATOR_NO_PUSHDOWN_EXTRACT=1`). Not yet: the native reader still
-reads the whole struct (selecting only the field would save its IO). Gate `verify_delta_struct_extract` (50): joins on
+reads the whole struct (selecting only the field would save its IO). Gate `verify_delta_struct_extract` (75): joins on
 an integer and a string field, a nested static filter, projections, NULL structs and fields, the folded CAST, outer and
-semi joins, and the codec engine on the same table; mutants: extract switched off dies at the log row, filters
+semi joins, and the codec engine on the same table, by default and under `'all'` (§6, below); mutants: extract switched off dies at the log row, filters
 rendered against the column dies at the first join.
+
+**The codec engine: the host re-applies its filters (2026-11-09).** With `pushdown_filters 'all'` the codec catalog
+declares `superset_filter_pushdown` instead of `exact_filter_pushdown`, the mechanism SQL Server and ADBC use: DuckDB
+still hands the scan every filter (a join's runtime filter among them), engineered-wood prunes files, row groups and
+bloom filters with what the filter tree carries (a join filter as its keys or their range), and the host re-applies
+every filter to each chunk the scan returns, natively and on every scan thread. Before, the codec path applied the
+rendered SQL per batch through a host query (`HostBatchFilter`, which now serves only a native read's buffered rows).
+TPC-H SF10 on MinIO, sum of round 2: per-batch host query 62.2 s, re-apply 43.0 s, the default `'static'` mode (no join
+filters) 39.6 s; Q1 10.0 s → 2.4 s. A step in C# was built, measured and REMOVED (never committed, as ABI v101): the
+join filter as a `lookup` node in the filter tree, evaluated per batch as the engineered-wood call
+`fabricator_join_filter_<id>(col)` through `ArrowRowEvaluator`, which handed the key column to the host as Arrow C data
+and got DuckDB's lookup back. It filtered correctly but runs serially on the scan's single managed producer stream,
+while the re-apply runs natively on every thread: 46.7 s with it, 43.0 s without (Q2 2.25 vs 0.76 s, Q5 3.76 vs
+1.89 s). It would pay only if engineered-wood decoded the key column first and the other columns only for the rows
+that survive. Pushdown extract works under re-apply: a filter on an extracted field is re-applied on the field the
+scan emits, typed by it (after a folded CAST). Late materialization stays with the native engine (it needs
+`exact_filter_pushdown`). Gates: the codec section of `verify_delta_catalog_dynamic_filter` (99: the server_info rows,
+prefix-range and bloom joins with the probe scan's row count from the profile, a static filter only the re-application
+applies, NULL, outer, semi and anti joins), `verify_delta_struct_extract` §6 (75), `verify_delta_catalog_filter_modes`
+(56). Mutants: the codec catalog declaring `exact_filter_pushdown` again (nothing applies the erased filters) dies at the
+profile rows of both suites; the re-apply typing a field filter by its struct column dies at §6 with an INTERNAL error.

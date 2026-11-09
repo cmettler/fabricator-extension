@@ -476,12 +476,11 @@ optional_ptr<TableCatalogEntry> ArrowStreamGetTableEntry(optional_ptr<const Func
 }
 
 // 2.0 pushdown extract (see ExtractPath): DuckDB may hand this scan `s.a` instead of `s` when we say yes here.
-// STRUCT columns only — a VARIANT field travels by name and needs variant_extract, not built. Not for a scan
-// that re-applies its filters itself (SQL Server: it has no struct columns, and that path types its filters
-// by the column, not the field).
+// STRUCT columns only — a VARIANT field travels by name and needs variant_extract, not built. A scan that
+// re-applies its filters (reapply_filters) types a filter on such a column by the FIELD it emits (ArrowStreamInitGlobal).
 bool ArrowStreamSupportsPushdownExtract(const FunctionData &bind_data_p, const LogicalIndex &column_index) {
 	auto &bind_data = bind_data_p.Cast<ArrowStreamBindData>();
-	if (bind_data.reapply_filters || getenv("FABRICATOR_NO_PUSHDOWN_EXTRACT")) {
+	if (getenv("FABRICATOR_NO_PUSHDOWN_EXTRACT")) {
 		return false;
 	}
 	auto idx = column_index.index;
@@ -2259,7 +2258,11 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 			}
 			auto col_id = input.column_ids[key];
 			LogicalType col_type;
-			if (col_id < bind_data.return_types.size()) {
+			if (gstate->output_extract[out].Active()) {
+				// a pushed-down struct field: the filter is on the field the scan emits (after a folded CAST), not
+				// on the struct column
+				col_type = gstate->output_extract[out].scan_type;
+			} else if (col_id < bind_data.return_types.size()) {
 				col_type = bind_data.return_types[col_id];
 			} else if (col_id == COLUMN_IDENTIFIER_ROW_ID && bind_data.rowid_type.id() != LogicalTypeId::INVALID) {
 				col_type = bind_data.rowid_type; // `WHERE rowid > …`: the scan returns the row id, so it re-checks it

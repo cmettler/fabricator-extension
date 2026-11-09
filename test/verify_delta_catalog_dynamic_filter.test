@@ -263,3 +263,102 @@ SELECT count(*), sum(b.g) FROM lake.main.big3 b JOIN lake.main.dim3 d ON b.f = d
 
 statement ok
 DETACH lake;
+
+# ---- The CODEC engine on the same tables, with pushdown_filters 'all': the catalog declares superset_filter_pushdown,
+#      so the scan takes DuckDB's filters (a hash join's runtime filter among them), engineered-wood prunes with
+#      what it can use, and the HOST re-applies every filter to each chunk, natively on every scan thread (as for
+#      SQL Server and ADBC). It used to run the rendered SQL per batch through a host query (62.2 s against 43.0 s
+#      on TPC-H SF10 on MinIO). 2026-11-09. ----
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catdynfilter' AS cod (TYPE fabricator, PROVIDER 'engineeredwooddelta',
+pushdown_filters 'all', READ_ONLY true);
+
+query II
+SELECT property, value FROM fabricator_server_info('cod') WHERE property LIKE '%filter_pushdown' ORDER BY property;
+----
+exact_filter_pushdown	false
+superset_filter_pushdown	true
+
+# an integer key (prefix-range filter): the same answer as the native engine
+query III
+SELECT count(*), sum(b.id), sum(b.g) FROM cod.main.big2 b JOIN cod.main.dim2 d ON b.id = d.id;
+----
+2000	398382279	6000
+
+# ...and big2's scan hands the join about the 2000 rows that can join, not the 400400 it read: the re-applied join
+# filter. Without it the answer is the same, which is why this needs the profile (dim2's scan is the other one).
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '${FABRICATOR_DELTA_WRITE_DIR}/codec_profile.json';
+
+statement ok
+SELECT count(*) FROM cod.main.big2 b JOIN cod.main.dim2 d ON b.id = d.id;
+
+statement ok
+PRAGMA disable_profiling;
+
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/codec_profile.json'));
+----
+2	true
+
+# a random-string key (bloom filter)
+query II
+SELECT count(*), sum(b.g) FROM cod.main.big3 b JOIN cod.main.dim3 d ON b.h = d.h;
+----
+1998	5997
+
+# ...filtered in the scan too
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '${FABRICATOR_DELTA_WRITE_DIR}/codec_bloom_profile.json';
+
+statement ok
+SELECT count(*) FROM cod.main.big3 b JOIN cod.main.dim3 d ON b.h = d.h;
+
+statement ok
+PRAGMA disable_profiling;
+
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/codec_bloom_profile.json'));
+----
+2	true
+
+# a static filter: erased from the plan, so the scan's re-application is the only thing applying it
+query II
+SELECT count(*), sum(id) FROM cod.main.big2 WHERE id > 399000 AND g <> 1;
+----
+856	341972286
+
+# NULL keys, outer, semi and anti joins through the same filter
+query II
+SELECT count(*), sum(b.g) FROM cod.main.big3 b JOIN cod.main.dim3 d ON b.h IS NOT DISTINCT FROM d.h;
+----
+2398	7200
+
+query II
+SELECT count(*), count(d.h) FROM cod.main.big3 b LEFT JOIN cod.main.dim3 d ON b.h = d.h;
+----
+400000	1998
+
+query I
+SELECT count(*) FROM cod.main.big3 WHERE h IN (SELECT h FROM cod.main.dim3);
+----
+1998
+
+query I
+SELECT count(*) FROM cod.main.big3 WHERE h NOT IN (SELECT h FROM cod.main.dim3 WHERE h IS NOT NULL);
+----
+397602
+
+statement ok
+DETACH cod;

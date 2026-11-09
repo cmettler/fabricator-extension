@@ -1,12 +1,13 @@
 # name: test/verify_delta_catalog_filter_modes.test
 # description: The `pushdown_filters` ATTACH option (duckdb-delta parity: 'none'|'static'|'dynamic'|'all')
 #              on the Delta catalog. none = no pushdown (pure fallback); static = best-effort
-#              file/row-group/bloom pruning (codec default; DuckDB re-applies); dynamic/all = EXACT mode:
-#              the scan declares filter_pushdown=true, DuckDB ERASES the pushed static filters from the
-#              plan and delivers hash-join DYNAMIC filters, and the host-rendered TableFilterSet SQL is
-#              applied EXACTLY — inside read_parquet under native_read, and per batch via HostBatchFilter
-#              (SELECT * FROM <batch> WHERE ... on the host engine) on the CODEC path. Correctness across
-#              modes is the safety net: under exact mode a dropped filter would return surplus rows.
+#              file/row-group/bloom pruning (codec default; DuckDB re-applies); dynamic/all: the scan
+#              declares filter_pushdown=true, DuckDB ERASES the pushed static filters from the plan and
+#              delivers hash-join DYNAMIC filters. Under native_read the host-rendered TableFilterSet SQL is
+#              applied EXACTLY inside read_parquet; on the CODEC path the catalog declares
+#              superset_filter_pushdown and the host re-applies every filter to the scan's chunks (since
+#              2026-11-09; it was a per-batch host query, HostBatchFilter). Correctness across modes is the
+#              safety net: with the filter erased, a dropped one would return surplus rows.
 #              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
 # group: [fabricator]
 
@@ -121,28 +122,17 @@ SELECT count(*) FROM n_static.main.t WHERE id = 250;
 1
 
 # ============================================================================================
-# ⚠⚠ THE CODEC EXACT PATH BINDS AN ARROW VIEW PER BATCH, AND IT MUST LEAVE NOTHING BEHIND.
-#
-# HostBatchFilter runs `SELECT * FROM <bound input> WHERE ...` on the host engine, binding the
-# batch as a named Arrow input. Until 2026-09-03 that input was registered by duckdb_arrow_scan,
-# which ends in CreateView(name, replace, temporary: FALSE) — an ordinary CATALOG view. MEASURED
-# then: three filtered SELECTs left THREE views in the user's own `memory.main`
-# (__fabricator_scan_batch_1..3), one per statement and unbounded, and `SELECT * FROM
-# __fabricator_scan_batch_1` afterwards SEGFAULTED, because the stream it points at was released
-# when its query finished. They are TEMPORARY views now, so they die with the fresh connection.
-#
-# ⚠ Note the earlier sections cannot see this: they attach PROVIDER 'delta', which defaults
-# native_read ON, and there the filter goes into read_parquet's WHERE — HostBatchFilter never runs.
-# The codec provider is what reaches it.
+# The CODEC engine under 'all' (superset_filter_pushdown since 2026-11-09): the filter is ERASED from
+# the plan, engineered-wood prunes with it, and the host re-applies it to every chunk the scan returns.
 # ============================================================================================
 
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/fmodes' AS codec_x (TYPE fabricator, PROVIDER 'engineeredwooddelta', column_mapping 'none', pushdown_filters 'all');
 
-# ⚠⚠ POSITIVE CONTROL, and the row counts below are worthless without it: under EXACT mode DuckDB
-# ERASES the filter from the plan — there is NO `FILTER` operator, the predicate sits on the scan —
-# so it will NOT re-apply, and on the codec path the only thing left that can apply it is
-# HostBatchFilter. A `static` catalog plans the same query with a FILTER above the scan instead.
+# ⚠⚠ POSITIVE CONTROL, and the row counts below are worthless without it: DuckDB ERASES the filter
+# from the plan — there is NO `FILTER` operator, the predicate sits on the scan — so it will NOT
+# re-apply above it, and the only thing left that applies it is the scan's own re-application. A
+# `static` catalog plans the same query with a FILTER above the scan instead.
 # ⚠ EXPLAIN cannot be a subquery source, hence the <REGEX>: form on the physical_plan row.
 # ⚠ DuckDB 2.0 RE-RENDERS EXPLAIN: operator titles are title-cased (`SEQ_SCAN` -> `Seq Scan`,
 # `PROJECTION` -> `Projection`) and a filter is spaced (`g=3` -> `g = 3`). The PLAN is unchanged; only
@@ -162,16 +152,25 @@ SELECT id, name FROM codec_x.main.t WHERE id > 495 ORDER BY id;
 499	name2
 500	name3
 
-statement ok
+query I
 SELECT count(*) FROM codec_x.main.t WHERE grp IS NULL;
+----
+45
 
-statement ok
-SELECT count(*) FROM codec_x.main.t WHERE name IN ('name0', 'name3') AND amt > 1.0;
+query II
+SELECT count(*), sum(id) FROM codec_x.main.t WHERE name IN ('name0', 'name3') AND amt > 1.0;
+----
+114	28500
 
-# ⚠ THE ASSERTION. Broad on purpose — `__fab%` covers every bound-input prefix in the tree
-# (__fabricator_scan_batch, __fab_files, __fab_dv, __fabricator_sort_input, …), so it also catches a
-# future path that registers one and forgets to clean up. Mutation-tested: registering them
-# non-temporary again (the pre-2026-09-03 duckdb_arrow_scan) makes this THREE.
+# ⚠⚠ BOUND ARROW INPUTS MUST LEAVE NOTHING BEHIND. A host query binds a named Arrow input as a view
+# (the native reader's file list and deletion vectors — read above, after m's DELETE — HostBatchFilter's
+# `__fabricator_scan_batch` for a native read's buffered rows, the sort input, …). Until 2026-09-03 that
+# was duckdb_arrow_scan, which ends in CreateView(name, replace, temporary: FALSE) — an ordinary CATALOG
+# view: MEASURED then, three filtered codec SELECTs (the per-batch host query, gone since 2026-11-09)
+# left THREE views in the user's own `memory.main`, and reading one afterwards SEGFAULTED, because the
+# stream it points at was released when its query finished. They are TEMPORARY views now, dying with
+# the fresh connection. Broad on purpose — `__fab%` covers every bound-input prefix in the tree, so it
+# also catches a future path that registers one and forgets to clean up.
 query I
 SELECT count(*) FROM duckdb_views() WHERE starts_with(view_name, '__fab');
 ----
