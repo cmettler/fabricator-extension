@@ -568,12 +568,13 @@ public sealed partial class DeltaCatalog : IProviderCatalog
 
     /// <summary>The rows of a stream part (<see cref="ITableBinding.ReadPart"/>): here a data file read through a
     /// host query — the spike's stand-in for a format DuckDB cannot read itself.</summary>
-    internal IArrowArrayStream ScanFilePart(string part, IReadOnlyList<string> columns)
+    internal IArrowArrayStream ScanFilePart(string part, IReadOnlyList<string?> columns)
     {
+        // a null column is the row's position in the file
         string projection = columns.Count == 0
             ? "1 AS \"__no_columns\""
-            : string.Join(", ", columns.Select(c => "\"" + c.Replace("\"", "\"\"") + "\""));
-        string sql = $"SELECT {projection} FROM read_parquet('{part.Replace("'", "''")}')";
+            : string.Join(", ", columns.Select(c => c is null ? "file_row_number" : "\"" + c.Replace("\"", "\"\"") + "\""));
+        string sql = $"SELECT {projection} FROM read_parquet('{part.Replace("'", "''")}', file_row_number = true)";
         _log.LogDebug("delta file part: {Sql}", sql);
         return Host.Query(sql, HostSession.Neutral);
     }

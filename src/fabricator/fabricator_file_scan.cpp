@@ -221,22 +221,41 @@ public:
 		return "fabricator_stream";
 	}
 
+	//! The mapper has just appended a virtual column to `columns`; the only one a stream part produces is the row's
+	//! position in the part (file_row_number), which the provider sends when asked.
+	void AddVirtualColumn(column_t virtual_column_id) override {
+		if (virtual_column_id != MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+			throw NotImplementedException("fabricator file scan: a stream part cannot produce virtual column %d",
+			                              virtual_column_id);
+		}
+		row_number_column = columns.size() - 1;
+		names.push_back("file_row_number");
+	}
+
 	bool TryInitializeScan(ClientContext &, GlobalTableFunctionState &, LocalTableFunctionState &) override {
 		// one thread drains a stream: the first to ask takes it
 		return !claimed.exchange(true);
 	}
 
 	void PrepareScan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &) override {
-		if (!expression_map.empty()) {
-			throw NotImplementedException("fabricator file scan: a stream part cannot evaluate a converted filter yet");
+		// a filter on a COMPUTED column (the row id: base + position) comes with the expression to evaluate first; its
+		// inputs are the consecutive output columns from its own position on, and its result replaces that column
+		for (auto &entry : expression_map) {
+			Converted converted;
+			converted.position = MultiFileLocalIndex(entry.first).GetIndex();
+			converted.inputs = entry.second.column_indexes.size();
+			converted.expression = entry.second.expression->Copy();
+			converted.executor = make_uniq<ExpressionExecutor>(context, *converted.expression);
+			converted_columns.push_back(std::move(converted));
 		}
-		// the columns asked for, in the order of the output chunk (column_ids are positions in `columns`)
+		// the columns asked for, in the order of the output chunk (column_ids are positions in `columns`); null asks for
+		// the row's position in the part (file_row_number, what the row id is built from)
 		string request = "{\"part\":" + Quote(plan->stream_parts[index]) + ",\"columns\":[";
 		for (idx_t i = 0; i < column_ids.size(); i++) {
 			auto local = column_ids[MultiFileLocalIndex(i)].GetId();
-			if (local >= names.size()) {
-				throw NotImplementedException("fabricator file scan: a stream part cannot produce a virtual column "
-				                              "(file_row_number) yet");
+			if (IsRowNumber(local)) {
+				request += i ? ",null" : "null";
+				continue;
 			}
 			request += (i ? "," : "") + Quote(names[local]);
 		}
@@ -252,12 +271,12 @@ public:
 			                  "for %d", file.path, types.size(), column_ids.size());
 		}
 		for (idx_t i = 0; i < column_ids.size(); i++) {
-			auto &expected = columns[column_ids[MultiFileLocalIndex(i)].GetId()].type;
+			auto local = column_ids[MultiFileLocalIndex(i)].GetId();
+			auto &expected = columns[local].type;
 			if (types[i] != expected) {
 				throw IOException("fabricator file scan: the provider's stream for '%s' gives column '%s' as %s, the "
 				                  "table declares %s",
-				                  file.path, names[column_ids[MultiFileLocalIndex(i)].GetId()], types[i].ToString(),
-				                  expected.ToString());
+				                  file.path, names[local], types[i].ToString(), expected.ToString());
 			}
 		}
 		if (filters && filters->HasFilters()) {
@@ -292,6 +311,9 @@ public:
 				chunk.SetCardinality(0);
 				return SourceResultType::FINISHED;
 			}
+			for (auto &converted : converted_columns) {
+				Convert(converted, chunk);
+			}
 			if (!executor) {
 				return SourceResultType::HAVE_MORE_OUTPUT;
 			}
@@ -313,6 +335,39 @@ public:
 	}
 
 private:
+	struct Converted {
+		idx_t position;
+		idx_t inputs;
+		unique_ptr<Expression> expression;
+		unique_ptr<ExpressionExecutor> executor;
+	};
+
+	static void Convert(Converted &converted, DataChunk &chunk) {
+		vector<LogicalType> input_types;
+		for (idx_t i = 0; i < converted.inputs; i++) {
+			input_types.push_back(chunk.data[converted.position + i].GetType());
+		}
+		DataChunk input;
+		input.InitializeEmpty(input_types);
+		for (idx_t i = 0; i < converted.inputs; i++) {
+			input.data[i].Reference(chunk.data[converted.position + i]);
+		}
+		input.SetCardinality(chunk.size());
+		auto &type = converted.expression->GetReturnType();
+		if (type != chunk.data[converted.position].GetType()) {
+			throw NotImplementedException("fabricator file scan: a stream part cannot convert a filtered column from %s "
+			                              "to %s yet",
+			                              chunk.data[converted.position].GetType().ToString(), type.ToString());
+		}
+		Vector result(type, chunk.size());
+		converted.executor->ExecuteExpression(input, result);
+		chunk.data[converted.position].Reference(result);
+	}
+
+	bool IsRowNumber(idx_t local) const {
+		return row_number_column.IsValid() && local == row_number_column.GetIndex();
+	}
+
 	static MultiFileColumnDefinition LocalColumn(const MultiFileColumnDefinition &global) {
 		MultiFileColumnDefinition local(global.GetIdentifierName(), global.type);
 		for (auto &child : global.children) {
@@ -341,11 +396,14 @@ private:
 	idx_t index;
 	//! the table's names of `columns` (what the provider is asked for), parallel to `columns`
 	vector<string> names;
+	//! the position in `columns` of the row's position in the part, when the scan needs it (AddVirtualColumn)
+	optional_idx row_number_column;
 	std::atomic<bool> claimed {false};
 	unique_ptr<ArrowChunkReader> rows;
 	unique_ptr<Expression> filter;
 	unique_ptr<ExpressionExecutor> executor;
 	SelectionVector selection {STANDARD_VECTOR_SIZE};
+	vector<Converted> converted_columns;
 };
 
 struct FabricatorFileScanReader : public MultiFileReader {

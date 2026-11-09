@@ -208,8 +208,10 @@ public interface ITableBinding : IDisposable
     ScanPlan? PlanScan() => null;
 
     /// <summary>The rows of a <see cref="StreamPart"/> this binding's plan named: <paramref name="columns"/> (the
-    /// table's names, in that order; empty = only the row count matters), the part's deleted rows removed.</summary>
-    IArrowArrayStream ReadPart(string name, IReadOnlyList<string> columns) =>
+    /// table's names, in that order; empty = only the row count matters), the part's deleted rows removed. A NULL
+    /// entry asks for the row's POSITION in the part as a BIGINT — its position before deleted rows were removed, which
+    /// is what the row id is built from.</summary>
+    IArrowArrayStream ReadPart(string name, IReadOnlyList<string?> columns) =>
         throw new NotSupportedException($"{GetType().Name} plans no stream parts");
 
     /// <summary>Whether <see cref="DeleteWhere"/> can run a DELETE on this table as ONE predicate statement

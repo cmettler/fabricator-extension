@@ -825,8 +825,9 @@ public static unsafe class Bootstrap
             using var request = System.Text.Json.JsonDocument.Parse(Marshal.PtrToStringUTF8((nint)requestJson) ?? "{}");
             string part = request.RootElement.GetProperty("part").GetString()
                           ?? throw new ArgumentException("table_part_scan: no part");
+            // a null entry asks for the row's position in the part
             var columns = request.RootElement.GetProperty("columns").EnumerateArray()
-                .Select(c => c.GetString() ?? throw new ArgumentException("table_part_scan: a null column"))
+                .Select(c => c.ValueKind == System.Text.Json.JsonValueKind.Null ? null : c.GetString())
                 .ToList();
             CArrowArrayStreamExporter.ExportArrayStream(session.PartScan(part, columns), outStream);
             return FabricatorStatus.Ok;

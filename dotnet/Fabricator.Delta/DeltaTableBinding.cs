@@ -574,7 +574,7 @@ internal sealed class DeltaTableBinding : ITableBinding, IDeleteWhereShape
     public ScanPlan? PlanScan() => Catalog.PlanScan(Path, _at);
 
     /// <inheritdoc/>
-    public IArrowArrayStream ReadPart(string name, IReadOnlyList<string> columns) =>
+    public IArrowArrayStream ReadPart(string name, IReadOnlyList<string?> columns) =>
         Catalog.ScanFilePart(name, columns);
 
     // The predicate-DELETE shape (DescribeDeleteShortcut): read once per binding, because the capability

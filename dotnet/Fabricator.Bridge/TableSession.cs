@@ -233,7 +233,7 @@ internal sealed class TableSession
     }, at ?? _at);
 
     /// <summary>The <c>table_part_scan</c> answer (ABI v101): the rows of a stream part the plan named.</summary>
-    internal IArrowArrayStream PartScan(string part, IReadOnlyList<string> columns) =>
+    internal IArrowArrayStream PartScan(string part, IReadOnlyList<string?> columns) =>
         With(t => t.ReadPart(part, columns));
 
     /// <summary>The <c>table_dml_info</c> answer (ABI v93): <c>{"delete_where": bool, "update_where": bool}</c>,
