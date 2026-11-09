@@ -1327,6 +1327,11 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             }
             // DELETE / UPDATE / MERGE … RETURNING (DeltaCatalog.Returning.cs)
             caps += ",\"dml_returning\":true";
+            // `parallel_table_open`: table_open / table_schema / table_info for DIFFERENT tables may run at once
+            // (per-transaction state is a ConcurrentDictionary of bindings, each pin behind its own lock), so a
+            // catalog enumeration opens its tables in parallel. On OneLake each open is a log listing plus a few
+            // reads (~1.5 s); dbt's information_schema scan over 29 tables took 43 s one after another.
+            caps += ",\"parallel_table_open\":true";
             // `cache_local_files`: the native reader opens a OneLake table through our onelake:// filesystem,
             // and DuckDB 2.0's file cache only caches the remote prefixes it knows (upstream 8ff69049cd0), so
             // without this every read refetches every byte (TPC-H SF1 on OneLake: 81 s -> 39 s). The host sets

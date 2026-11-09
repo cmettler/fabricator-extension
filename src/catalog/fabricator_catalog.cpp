@@ -258,6 +258,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
+		parallel_table_open_ = caps.parallel_table_open;
 		dml_returning_ = caps.dml_returning;
 		schema_by_name_ = caps.schema_by_name;
 		default_schema_ = caps.default_schema;
@@ -273,6 +274,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = false;
 		remote_select_ = false;
 		bind_schema_cacheable_ = false;
+		parallel_table_open_ = false;
 		dml_returning_ = false;
 		schema_by_name_ = false;
 		default_schema_.clear();

@@ -1,0 +1,119 @@
+# name: test/verify_delta_parallel_enumeration.test
+# description: A Delta catalog declares `parallel_table_open`, so a catalog enumeration (duckdb_tables, duckdb_columns,
+#              information_schema — what dbt runs first) opens its uncached tables on several threads. The listing must
+#              be exactly the sequential one: every table, its columns, a broken table skipped without taking the rest
+#              down, and a table created in the open transaction seen by that transaction only. Each section runs on
+#              a FRESH attach (nothing cached). The expected values were taken from a run with the parallel opens
+#              turned off (FABRICATOR_PARALLEL_TABLE_OPEN=0), so they ARE the sequential listing.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/penum' AS w (TYPE fabricator, PROVIDER 'delta', schemas 'onelevel');
+
+statement ok
+CREATE SCHEMA w.a;
+
+statement ok
+CREATE SCHEMA w.b;
+
+# twelve tables over two schemas (the provider's declared views are listed too, and left out of every count here), each with a distinct column count so a mix-up shows in the totals
+loop i 1 7
+
+statement ok
+CREATE TABLE w.a.t${i} AS SELECT range AS c0, ${i} AS x FROM range(${i});
+
+statement ok
+ALTER TABLE w.a.t${i} ADD COLUMN extra_${i} VARCHAR;
+
+endloop
+
+loop i 1 7
+
+statement ok
+CREATE TABLE w.b.u${i} AS SELECT range AS id, 'v' || range AS name FROM range(${i});
+
+endloop
+
+statement ok
+CREATE TABLE w.b.broken AS SELECT 1 AS id;
+
+statement ok
+DETACH w;
+
+# a table whose log cannot be read (its first commit overwritten with garbage): enumeration skips it with a warning
+# instead of failing the whole listing
+statement ok
+COPY (SELECT 'not a delta commit' AS garbage) TO '${FABRICATOR_DELTA_WRITE_DIR}/penum/b/broken/_delta_log/00000000000000000000.json' (FORMAT csv, HEADER false);
+
+# ---- 1. a fresh attach: the full listing ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/penum' AS p1 (TYPE fabricator, PROVIDER 'delta', schemas 'onelevel', READ_ONLY true);
+
+query III
+SELECT count(DISTINCT schema_name || '.' || table_name), count(*), sum(length(column_name))
+FROM duckdb_columns() JOIN duckdb_tables() USING (database_name, schema_name, table_name) WHERE database_name = 'p1';
+----
+12	30	96
+
+query II
+SELECT table_name, count(*) FROM duckdb_columns() JOIN duckdb_tables() USING (database_name, schema_name, table_name)
+WHERE database_name = 'p1' AND schema_name = 'a' GROUP BY ALL ORDER BY 1;
+----
+t1	3
+t2	3
+t3	3
+t4	3
+t5	3
+t6	3
+
+# the tables read back through the entries the parallel opens created
+query II
+SELECT sum(c0), sum(x) FROM (SELECT c0, x FROM p1.a.t6 UNION ALL SELECT c0, x FROM p1.a.t1);
+----
+15	37
+
+query I
+SELECT count(*) FROM p1.b.u6;
+----
+6
+
+statement ok
+DETACH p1;
+
+# ---- 3. inside a transaction that created a table: that transaction lists it, with its columns ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/penum' AS p3 (TYPE fabricator, PROVIDER 'delta', schemas 'onelevel');
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE p3.a.fresh (k INTEGER, v VARCHAR, w DOUBLE);
+
+query II
+SELECT count(DISTINCT schema_name || '.' || table_name), count(*) FROM duckdb_columns() JOIN duckdb_tables() USING (database_name, schema_name, table_name) WHERE database_name = 'p3';
+----
+13	33
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(DISTINCT schema_name || '.' || table_name), count(*) FROM duckdb_columns() JOIN duckdb_tables() USING (database_name, schema_name, table_name) WHERE database_name = 'p3';
+----
+12	30
+
+# ---- 4. repeated enumeration on the same attach: everything cached now, same answer ----
+query II
+SELECT count(DISTINCT schema_name || '.' || table_name), count(*) FROM duckdb_columns() JOIN duckdb_tables() USING (database_name, schema_name, table_name) WHERE database_name = 'p3';
+----
+12	30
+
+statement ok
+DETACH p3;

@@ -74,6 +74,9 @@ struct FabricatorCapabilities {
 	//! later binds (FabricatorTableEntry). \warning Must stay FALSE for a provider whose describe does work
 	//! that a real scan depends on — the Delta catalog's seeds the statement's snapshot pin.
 	bool bind_schema_cacheable = false;
+	//! The provider's table_open / table_schema / table_info may run on several threads at once for different tables
+	//! of one transaction, so a catalog enumeration opens its uncached tables in parallel (FabricatorSchemaEntry::Scan).
+	bool parallel_table_open = false;
 	//! DELETE / UPDATE / MERGE … RETURNING: the provider returns the rows a rowid DML changed (ABI v98).
 	bool dml_returning = false;
 	//! The provider reads files through a filesystem DuckDB 2.0's ExternalFileCache does not treat as remote

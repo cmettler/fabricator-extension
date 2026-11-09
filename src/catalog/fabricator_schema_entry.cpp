@@ -79,6 +79,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <thread>
 #include <unordered_map>
 
 namespace duckdb {
@@ -4581,6 +4582,55 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			table_names.reserve(table_types_.size());
 			for (auto &entry : table_types_) {
 				table_names.push_back(entry.first);
+			}
+		}
+		// PARALLEL OPENS (capability `parallel_table_open`). Each uncached table costs a table_open + describe,
+		// which on OneLake is a log listing and a few reads (~1.5 s); dbt's information_schema scan opened 29
+		// tables one after another in 43 s. The opens go through GetOrCreateEntry exactly as below, on up to 8
+		// threads, and land in the entry cache; the loop below then finds them there and keeps the error
+		// handling and the order. A failed open is simply tried again by the loop (rare: absence, a broken
+		// table). Each thread sets the transaction and opener first, because the managed side keeps both per
+		// thread.
+		// FABRICATOR_PARALLEL_TABLE_OPEN=0 turns it off, for comparing against the sequential opens.
+		const char *parallel_env = getenv("FABRICATOR_PARALLEL_TABLE_OPEN");
+		if (catalog.Cast<FabricatorCatalog>().ParallelTableOpen() && !(parallel_env && string(parallel_env) == "0")) {
+			vector<string> todo;
+			{
+				lock_guard<mutex> lock(entry_lock_);
+				for (auto &table_name : table_names) {
+					if (entries_.find(table_name) == entries_.end() && pending_.find(table_name) == pending_.end()) {
+						todo.push_back(table_name);
+					}
+				}
+			}
+			if (todo.size() > 1) {
+				const idx_t thread_count = MinValue<idx_t>(8, todo.size());
+				std::atomic<idx_t> next {0};
+				auto worker = [&]() {
+					// nothing may escape a std::thread (it would terminate the process): a failed setup leaves the
+					// opens to the loop below
+					try {
+						FabricatorSetActiveTxn(handle_, context);
+					} catch (...) {
+						return;
+					}
+					for (idx_t i = next++; i < todo.size(); i = next++) {
+						try {
+							GetOrCreateEntry(context, todo[i], nullptr, /*enumerating=*/true);
+						} catch (...) {
+							// the loop below opens it again and reports or rethrows what it finds
+						}
+					}
+				};
+				vector<std::thread> threads;
+				for (idx_t t = 1; t < thread_count; t++) {
+					threads.emplace_back(worker);
+				}
+				worker(); // this thread takes part too
+				for (auto &th : threads) {
+					th.join();
+				}
+				FabricatorSetActiveTxn(handle_, context); // restore this thread's ambient for the loop
 			}
 		}
 		for (auto &table_name : table_names) {

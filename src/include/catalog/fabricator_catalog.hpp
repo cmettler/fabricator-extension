@@ -95,6 +95,10 @@ public:
 	bool BindSchemaCacheable() const {
 		return bind_schema_cacheable_;
 	}
+	//! Whether enumeration may open several tables at once (capability `parallel_table_open`).
+	bool ParallelTableOpen() const {
+		return parallel_table_open_;
+	}
 
 	//! DuckDB 2.0 nested schemas: whether a dotted schema string may denote a PATH (`a.b` = schema `b`
 	//! inside schema `a`) rather than a literal schema named "a.b". Provider-declared through the
@@ -248,6 +252,7 @@ private:
 	bool string_order_pushable_ = false;
 	bool null_order_expressible_ = false;
 	bool bind_schema_cacheable_ = false;
+	bool parallel_table_open_ = false;
 	//! Capability `dml_returning`: DELETE / UPDATE / MERGE … RETURNING. Refused at PLANNING otherwise, before any
 	//! action has written anything.
 	bool dml_returning_ = false;
