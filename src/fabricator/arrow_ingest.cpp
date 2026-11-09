@@ -60,6 +60,86 @@ using namespace duckdb;
 
 static void UnregisterJoinFilters(const vector<idx_t> &ids);
 
+//! A STRUCT field DuckDB pushed down into the scan (2.0 "pushdown extract", which the scan opts into through
+//! ArrowStreamSupportsPushdownExtract): the scan emits the FIELD in that output position, not the column. The
+//! provider still returns the whole column; the ingest takes the field out of it. Why it matters: a join on
+//! `t.s.a` only gets DuckDB's join filters when `s.a` is a scan column of its own (the join filter pushdown
+//! takes plain columns only), so without this a join on a struct field read the whole probe table.
+struct ExtractPath {
+	//! the path below the column: child index and name per level, and whether that level's struct is unnamed
+	vector<idx_t> indexes;
+	vector<string> names;
+	vector<bool> unnamed;
+	//! the field's own type, and the type the scan must emit: the field's, or a CAST DuckDB folded on top of it
+	LogicalType field_type;
+	LogicalType scan_type;
+
+	bool Active() const {
+		return !indexes.empty();
+	}
+	bool HasCast() const {
+		return scan_type != field_type;
+	}
+};
+
+//! Reads a pushed-down field's path off its ColumnIndex; false for a plain column (or a shape the scan never
+//! declared, such as a VARIANT field, which travels by name rather than by child index).
+static bool ReadExtractPath(const ColumnIndex &index, const LogicalType &column_type, ExtractPath &out) {
+	if (!index.IsPushdownExtract()) {
+		return false;
+	}
+	reference<const ColumnIndex> cur(index);
+	LogicalType type = column_type;
+	while (cur.get().IsPushdownExtract()) {
+		if (type.id() != LogicalTypeId::STRUCT || cur.get().ChildIndexCount() != 1) {
+			return false;
+		}
+		auto &child = cur.get().GetChildIndex(0);
+		if (!child.HasPrimaryIndex()) {
+			return false;
+		}
+		auto idx = child.GetPrimaryIndex();
+		auto &children = StructType::GetChildTypes(type);
+		if (idx >= children.size()) {
+			return false;
+		}
+		out.indexes.push_back(idx);
+		out.names.push_back(children[idx].first.GetIdentifierName());
+		out.unnamed.push_back(StructType::IsUnnamed(type));
+		auto next = children[idx].second;
+		type = next;
+		cur = child;
+	}
+	out.field_type = type;
+	out.scan_type = cur.get().HasType() ? cur.get().GetType() : type;
+	return true;
+}
+
+//! The field as a DuckDB expression over the quoted column, for the inner query's WHERE (struct_extract by name,
+//! never `"s"."a"`, which the binder could read as table s, column a).
+static string ExtractPathSql(const string &qcol, const ExtractPath &path) {
+	string sql = qcol;
+	for (idx_t i = 0; i < path.indexes.size(); i++) {
+		if (path.unnamed[i]) {
+			sql = "struct_extract_at(" + sql + ", " + to_string(path.indexes[i] + 1) + ")";
+		} else {
+			string quoted = "'";
+			for (char c : path.names[i]) {
+				quoted += c;
+				if (c == '\'') {
+					quoted += '\'';
+				}
+			}
+			quoted += "'";
+			sql = "struct_extract(" + sql + ", " + quoted + ")";
+		}
+	}
+	if (path.HasCast()) {
+		sql = "CAST(" + sql + " AS " + path.scan_type.ToString() + ")";
+	}
+	return sql;
+}
+
 namespace {
 
 struct ArrowStreamGlobalState : public GlobalTableFunctionState {
@@ -92,6 +172,8 @@ struct ArrowStreamGlobalState : public GlobalTableFunctionState {
 	vector<column_t> output_column_ids;
 	//! For each output column: its position in the (subset) result, or -1 for ROW_ID.
 	vector<int64_t> output_source_pos;
+	//! For each output column: the pushed-down struct field it emits (inactive = the column itself).
+	vector<ExtractPath> output_extract;
 	//! Positions (in the result) of the rowid source columns.
 	vector<idx_t> rowid_source_pos;
 
@@ -391,6 +473,19 @@ optional_ptr<TableCatalogEntry> ArrowStreamGetTableEntry(optional_ptr<const Func
 		return nullptr;
 	}
 	return bind_data->Cast<ArrowStreamBindData>().table;
+}
+
+// 2.0 pushdown extract (see ExtractPath): DuckDB may hand this scan `s.a` instead of `s` when we say yes here.
+// STRUCT columns only — a VARIANT field travels by name and needs variant_extract, not built. Not for a scan
+// that re-applies its filters itself (SQL Server: it has no struct columns, and that path types its filters
+// by the column, not the field).
+bool ArrowStreamSupportsPushdownExtract(const FunctionData &bind_data_p, const LogicalIndex &column_index) {
+	auto &bind_data = bind_data_p.Cast<ArrowStreamBindData>();
+	if (bind_data.reapply_filters || getenv("FABRICATOR_NO_PUSHDOWN_EXTRACT")) {
+		return false;
+	}
+	auto idx = column_index.index;
+	return idx < bind_data.return_types.size() && bind_data.return_types[idx].id() == LogicalTypeId::STRUCT;
 }
 
 BindInfo ArrowStreamGetBindInfo(TableFunctionGetBindInfoInput &input) { // 2.0: takes an input struct
@@ -1766,7 +1861,23 @@ static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFu
 			                                                         : LogicalType(LogicalTypeId::ANY);
 		}
 		vector<string> path {col_name};
-		const LogicalType &type = col_type;
+		LogicalType type = col_type;
+		// a filter on a pushed-down struct field: the field's path below the column. Not for a field under a
+		// CAST (the provider would prune the cast value against the field's statistics) or an unnamed struct.
+		ExtractPath extract;
+		if (key < input.column_indexes.size() && ReadExtractPath(input.column_indexes[key], col_type, extract)) {
+			bool has_unnamed = false;
+			for (auto u : extract.unnamed) {
+				has_unnamed = has_unnamed || u;
+			}
+			if (extract.HasCast() || has_unnamed) {
+				continue;
+			}
+			for (auto &n : extract.names) {
+				path.push_back(n);
+			}
+			type = extract.field_type;
+		}
 		string node;
 		if (LiveFilterNode(entry.Filter(), path, type, constants, bind_data.string_order_pushable, node) &&
 		    !node.empty()) {
@@ -1831,6 +1942,14 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 		}
 		string qcol;
 		SqlIdentIngest(col_name, qcol);
+		// a filter on a pushed-down struct field: the field (and a cast DuckDB folded on top) stands in for the
+		// column, so the inner query evaluates it on the same value the scan emits
+		if ((idx_t)col_id < bind_data.return_types.size() && key < input.column_indexes.size()) {
+			ExtractPath extract;
+			if (ReadExtractPath(input.column_indexes[key], bind_data.return_types[(idx_t)col_id], extract)) {
+				qcol = ExtractPathSql(qcol, extract);
+			}
+		}
 		string rendered;
 		bool ok = RenderTableFilter(entry.Filter(), qcol, rendered);
 		// ⚠ SHIPPED, env-gated, like the Fabricator.Memory marks and the Arrow liveness registry: what a
@@ -2105,6 +2224,21 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 			gstate->output_column_ids.push_back(input.column_ids[proj]);
 		}
 	}
+	// a pushed-down struct field in an output position: the scan fetches the whole column (BuildScanSpec asks for
+	// it by name) and emits the field (ArrowStreamScanChunk)
+	for (idx_t k = 0; k < gstate->output_column_ids.size(); k++) {
+		idx_t in_idx = input.projection_ids.empty() ? k : input.projection_ids[k];
+		ExtractPath extract;
+		auto col_id = gstate->output_column_ids[k];
+		if (in_idx < input.column_indexes.size() && col_id < bind_data.return_types.size()) {
+			if (input.column_indexes[in_idx].IsPushdownExtract() &&
+			    !ReadExtractPath(input.column_indexes[in_idx], bind_data.return_types[col_id], extract)) {
+				// the scan only declares struct fields; anything else here is a contract it cannot keep
+				throw InternalException("fabricator: a pushed-down extract the scan does not support");
+			}
+		}
+		gstate->output_extract.push_back(std::move(extract));
+	}
 	if (bind_data.reapply_filters && input.filters) {
 		vector<unique_ptr<Expression>> conjuncts;
 		for (auto entry : *input.filters) {
@@ -2341,6 +2475,28 @@ static void ArrowStreamScanChunk(ClientContext &context, TableFunctionInput &dat
 	for (idx_t k = 0; k < gstate.output_column_ids.size(); k++) {
 		if (gstate.output_source_pos[k] < 0) {
 			BuildRowId(gstate.rowid_source_pos, lstate.all_columns, output.data[k], output_size);
+		} else if (k < gstate.output_extract.size() && gstate.output_extract[k].Active()) {
+			// a pushed-down struct field: walk from the column to the field. The Arrow import already marks a field
+			// NULL wherever its struct is NULL, so the field vector is the extracted value as it stands.
+			auto &extract = gstate.output_extract[k];
+			auto &bind_data = data.bind_data->Cast<ArrowStreamBindData>();
+			auto col_id = gstate.output_column_ids[k];
+			reference<Vector> field(lstate.all_columns.data[(idx_t)gstate.output_source_pos[k]]);
+			if (field.get().GetType() != bind_data.return_types[col_id]) {
+				ThrowSchemaChanged(bind_data, col_id, field.get().GetType(), bind_data.return_types[col_id]);
+			}
+			for (auto idx : extract.indexes) {
+				if (field.get().GetVectorType() != VectorType::FLAT_VECTOR) {
+					field.get().Flatten(output_size);
+				}
+				field = StructVector::GetEntries(field.get())[idx];
+			}
+			if (extract.HasCast()) {
+				// the CAST DuckDB folded into the extract: the plain cast it would have run above the scan
+				VectorOperations::Cast(context, field.get(), output.data[k], output_size);
+			} else {
+				output.data[k].Reference(field.get());
+			}
 		} else {
 			auto &source = lstate.all_columns.data[(idx_t)gstate.output_source_pos[k]];
 			if (source.GetType() != output.data[k].GetType()) {

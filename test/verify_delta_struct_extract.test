@@ -1,0 +1,152 @@
+# name: test/verify_delta_struct_extract.test
+# description: DuckDB 2.0 "pushdown extract": the Delta scan declares supports_pushdown_extract for STRUCT columns, so
+#              a query using `s.a` gets the FIELD from the scan instead of the whole struct. What it buys: a join on a
+#              struct field gets DuckDB's join filters (the join filter pushdown takes plain scan columns only), so
+#              the probe scan no longer reads every row. The provider still returns the whole column; the ingest
+#              takes the field out (a NULL struct makes the field NULL), filters on the field are rendered against
+#              struct_extract(...). Expected values computed by plain DuckDB over the same rows. 2026-11-08.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sx' AS l (TYPE fabricator, PROVIDER 'delta');
+
+# 400000 rows; every 5000th struct NULL, every 777th field `a` NULL, a nested struct `n`
+statement ok
+CREATE TABLE l.main.big AS SELECT CASE WHEN i % 5000 = 0 THEN NULL ELSE {'a': CASE WHEN i % 777 = 0 THEN NULL ELSE i END,
+'b': md5(i::VARCHAR), 'n': {'x': i % 13}} END AS s, i % 7 AS g FROM range(1, 400001) AS r(i);
+
+statement ok
+CREATE TABLE l.main.dim AS SELECT i * 199 AS k, md5((i * 199)::VARCHAR) AS h FROM range(1, 2001) AS r(i);
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+# ---- 1. a join on an integer struct field: the field is a scan column, and the join's key range + prefix-range
+#      filter reach the inner query against struct_extract("s", 'a') ----
+query II
+SELECT count(*), sum(b.g) FROM l.main.big b JOIN l.main.dim d ON b.s.a = d.k;
+----
+1998	6002
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE type = 'Fabricator.Delta' AND message LIKE '%delta scan main.big%'
+AND message LIKE '%fabricator_join_filter(%, struct_extract("s", ''a''))%';
+----
+true
+
+# and it filters: the rows big's scan hands to the join (about 2000, not 400000)
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '${FABRICATOR_DELTA_WRITE_DIR}/sx_profile.json';
+
+statement ok
+SELECT count(*) FROM l.main.big b JOIN l.main.dim d ON b.s.a = d.k;
+
+statement ok
+PRAGMA disable_profiling;
+
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/sx_profile.json'));
+----
+2	true
+
+# ---- 2. a string field: a bloom filter, through the same function ----
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(b.g) FROM l.main.big b JOIN l.main.dim d ON b.s.b = d.h;
+----
+2000	6002
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE type = 'Fabricator.Delta' AND message LIKE '%delta scan main.big%'
+AND message LIKE '%fabricator_join_filter(%, struct_extract("s", ''b''))%';
+----
+true
+
+# ---- 3. a static filter on a nested field, rendered as nested struct_extract ----
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(b.s.a) FROM l.main.big b WHERE b.s.n.x = 5;
+----
+30763	6144276353
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE type = 'Fabricator.Delta' AND message LIKE '%delta scan main.big%'
+AND message LIKE '%(struct_extract(struct_extract("s", ''n''), ''x'') = 5)%';
+----
+true
+
+# ---- 4. projections of fields, NULL structs and NULL fields ----
+query IIII
+SELECT sum(s.a), count(s.b), count(*) FILTER (WHERE s IS NULL), count(*) FILTER (WHERE s.a IS NULL) FROM l.main.big;
+----
+79881160165	399920	80	594
+
+# a CAST on top of the field, which DuckDB folds into the extract (the scan applies it)
+query I
+SELECT sum(CAST(s.a AS DOUBLE)) FROM l.main.big WHERE s.a < 10;
+----
+45.0
+
+# the preserved side of an outer join keeps every row; a semi join through the same filter
+query II
+SELECT count(*), count(d.k) FROM l.main.big b LEFT JOIN l.main.dim d ON b.s.a = d.k;
+----
+400000	1998
+
+query I
+SELECT count(*) FROM l.main.big WHERE s.a IN (SELECT k FROM l.main.dim);
+----
+1998
+
+query III
+SELECT s.a, s.n.x, g FROM l.main.big WHERE s.a BETWEEN 776 AND 779 ORDER BY 2, 1;
+----
+776	9	6
+778	11	1
+779	12	2
+
+statement ok
+DETACH l;
+
+# ---- 5. the codec engine on the same table: the scan emits the field too (its default filter mode sends no join
+#      filters, so these check the answers) ----
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sx' AS c (TYPE fabricator, PROVIDER 'engineeredwooddelta', READ_ONLY true);
+
+query II
+SELECT count(*), sum(b.g) FROM c.main.big b JOIN c.main.dim d ON b.s.a = d.k;
+----
+1998	6002
+
+query II
+SELECT count(*), sum(b.s.a) FROM c.main.big b WHERE b.s.n.x = 5;
+----
+30763	6144276353
+
+query IIII
+SELECT sum(s.a), count(s.b), count(*) FILTER (WHERE s IS NULL), count(*) FILTER (WHERE s.a IS NULL) FROM c.main.big;
+----
+79881160165	399920	80	594
+
+query I
+SELECT sum(CAST(s.a AS DOUBLE)) FROM c.main.big WHERE s.a < 10;
+----
+45.0
+
+statement ok
+DETACH c;

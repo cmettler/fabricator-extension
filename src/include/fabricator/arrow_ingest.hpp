@@ -252,6 +252,8 @@ duckdb::BindInfo ArrowStreamGetBindInfo(duckdb::TableFunctionGetBindInfoInput &i
 //! base table to the binder.
 duckdb::optional_ptr<duckdb::TableCatalogEntry>
 ArrowStreamGetTableEntry(duckdb::optional_ptr<const duckdb::FunctionData> bind_data);
+//! 2.0 pushdown extract: whether the scan emits a STRUCT column's field itself (see ExtractPath).
+bool ArrowStreamSupportsPushdownExtract(const duckdb::FunctionData &bind_data, const duckdb::LogicalIndex &column_index);
 
 // The spec_json for a SCHEMA-ONLY describe: `{"schema_only":true}` plus the AT clause when the reference is
 // a time-travel one, so the table is described AS OF the requested version rather than at latest.

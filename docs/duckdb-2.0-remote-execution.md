@@ -2412,3 +2412,19 @@ DuckDB's choice, unchanged here.
 Gate: `verify_delta_catalog_dynamic_filter` 21 -> 47 -> 48 (the range row) -> 68 (the bloom section: md5 keys, NULL-safe,
 outer, semi, anti and a FLOAT/DOUBLE join; mutants: bloom never rendered dies at the log row, lookup passing every row dies at
 the profile row)
+
+**Joins on a struct field: DuckDB 2.0 "pushdown extract".** DuckDB's join filter pushdown takes plain scan columns only
+(`join_filter_pushdown_optimizer.cpp` refuses nested types, and `s.a` is a `struct_extract` call), so a join on `t.s.a`
+got no join filter at all. Since [duckdb#22266](https://github.com/duckdb/duckdb/pull/22266) a scan can say yes to
+`supports_pushdown_extract`, and DuckDB then hands it `s.a` as a scan column of its own — after which the join filters
+apply as on any column (measured on plain parquet first: `Dynamic Filters: s.a IN PRF(k)`, 2,000 of 4M rows). Our scan
+now declares it for STRUCT columns (not VARIANT, not a scan that re-applies its filters itself). Two conditions:
+the callback, and statistics through `statistics_extended` — DuckDB switches pushdown extract off for a scan with the
+plain `statistics` callback. The provider still returns the whole column; the ingest takes the field out (the Arrow
+import already marks a field NULL under a NULL struct), applies a CAST DuckDB folds on top, and the filters render
+against `struct_extract("s", 'a')` (SQL) and the path `["s","a"]` (JSON). Measured, 20M rows, 2000 keys:
+0.59–0.61 s against 1.67–1.89 s with it off (`FABRICATOR_NO_PUSHDOWN_EXTRACT=1`). Not yet: the native reader still
+reads the whole struct (selecting only the field would save its IO). Gate `verify_delta_struct_extract` (50): joins on
+an integer and a string field, a nested static filter, projections, NULL structs and fields, the folded CAST, outer and
+semi joins, and the codec engine on the same table; mutants: extract switched off dies at the log row, filters
+rendered against the column dies at the first join.

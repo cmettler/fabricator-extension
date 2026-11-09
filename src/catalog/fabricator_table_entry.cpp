@@ -969,6 +969,15 @@ static unique_ptr<BaseStatistics> FabricatorScanStatistics(ClientContext &contex
 	return make_uniq<BaseStatistics>(std::move(stats));
 }
 
+// The same, given the full column index: nothing for a pushed-down struct field (the NDV is the column's).
+static unique_ptr<BaseStatistics> FabricatorScanStatisticsExtended(ClientContext &context,
+                                                                 TableFunctionGetStatisticsInput &input) {
+	if (!input.bind_data || !input.column_index.HasPrimaryIndex() || input.column_index.IsPushdownExtract()) {
+		return nullptr;
+	}
+	return FabricatorScanStatistics(context, input.bind_data.get(), input.column_index.GetPrimaryIndex());
+}
+
 // ONE file's statistics, as DuckDB's aggregate rewrite reads them. Built once from the provider's doc and
 // immutable; keyed by PHYSICAL column index, which is what a StorageIndex carries.
 struct FabricatorPartitionRowGroup : public PartitionRowGroup {
@@ -1438,7 +1447,9 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 		function.filter_pushdown = true;
 	}
 	function.cardinality = FabricatorScanCardinality;
-	function.statistics = FabricatorScanStatistics;
+	// statistics through the EXTENDED callback: DuckDB turns pushdown extract off for a scan with the plain one
+	function.statistics_extended = FabricatorScanStatisticsExtended;
+	function.supports_pushdown_extract = fabricator::ArrowStreamSupportsPushdownExtract;
 	function.get_partition_stats = FabricatorScanPartitionStats;
 	function.get_bind_info = fabricator::ArrowStreamGetBindInfo;
 	function.get_table_entry = fabricator::ArrowStreamGetTableEntry; // 2.0: or the binder sees no base table
