@@ -143,7 +143,7 @@ services:
   # unchanged against it: FABRICATOR_S3_ENDPOINT=localhost:9100, FABRICATOR_S3_SQL_ENDPOINT=rustfs:9000.
   # Measured 2026-11-08 on 1.0.4: put-if-absent (If-None-Match: *) is atomic -- 20 rounds of 32 concurrent writers,
   # exactly one winner each -- which is what our S3 commits depend on. TLS from certs/rustfs (generate-certs.ps1).
-  # Nothing creates the bucket yet: create `fabricator` with any S3 client after the first start.
+  # The bucket comes from `rustfs-init` below (RustFS's own client, rc).
   rustfs:
     image: rustfs/rustfs:1.0.4
     profiles: ["rustfs"]
@@ -158,6 +158,28 @@ services:
     volumes:
       - rustfs-data:/data
       - ./certs/rustfs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -skf -o /dev/null https://localhost:9000/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # One-shot: creates the `fabricator` bucket in RustFS with rc, RustFS's own client (`-p`: an existing bucket is
+  # fine, so it is re-runnable). --insecure because rc's TLS stack (rustls) refuses our certificate: it is self-signed
+  # with CA:TRUE, i.e. a CA used as the server's own certificate (CaUsedAsEndEntity), which curl, SQL Server and
+  # MinIO's mc accept. A separate CA + server certificate would let it verify.
+  rustfs-init:
+    image: rustfs/rc:v0.1.37
+    profiles: ["rustfs"]
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        rc alias set rfs https://rustfs:9000 miniouser miniosecret123 --insecure &&
+        rc bucket create -p rfs/fabricator
 
 volumes:
   mssql-data:

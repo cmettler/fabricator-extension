@@ -52,11 +52,16 @@ SELECT fabricator_exec('sqldb',
      CREATE DATABASE SCOPED CREDENTIAL s3_dc WITH IDENTITY = ''S3 Access Key'',
        SECRET = ''miniouser:miniosecret123''');
 
+# ⚠ The data source survives between runs: one left from a run against another store (MinIO vs RustFS) is
+#   re-pointed, or SQL Server reads the OTHER store's leftover files and the assertions pass or fail by accident.
 statement ok
 SELECT fabricator_exec('sqldb',
   'IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = ''s3_ds'')
      CREATE EXTERNAL DATA SOURCE s3_ds WITH (LOCATION = ''s3://${FABRICATOR_S3_SQL_ENDPOINT}/'',
-       CREDENTIAL = s3_dc)');
+       CREDENTIAL = s3_dc)
+   ELSE IF NOT EXISTS (SELECT 1 FROM sys.external_data_sources WHERE name = ''s3_ds''
+                       AND location = ''s3://${FABRICATOR_S3_SQL_ENDPOINT}/'')
+     ALTER EXTERNAL DATA SOURCE s3_ds SET LOCATION = ''s3://${FABRICATOR_S3_SQL_ENDPOINT}/''');
 
 statement ok
 SELECT fabricator_exec('sqldb',

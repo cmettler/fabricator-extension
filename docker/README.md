@@ -10,7 +10,7 @@ providers and SQL Server's native S3 data virtualization (external tables / `OPE
 # 0. one-time: remove the old ad-hoc container if it exists
 docker stop mssql-fabricator; docker rm mssql-fabricator
 
-# 1. generate the MinIO TLS cert (gitignored; SANs: minio, localhost, 127.0.0.1)
+# 1. generate the TLS cert (gitignored; SANs: minio, rustfs, localhost, 127.0.0.1)
 pwsh docker/certs/generate-certs.ps1
 
 # 2. start everything (SQL Server 1433, MinIO S3 9000 / console 9001, bucket `fabricator`)
@@ -43,6 +43,14 @@ process start — restart the `sqlserver` service after rotating certs).
 Without it the container starts **healthy** and the bucket is silently absent. `generate-certs.ps1`
 writes it; the certs are gitignored, so nothing else will.
 
+⚠⚠ **After regenerating the certs, RECREATE the MinIO container — a restart is not enough** (measured
+2026-11-09). `setup.sh` copies `/certs/CAs` into `mc`'s trust store only when no copy is there yet, and a
+restart keeps the container's filesystem, so `mc` keeps trusting the OLD certificate: setup fails with
+*"Failed to add temporary MinIO server"* (`x509: failed to verify certificate`) and the container restarts
+every ~75 s — while reporting **healthy** and answering requests for most of each cycle, so suites pass or
+fail by timing. Use `docker compose up -d --force-recreate --no-deps minio` (the data is in the volume).
+SQL Server only needs a restart: it reads the CA at process start.
+
 ## SQL Server 2025 + S3 notes
 
 - File queries (CSV/Parquet/**DELTA**) over S3 are a **native engine capability** in 2025 — no
@@ -61,3 +69,31 @@ writes it; the certs are gitignored, so nothing else will.
 export FABRICATOR_S3_ENDPOINT=localhost:9000   # gates test/verify_delta_catalog_s3.test
 export FABRICATOR_S3_SQL_ENDPOINT=minio:9000   # gates test/verify_mssql_s3_polybase.test (with MSSQL_TESTDB_DSN)
 ```
+
+## RustFS (trial, profile `rustfs`)
+
+[RustFS](https://github.com/rustfs/rustfs) (Apache-2.0, maintained) is a candidate replacement for MinIO, whose
+community image is no longer published (we run Bitnami's frozen 2025.7.23 mirror). Same keys, same bucket name,
+so every S3 suite runs against it by changing two env vars:
+
+```pwsh
+docker compose -f docker/docker-compose.yml --profile rustfs up -d rustfs rustfs-init
+```
+
+```bash
+export FABRICATOR_S3_ENDPOINT=localhost:9100   # DuckDB on the host
+export FABRICATOR_S3_SQL_ENDPOINT=rustfs:9000  # SQL Server inside the compose network
+```
+
+- `rustfs-init` creates the bucket with `rc`, RustFS's own client (`rustfs/rc`), and is re-runnable. It runs with
+  `--insecure`: rc's TLS stack (rustls) refuses our certificate because it is self-signed with CA:TRUE, a CA used
+  as the server's own certificate (`CaUsedAsEndEntity`); curl, SQL Server and MinIO's `mc` accept it.
+- RustFS reads the certificate from `docker/certs/rustfs/` under its own file names; `generate-certs.ps1` writes
+  that copy. The `rustfs` SAN is what lets SQL Server reach it as `rustfs:9000`.
+- **Measured 2026-11-09 on RustFS 1.0.4, all green at full counts:** `verify_delta_catalog_s3` (222, both engines),
+  `verify_mssql_s3_polybase` (297), `verify_mssql_external_delete` (45), `verify_mssql_external_txn` (127).
+  Put-if-absent (`If-None-Match: *`), which our S3 commits rely on, is atomic: 20 rounds of 32 concurrent
+  writers, exactly one winner each (2026-11-08).
+- ⚠ SQL Server's external data source `s3_ds` in TestDB points at ONE store at a time. The SQL Server suites
+  re-point it to `FABRICATOR_S3_SQL_ENDPOINT` when it differs; before 2026-11-09 they kept whatever a previous run
+  left, so a switch between MinIO and RustFS read the other store's leftover files.
