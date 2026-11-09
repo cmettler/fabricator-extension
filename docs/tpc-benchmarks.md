@@ -111,3 +111,93 @@ filter, table variables on box) — all at DuckDB's default `dynamic_or_filter_t
   random2 3.2 s, q18 ~1.5 s. Before the key lists (columnstore column): q8 ~7.3 s where lineitem is remote and `part`
   local (DuckDB joins them first, so no server-only part holds lineitem and it comes back unfiltered); q21 ~11 s and q9 ~9 s where lineitem is remote and other tables are local; q17 8.9 s and q5 6.5 s in
   facts-remote; q18 ~5 s; q13 ~4 s.
+
+## Lakehouse engines on S3 (RustFS), TPC-H SF10 (2026-11-09)
+
+The same parquet files read as Delta and as Iceberg by several engines, from RustFS (`rustfs/rustfs:1.0.4` in the
+docker rig, HTTPS, on the same machine: 20 cores, 32 GB). The question it answers: where our Delta reading stands next
+to DuckDB's own Iceberg reader and two other engines, on identical data.
+
+**Data.** The TPC-H SF10 copy of OneLake's `CH0010` (42 parquet files, 2.3 GiB, the copy the 2026-11-08 SF10 runs used)
+as Delta in `s3://fabricator/tpch10/CH0010`, plus Iceberg tables over the SAME files in `s3://fabricator/tpch10ice`
+(pyiceberg `SqlCatalog`, `add_files`, unpartitioned). So Delta and Iceberg read byte-identical data files, and the
+comparison measures engine and metadata path only.
+
+**Engines.** Each runs in its own process, three rounds of the 22 queries, the first cold, all with their default
+thread settings (all cores). The queries are `sql/tpch.sql` of `lakehouse_benchmark` with only the table names
+rewritten per engine.
+- DuckDB 2.0 with fabricator: `ATTACH 's3://fabricator/tpch10' (TYPE fabricator, PROVIDER 'delta' | 'engineeredwooddelta', schemas 'onelevel')`.
+  Native reader and codec engine, both with their default `pushdown_filters`.
+- DuckDB 2.0 `iceberg_scan` over each table's metadata file.
+- Polars 2.1.0, `scan_delta` (deltalake 1.6.6) and `scan_iceberg` (the table loaded through the pyiceberg 0.12.0
+  catalog, the data files read by Polars itself).
+- LakeSail 0.7.3 (`pysail`, Spark Connect), `format("delta")` / `format("iceberg")` loads registered as temp views.
+
+**Correctness.** Every query of every engine and round matches a reference: DuckDB 2.0 over the same files locally,
+compared as multisets with numbers within 0.02 absolute or 1e-6 relative.
+
+**Seconds, sum over the 22 queries:**
+
+| engine | round 0 (cold) | round 1 | round 2 |
+|---|---|---|---|
+| DuckDB `iceberg_scan` | 15.0 | 14.6 | 13.8 |
+| Polars Iceberg | 22.3 | 20.6 | 21.1 |
+| Polars Delta | 25.9 | 26.1 | 26.6 |
+| Sail Iceberg | 32.0 | 32.1 | 33.6 |
+| Sail Delta | 33.8 | 33.5 | 32.7 |
+| fabricator codec engine | 38.2 | 35.8 | 36.7 |
+| **fabricator native reader** | 44.9 | 45.0 | 44.4 |
+| reference: DuckDB on the local files, one round | 17.3 | | |
+
+**Per query, the better of the two warm rounds:**
+
+| query | DuckDB Iceberg | Polars Iceberg | Polars Delta | Sail Iceberg | Sail Delta | fab. codec | fab. native |
+|---|---|---|---|---|---|---|---|
+| Q1 | 0.55 | 1.20 | 2.23 | 2.00 | 1.93 | 2.12 | 3.81 |
+| Q2 | 0.21 | 0.47 | 0.53 | 0.33 | 0.40 | 0.53 | 0.66 |
+| Q3 | 0.40 | 0.77 | 0.92 | 1.14 | 1.17 | 1.44 | 1.57 |
+| Q4 | 0.24 | 0.50 | 0.51 | 0.56 | 0.55 | 0.74 | 1.06 |
+| Q5 | 0.50 | 0.95 | 1.10 | 2.16 | 2.08 | 1.81 | 1.50 |
+| Q6 | 0.20 | 0.56 | 0.73 | 0.75 | 0.72 | 1.43 | 1.01 |
+| Q7 | 0.51 | 1.11 | 1.20 | 1.25 | 1.21 | 1.89 | 1.60 |
+| Q8 | 0.58 | 1.11 | 1.28 | 2.01 | 2.02 | 2.21 | 1.90 |
+| Q9 | 1.19 | 1.68 | 2.36 | 3.08 | 3.06 | 3.23 | 3.60 |
+| Q10 | 0.81 | 1.07 | 1.21 | 1.56 | 1.56 | 2.30 | 2.08 |
+| Q11 | 0.13 | 0.12 | 0.18 | 0.32 | 0.24 | 0.26 | 0.42 |
+| Q12 | 0.26 | 0.54 | 0.81 | 0.76 | 0.80 | 1.19 | 1.38 |
+| Q13 | 0.87 | 0.86 | 1.03 | 1.04 | 0.97 | 1.89 | 2.10 |
+| Q14 | 0.40 | 0.74 | 0.84 | 0.93 | 0.92 | 1.33 | 0.81 |
+| Q15 | 0.26 | 0.60 | 0.89 | 1.74 | 1.73 | 1.32 | 0.73 |
+| Q16 | 0.28 | 0.18 | 0.18 | 0.37 | 0.47 | 0.37 | 0.41 |
+| Q17 | 1.67 | 1.76 | 1.99 | 2.84 | 2.88 | 2.96 | 3.84 |
+| Q18 | 0.80 | 1.17 | 1.25 | 2.94 | 2.97 | 1.26 | 1.88 |
+| Q19 | 0.46 | 0.73 | 1.26 | 1.44 | 1.47 | 2.35 | 2.17 |
+| Q20 | 0.71 | 1.12 | 1.64 | 1.58 | 1.53 | 1.56 | 2.16 |
+| Q21 | 2.09 | 2.40 | 2.50 | 2.59 | 3.20 | 2.76 | 5.24 |
+| Q22 | 0.35 | 0.36 | 0.36 | 0.36 | 0.35 | 0.51 | 0.54 |
+| **sum** | **13.5** | **20.0** | **25.0** | **31.7** | **32.2** | **35.5** | **40.5** |
+
+**What it says:**
+- **Our native Delta reader is three times slower than DuckDB's Iceberg reader** on the same files, in the same DuckDB,
+  with the same join filters. The gap is widest on plain scans: Q1 3.81 against 0.55 s, Q6 1.01 against 0.20, Q12
+  1.38 against 0.26. It is the transport measured on 2026-11-07 (commit `abcbd5d`, which already moved the inner
+  query's Arrow export onto DuckDB's own producer threads): our scan takes its rows out of an inner DuckDB query as Arrow and imports them into the outer plan again, where
+  Iceberg plans `read_parquet` into the query. Planning the Delta read as `read_parquet` directly (an optimizer pass,
+  the same technique as the SQL Server subtree pushdown) is the lever.
+- **The codec engine beats the native reader here** (35.5 against 40.5 s, warm). It has no second transport and wins
+  where `lineitem` is read more than once (Q17, Q18, Q21) and on Q1; it loses on Q5–Q8, Q10, Q14, Q15, Q19.
+- DuckDB Iceberg's warm rounds beat the local reference because DuckDB's external file cache serves the S3 bytes from
+  memory after the first round.
+- Polars reads Iceberg faster than Delta (20.0 against 25.0 s); Sail is about equal on both and slowest on Q5, Q15 and
+  Q18.
+- The 2026-11-08 SF10 runs on MinIO (round 2: Iceberg 14.0 s, native 41.0 s, codec 39.6 s) agree with these.
+
+**Caveats.** One machine, the store local in Docker, so network latency plays almost no part. Three rounds. Engines at
+their defaults: no thread or memory tuning, Sail with join reordering on (as in `lakehouse_benchmark`). The Rust
+clients (Polars, Sail) read with `allow_invalid_certificates`, because rustls refuses the rig's self-signed CA:TRUE
+certificate (docker/README.md).
+
+**Rerun.** The harness is local and gitignored: `scratchpad/rustfs-bench/` with `upload.py` (data to RustFS + Iceberg
+metadata), `bench.py <engine> [rounds]` (one engine per process, results to `results/<engine>.json`) and `compare.py`
+(sums and the correctness check). The Python side is a uv venv there (polars, deltalake, pysail, pyspark-client,
+pyiceberg[sql-sqlite], s3fs, duckdb 2.0.0); the DuckDB engines use `build/release-v2/duckdb.exe`.
