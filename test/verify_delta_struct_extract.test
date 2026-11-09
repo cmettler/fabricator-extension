@@ -13,6 +13,11 @@ require parquet
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
+# Pins the Delta provider's own scan — struct field pushdown, which the file scan leaves off (docs/duckdb-upstream-issues.md §17) — so it keeps testing it whatever
+# fabricator_file_scan defaults to. The file scan has its own gate: verify_delta_file_scan.
+statement ok
+SET fabricator_file_scan = false;
+
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sx' AS l (TYPE fabricator, PROVIDER 'delta');
 

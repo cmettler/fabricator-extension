@@ -1527,6 +1527,90 @@
     such join needs a `LEFT JOIN` plus an `error()` on an unmatched file. And the residual per-row cost is
     the Arrow hand-back, which no batching of any shape touches.
 
+## The file scan — DuckDB reads the parts itself (2026-11-09/10, ABI v101, opt-in)
+
+Everything above is the PROVIDER's scan: C# builds a `read_parquet` query, runs it through a host query and hands
+the rows back over Arrow. On TPC-H SF10 that hand-back was the cost: the same query as a direct `read_parquet` took
+0.36 s for Q1 where the provider's scan took 2–3.4 s, and batching or passing chunks through did not close it
+(chunk passthrough measured ~6%, discarded). The file scan removes the hand-back: the provider describes the table,
+and DuckDB's own multi-file parquet reader reads it in the scan's own pipeline.
+
+**Switch:** `SET fabricator_file_scan = true` (default `false` while it is built; `FABRICATOR_FILE_SCAN=1` makes
+`true` the process default, and a `SET` still wins). Only for an autocommit statement on a catalog that declares
+the capability `file_scan` (Delta with `native_read`). Anything else, and anything the plan declines, takes the
+provider's scan as before. `EXPLAIN` shows `Fabricator File Scan` when it is used.
+
+### The concept: a table is a set of parts
+
+One abstraction, format-neutral (`Fabricator.Abstractions/ScanPlan.cs`, experimental):
+
+- a **part** is either a `FilePart` (a parquet file DuckDB reads) or a `StreamPart` (rows the provider produces
+  through `ITable.ReadPart` — the shape for Lance, Vortex or anything DuckDB cannot read);
+- the **mapping** is shared by both: per part the deleted row positions, per-part constants (partition values,
+  as text the host casts), stored names or field ids per column and struct member, and virtual columns whose value
+  is a per-part constant, optionally plus the row's position (the row id, Delta row tracking);
+- `ITable.PlanScan()` returns the plan at bind; `ITable.PartsMatching(filter, values)` names, at scan start, the
+  parts that may hold a row matching the scan's filters — the rest are never opened.
+
+The host side (`src/fabricator/fabricator_file_scan.cpp`) is a copy of the system catalog's `parquet_scan` with
+our `MultiFileReader`: the file list from the plan, the table's schema as the bind schema (files mapped by name, or
+by field id when the plan gives ids), deletes as a `DeleteFilter`, constants through the constant map, virtual
+columns as expressions. There is no Delta in it.
+
+Wire (`abi.h`): `table_file_plan` returns the table's half as JSON and the parts as ONE Arrow batch (path, stream,
+size, deleted `LIST<BIGINT>`, `constant:<col>` VARCHAR, `virtual:<name>` BIGINT); `table_part_scan` reads a stream
+part; `table_parts_matching` answers the pruning question.
+
+### What Delta does with it
+
+`DeltaCatalog.PlanScan` lists the active files at the pinned version (the same pin and read set as the
+partition-statistics answer), each with its deletion vector, partition values (looked up by their PHYSICAL key under
+column mapping — in id mode from the schema's `physicalName`, which once read NULL for every partition) and
+`TransientRowAddress.Pack(ordinal, 0)` as the row id base. Column mapping `name` sends stored names (struct members
+inside lists and maps too); `id` sends field ids. Row tracking: `COALESCE(materialized, baseRowId + position)`.
+
+`PartsMatching` lists the same snapshot again with the filter as engineered-wood's file pruner, so partition values
+and log statistics are used by exactly the native reader's rules (a Spark millisecond timestamp max widened, a column
+widened from float unbounded).
+
+**A naive timestamp file under a UTC-adjusted column** (a DuckLake `'utc'` mirror, Spark INT96): the mapper would
+cast it — and convert pushed filters — in the session zone, a silent shift. The file's column is declared as the
+table's kind instead, so the microseconds are read as UTC, filters included. Another unit (`TIMESTAMP_NS` etc.)
+under such a column is refused by name.
+
+### Declines (the provider's scan reads instead)
+
+`native_read` off, an explicit transaction (the plan would read the whole table where the scan records its predicate
+as the read set — `verify_delta_catalog_transactions:517` under serializable), pending writes in the transaction,
+column mapping `id` with a struct inside a list or map, a binary partition column, nested timestamps, VARIANT.
+
+### Not done, and why
+
+- **Struct field pushdown is off** in the file scan: with it, DuckDB 2.0.0 hits an INTERNAL error when a struct path
+  reaches a member older files lack (`docs/duckdb-upstream-issues.md` §17). The cost is join filters on struct fields
+  (`verify_delta_struct_extract`'s profile rows).
+- **Late materialization** (rowid filters selecting files) is not wired; the provider's scan does it.
+
+### Measured
+
+TPC-H SF10, Delta on RustFS, best warm of three: **13.3 s** with the file scan (all 22 correct), against 37.5 s for
+the provider's scan and 13.8 s for DuckDB's `iceberg_scan` over the same parquet files. With part pruning added
+13.9 s (within noise: the TPC-H tables are not partitioned, so there is little to prune; the init-time crossing
+costs nothing measurable).
+
+### Gate
+
+`test/verify_delta_file_scan.test` (hermetic): routing, a differential against the provider's scan over deletion
+vectors, schema evolution, row tracking, DML, partitions, timestamps, column mapping `none` / `name` / `id`, structs
+in lists and maps, the plan copy in a CTE, the explicit-transaction decline, naive timestamps under a non-UTC zone
+(§10) and pruning (§11 — a data file the filter rules out is overwritten with garbage, so the filtered read only
+succeeds if that part is never opened; the unfiltered read failing on it is the control). Mutants killed at their own
+rows: the type rewrite for naive timestamps (§10), no pruning (§11), and earlier the id-mode, list/map and
+row-number paths.
+
+Suites that test the provider scan's own routing, logs or plan markers set `fabricator_file_scan = false`, so they
+keep testing it when the default flips.
+
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 
 CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every

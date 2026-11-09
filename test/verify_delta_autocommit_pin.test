@@ -45,6 +45,11 @@ require-env FABRICATOR_DELTA_WRITE_DIR
 # PROVIDER 'engineeredwooddelta': this suite is ABOUT the codec read path's pin, so it names the pure-EW
 # engine rather than relying on a default. Under 'delta' the native reader pins via ResolveVersionAsOf and
 # the 'delta codec pin' line these assertions count is never emitted.
+# Pins the Delta provider's own scan — its routing, logs and plan markers — so it keeps testing it whatever
+# fabricator_file_scan defaults to. The file scan has its own gate: verify_delta_file_scan.
+statement ok
+SET fabricator_file_scan = false;
+
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/apin' AS lake
   (TYPE fabricator, PROVIDER 'engineeredwooddelta', READ_ONLY false);

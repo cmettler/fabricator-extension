@@ -14,6 +14,11 @@ require parquet
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
+# Pins the Delta provider's own scan — its routing, logs and plan markers — so it keeps testing it whatever
+# fabricator_file_scan defaults to. The file scan has its own gate: verify_delta_file_scan.
+statement ok
+SET fabricator_file_scan = false;
+
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catdynfilter' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true);
 

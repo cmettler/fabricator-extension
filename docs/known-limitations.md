@@ -368,6 +368,17 @@ row and column and pointing at `v::JSON` (which lands as `nvarchar(max)` / nativ
 conversion inside `sql_variant`. The CTAS must leave no table behind when that refusal fires — verify.
 2.0 line only; breaking (the column type changes from VARCHAR to VARIANT).
 
+### 1.33 The Delta file scan (`fabricator_file_scan`, experimental) does not push struct fields
+
+Under the file scan (DuckDB's own parquet reader reading the Delta parts, docs/delta-read-path.md "The file scan")
+a filter on a struct FIELD is applied above the scan rather than inside it, so a join on `s.a` gets no join filter
+and a `WHERE s.a = …` no row-group pruning. Results are unchanged. The reason is upstream: with struct pushdown on,
+DuckDB 2.0.0 raises an INTERNAL error when the path reaches a member an older file lacks
+(docs/duckdb-upstream-issues.md §17). The provider's scan, the default, still pushes them
+(`verify_delta_struct_extract`). Also unwired under the file scan: late materialization (row-id filters selecting
+files). Everything the file scan cannot express — an explicit transaction, pending writes, VARIANT, nested
+timestamps, column mapping `id` with a struct inside a list or map — falls back to the provider's scan by itself.
+
 ---
 
 ## 2. Claimed but NOT measured — treat as unproven

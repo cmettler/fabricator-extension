@@ -21,6 +21,12 @@ require-env FABRICATOR_DELTA_WRITE_DIR
 
 require-env DELTA_PROVIDER
 
+# Pins the Delta provider's own scan — its routing, logs and plan markers — so it keeps testing it whatever
+# fabricator_file_scan defaults to. The file scan has its own gate: verify_delta_file_scan. GLOBAL: §5 reads
+# through the named connections con1 / con2 too.
+statement ok
+SET GLOBAL fabricator_file_scan = false;
+
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/pstats' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', deletion_vectors true);
 

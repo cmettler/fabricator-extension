@@ -1030,10 +1030,11 @@ TableCatalogEntry &FileScanTable(const FunctionData &bind_data, std::string &at_
 }
 
 bool FileScanEnabled(ClientContext &context) {
+	// the setting (FABRICATOR_FILE_SCAN=1 is its default, so a SET overrides the environment); the variable itself
+	// only where the setting is not registered
 	Value enabled;
-	if (context.TryGetCurrentSetting("fabricator_file_scan", enabled) && !enabled.IsNull() &&
-	    enabled.GetValue<bool>()) {
-		return true;
+	if (context.TryGetCurrentSetting("fabricator_file_scan", enabled) && !enabled.IsNull()) {
+		return enabled.GetValue<bool>();
 	}
 	auto env = getenv("FABRICATOR_FILE_SCAN");
 	return env && string(env) == "1";

@@ -21,6 +21,8 @@ namespace Fabricator.Bridge;
 /// <para>Nothing here is format-specific: a Delta log, an Iceberg manifest, a DuckLake catalog or a Lance dataset
 /// each only say which parts exist. A format DuckDB cannot read itself is a <see cref="StreamPart"/>.</para>
 /// <para>BCL-only on purpose, so the plan and its wire form are tested offline (Fabricator.Bridge.Tests).</para>
+/// <para>⚠ EXPERIMENTAL: the host uses a plan only under <c>SET fabricator_file_scan = true</c> while it is being
+/// built, and these types may still change (docs/delta-read-path.md, "The file scan").</para>
 /// </remarks>
 public sealed record ScanPlan
 {
