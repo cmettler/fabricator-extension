@@ -25,6 +25,10 @@
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
@@ -81,6 +85,10 @@ struct FileScanPlan : public TableFunctionInfo {
 	//! the AT clause the scan was bound with ("" = latest)
 	string at_unit;
 	string at_value;
+	//! per file, the provider's token when the PROVIDER reads the part (a stream part); empty = DuckDB reads the file
+	vector<string> stream_parts;
+	//! the table session the stream parts are asked from
+	FabricatorHandle table_handle = 0;
 };
 
 //! Excludes a file's deleted rows from DuckDB's parquet read (called per row range; returns the KEPT rows).
@@ -138,6 +146,172 @@ unique_ptr<Expression> AddRowNumber(ClientContext &context, Value value, const L
 	}
 	return sum;
 }
+
+//! A part whose rows the PROVIDER produces (the plan's "stream"): an Arrow stream asked for with the columns the scan
+//! needs, read by one thread. Everything that maps rows onto the table — deleted rows aside, which the provider
+//! applies itself — stays with the multi-file reader: constants, stored names, NULL defaults, virtual columns.
+class StreamPartReader : public BaseFileReader {
+public:
+	StreamPartReader(const OpenFileInfo &file, shared_ptr<FileScanPlan> plan_p, idx_t index_p)
+	    : BaseFileReader(file), plan(std::move(plan_p)), index(index_p) {
+		// the part's own columns: the table's, under their stored names (what the mapper matches), minus the ones the
+		// plan gives this file as constants (the provider does not produce them)
+		auto &constants = plan->constants[index];
+		for (idx_t i = 0; i < plan->columns.size(); i++) {
+			if (constants.find(i) != constants.end()) {
+				continue;
+			}
+			columns.push_back(LocalColumn(plan->columns[i]));
+			names.push_back(plan->columns[i].name.GetIdentifierName());
+		}
+	}
+
+	string GetReaderType() const override {
+		return "fabricator_stream";
+	}
+
+	bool TryInitializeScan(ClientContext &, GlobalTableFunctionState &, LocalTableFunctionState &) override {
+		// one thread drains a stream: the first to ask takes it
+		return !claimed.exchange(true);
+	}
+
+	void PrepareScan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &) override {
+		if (!expression_map.empty()) {
+			throw NotImplementedException("fabricator file scan: a stream part cannot evaluate a converted filter yet");
+		}
+		// the columns asked for, in the order of the output chunk (column_ids are positions in `columns`)
+		string request = "{\"part\":" + Quote(plan->stream_parts[index]) + ",\"columns\":[";
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			auto local = column_ids[MultiFileLocalIndex(i)].GetId();
+			if (local >= names.size()) {
+				throw NotImplementedException("fabricator file scan: a stream part cannot produce a virtual column "
+				                              "(file_row_number) yet");
+			}
+			request += (i ? "," : "") + Quote(names[local]);
+		}
+		request += "]}";
+		stream = make_uniq<ArrowArrayStreamWrapper>();
+		TablePartScan(plan->table_handle, request, stream->arrow_array_stream);
+		ArrowSchemaWrapper schema;
+		stream->GetSchema(schema);
+		ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema.arrow_schema);
+		auto &arrow_columns = arrow_table.GetColumns();
+		// no columns asked (a COUNT(*)): the provider sends a placeholder column only to carry the row count
+		if (!column_ids.empty() && arrow_columns.size() != column_ids.size()) {
+			throw IOException("fabricator file scan: the provider's stream for '%s' has %d columns, the scan asked "
+			                  "for %d", file.path, arrow_columns.size(), column_ids.size());
+		}
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			auto &expected = columns[column_ids[MultiFileLocalIndex(i)].GetId()].type;
+			auto actual = arrow_columns.at(i)->GetDuckType();
+			if (actual != expected) {
+				throw IOException("fabricator file scan: the provider's stream for '%s' gives column '%s' as %s, the "
+				                  "table declares %s",
+				                  file.path, names[column_ids[MultiFileLocalIndex(i)].GetId()], actual.ToString(), expected.ToString());
+			}
+		}
+		state = make_uniq<ArrowScanLocalState>(nullptr, context);
+		if (filters && filters->HasFilters()) {
+			vector<unique_ptr<Expression>> conjuncts;
+			for (auto &entry : *filters) {
+				MultiFileLocalIndex position(entry.GetIndex());
+				BoundReferenceExpression column(columns[column_ids[position].GetId()].type, position.GetIndex());
+				conjuncts.push_back(entry.Filter().ToExpression(column));
+			}
+			if (conjuncts.size() == 1) {
+				filter = std::move(conjuncts[0]);
+			} else {
+				auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+				for (auto &conjunct : conjuncts) {
+					conjunction->GetChildrenMutable().push_back(std::move(conjunct));
+				}
+				filter = std::move(conjunction);
+			}
+			executor = make_uniq<ExpressionExecutor>(context, *filter);
+		}
+	}
+
+	AsyncResult Scan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &,
+	                 DataChunk &chunk) override {
+		while (true) {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+			if (!state->chunk || state->chunk_offset >= idx_t(state->chunk->arrow_array.length)) {
+				auto next = stream->GetNextChunk();
+				if (!next || !next->arrow_array.release) {
+					// the end of the part: release the stream here, on the thread that drained it (see FinishFile)
+					state.reset();
+					stream.reset();
+					chunk.SetCardinality(0);
+					return SourceResultType::FINISHED;
+				}
+				state->chunk = std::move(next);
+				state->Reset();
+			}
+			auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE,
+			                             idx_t(state->chunk->arrow_array.length) - state->chunk_offset);
+			chunk.Reset();
+			chunk.SetCardinality(count);
+			ArrowTableFunction::ArrowToDuckDB(*state, arrow_table.GetColumns(), chunk);
+			state->chunk_offset += count;
+			if (!executor) {
+				return SourceResultType::HAVE_MORE_OUTPUT;
+			}
+			auto kept = executor->SelectExpression(chunk, selection);
+			if (kept == 0) {
+				continue; // no row passed; an empty chunk would read as the end of the part
+			}
+			if (kept < chunk.size()) {
+				chunk.Slice(selection, kept);
+			}
+			return SourceResultType::HAVE_MORE_OUTPUT;
+		}
+	}
+
+	//! ⚠ NOT where the stream is released: DuckDB calls FinishFile from the thread that found no more work in this file,
+	//! which may be another thread while the owner is still draining it (a parquet reader's FinishFile only resets a
+	//! counter). Releasing here was a null dereference mid-scan; the owner releases at the end of the part instead.
+	void FinishFile(ClientContext &, GlobalTableFunctionState &) override {
+	}
+
+private:
+	static MultiFileColumnDefinition LocalColumn(const MultiFileColumnDefinition &global) {
+		MultiFileColumnDefinition local(global.GetIdentifierName(), global.type);
+		for (auto &child : global.children) {
+			local.children.push_back(LocalColumn(child));
+		}
+		return local;
+	}
+	static string Quote(const string &text) {
+		string out = "\"";
+		for (auto c : text) {
+			if (c == '"' || c == '\\') {
+				out += '\\';
+				out += c;
+			} else if (static_cast<unsigned char>(c) < 0x20) {
+				char buf[8];
+				snprintf(buf, sizeof(buf), "\\u%04x", c);
+				out += buf;
+			} else {
+				out += c;
+			}
+		}
+		return out + "\"";
+	}
+
+	shared_ptr<FileScanPlan> plan;
+	idx_t index;
+	//! the table's names of `columns` (what the provider is asked for), parallel to `columns`
+	vector<string> names;
+	std::atomic<bool> claimed {false};
+	unique_ptr<ArrowArrayStreamWrapper> stream;
+	ArrowTableSchema arrow_table;
+	unique_ptr<ArrowScanLocalState> state;
+	unique_ptr<Expression> filter;
+	unique_ptr<ExpressionExecutor> executor;
+	SelectionVector selection {STANDARD_VECTOR_SIZE};
+};
 
 struct FabricatorFileScanReader : public MultiFileReader {
 	explicit FabricatorFileScanReader(shared_ptr<TableFunctionInfo> info)
@@ -315,6 +489,17 @@ struct FabricatorFileScanReader : public MultiFileReader {
 		}
 		vector<idx_t> column_ids {COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
 		return MultiFileReaderVirtualColumnBinding(derived(local_idx.GetIndex()), std::move(column_ids));
+	}
+
+	//! A stream part is read by the provider; every other part by DuckDB's own reader for its format.
+	shared_ptr<BaseFileReader> CreateReader(ClientContext &context, GlobalTableFunctionState &gstate,
+	                                        const OpenFileInfo &file, idx_t file_idx,
+	                                        const MultiFileBindData &bind_data) override {
+		auto index = FileIndex(file, *plan);
+		if (!plan->stream_parts[index].empty()) {
+			return make_shared_ptr<StreamPartReader>(file, plan, index);
+		}
+		return MultiFileReader::CreateReader(context, gstate, file, file_idx, bind_data);
 	}
 
 	unique_ptr<MultiFileReader> Copy() const override {
@@ -532,6 +717,11 @@ bool ParsePlan(const YyjsonDoc &doc, FileScanPlan &plan) {
 			    yyjson_is_null(fval) ? Value()
 			                         : Value::BIGINT(PlanInteger(fval, where + ".virtual." + yyjson_get_str(fkey), false));
 		}
+		auto stream = PlanOptionalString(file, "stream", where);
+		if (stream && !deleted.empty()) {
+			PlanError(where + " is a stream part with deleted rows: the provider applies its own deletes");
+		}
+		plan.stream_parts.push_back(stream ? stream : "");
 		plan.files.push_back(std::move(info));
 		plan.deleted.push_back(std::move(deleted));
 		plan.constant_text.push_back(std::move(constants));
@@ -588,6 +778,7 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	}
 
 	plan->table = &table;
+	plan->table_handle = table_handle;
 	plan->at_unit = at_unit;
 	plan->at_value = at_value;
 	auto column_specs = PlanObject(doc.Root(), "columns", "plan");

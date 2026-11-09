@@ -17,4 +17,8 @@ internal interface IFileScanPlan
 {
     /// <summary>The plan as a JSON doc (see the remarks).</summary>
     string FilePlanJson();
+
+    /// <summary>The rows of a part the plan named as a <c>"stream"</c>: the given columns (the table's names), in that
+    /// order, with the part's deleted rows already removed.</summary>
+    Apache.Arrow.Ipc.IArrowArrayStream ScanPart(string part, IReadOnlyList<string> columns);
 }

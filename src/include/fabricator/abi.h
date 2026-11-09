@@ -1265,6 +1265,13 @@ typedef struct FabricatorVTable {
 	// -------------------------------------------------------------------------
 	int32_t (*table_file_plan)(FabricatorHandle table, const char *at_unit, const char *at_value, char **out_json,
 	                           char **err);
+
+	// The rows of a plan's STREAM part — ABI v101. A file entry with "stream": "<token>" (and no "dv") is read by the
+	// provider rather than by DuckDB: request_json = {"part": "<token>", "columns": ["<col>", …]} (the table's names,
+	// in the order the scan needs them); *out = those columns in that order, the part's deleted rows already removed.
+	// The host still applies the part's constants, stored names, defaults and virtual columns.
+	int32_t (*table_part_scan)(FabricatorHandle table, const char *request_json, struct ArrowArrayStream *out,
+	                           char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------

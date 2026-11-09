@@ -266,6 +266,8 @@ int64_t TableDmlWhere(FabricatorHandle table, const std::string &spec_json, Arro
 std::string TablePartitionStats(FabricatorHandle table, const std::string &at_unit, const std::string &at_value);
 //! ABI v101: the data files the table's scan would read, as JSON (abi.h table_file_plan); {"declined":…} otherwise.
 std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, const std::string &at_value);
+//! ABI v101: the rows of a plan's stream part (abi.h table_part_scan) into `out`.
+void TablePartScan(FabricatorHandle table, const std::string &request_json, ArrowArrayStream &out);
 
 //! remote_translate (ABI v96): a Substrait plan to the provider's query, as the JSON doc in abi.h ("{}" = declined).
 std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan);

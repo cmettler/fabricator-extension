@@ -181,6 +181,7 @@ public static unsafe class Bootstrap
         vtable->ExecuteQueryFiltered = &ExecuteQueryFiltered;
         vtable->CatalogSchemaExists = &CatalogSchemaExists;
         vtable->TableFilePlan = &TableFilePlan;
+        vtable->TablePartScan = &TablePartScan;
         return FabricatorStatus.Ok;
     }
 
@@ -797,6 +798,31 @@ public static unsafe class Bootstrap
             string value = atValue is null ? "" : Marshal.PtrToStringUTF8((nint)atValue) ?? "";
             TableAt? at = unit.Length == 0 ? null : new TableAt(unit, value);
             *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.FilePlanJson(at)); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TablePartScan(nint table, byte* requestJson, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            using var request = System.Text.Json.JsonDocument.Parse(Marshal.PtrToStringUTF8((nint)requestJson) ?? "{}");
+            string part = request.RootElement.GetProperty("part").GetString()
+                          ?? throw new ArgumentException("table_part_scan: no part");
+            var columns = request.RootElement.GetProperty("columns").EnumerateArray()
+                .Select(c => c.GetString() ?? throw new ArgumentException("table_part_scan: a null column"))
+                .ToList();
+            CArrowArrayStreamExporter.ExportArrayStream(session.PartScan(part, columns), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

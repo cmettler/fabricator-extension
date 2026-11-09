@@ -918,6 +918,18 @@ std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, co
 	return result;
 }
 
+void TablePartScan(FabricatorHandle table, const std::string &request_json, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_part_scan) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_part_scan");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.table_part_scan(table, request_json.c_str(), &out, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_part_scan failed");
+	}
+}
+
 std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.remote_translate) {

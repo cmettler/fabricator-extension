@@ -552,6 +552,13 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 }
                 json.WriteStartObject();
                 json.WriteString("path", f.Uri);
+                // ⚠ SPIKE (FABRICATOR_FILE_SCAN_STREAM_PARTS=1): every other DV-free file of an unmapped table is a
+                // stream part, read by this provider (ScanFilePart) instead of by DuckDB — to prove the two mix in one
+                // scan, and to measure what a provider-read part costs
+                if (StreamPartsSpike && f.Dv.Length == 0 && listing.LogicalToPhysical is null && f.Ordinal % 2 == 1)
+                {
+                    json.WriteString("stream", f.Uri);
+                }
                 if (f.SizeBytes is { } size && size > 0)
                 {
                     json.WriteNumber("size", size);
@@ -601,6 +608,21 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         }
         _log.LogDebug("delta file plan {Path} v{Version}: {Count} files", path, listing.Version, listing.Files.Count);
         return System.Text.Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    private static readonly bool StreamPartsSpike =
+        Environment.GetEnvironmentVariable("FABRICATOR_FILE_SCAN_STREAM_PARTS") == "1";
+
+    /// <summary>The rows of a stream part (<see cref="IFileScanPlan.ScanPart"/>): here a data file read through a
+    /// host query — the spike's stand-in for a format DuckDB cannot read itself.</summary>
+    internal IArrowArrayStream ScanFilePart(string part, IReadOnlyList<string> columns)
+    {
+        string projection = columns.Count == 0
+            ? "1 AS \"__no_columns\""
+            : string.Join(", ", columns.Select(c => "\"" + c.Replace("\"", "\"\"") + "\""));
+        string sql = $"SELECT {projection} FROM read_parquet('{part.Replace("'", "''")}')";
+        _log.LogDebug("delta file part: {Sql}", sql);
+        return Host.Query(sql, HostSession.Neutral);
     }
 
     /// <summary>Whether a struct sits inside a list or map anywhere under <paramref name="type"/>.</summary>
