@@ -50,6 +50,8 @@ struct FabricatorCapabilities {
 	//! `filter_pushdown = true` on the scan (so DuckDB delivers runtime dynamic/join filters and stops
 	//! re-applying the pushed ones). Currently true only for the Delta catalog in Exact pushdown mode.
 	bool exact_filter_pushdown = false;
+	//! The provider can answer table_file_plan (ABI v101): the host may read the table's files itself.
+	bool file_scan = false;
 	//! The provider renders pushed filters as a SUPERSET (never drops a matching row); the host re-applies them.
 	bool superset_filter_pushdown = false;
 	//! The provider can RENDER an arbitrary NULL placement for a pushed ORDER BY key, so the host may hand

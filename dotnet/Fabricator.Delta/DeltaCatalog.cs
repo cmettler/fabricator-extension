@@ -411,8 +411,184 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     internal IReadOnlyList<FileStatistics>? PartitionStatistics(string path, TableAt? at)
     {
         long txn = AmbientTransaction.Current;
-        string? unit = null, value = null;
-        bool seed = false;
+        if (!TryResolveMetadataRead(path, at, "partition stats", out var unit, out var value, out bool seed))
+        {
+            return null;
+        }
+        var (files, version) = DeltaReader.GetFileStatistics(Opener(), path, unit, value, ReadBound(path));
+        if (files is null)
+        {
+            return null;
+        }
+        if (seed && !SeedPin(txn, path, version))
+        {
+            // A concurrent reference pinned a different version first; these describe the wrong one.
+            return null;
+        }
+        _log.LogDebug("delta partition stats {Path} v{Version}: {Count} files", path, version, files.Count);
+        return files;
+    }
+
+    /// <summary>
+    /// The file plan for <paramref name="path"/> (ABI v101 <c>table_file_plan</c>, <see cref="IFileScanPlan"/>):
+    /// the active data files of the snapshot the scan would read, with each file's deleted positions and the row
+    /// id of its first row, so the host can read them with DuckDB's own parquet reader instead of this provider's
+    /// scan. Resolves and seeds the version exactly as <see cref="PartitionStatistics"/> does.
+    /// </summary>
+    /// <remarks>Declines (the host then scans as before) for what the plan cannot express yet: a pending write in
+    /// the transaction, the codec engine, column mapping 'id' or with nested fields, partition columns, timestamps (a naive file timestamp
+    /// would be cast in the session zone) and VARIANT.</remarks>
+    internal string FilePlanJson(string path, TableAt? at)
+    {
+        static string Declined(string reason) => JsonSerializer.Serialize(new { declined = reason });
+        if (!_nativeRead)
+        {
+            return Declined("native_read is off");
+        }
+        long txn = AmbientTransaction.Current;
+        if (IsExplicitTxn(txn))
+        {
+            // the scan records its pushed predicate as the read set; a plan does not know it yet and would read the
+            // WHOLE table, which turns a concurrent append the predicate excludes into a conflict
+            // (verify_delta_catalog_transactions:517 under serializable)
+            return Declined("explicit transaction");
+        }
+        if (!TryResolveMetadataRead(path, at, "file plan", out var unit, out var value, out bool seed))
+        {
+            return Declined("the transaction has pending writes on the table");
+        }
+        var listing = DeltaReader.ListNativeScanFiles(Opener(), path, unit, value, prune: null, _log,
+                                                      bound: ReadBound(path));
+        // name mode: each column is found in the files under its physical name (top level; a mapped struct's members
+        // are renamed too, which the plan cannot say yet). id mode would map by field id — not yet.
+        if (listing.LogicalToFieldId is not null)
+        {
+            return Declined("column mapping 'id'");
+        }
+        if (listing.MappedSchema is not null)
+        {
+            return Declined("column mapping with nested fields");
+        }
+        if (listing.PartitionColumns.Count > 0)
+        {
+            return Declined("partition columns");
+        }
+        if (listing.TableSchema is { } schema && UnsupportedForFilePlan(schema) is { } type)
+        {
+            return Declined("column type " + type);
+        }
+        if (seed && !SeedPin(txn, path, listing.Version))
+        {
+            return Declined("a concurrent reference pinned another version");
+        }
+        using var buffer = new MemoryStream();
+        using (var json = new Utf8JsonWriter(buffer))
+        {
+            json.WriteStartObject();
+            json.WriteNumber("version", listing.Version);
+            // row tracking: the stored names of the materialized row id / commit version (a file's value wins where
+            // non-NULL), else base_row_id + file_row_number / commit_version per file (as DeltaNativeReader.RowTrackingExpr)
+            json.WriteString("row_id_column", listing.MaterializedRowIdName);
+            json.WriteString("row_version_column", listing.MaterializedRowCommitVersionName);
+            if (listing.LogicalToPhysical is { } physical)
+            {
+                json.WriteStartObject("physical");
+                foreach (var pair in physical)
+                {
+                    json.WriteString(pair.Key, pair.Value);
+                }
+                json.WriteEndObject();
+            }
+            // the live row count from the log (records minus deleted), when every file states its records: the
+            // optimizer's cardinality — parquet's own estimate is switched off, it would count deleted rows
+            long rows = 0;
+            bool rowsKnown = true;
+            foreach (var f in listing.Files)
+            {
+                if (f.NumRecords is { } n)
+                {
+                    rows += System.Math.Max(0, n - f.Dv.Length);
+                }
+                else
+                {
+                    rowsKnown = false;
+                }
+            }
+            if (rowsKnown)
+            {
+                json.WriteNumber("row_count", rows);
+            }
+            json.WriteStartArray("files");
+            foreach (var f in listing.Files)
+            {
+                // a file whose deletion vector covers every row contributes nothing (as in the native reader)
+                if (f.NumRecords is { } n && n > 0 && f.Dv.Length >= n)
+                {
+                    continue;
+                }
+                json.WriteStartObject();
+                json.WriteString("path", f.Uri);
+                // the row id of the file's first row: the host adds file_row_number (engineered-wood owns the encoding)
+                json.WriteNumber("rowid_base", TransientRowAddress.Pack(f.Ordinal, 0));
+                if (f.SizeBytes is { } size && size > 0)
+                {
+                    json.WriteNumber("size", size);
+                }
+                if (f.BaseRowId is { } baseRowId)
+                {
+                    json.WriteNumber("base_row_id", baseRowId);
+                }
+                if (f.CommitVersion is { } commitVersion)
+                {
+                    json.WriteNumber("commit_version", commitVersion);
+                }
+                if (f.Dv.Length > 0)
+                {
+                    json.WriteStartArray("dv");
+                    foreach (var p in f.Dv)
+                    {
+                        json.WriteNumberValue(p);
+                    }
+                    json.WriteEndArray();
+                }
+                json.WriteEndObject();
+            }
+            json.WriteEndArray();
+            json.WriteEndObject();
+        }
+        _log.LogDebug("delta file plan {Path} v{Version}: {Count} files", path, listing.Version, listing.Files.Count);
+        return System.Text.Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    /// <summary>The first column type a file plan cannot read faithfully yet, or null.</summary>
+    private static string? UnsupportedForFilePlan(EngineeredWood.DeltaLake.Schema.DeltaDataType type) => type switch
+    {
+        EngineeredWood.DeltaLake.Schema.PrimitiveType p
+            when p.TypeName is "timestamp" or "timestamp_ntz" or "variant" => p.TypeName,
+        EngineeredWood.DeltaLake.Schema.StructType s => s.Fields.Select(f => UnsupportedForFilePlan(f.Type))
+                                                               .FirstOrDefault(t => t is not null),
+        EngineeredWood.DeltaLake.Schema.ArrayType a => UnsupportedForFilePlan(a.ElementType),
+        EngineeredWood.DeltaLake.Schema.MapType m => UnsupportedForFilePlan(m.KeyType) ?? UnsupportedForFilePlan(m.ValueType),
+        _ => null,
+    };
+
+    /// <summary>Seeds the autocommit/transaction pin with the version a metadata answer read; false when another
+    /// reference pinned a different version first (the answer then describes the wrong snapshot).</summary>
+    private bool SeedPin(long txn, string path, long version) =>
+        _txns.GetOrCreate(txn).GetOrCreate(path).PinVersion(_ => version, System.DateTime.UtcNow) == version;
+
+    /// <summary>
+    /// Resolves the version a metadata answer that REPLACES the scan must describe — an explicit AT, else the
+    /// transaction's pin, else latest (<paramref name="seed"/>: the caller pins what it read). False while the
+    /// transaction has anything pending on the table: a scan overlays buffered writes the log does not know.
+    /// </summary>
+    private bool TryResolveMetadataRead(string path, TableAt? at, string what, out string? unit, out string? value,
+                                        out bool seed)
+    {
+        long txn = AmbientTransaction.Current;
+        unit = null;
+        value = null;
+        seed = false;
         if (at is { } a)
         {
             unit = a.Unit;
@@ -424,8 +600,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             if (entry is not null && (entry.HasAny || entry.Files.Count > 0 || entry.Batches.Count > 0
                                       || entry.HeldTxn is not null))
             {
-                _log.LogDebug("delta partition stats {Path}: none — the transaction has pending writes", path);
-                return null;
+                _log.LogDebug("delta {What} {Path}: none — the transaction has pending writes", what, path);
+                return false;
             }
             if (IsExplicitTxn(txn))
             {
@@ -457,22 +633,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 seed = txn != 0;
             }
         }
-        var (files, version) = DeltaReader.GetFileStatistics(Opener(), path, unit, value, ReadBound(path));
-        if (files is null)
-        {
-            return null;
-        }
-        if (seed)
-        {
-            long pinned = _txns.GetOrCreate(txn).GetOrCreate(path).PinVersion(_ => version, System.DateTime.UtcNow);
-            if (pinned != version)
-            {
-                // A concurrent reference pinned a different version first; these describe the wrong one.
-                return null;
-            }
-        }
-        _log.LogDebug("delta partition stats {Path} v{Version}: {Count} files", path, version, files.Count);
-        return files;
+        return true;
     }
 
     /// <summary>The Delta <see cref="ITable"/> — transient in the current transport (see the
@@ -1337,6 +1498,14 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             // catalog enumeration opens its tables in parallel. On OneLake each open is a log listing plus a few
             // reads (~1.5 s); dbt's information_schema scan over 29 tables took 43 s one after another.
             caps += ",\"parallel_table_open\":true";
+            // `file_scan` (ABI v101 table_file_plan): the host may ask for a file plan and read the files itself.
+            // Declared only where a plan can come back — asking is a crossing that BINDS the table in the
+            // transaction, so a provider that would decline anyway must not be asked
+            // (verify_delta_partition_stats:288 on the codec engine).
+            if (_nativeRead)
+            {
+                caps += ",\"file_scan\":true";
+            }
             // `cache_local_files`: the native reader opens a OneLake table through our onelake:// filesystem,
             // and DuckDB 2.0's file cache only caches the remote prefixes it knows (upstream 8ff69049cd0), so
             // without this every read refetches every byte (TPC-H SF1 on OneLake: 81 s -> 39 s). The host sets

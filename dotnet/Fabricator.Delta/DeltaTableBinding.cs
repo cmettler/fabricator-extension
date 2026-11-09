@@ -95,7 +95,7 @@ internal sealed class DeltaTableDefinition : ITable
 /// replay the <c>_delta_log</c> ONCE (measured: 195 s of 291 s in redundant snapshot builds on a Fabric
 /// table at v1850) — see the sharing rules on <see cref="TryGetOpen"/>.</para>
 /// </summary>
-internal sealed class DeltaTableBinding : ITableBinding, IDeleteWhereShape
+internal sealed class DeltaTableBinding : ITableBinding, IDeleteWhereShape, IFileScanPlan
 {
     /// <summary>Memoized form: created by <see cref="DeltaTransaction.GetOrCreate"/>; the catalog comes from
     /// the owner. <c>Path</c> is mutable for the created-table RENAME re-key
@@ -569,6 +569,9 @@ internal sealed class DeltaTableBinding : ITableBinding, IDeleteWhereShape
 
     /// <inheritdoc/>
     public IReadOnlyList<FileStatistics>? PartitionStatistics() => Catalog.PartitionStatistics(Path, _at);
+
+    /// <inheritdoc/>
+    public string FilePlanJson() => Catalog.FilePlanJson(Path, _at);
 
     // The predicate-DELETE shape (DescribeDeleteShortcut): read once per binding, because the capability
     // answer asks for the yes/no and the column list in the same call.

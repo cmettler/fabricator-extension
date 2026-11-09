@@ -253,6 +253,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		auto caps = FetchCapabilities(handle_);
 		string_order_pushable_ = caps.string_order_pushable;
 		exact_filter_pushdown_ = caps.exact_filter_pushdown;
+		file_scan_ = caps.file_scan;
 		superset_filter_pushdown_ = caps.superset_filter_pushdown && !caps.exact_filter_pushdown;
 		null_order_expressible_ = caps.null_order_expressible;
 		supports_nested_schemas_ = caps.supports_nested_schemas;

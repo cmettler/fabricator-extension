@@ -900,6 +900,24 @@ std::string TablePartitionStats(FabricatorHandle table, const std::string &at_un
 	return result;
 }
 
+std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, const std::string &at_value) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_file_plan) {
+		return "{\"declined\":\"the bridge does not plan files\"}";
+	}
+	char *out_json = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.table_file_plan(table, at_unit.c_str(), at_value.c_str(), &out_json, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_file_plan failed");
+	}
+	std::string result = out_json ? out_json : "";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json);
+	}
+	return result;
+}
+
 std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.remote_translate) {

@@ -1246,6 +1246,19 @@ typedef struct FabricatorVTable {
 	// -------------------------------------------------------------------------
 	int32_t (*catalog_schema_exists)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
 	                                 int32_t *exists, char **err);
+
+	// -------------------------------------------------------------------------
+	// The data files a table's scan would read — ABI v101, on the table session. ONE JSON doc in *out_json (host
+	// frees via free_error): {"version":V,"files":[{"path":"…","rowid_base":B,"size":S,"dv":[p,…]}…]}, or
+	// {"declined":"…"} when the table cannot be read that way. The host then plans the scan as DuckDB's own
+	// parquet reader over exactly these files (src/fabricator/fabricator_file_scan.cpp): "dv" are the deleted
+	// row positions of a file (sorted), "rowid_base" the row id of its first row (the row id is rowid_base +
+	// file_row_number), "size" its byte size when known. ⚠ The plan REPLACES the scan, so it must describe the
+	// snapshot the scan would read (the same pin) with nothing pending in the transaction — a provider declines
+	// otherwise. at_unit/at_value carry the scan's AT clause ("" = none).
+	// -------------------------------------------------------------------------
+	int32_t (*table_file_plan)(FabricatorHandle table, const char *at_unit, const char *at_value, char **out_json,
+	                           char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1483,7 +1496,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 100
+#define FABRICATOR_ABI_VERSION 101
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

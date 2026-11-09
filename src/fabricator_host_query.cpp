@@ -1402,6 +1402,7 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	scans.AddFunction(scan);
 	scans.AddFunction(FabricatorTableEntry::CatalogScanStub());
 	loader.RegisterFunction(scans);
+	loader.RegisterFunction(FabricatorTableEntry::FileScanStub());
 }
 
 } // namespace duckdb

@@ -10,6 +10,7 @@
 
 #include "fabricator/arrow_ingest.hpp"
 #include "fabricator/clr_host.hpp"
+#include "fabricator/fabricator_file_scan.hpp"
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_txn_util.hpp"
@@ -1080,20 +1081,39 @@ static bool PartitionStatsEnabled(ClientContext &context) {
 // may report them: (1) the provider answers for the snapshot the scan would read and gives nothing while
 // the transaction has pending writes on the table; (2) it is asked per statement, never latched on the
 // entry; (3) perfect-hash aggregation sizes itself from `statistics`, not from these.
+static vector<PartitionStatistics> PartitionStatsFor(ClientContext &context, const FabricatorTableEntry &entry,
+                                                     const string &at_unit, const string &at_value);
+
 static vector<PartitionStatistics> FabricatorScanPartitionStats(ClientContext &context, GetPartitionStatsInput &input) {
-	vector<PartitionStatistics> result;
 	if (!input.bind_data || !PartitionStatsEnabled(context)) {
-		return result;
+		return {};
 	}
 	auto &bind_data = input.bind_data->Cast<fabricator::ArrowStreamBindData>();
 	if (!bind_data.table) {
-		return result;
+		return {};
 	}
-	auto &entry = bind_data.table->Cast<FabricatorTableEntry>();
+	return PartitionStatsFor(context, bind_data.table->Cast<FabricatorTableEntry>(), bind_data.at_unit,
+	                         bind_data.at_value);
+}
+
+// The FILE scan answers COUNT/MIN/MAX from the same provider statistics (parquet's own would count deleted rows).
+static vector<PartitionStatistics> FabricatorFileScanPartitionStats(ClientContext &context,
+                                                                    GetPartitionStatsInput &input) {
+	if (!input.bind_data || !PartitionStatsEnabled(context)) {
+		return {};
+	}
+	string at_unit, at_value;
+	auto &table = fabricator::FileScanTable(*input.bind_data, at_unit, at_value);
+	return PartitionStatsFor(context, table.Cast<FabricatorTableEntry>(), at_unit, at_value);
+}
+
+static vector<PartitionStatistics> PartitionStatsFor(ClientContext &context, const FabricatorTableEntry &entry,
+                                                     const string &at_unit, const string &at_value) {
+	vector<PartitionStatistics> result;
 	vector<FabricatorPartitionFile> files;
 	try {
 		FabricatorSetActiveTxn(entry.ParentCatalog().Cast<FabricatorCatalog>().GetHandle(), context);
-		files = FetchPartitionStats(entry.TableHandle(), bind_data.at_unit, bind_data.at_value);
+		files = FetchPartitionStats(entry.TableHandle(), at_unit, at_value);
 	} catch (...) {
 		return result;
 	}
@@ -1230,6 +1250,58 @@ static unique_ptr<FunctionData> FabricatorScanStubBind(ClientContext &, TableFun
 	                      "cannot be called directly; use fabricator_scan('<source>') for a named source");
 }
 
+// The FILE SCAN's copy (fabricator_file_scan.cpp): a plan copy serializes the table and the AT clause and rebuilds
+// through the live entry, like FabricatorScanSerialize — with the file scan on, the rebuild is a file scan again.
+// Filters and the projection live on the LogicalGet, not in this payload.
+static void FabricatorFileScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                                        const BoundTableFunction &) {
+	string at_unit, at_value;
+	auto &table = fabricator::FileScanTable(*bind_data, at_unit, at_value);
+	serializer.WriteProperty(100, "catalog", table.schema.catalog.GetName());
+	serializer.WriteProperty(101, "schema", table.schema.name);
+	serializer.WriteProperty(102, "table", table.name);
+	serializer.WriteProperty(103, "at_unit", at_unit);
+	serializer.WriteProperty(104, "at_value", at_value);
+}
+
+static unique_ptr<FunctionData> FabricatorFileScanDeserialize(Deserializer &deserializer,
+                                                              BoundTableFunction &function) {
+	auto catalog = deserializer.ReadProperty<string>(100, "catalog");
+	auto schema = deserializer.ReadProperty<string>(101, "schema");
+	auto table = deserializer.ReadProperty<string>(102, "table");
+	auto at_unit = deserializer.ReadProperty<string>(103, "at_unit");
+	auto at_value = deserializer.ReadProperty<string>(104, "at_value");
+	auto &context = deserializer.Get<ClientContext &>();
+	auto &entry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
+	                                                   Identifier(table));
+	auto *fabricator_entry = dynamic_cast<FabricatorTableEntry *>(&entry);
+	if (!fabricator_entry) {
+		throw SerializationException("fabricator_file_scan: %s.%s is not a fabricator table", schema, table);
+	}
+	unique_ptr<FunctionData> bind_data;
+	function = BoundTableFunction(fabricator_entry->RebuildScanFunction(context, bind_data, at_unit, at_value));
+	if (function.GetName() != "fabricator_file_scan") {
+		// the rebuild declined the file scan (switched off, or the provider declines now): the copy would not
+		// produce the columns and filters the copied LogicalGet expects
+		throw SerializationException("fabricator_file_scan: the copy of %s.%s is no longer a file scan", schema,
+		                             table);
+	}
+	return bind_data;
+}
+
+static unique_ptr<FunctionData> FabricatorFileScanStubBind(ClientContext &, TableFunctionBindInput &,
+                                                           vector<LogicalType> &, vector<Identifier> &) {
+	throw BinderException("fabricator_file_scan() is internal: it names the file scan of an attached fabricator table");
+}
+
+TableFunction FabricatorTableEntry::FileScanStub() {
+	// the file scan is a copy of parquet_scan(VARCHAR), and a serialized one is looked up by that signature
+	TableFunction stub("fabricator_file_scan", {LogicalType::VARCHAR}, nullptr, FabricatorFileScanStubBind);
+	stub.serialize = FabricatorFileScanSerialize;
+	stub.deserialize = FabricatorFileScanDeserialize;
+	return stub;
+}
+
 TableFunction FabricatorTableEntry::CatalogScanStub() {
 	// Same name, no arguments, and the catalog scan's callbacks: exactly what a serialized catalog scan
 	// is looked up by. Only `deserialize` is ever used from it — it replaces the stub with the real scan.
@@ -1262,6 +1334,23 @@ TableFunction FabricatorTableEntry::RebuildScanFunction(ClientContext &context, 
 
 TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
                                                     const string &at_unit, const string &at_value) {
+	// The FILE SCAN (ABI v101): where the provider can list the data files, DuckDB's own parquet reader reads them
+	// and no row crosses the bridge (src/fabricator/fabricator_file_scan.cpp). The plan reads the transaction's
+	// pinned snapshot, hence the ambients first. A provider that declines gets the ordinary scan below.
+	// ⚠ Asked only where a plan can come back: the crossing binds the table in the transaction, which an explicit
+	// transaction's later reads depend on (verify_delta_partition_stats:288), and in an explicit transaction the plan
+	// would read the whole table where the scan records its pushed predicate (verify_delta_catalog_transactions:517).
+	if (fabricator::FileScanEnabled() && catalog.Cast<FabricatorCatalog>().FileScan() &&
+	    context.transaction.IsAutoCommit()) {
+		FabricatorSetActiveTxn(catalog.Cast<FabricatorCatalog>().GetHandle(), context);
+		TableFunction file_scan;
+		if (fabricator::TryBuildFileScan(context, *this, table_handle_, at_unit, at_value, bind_data, file_scan)) {
+			file_scan.serialize = FabricatorFileScanSerialize;
+			file_scan.deserialize = FabricatorFileScanDeserialize;
+			file_scan.get_partition_stats = FabricatorFileScanPartitionStats;
+			return file_scan;
+		}
+	}
 	auto data = make_uniq<fabricator::ArrowStreamBindData>();
 	auto table_handle = table_handle_;
 	// The managed side builds the provider SELECT for the whole table.

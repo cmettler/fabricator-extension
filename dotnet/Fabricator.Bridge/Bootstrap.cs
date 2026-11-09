@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 100;
+        vtable->AbiVersion = 101;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -180,6 +180,7 @@ public static unsafe class Bootstrap
         vtable->ExecuteModifyReturning = &ExecuteModifyReturning;
         vtable->ExecuteQueryFiltered = &ExecuteQueryFiltered;
         vtable->CatalogSchemaExists = &CatalogSchemaExists;
+        vtable->TableFilePlan = &TableFilePlan;
         return FabricatorStatus.Ok;
     }
 
@@ -774,6 +775,28 @@ public static unsafe class Bootstrap
             string value = atValue is null ? "" : Marshal.PtrToStringUTF8((nint)atValue) ?? "";
             TableAt? at = unit.Length == 0 ? null : new TableAt(unit, value);
             *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.PartitionStatsJson(at)); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableFilePlan(nint table, byte* atUnit, byte* atValue, byte** outJson, byte** err)
+    {
+        try
+        {
+            if (outJson is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            string unit = atUnit is null ? "" : Marshal.PtrToStringUTF8((nint)atUnit) ?? "";
+            string value = atValue is null ? "" : Marshal.PtrToStringUTF8((nint)atValue) ?? "";
+            TableAt? at = unit.Length == 0 ? null : new TableAt(unit, value);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.FilePlanJson(at)); // host frees via free_error
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

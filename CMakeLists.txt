@@ -41,6 +41,7 @@ set(EXTENSION_SOURCES
     src/fabricator/arrow_ingest.cpp
     src/fabricator/scan_wait.cpp
     src/fabricator/arrow_produce.cpp
+    src/fabricator/fabricator_file_scan.cpp
     src/catalog/fabricator_metadata.cpp
     src/catalog/fabricator_catalog.cpp
     src/catalog/fabricator_lateral.cpp

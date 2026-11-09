@@ -69,6 +69,8 @@ public:
 	//! The zero-argument `fabricator_scan()` overload registered beside the named-source scan, so a
 	//! deserialized catalog scan resolves (see FabricatorScanDeserialize). Calling it directly is refused.
 	static TableFunction CatalogScanStub();
+	//! The zero-argument `fabricator_file_scan()` a serialized FILE scan is looked up by (fabricator_file_scan.cpp).
+	static TableFunction FileScanStub();
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;

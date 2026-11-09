@@ -224,6 +224,12 @@ internal sealed class TableSession
         return Encoding.UTF8.GetString(buffer.ToArray());
     }, at ?? _at);
 
+    /// <summary>The <c>table_file_plan</c> answer (ABI v101, <see cref="IFileScanPlan"/>). A binding that
+    /// cannot plan files declines, and the host scans as before.</summary>
+    internal string FilePlanJson(TableAt? at) => With(t => t is IFileScanPlan plan
+        ? plan.FilePlanJson()
+        : "{\"declined\":\"the provider does not plan files\"}", at ?? _at);
+
     /// <summary>The <c>table_dml_info</c> answer (ABI v93): <c>{"delete_where": bool, "update_where": bool}</c>,
     /// plus — for a binding that is an <see cref="IDeleteWhereShape"/> — the three keys that narrow when the host
     /// may take the DELETE shortcut (additive, no ABI change: an older host ignores them).</summary>

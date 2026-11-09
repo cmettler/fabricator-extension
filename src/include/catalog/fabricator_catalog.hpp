@@ -77,6 +77,10 @@ public:
 	bool ExactFilterPushdown() const {
 		return exact_filter_pushdown_;
 	}
+	//! Whether the provider can answer a file plan (ABI v101), i.e. the host may read the table's files itself.
+	bool FileScan() const {
+		return file_scan_;
+	}
 
 	//! Whether a pushed ORDER BY key may carry ANY resolved NULL placement, because the provider renders it
 	//! (`NULLS FIRST` / `NULLS LAST`) rather than owning a fixed convention. False keeps
@@ -271,6 +275,7 @@ private:
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
 	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().
 	bool exact_filter_pushdown_ = false;
+	bool file_scan_ = false;
 	bool superset_filter_pushdown_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> schemas_;
