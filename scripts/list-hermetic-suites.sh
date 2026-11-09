@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Prints the sqllogictest suites that need NOTHING from the environment except a writable scratch
-# directory and the in-repo fixtures — no SQL Server, no MinIO, no Power BI Desktop, no live Fabric
+# directory and the in-repo fixtures — no SQL Server, no RustFS, no Power BI Desktop, no live Fabric
 # credentials, no opt-in native libraries. These are what CI can run on a bare runner, and they
 # carry most of this project's coverage (the Delta catalog suites: transactions, row tracking,
 # column mapping, native write/read, clustered optimize, ...).

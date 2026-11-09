@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Prints the suites that need the docker/docker-compose.yml stack — SQL Server 2025 and MinIO — and
+# Prints the suites that need the docker/docker-compose.yml stack — SQL Server 2025 and RustFS — and
 # nothing else. This is the COMPLEMENT of scripts/list-hermetic-suites.sh within the automatable set,
 # so the two tiers together cover every suite CI can run, with no overlap and no silent gaps.
 #
@@ -12,8 +12,8 @@
 #        MSSQL_TEST_PASS   — the compose SQL Server
 #        MSSQL_BINCOLL_DSN — the BinCollTest database (binary UTF-8 collation), provisioned by
 #                            docker/provision.ps1; the suite does NOT self-provision it
-#        FABRICATOR_S3_ENDPOINT / FABRICATOR_S3_SQL_ENDPOINT — MinIO, and the endpoint AS SQL SERVER
-#                            SEES IT (the two differ: localhost:9000 vs minio:9000)
+#        FABRICATOR_S3_ENDPOINT / FABRICATOR_S3_SQL_ENDPOINT — RustFS (S3), and the endpoint AS SQL SERVER
+#                            SEES IT (the two differ: localhost:9000 vs rustfs:9000)
 #        FABRICATOR_DELTA_WRITE_DIR / FABRICATOR_DELTA_DIR — a scratch dir and the in-repo fixture
 #        FABRICATOR_PLUGIN_DIR — a published Fabricator.SamplePlugin
 #        FABRICATOR_PLUGIN_ZIP — that same plugin as an INSTALLABLE ARCHIVE, emitted by its own build

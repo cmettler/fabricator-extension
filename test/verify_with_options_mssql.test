@@ -2,7 +2,7 @@
 # description: CREATE TABLE ... WITH (...) on the SQL Server provider — the keys describe an S3 EXTERNAL
 #              TABLE (slice B of docs/create-table-with-options.md: location/table_type/data_source/
 #              file_format); anything else is rejected, never silently ignored. The live external-table
-#              round-trip is in verify_mssql_s3_polybase.test (needs MinIO); this file pins the guards.
+#              round-trip is in verify_mssql_s3_polybase.test (needs RustFS); this file pins the guards.
 # group: [fabricator]
 
 require fabricator
@@ -20,42 +20,42 @@ unknown CREATE TABLE WITH option 'parquet_compression'
 
 # external-table keys are validated as a set: location alone lacks table_type
 statement error
-CREATE TABLE db.dbo.with_opts_rejected WITH (location='s3://minio:9000/bucket/t') AS SELECT 1 AS id;
+CREATE TABLE db.dbo.with_opts_rejected WITH (location='s3://rustfs:9000/bucket/t') AS SELECT 1 AS id;
 ----
 table_type
 
 # ... and data_source is required (the no-secret-material posture)
 statement error
 CREATE TABLE db.dbo.with_opts_rejected
-  WITH (location='s3://minio:9000/bucket/t', table_type='DELTA') AS SELECT 1 AS id;
+  WITH (location='s3://rustfs:9000/bucket/t', table_type='DELTA') AS SELECT 1 AS id;
 ----
 data_source
 
 # credential auto-provisioning is deferred — pre-provision + pass data_source
 statement error
 CREATE TABLE db.dbo.with_opts_rejected
-  WITH (location='s3://minio:9000/bucket/t', table_type='DELTA', secret='minio_s3') AS SELECT 1 AS id;
+  WITH (location='s3://rustfs:9000/bucket/t', table_type='DELTA', secret='minio_s3') AS SELECT 1 AS id;
 ----
 pre-provision
 
 # ICEBERG has no writer
 statement error
 CREATE TABLE db.dbo.with_opts_rejected
-  WITH (location='s3://minio:9000/bucket/t', table_type='ICEBERG', data_source='ds') AS SELECT 1 AS id;
+  WITH (location='s3://rustfs:9000/bucket/t', table_type='ICEBERG', data_source='ds') AS SELECT 1 AS id;
 ----
 ICEBERG has no writer
 
 # the location must carry bucket + table path
 statement error
 CREATE TABLE db.dbo.with_opts_rejected
-  WITH (location='s3://minio:9000/bucketonly', table_type='DELTA', data_source='ds') AS SELECT 1 AS id;
+  WITH (location='s3://rustfs:9000/bucketonly', table_type='DELTA', data_source='ds') AS SELECT 1 AS id;
 ----
 at least a bucket
 
 # empty CREATE needs DELTA (a parquet external table has no file until data exists)
 statement error
 CREATE TABLE db.dbo.with_opts_rejected (id INTEGER)
-  WITH (location='s3://minio:9000/bucket/t', table_type='PARQUET', data_source='ds');
+  WITH (location='s3://rustfs:9000/bucket/t', table_type='PARQUET', data_source='ds');
 ----
 use CREATE TABLE ... AS
 
@@ -204,7 +204,7 @@ describe an external table
 # come from the storage files).
 statement error
 CREATE TABLE db.dbo.wo_bad
-  WITH (location='s3://minio:9000/bucket/t', table_type='DELTA', data_source='ds', varchar_length=50)
+  WITH (location='s3://rustfs:9000/bucket/t', table_type='DELTA', data_source='ds', varchar_length=50)
   AS SELECT 1 AS id;
 ----
 not to an external table

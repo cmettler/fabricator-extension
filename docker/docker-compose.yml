@@ -1,16 +1,16 @@
-# Test environment for fabricator: SQL Server 2025 + MinIO (S3-compatible object storage).
+# Test environment for fabricator: SQL Server 2025 + RustFS (S3-compatible object storage).
 #
 # Bring-up (see docker/README.md):
-#   1. pwsh docker/certs/generate-certs.ps1     # self-signed TLS cert for MinIO (gitignored output)
+#   1. pwsh docker/certs/generate-certs.ps1     # self-signed TLS cert for RustFS (gitignored output)
 #   2. docker compose -f docker/docker-compose.yml up -d
 #   3. pwsh docker/provision.ps1                # creates the ArrowTest + TestDB databases
 #
 # SQL Server 2025 (17.x) reads CSV/Parquet/DELTA on S3 NATIVELY (no PolyBase package/service needed
 # for file queries — the data-virtualization guide: "no longer requires installing or running PolyBase
-# services"). The S3 connector REQUIRES HTTPS: MinIO auto-enables TLS from the certs mounted at
-# /root/.minio/certs, and SQL Server trusts the self-signed cert via the CA file mounted at
+# services"). The S3 connector REQUIRES HTTPS: RustFS serves TLS from the certs mounted at /certs, and
+# SQL Server trusts the self-signed cert via the CA file mounted at
 # /var/opt/mssql/security/ca-certificates (read once at process start). The cert's SANs must cover the
-# host SQL uses in LOCATION ('s3://minio:9000/') and the host the DuckDB tests use ('localhost:9000').
+# host SQL uses in LOCATION ('s3://rustfs:9000/') and the host the DuckDB tests use ('localhost:9000').
 #
 # Fallback (NOT installed by default — only needed for RDBMS connectors, not S3 file queries):
 #   mssql-server-polybase exists for 2025/Ubuntu 24.04. To add it, build a custom image:
@@ -22,8 +22,9 @@
 #      && rm -rf /var/lib/apt/lists/*
 #     USER mssql
 #
-# MinIO credentials are TEST-ONLY and deliberately ALPHANUMERIC — SQL Server's S3 credential requires
-# "Access Key ID and Secret Key ID must only contain alphanumeric values".
+# S3 credentials are TEST-ONLY and deliberately ALPHANUMERIC — SQL Server's S3 credential requires
+# "Access Key ID and Secret Key ID must only contain alphanumeric values". (`miniouser`/`miniosecret123` are
+# left from the MinIO days; the suites create a SQL Server credential from them only when it is absent.)
 
 name: mssql-fabricator
 
@@ -47,8 +48,8 @@ services:
       - MSSQL_AGENT_ENABLED=true
     volumes:
       - mssql-data:/var/opt/mssql
-      # CA trust for the MinIO self-signed cert (SQL Server on Linux reads this folder at startup).
-      - ./certs/public.crt:/var/opt/mssql/security/ca-certificates/minio.crt:ro
+      # CA trust for the self-signed S3 cert (SQL Server on Linux reads this folder at startup).
+      - ./certs/public.crt:/var/opt/mssql/security/ca-certificates/s3.crt:ro
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Arrow_Net_123!' -C -Q 'SELECT 1' -b -o /dev/null"]
       interval: 10s
@@ -78,7 +79,7 @@ services:
       - MSSQL_SA_PASSWORD=Arrow_Net_123!
     volumes:
       - mssql-poly-data:/var/opt/mssql
-      - ./certs/public.crt:/var/opt/mssql/security/ca-certificates/minio.crt:ro
+      - ./certs/public.crt:/var/opt/mssql/security/ca-certificates/s3.crt:ro
       - ./polybase/stage:/opt/duckodbc:ro
       - ./polybase/stage/odbc.ini:/etc/odbc.ini:ro
     healthcheck:
@@ -88,69 +89,23 @@ services:
       retries: 12
       start_period: 20s
 
-  minio:
-    # ⚠⚠ THIS IMAGE HAS MOVED TWICE, BOTH TIMES BECAUSE THE PUBLISHER WITHDREW IT — treat the registry as
-    # the fragile part of this rig, not the software. 2026-09-13: `minio/minio` + `minio/mc` on Docker Hub
-    # became unpullable, so we moved to quay.io. 2026-10-20: quay.io went the same way ("unauthorized"),
-    # and this time it is TOTAL -- the quay tag listing itself now demands authentication, Docker Hub
-    # denies access, and even the raw binaries at dl.min.io answer 410 Gone. MinIO no longer distributes
-    # a community build at all.
-    #
-    # `bitnamilegacy/minio` is Bitnami's frozen mirror of the real MinIO (they moved their free images
-    # there in 2025) and is the newest freely obtainable build: 2025.7.23, which is ~6 weeks OLDER than
-    # the last image we had cached (RELEASE.2025-09-07). PINNED to an exact tag on purpose -- a moving
-    # `latest` on a frozen mirror is the worst of both worlds.
-    #
-    # ⚠ Both previous breakages hit the SCHEDULED service tier while local runs kept passing on a cached
-    # image; this one killed it from 2026-10-17. Do NOT read a green local service tier as evidence that
-    # the rig can be provisioned from scratch -- only a clean machine pulls, so only CI notices.
-    #
-    # ⚠ Bitnami conventions differ from the official image and all three matter: it runs as NON-ROOT
-    # (uid 1001), the data dir is /bitnami/minio/data (not /data), and the certs dir is /certs (not
-    # /root/.minio/certs). MINIO_DEFAULT_BUCKETS replaces the old `createbucket` service, which is why
-    # there is no longer a second image to lose.
-    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
-    # Survive a host reboot. Without this the containers exit and STAY exited — which happened on
-    # 2026-07-30 (an overnight OS update rebooted the box) and surfaced only as the whole service tier
-    # failing at each suite's first ATTACH with 'error 258: server not found'. `unless-stopped` rather
-    # than `always`, so an explicit `docker compose stop` still means stopped.
-    restart: unless-stopped
-    container_name: minio-fabricator
-    ports:
-      - "9000:9000"   # S3 API (HTTPS — certs auto-enable TLS)
-      - "9001:9001"   # web console
-    environment:
-      - MINIO_ROOT_USER=miniouser
-      - MINIO_ROOT_PASSWORD=miniosecret123
-      # Without this the bundled mc talks http to an https server and the bucket is never created.
-      - MINIO_SCHEME=https
-      # Replaces the old one-shot `createbucket` service. ⚠ It runs mc against our own self-signed
-      # endpoint, which only works because certs/CAs/public.crt is copied into mc's trust store by the
-      # image's setup.sh — see docker/certs/generate-certs.ps1, which writes that copy.
-      - MINIO_DEFAULT_BUCKETS=fabricator
-    volumes:
-      - minio-data:/bitnami/minio/data
-      - ./certs:/certs:ro
-    healthcheck:
-      test: ["CMD", "curl", "-k", "-f", "https://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-
-  # RustFS (Apache-2.0, maintained) as the S3 test store -- a TRIAL beside MinIO, whose community image is no longer
-  # published (we run Bitnami's frozen 2025.7.23 mirror). Same keys and bucket name as MinIO, so the S3 suites run
-  # unchanged against it: FABRICATOR_S3_ENDPOINT=localhost:9100, FABRICATOR_S3_SQL_ENDPOINT=rustfs:9000.
-  # Measured 2026-11-08 on 1.0.4: put-if-absent (If-None-Match: *) is atomic -- 20 rounds of 32 concurrent writers,
-  # exactly one winner each -- which is what our S3 commits depend on. TLS from certs/rustfs (generate-certs.ps1).
-  # The bucket comes from `rustfs-init` below (RustFS's own client, rc).
+  # RustFS (Apache-2.0, maintained) is the S3 store since 2026-11-09. It replaced MinIO, whose community image is no
+  # longer published anywhere (quay.io and Docker Hub refuse, dl.min.io answers 410 Gone; we had been running Bitnami's
+  # frozen 2025.7.23 mirror). Measured on 1.0.4 before the switch: put-if-absent (If-None-Match: *), which our S3
+  # commits depend on, is atomic (20 rounds of 32 concurrent writers, one winner each), and the full service tier is
+  # green against it at the same counts as against MinIO.
+  # ⚠ The lesson from MinIO, kept: a registry can withdraw an image, and a green LOCAL run proves nothing about that
+  # (it uses the cached image). Only a clean machine pulls, so only CI notices. Pinned to an exact tag.
+  # TLS from certs/rustfs (generate-certs.ps1, the same pair under RustFS's file names). The bucket comes from
+  # `rustfs-init` below (RustFS's own client, rc). Endpoints: localhost:9000 from the host (DuckDB), rustfs:9000
+  # inside the compose network (SQL Server).
   rustfs:
     image: rustfs/rustfs:1.0.4
-    profiles: ["rustfs"]
+    # Survive a host reboot (an exited store once surfaced as every suite failing at its first ATTACH).
     restart: unless-stopped
     container_name: rustfs-fabricator
     ports:
-      - "9100:9000"   # S3 API (HTTPS)
+      - "9000:9000"   # S3 API (HTTPS)
     environment:
       - RUSTFS_ACCESS_KEY=miniouser
       - RUSTFS_SECRET_KEY=miniosecret123
@@ -168,10 +123,9 @@ services:
   # One-shot: creates the `fabricator` bucket in RustFS with rc, RustFS's own client (`-p`: an existing bucket is
   # fine, so it is re-runnable). --insecure because rc's TLS stack (rustls) refuses our certificate: it is self-signed
   # with CA:TRUE, i.e. a CA used as the server's own certificate (CaUsedAsEndEntity), which curl, SQL Server and
-  # MinIO's mc accept. A separate CA + server certificate would let it verify.
+  # MinIO's mc accepted. A separate CA + server certificate would let it verify.
   rustfs-init:
     image: rustfs/rc:v0.1.37
-    profiles: ["rustfs"]
     depends_on:
       rustfs:
         condition: service_healthy
@@ -183,6 +137,5 @@ services:
 
 volumes:
   mssql-data:
-  minio-data:
   rustfs-data:
   mssql-poly-data:

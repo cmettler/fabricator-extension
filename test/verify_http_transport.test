@@ -3,7 +3,7 @@
 #              (ABI v76 http_request -> HTTPUtil -> httpfs' curl client), so it inherits DuckDB's secrets,
 #              TLS trust, proxy and retry configuration. This is the transport a PLUGIN calling a REST API
 #              is meant to use; the function exists to make it observable from SQL.
-#              Runs against the docker/docker-compose.yml MinIO (test-only creds, HTTPS with a SELF-SIGNED
+#              Runs against the docker/docker-compose.yml RustFS (test-only creds, HTTPS with a SELF-SIGNED
 #              cert) — deliberately, and not against a public endpoint: the self-signed cert is what turns
 #              "DuckDB's TLS configuration reaches the call" from a claim into a two-legged A/B, and it
 #              keeps the suite off the internet.
@@ -24,11 +24,11 @@ require-env FABRICATOR_S3_ENDPOINT
 # both legs were measured with the Python wheel, and neither is reachable from sqllogictest.
 
 # ==========================================================================================================
-# §1 THE TLS A/B — the load-bearing section, and the reason this suite is on MinIO.
+# §1 THE TLS A/B — the load-bearing section, and the reason this suite is on the rig's S3 store (RustFS).
 #
 # The whole justification for routing managed HTTP through DuckDB is that the call inherits configuration
 # the plugin never sees. Nothing about a successful request demonstrates that; only a setting CHANGING the
-# outcome does. `enable_curl_server_cert_verification` defaults to true, and MinIO's cert is self-signed, so
+# outcome does. `enable_curl_server_cert_verification` defaults to true, and RustFS's cert is self-signed, so
 # the same statement fails one way and succeeds the other with the setting as the only variable.
 #
 # ⚠ Whichever way this is read, read BOTH legs. "It returned 200" would be equally true of a transport that
@@ -42,7 +42,7 @@ true
 
 # Leg A: verification ON (the default) => the self-signed cert is REFUSED.
 statement error
-SELECT status FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+SELECT status FROM fabricator_http_request('https://localhost:9000/health');
 ----
 certificate
 
@@ -51,7 +51,7 @@ statement ok
 SET GLOBAL enable_curl_server_cert_verification = false;
 
 query II
-SELECT status, reason FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+SELECT status, reason FROM fabricator_http_request('https://localhost:9000/health');
 ----
 200	OK
 
@@ -72,7 +72,7 @@ CREATE SECRET http_here (TYPE http, SCOPE 'https://localhost:9000', VERIFY_SSL f
 
 # The secret's scope covers this URL => its verify_ssl reaches the request and the self-signed cert passes.
 query I
-SELECT status FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+SELECT status FROM fabricator_http_request('https://localhost:9000/health');
 ----
 200
 
@@ -86,7 +86,7 @@ statement ok
 CREATE SECRET http_elsewhere (TYPE http, SCOPE 'https://elsewhere.example', VERIFY_SSL false);
 
 statement error
-SELECT status FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+SELECT status FROM fabricator_http_request('https://localhost:9000/health');
 ----
 certificate
 
@@ -105,7 +105,7 @@ SET GLOBAL enable_curl_server_cert_verification = false;
 # says — so 404/401/403 were always rows. `try_request` governs only the RETRYABLE set (408, 418, 429, 500,
 # 503, 504 and transport errors), which would otherwise throw after the last attempt.
 # ⚠ So that flag is NOT GATED here: producing an exhausted-retry 500 needs a server that returns one on
-# demand, and neither MinIO nor SQL Server does. Stated rather than papered over — a section that claims to
+# demand, and neither RustFS nor SQL Server does. Stated rather than papered over — a section that claims to
 # cover a flag it cannot reach is worse than an admitted gap.
 # ==========================================================================================================
 
@@ -146,15 +146,15 @@ not supported by DuckDB's HTTP layer
 # ==========================================================================================================
 
 query II
-SELECT body_bytes, headers LIKE '%Server%' OR headers LIKE '%server%'
-FROM fabricator_http_request('https://localhost:9000/minio/health/live', method := 'HEAD');
+SELECT body_bytes, lower(headers) LIKE '%content-type%'
+FROM fabricator_http_request('https://localhost:9000/health', method := 'HEAD');
 ----
 0	true
 
 # ==========================================================================================================
 # §7 The request carries a caller-supplied header and a body.
 #
-# MinIO does not echo headers, so what is asserted here is that supplying them does not BREAK the request —
+# RustFS does not echo headers, so what is asserted here is that supplying them does not BREAK the request —
 # the echo-based proof needs a server that reflects, and lives outside CI. The value of the section is the
 # body path: a POST's response body arrives through `PostRequestInfo::buffer_out`, NOT through
 # HTTPResponse::body like every other method, so a POST returning content at all is what pins that.

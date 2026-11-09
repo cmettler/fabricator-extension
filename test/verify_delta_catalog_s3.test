@@ -1,9 +1,9 @@
 # name: test/verify_delta_catalog_s3.test
-# description: The engineered-wood Delta folder-catalog on S3-COMPATIBLE storage (MinIO): all IO through
+# description: The engineered-wood Delta folder-catalog on S3-COMPATIBLE storage (RustFS): all IO through
 #              DuckDB's FileSystem (httpfs) + an s3 secret — discovery (host-FS glob), CREATE/CTAS/INSERT,
 #              filter pushdown, DV DELETE + merge-on-read UPDATE (no dir-ops), snapshots, explicit
 #              transactions, re-ATTACH durability, and the native_write/native_read variant (COPY +
-#              read_parquet over s3://). Uses the docker/docker-compose.yml MinIO (bucket `fabricator`,
+#              read_parquet over s3://). Uses the docker/docker-compose.yml RustFS (bucket `fabricator`,
 #              test-only creds; HTTPS via the self-signed cert — httpfs does not pin the CA).
 #              Re-runnable against a persistent bucket: every table is CREATE OR REPLACE'd (DROP TABLE
 #              is exercised mid-suite — httpfs implements s3 file deletion for the recursive dir-remove),
@@ -35,7 +35,7 @@ require-env FABRICATOR_S3_ENDPOINT
 # wrote — a real scenario for anyone who flips the flag on an existing catalog.
 require-env DELTA_PROVIDER
 
-# The test rig's MinIO serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
+# The test rig's RustFS serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
 # curl-based httpfs verifies against the system store) — disable verification GLOBALLY (the transaction
 # flush runs on its own connection, which must inherit it).
 # (Production alternative: SET ca_cert_file = '<path to docker/certs/public.crt>'.)

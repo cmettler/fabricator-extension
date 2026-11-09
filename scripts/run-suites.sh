@@ -3,7 +3,7 @@
 # Runs a TIER of suites, and fails loudly unless every selected suite actually ran.
 #
 #   run-suites.sh hermetic   (default) needs nothing but a scratch dir and the in-repo fixtures
-#   run-suites.sh service              needs the docker/docker-compose.yml stack: SQL Server + MinIO
+#   run-suites.sh service              needs the docker/docker-compose.yml stack: SQL Server + RustFS
 #
 # One runner for both so the assertions below Ã¢ÂÂ the part with the actual value Ã¢ÂÂ exist once. Used by
 # CI and usable as-is on a dev machine.

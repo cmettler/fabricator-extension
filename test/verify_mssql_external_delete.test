@@ -8,7 +8,7 @@
 #
 #              ⚠ §2 is a DIFFERENTIAL: the same deletes run on a twin Delta table through the Delta catalog with the
 #              predicate shortcut off (the rowid path, the oracle); contents must agree. §3 is what makes the change
-#              matter: SQL Server itself reads the result. Needs the docker SQL Server + MinIO (service tier).
+#              matter: SQL Server itself reads the result. Needs the docker SQL Server + RustFS (service tier).
 # group: [fabricator]
 
 require fabricator

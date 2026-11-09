@@ -1,7 +1,7 @@
 # Tier 0 of this repo's CI: the pure-.NET logic that needs no toolchain to test.
 #
 # Deliberately the FIRST workflow, because it is the cheapest useful one — no C++ toolchain, no
-# vcpkg, no .NET publish, no SQL Server, no MinIO, no submodules. Two minutes.
+# vcpkg, no .NET publish, no SQL Server, no RustFS, no submodules. Two minutes.
 #
 # TWO projects now, one job each:
 #   Fabricator.Installer.Core.Tests  the single-file-distribution logic (the payload packer, the

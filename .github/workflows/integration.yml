@@ -1,9 +1,9 @@
-# Tier 2: the suites that need real services — SQL Server 2025 and MinIO.
+# Tier 2: the suites that need real services — SQL Server 2025 and RustFS (S3).
 #
 # 42 suites in 43 RUNS, the entire SQL Server provider surface plus the S3/PolyBase round trip:
 # catalog and DML, pushdown (filter/projection/limit/order-by/collation), scalar UDFs, TVFs, stored
 # procedures, table-in-out, custom functions and aggregates, secrets, server profiles, identity,
-# columnstore, time travel, and the full circle where SQL Server reads Delta tables we wrote to MinIO.
+# columnstore, time travel, and the full circle where SQL Server reads Delta tables we wrote to RustFS.
 #
 # 43 runs from 42 suites because verify_delta_catalog_s3 runs ONCE PER DELTA ENGINE. The provider name
 # picks a default engine ('delta' = DuckDB moves the parquet bytes, 'engineeredwooddelta' = the EW
@@ -44,7 +44,7 @@ defaults:
 jobs:
   service-suites:
     runs-on: ubuntu-latest
-    name: linux_amd64 + SQL Server 2025 + MinIO
+    name: linux_amd64 + SQL Server 2025 + RustFS
     timeout-minutes: 150
 
     steps:
@@ -87,18 +87,21 @@ jobs:
           # that made Fluid the closure fixture when it was a plugin. That suite is HERMETIC since
           # 2026-09-02 and runs on all three platforms, so this tier is not its coverage either.
 
-      - name: Generate the MinIO TLS certificate
-        # SQL Server's s3:// connector REFUSES plain HTTP, so MinIO must serve TLS even in tests. The
-        # certs are gitignored, so CI generates them; SANs cover `minio` (as SQL Server sees it inside
+      - name: Generate the S3 TLS certificate
+        # SQL Server's s3:// connector REFUSES plain HTTP, so RustFS must serve TLS even in tests. The
+        # certs are gitignored, so CI generates them; SANs cover `rustfs` (as SQL Server sees it inside
         # the compose network) and localhost/127.0.0.1 (as the DuckDB tests see it from the host).
         run: pwsh -NoProfile -File docker/certs/generate-certs.ps1
 
-      - name: Start SQL Server + MinIO
+      - name: Start SQL Server + RustFS
         working-directory: docker
         # Plain `up -d` rather than `--wait`: provision.ps1 does its own readiness polling, and
-        # `--wait` fails outright on a service that declares no healthcheck.
+        # `--wait` fails outright on a service that declares no healthcheck. `compose wait rustfs-init` blocks
+        # until the one-shot that creates the bucket has exited and fails the step if it failed — without it
+        # a suite could start before the bucket exists.
         run: |
           docker compose up -d
+          docker compose wait rustfs-init
           docker compose ps
 
       - name: Provision databases and fixtures
@@ -116,11 +119,11 @@ jobs:
           MSSQL_BINCOLL_DSN: Server=localhost,1433;Database=BinCollTest;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true
           MSSQL_TESTDB_URI: mssql://sa:Arrow_Net_123!@localhost:1433/TestDB
           MSSQL_TEST_PASS: Arrow_Net_123!
-          # The two S3 endpoints differ ON PURPOSE and are not interchangeable: DuckDB reaches MinIO
+          # The two S3 endpoints differ ON PURPOSE and are not interchangeable: DuckDB reaches RustFS
           # from the host via the published port, SQL Server reaches it by compose DNS from inside the
           # network. The TLS SANs cover both names for exactly this reason.
           FABRICATOR_S3_ENDPOINT: localhost:9000
-          FABRICATOR_S3_SQL_ENDPOINT: minio:9000
+          FABRICATOR_S3_SQL_ENDPOINT: rustfs:9000
           FABRICATOR_PLUGIN_DIR: dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/publish
           # The same plugin as an INSTALLABLE ARCHIVE, emitted by the project's own PackPluginArchive target
           # (so `dotnet publish` above produces it too — publish runs Build first). It lands in the BUILD
@@ -137,4 +140,5 @@ jobs:
         working-directory: docker
         run: |
           echo "===== sqlserver ====="; docker compose logs --tail 120 sqlserver || true
-          echo "===== minio =====";     docker compose logs --tail 60 minio || true
+          echo "===== rustfs =====";    docker compose logs --tail 60 rustfs || true
+          echo "===== rustfs-init ====="; docker compose logs --tail 20 rustfs-init || true

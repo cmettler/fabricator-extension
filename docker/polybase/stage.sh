@@ -13,7 +13,7 @@ ODBC_RELEASE=${ODBC_RELEASE:-v2.0.0.1}   # the first release with our three fixe
 DRIVER=${DRIVER:-}
 LOADABLE=${LOADABLE:-$HOME/sqlext2/build/odbc/extension/fabricator/fabricator.duckdb_extension}
 PAYLOAD=${PAYLOAD:-/mnt/d/repos/fabricator-extension/scratchpad/linuxpub-sc/extension/fabricator/fabricator}
-# DuckLake metadata lives in the SAME SQL Server (inside the container it is localhost:1433); the data on MinIO,
+# DuckLake metadata lives in the SAME SQL Server (inside the container it is localhost:1433); the data on RustFS,
 # reached by service name. Test-only credentials, the same as the rest of the rig.
 META="Server=localhost,1433;Database=DLPoly;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true"
 
@@ -50,9 +50,9 @@ INSTALL httpfs;
 LOAD httpfs;
 INSTALL ducklake;
 LOAD ducklake;
--- MinIO's certificate is self-signed (docker/certs); the test rig does not verify it, same as the suites
+-- RustFS's certificate is self-signed (docker/certs); the test rig does not verify it, same as the suites
 SET GLOBAL enable_curl_server_cert_verification = false;
-CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123', ENDPOINT 'minio:9000',
+CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123', ENDPOINT 'rustfs:9000',
                         URL_STYLE 'path', REGION 'us-east-1', USE_SSL true);
 -- PolyBase always passes the FIRST part of an external table's LOCATION as Database=, and the driver opens that
 -- as a database FILE (relative to EES's working directory, see start.sh). So LOCATION 'lake.main.t' leaves an

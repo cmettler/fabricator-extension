@@ -1,11 +1,11 @@
 # name: test/verify_mssql_s3_polybase.test
-# description: The FULL CIRCLE — our Delta provider writes a table to MinIO (s3://), and SQL Server 2025
+# description: The FULL CIRCLE — our Delta provider writes a table to RustFS (s3://), and SQL Server 2025
 #              reads it back over its NATIVE S3 data virtualization (no PolyBase package needed on 17.x),
 #              driven through our mssql provider: OPENROWSET(FORMAT='DELTA') + CREATE EXTERNAL TABLE, both
 #              provisioned via fabricator_exec and read via fabricator_query / a normal catalog scan. The
 #              SQL-side DELTA reader supports Delta protocol 1.0 ONLY, so the interop table is written
 #              with deletion_vectors false + column_mapping 'none' (plain minReader-1); a DV-default
-#              table is pinned as NOT readable. Requires the docker/docker-compose.yml stack (MinIO with
+#              table is pinned as NOT readable. Requires the docker/docker-compose.yml stack (RustFS with
 #              the self-signed TLS cert SQL Server trusts via /var/opt/mssql/security/ca-certificates).
 # group: [fabricator]
 
@@ -33,7 +33,7 @@ require-env FABRICATOR_S3_SQL_ENDPOINT
 
 require-env FABRICATOR_DELTA_WRITE_DIR
 
-# The test rig's MinIO serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
+# The test rig's RustFS serves a SELF-SIGNED cert (SQL Server trusts it via its CA mount; DuckDB's
 # curl-based httpfs verifies against the system store) — disable verification GLOBALLY (the transaction
 # flush runs on its own connection, which must inherit it).
 # (Production alternative: SET ca_cert_file = '<path to docker/certs/public.crt>'.)
@@ -137,8 +137,8 @@ SELECT fabricator_exec('sqldb',
 statement ok
 SELECT fabricator_refresh_cache('sqldb');
 
-# Our provider scanning a SQL Server EXTERNAL table whose data lives in MinIO, written by our Delta
-# provider — DuckDB -> fabricator -> SQL Server -> S3 delta reader -> MinIO.
+# Our provider scanning a SQL Server EXTERNAL table whose data lives in RustFS, written by our Delta
+# provider — DuckDB -> fabricator -> SQL Server -> S3 delta reader -> RustFS.
 query IIT
 SELECT id, amount, city FROM sqldb.dbo.s3_delta_trips ORDER BY id LIMIT 4;
 ----
@@ -367,7 +367,7 @@ SELECT fabricator_exec('sqldb',
 statement ok
 SELECT fabricator_refresh_cache('sqldb');
 
-# the INSERT goes through the ATTACHed SQL catalog — and lands in the Delta table on MinIO
+# the INSERT goes through the ATTACHed SQL catalog — and lands in the Delta table on RustFS
 statement ok
 INSERT INTO sqldb.dbo.s3_delta_ins VALUES (100, 'newrow');
 
@@ -648,7 +648,7 @@ statement ok
 DROP TABLE sqldb.dbo.s3_iddml;
 
 # ---- 6e. the CETAS-analog DDL (slice B): CREATE TABLE ... WITH (location=..., table_type='DELTA') ----
-# One statement: the data is written CLIENT-SIDE as a protocol-1.0 Delta table on MinIO (something SQL
+# One statement: the data is written CLIENT-SIDE as a protocol-1.0 Delta table on RustFS (something SQL
 # Server could never write), then the EXTERNAL TABLE is provisioned over it — the whole §2-§4 manual flow
 # as DDL. data_source names the pre-provisioned EXTERNAL DATA SOURCE (no secret material crosses).
 
@@ -734,7 +734,7 @@ ROLLBACK;
 # ---- 6f. the FULL CIRCLE: empty CREATE + IDENTITY marker -> INSERT (C) -> UPDATE/DELETE (D) ----
 # The identity marker (`id BIGINT AS (0)`) rides into the Delta create (engine-assigned ids; the external
 # declaration is plain BIGINT), so the table is DML-capable from birth — created, written, updated and
-# deleted entirely through the SQL catalog, with every byte on MinIO and SQL Server serving the reads.
+# deleted entirely through the SQL catalog, with every byte on RustFS and SQL Server serving the reads.
 
 statement ok
 CREATE TABLE sqldb.dbo.cetas_id (id BIGINT AS (0), name VARCHAR)

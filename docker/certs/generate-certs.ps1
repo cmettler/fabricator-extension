@@ -1,19 +1,16 @@
-# Generates the self-signed TLS certificate MinIO serves and SQL Server trusts (test-only).
+# Generates the self-signed TLS certificate RustFS serves and SQL Server trusts (test-only).
 #
-# SANs must cover every name a client uses to reach MinIO:
-#   - DNS:minio      -> SQL Server inside the compose network (LOCATION = 's3://minio:9000/')
-#   - DNS:rustfs     -> the same for the RustFS service (profile `rustfs`, LOCATION = 's3://rustfs:9000/')
+# SANs must cover every name a client uses to reach RustFS:
+#   - DNS:rustfs     -> SQL Server inside the compose network (LOCATION = 's3://rustfs:9000/')
 #   - DNS:localhost + IP:127.0.0.1 -> DuckDB tests on the host (ENDPOINT 'localhost:9000')
 #
-# Output (public.crt + private.key, PEM) lands next to this script and is GITIGNORED; the compose file
-# mounts the folder into MinIO (/certs -> auto-TLS) and the cert into SQL Server's CA store
-# (/var/opt/mssql/security/ca-certificates). Re-run + `docker compose restart` to rotate.
+# Output (public.crt + private.key, PEM) lands next to this script and is GITIGNORED. The compose file mounts
+# public.crt into SQL Server's CA store (/var/opt/mssql/security/ca-certificates, read once at process start), and
+# RustFS reads the same pair from rustfs/ under its own file names (RUSTFS_TLS_PATH). To rotate: re-run, then
+# `docker compose up -d --force-recreate rustfs` and restart SQL Server.
 #
-# It ALSO writes a copy to CAs/public.crt, and that copy is load-bearing rather than tidy: the Bitnami
-# MinIO image's setup.sh copies ${MINIO_CERTS_DIR}/CAs/ into the bundled mc client's trust store, and mc
-# is what MINIO_DEFAULT_BUCKETS uses to create the bucket -- over HTTPS, against this very self-signed
-# cert. Without the copy the container starts healthy and the `fabricator` bucket is silently ABSENT.
-# The cert is self-signed, so it IS its own CA and the copy is literally the same bytes.
+# The certificate is its own CA (CA:TRUE). curl and SQL Server accept that; rustls (RustFS's rc client) refuses it
+# as CaUsedAsEndEntity, which is why rustfs-init runs rc with --insecure.
 
 $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
@@ -26,7 +23,7 @@ x509_extensions = v3_req
 prompt = no
 
 [dn]
-CN = minio
+CN = rustfs
 
 [v3_req]
 basicConstraints = critical, CA:TRUE
@@ -35,9 +32,8 @@ extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 
 [alt_names]
-DNS.1 = minio
+DNS.1 = rustfs
 DNS.2 = localhost
-DNS.3 = rustfs
 IP.1 = 127.0.0.1
 '@ | Set-Content -Path $cnf -Encoding ascii
 
@@ -53,15 +49,11 @@ if ($openssl) {
     if ($LASTEXITCODE -ne 0) { throw "dockerized openssl failed ($LASTEXITCODE)" }
 }
 
-$caDir = Join-Path $dir 'CAs'
-New-Item -ItemType Directory -Force -Path $caDir | Out-Null
-Copy-Item -Force (Join-Path $dir 'public.crt') (Join-Path $caDir 'public.crt')
-
 # RustFS reads its certificate from a directory under fixed names (RUSTFS_TLS_PATH): the same pair, renamed.
 $rustfsDir = Join-Path $dir 'rustfs'
 New-Item -ItemType Directory -Force -Path $rustfsDir | Out-Null
 Copy-Item -Force (Join-Path $dir 'public.crt') (Join-Path $rustfsDir 'rustfs_cert.pem')
 Copy-Item -Force (Join-Path $dir 'private.key') (Join-Path $rustfsDir 'rustfs_key.pem')
 
-Write-Host "Generated $(Join-Path $dir 'public.crt') (CN=minio; SANs: minio, localhost, rustfs, 127.0.0.1)"
-Write-Host "Copied    $(Join-Path $caDir 'public.crt') (trust store for the bundled mc client)"
+Write-Host "Generated $(Join-Path $dir 'public.crt') (CN=rustfs; SANs: rustfs, localhost, 127.0.0.1)"
+Write-Host "Copied    $(Join-Path $rustfsDir 'rustfs_cert.pem') + rustfs_key.pem (for RustFS)"

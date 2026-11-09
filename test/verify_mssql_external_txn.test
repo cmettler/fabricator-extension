@@ -11,7 +11,7 @@
 #              written to that table (§5). Still refused: deleting a row inserted in the same transaction (no
 #              deletion vectors), a second UPDATE/DELETE keyed by SQL Server's read after the transaction wrote the
 #              table (§5), and an INSERT into a parquet external table (a file is
-#              visible the moment it exists). Needs the docker SQL Server + MinIO (service tier).
+#              visible the moment it exists). Needs the docker SQL Server + RustFS (service tier).
 # group: [fabricator]
 
 require fabricator
