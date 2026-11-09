@@ -18,6 +18,8 @@ require parquet
 
 require icu
 
+require json
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
@@ -275,3 +277,48 @@ query II
 SELECT count(*), count(k) FROM ref3;
 ----
 3001	3001
+
+# ============================================================================
+# 9. STRUCTS INSIDE LISTS AND MAPS under column mapping 'name': their members are stored under physical names too
+#    (the plan's "element" / "key" / "value" members) — differential, on one table
+# ============================================================================
+statement ok
+CREATE TABLE l.main.lm (id INTEGER, ls STRUCT(a INTEGER, b VARCHAR)[], mp MAP(VARCHAR, STRUCT(x INTEGER)), nl INTEGER[][]);
+
+statement ok
+INSERT INTO l.main.lm SELECT r, [{'a': r, 'b': 'x' || r}, {'a': -r, 'b': NULL}], MAP {'k' || (r % 3): {'x': r}}, [[r, r + 1], [r * 2]] FROM range(500) x(r);
+
+statement ok
+INSERT INTO l.main.lm VALUES (9001, NULL, NULL, NULL), (9002, [], MAP {}, [[]]);
+
+statement ok
+DELETE FROM l.main.lm WHERE id % 50 = 7;
+
+statement ok
+SET fabricator_file_scan = false;
+
+statement ok
+CREATE TEMP TABLE ref4 AS SELECT id, to_json(ls) AS ls, to_json(mp) AS mp, to_json(nl) AS nl FROM l.main.lm;
+
+statement ok
+SET fabricator_file_scan = true;
+
+query II
+EXPLAIN SELECT count(*) FROM l.main.lm WHERE id > 5;
+----
+physical_plan	<REGEX>:.*Fabricator File Scan.*
+
+query I
+SELECT count(*) FROM ((SELECT id, to_json(ls), to_json(mp), to_json(nl) FROM l.main.lm) EXCEPT ALL (SELECT * FROM ref4));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ref4) EXCEPT ALL (SELECT id, to_json(ls), to_json(mp), to_json(nl) FROM l.main.lm));
+----
+0
+
+query III
+SELECT count(*), sum(ls[1].a), sum(mp['k1'].x) FROM l.main.lm;
+----
+492	122430	40822

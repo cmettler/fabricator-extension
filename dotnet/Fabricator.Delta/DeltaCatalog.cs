@@ -460,10 +460,11 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         }
         var listing = DeltaReader.ListNativeScanFiles(Opener(), path, unit, value, prune: null, _log,
                                                       bound: ReadBound(path));
-        if (listing.MappedSchema is { } mapped && mapped.Fields.Any(f => MappedInsideCollection(f.Type, false)))
+        if (listing.LogicalToFieldId is not null && listing.TableSchema is { } idTable
+            && idTable.Fields.Any(f => MappedInsideCollection(f.Type, false)))
         {
-            // a struct member inside a list or map is stored under its physical name too; the plan does not say yet
-            return Declined("column mapping with a struct inside a list or map");
+            // id mode: the element of a list or map has its own field id (delta.columnMapping.nested.ids), not said yet
+            return Declined("column mapping 'id' with a struct inside a list or map");
         }
         // partition columns are not in the data files: each file's values come from the log (as text; the host casts
         // them to the column type). A binary partition value's text form is not its bytes.
@@ -628,21 +629,31 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         return new StoredColumn(null, members, id);
     }
 
-    /// <summary>A column's stored name and, for a struct, its members' (column mapping 'name').</summary>
+    /// <summary>A column's stored name and its members' — a struct's, also inside a list (<c>element</c>) or a map
+    /// (<c>key</c>, <c>value</c>) — under column mapping 'name'.</summary>
     private static StoredColumn StoredNames(EngineeredWood.DeltaLake.Schema.StructField field, string? stored)
     {
         stored ??= field.Metadata?.GetValueOrDefault("delta.columnMapping.physicalName");
-        Dictionary<string, StoredColumn>? members = null;
-        if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
-        {
-            members = new Dictionary<string, StoredColumn>(StringComparer.Ordinal);
-            foreach (var member in s.Fields)
-            {
-                members[member.Name] = StoredNames(member, null);
-            }
-        }
-        return new StoredColumn(stored is { Length: > 0 } && stored != field.Name ? stored : null, members);
+        return new StoredColumn(stored is { Length: > 0 } && stored != field.Name ? stored : null,
+                                StoredMembers(field.Type));
     }
+
+    private static Dictionary<string, StoredColumn>? StoredMembers(EngineeredWood.DeltaLake.Schema.DeltaDataType type) =>
+        type switch
+        {
+            EngineeredWood.DeltaLake.Schema.StructType s =>
+                s.Fields.ToDictionary(m => m.Name, m => StoredNames(m, null), StringComparer.Ordinal),
+            EngineeredWood.DeltaLake.Schema.ArrayType a when StoredMembers(a.ElementType) is { } element =>
+                new Dictionary<string, StoredColumn>(StringComparer.Ordinal) { ["element"] = new(null, element) },
+            EngineeredWood.DeltaLake.Schema.MapType m when (StoredMembers(m.KeyType), StoredMembers(m.ValueType)) is var kv
+                                                           && (kv.Item1 is not null || kv.Item2 is not null) =>
+                new Dictionary<string, StoredColumn>(StringComparer.Ordinal)
+                {
+                    ["key"] = new(null, kv.Item1),
+                    ["value"] = new(null, kv.Item2),
+                },
+            _ => null,
+        };
 
     /// <summary>The first column type a file plan cannot read faithfully yet, or null. A top-level timestamp is
     /// fine — the host refuses a file whose timestamp kind differs from the column's (naive vs UTC-adjusted), since

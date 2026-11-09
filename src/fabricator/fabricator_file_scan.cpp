@@ -378,6 +378,15 @@ private:
 		if (by_id) {
 			local.identifier = global.identifier;
 		}
+		if (global.type.id() == LogicalTypeId::MAP) {
+			// a part's map, like a file's, has its key and value under a "key_value" node
+			MultiFileColumnDefinition key_value(Identifier("key_value"), ListType::GetChildType(global.type));
+			for (auto &child : global.children) {
+				key_value.children.push_back(LocalColumn(child));
+			}
+			local.children.push_back(std::move(key_value));
+			return local;
+		}
 		for (auto &child : global.children) {
 			local.children.push_back(LocalColumn(child));
 		}
@@ -708,9 +717,48 @@ void ApplyStoredNames(MultiFileColumnDefinition &column, yyjson_val *spec) {
 	if (!members) {
 		return;
 	}
-	for (auto &child : column.children) {
-		ApplyStoredNames(child, yyjson_obj_get(members, child.name.GetIdentifierName().c_str()));
+	// the plan names a list's elements "element" and a map's "key" / "value"; the table column's nodes are "list" and
+	// "key" / "value" (TableColumnDefinition)
+	switch (column.type.id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		ApplyStoredNames(column.children[0], yyjson_obj_get(members, "element"));
+		break;
+	case LogicalTypeId::MAP:
+		ApplyStoredNames(column.children[0], yyjson_obj_get(members, "key"));
+		ApplyStoredNames(column.children[1], yyjson_obj_get(members, "value"));
+		break;
+	default:
+		for (auto &child : column.children) {
+			ApplyStoredNames(child, yyjson_obj_get(members, child.name.GetIdentifierName().c_str()));
+		}
 	}
+}
+
+//! A table column as the mapper matches files onto it: a child per struct member, the element of a list ("list"), and
+//! the key and the value of a map — directly, where a FILE's map has a "key_value" node between (MapColumnMap).
+MultiFileColumnDefinition TableColumnDefinition(const Identifier &name, const LogicalType &type) {
+	MultiFileColumnDefinition result(name, type);
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT:
+		for (auto &child : StructType::GetChildTypes(type)) {
+			result.children.push_back(TableColumnDefinition(child.first, child.second));
+		}
+		break;
+	case LogicalTypeId::LIST:
+		result.children.push_back(TableColumnDefinition(Identifier("list"), ListType::GetChildType(type)));
+		break;
+	case LogicalTypeId::ARRAY:
+		result.children.push_back(TableColumnDefinition(Identifier("list"), ArrayType::GetChildType(type)));
+		break;
+	case LogicalTypeId::MAP:
+		result.children.push_back(TableColumnDefinition(Identifier("key"), MapType::KeyType(type)));
+		result.children.push_back(TableColumnDefinition(Identifier("value"), MapType::ValueType(type)));
+		break;
+	default:
+		break;
+	}
+	return result;
 }
 
 //! A column or struct member a file lacks (added later) reads NULL, at every depth. By name the mapper would supply a
@@ -718,6 +766,9 @@ void ApplyStoredNames(MultiFileColumnDefinition &column, yyjson_val *spec) {
 //! and has no default expression").
 void SetNullDefaults(MultiFileColumnDefinition &column) {
 	column.default_expression = ConstantExpression::FromValue(Value(column.type));
+	if (column.type.id() != LogicalTypeId::STRUCT) {
+		return; // a list's element or a map's entry is not a member that can be missing
+	}
 	for (auto &child : column.children) {
 		SetNullDefaults(child);
 	}
@@ -948,7 +999,7 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	plan->at_value = at_value;
 	auto column_specs = PlanObject(doc.Root(), "columns", "plan");
 	for (auto &column : table.GetColumns().Logical()) {
-		auto definition = MultiFileColumnDefinition::CreateFromNameAndType(column.Name(), column.Type());
+		auto definition = TableColumnDefinition(column.Name(), column.Type());
 		SetNullDefaults(definition);
 		if (column_specs) {
 			ApplyStoredNames(definition, yyjson_obj_get(column_specs, column.Name().GetIdentifierName().c_str()));

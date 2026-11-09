@@ -47,7 +47,8 @@ public sealed record ScanPlan
 
 /// <summary>Where a column (and, for a struct, each member) is stored in the parts.</summary>
 /// <param name="StoredName">The name in the parts; null = the column's own name.</param>
-/// <param name="Members">A struct's members stored under other names or with field ids, by member name.</param>
+/// <param name="Members">A struct's members stored under other names or with field ids, by member name; a list's
+/// elements are the member <c>element</c>, a map's keys and values the members <c>key</c> and <c>value</c>.</param>
 /// <param name="FieldId">The parquet field id the parts store the column under; matching then goes by id, which
 /// survives a rename and a foreign writer's own names.</param>
 public sealed record StoredColumn(string? StoredName, IReadOnlyDictionary<string, StoredColumn>? Members = null,
