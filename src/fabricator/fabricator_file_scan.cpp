@@ -354,17 +354,63 @@ void Trace(const string &message) {
 	}
 }
 
+// ---- reading the plan: a malformed doc is an error that names what is wrong, never a crash ------------------------
+
+[[noreturn]] void PlanError(const string &what) {
+	throw IOException("fabricator file scan: malformed plan from the provider: %s", what);
+}
+
+//! The member if present, checked to be an object; null when absent.
+yyjson_val *PlanObject(yyjson_val *parent, const char *key, const string &where) {
+	auto value = yyjson_obj_get(parent, key);
+	if (value && !yyjson_is_obj(value)) {
+		PlanError(where + "." + key + " must be an object");
+	}
+	return value;
+}
+
+//! A string member, or null when absent; any other type is an error.
+const char *PlanOptionalString(yyjson_val *parent, const char *key, const string &where) {
+	auto value = yyjson_obj_get(parent, key);
+	if (!value || yyjson_is_null(value)) {
+		return nullptr;
+	}
+	if (!yyjson_is_str(value)) {
+		PlanError(where + "." + key + " must be a string");
+	}
+	return yyjson_get_str(value);
+}
+
+//! An integer value (non-negative when `non_negative`); any other type is an error.
+int64_t PlanInteger(yyjson_val *value, const string &what, bool non_negative) {
+	if (!yyjson_is_int(value)) {
+		PlanError(what + " must be an integer");
+	}
+	if (yyjson_is_uint(value) && yyjson_get_uint(value) > uint64_t(NumericLimits<int64_t>::Maximum())) {
+		PlanError(what + " is out of range");
+	}
+	auto result = yyjson_get_sint(value);
+	if (non_negative && result < 0) {
+		PlanError(what + " must not be negative");
+	}
+	return result;
+}
+
 //! Sets a column's stored name (the plan's {"stored": …, "members": {…}}) as its identifier, recursively through
 //! struct members: the reader matches the identifier, the scan still outputs the table's names.
 void ApplyStoredNames(MultiFileColumnDefinition &column, yyjson_val *spec) {
 	if (!spec) {
 		return;
 	}
-	auto stored = yyjson_get_str(yyjson_obj_get(spec, "stored"));
+	auto where = "columns." + column.name.GetIdentifierName();
+	if (!yyjson_is_obj(spec)) {
+		PlanError(where + " must be an object");
+	}
+	auto stored = PlanOptionalString(spec, "stored", where);
 	if (stored) {
 		column.identifier = Value(stored);
 	}
-	auto members = yyjson_obj_get(spec, "members");
+	auto members = PlanObject(spec, "members", where);
 	if (!members) {
 		return;
 	}
@@ -401,30 +447,49 @@ struct YyjsonDoc {
 //! declined or listed no files.
 bool ParsePlan(const YyjsonDoc &doc, FileScanPlan &plan) {
 	auto root = doc.Root();
-	auto declined = yyjson_obj_get(root, "declined");
-	if (declined) {
-		Trace(string("declined: ") + (yyjson_get_str(declined) ? yyjson_get_str(declined) : "?"));
+	if (!yyjson_is_obj(root)) {
+		PlanError("the plan must be an object");
+	}
+	if (yyjson_obj_get(root, "declined")) {
+		auto reason = PlanOptionalString(root, "declined", "plan");
+		Trace(string("declined: ") + (reason ? reason : "?"));
 		return false;
 	}
 	auto rows = yyjson_obj_get(root, "row_count");
 	if (rows) {
-		plan.row_count = yyjson_get_sint(rows);
+		plan.row_count = PlanInteger(rows, "row_count", true);
 	}
 	size_t vi, vmax;
 	yyjson_val *vkey, *vval;
-	yyjson_obj_foreach(yyjson_obj_get(root, "virtual"), vi, vmax, vkey, vval) {
+	yyjson_obj_foreach(PlanObject(root, "virtual", "plan"), vi, vmax, vkey, vval) {
+		auto where = string("virtual.") + yyjson_get_str(vkey);
+		if (!yyjson_is_obj(vval)) {
+			PlanError(where + " must be an object");
+		}
 		VirtualColumnSpec spec;
-		auto stored = yyjson_get_str(yyjson_obj_get(vval, "stored"));
+		auto stored = PlanOptionalString(vval, "stored", where);
 		spec.stored = stored ? stored : "";
-		spec.add_row_number = yyjson_get_bool(yyjson_obj_get(vval, "add_row_number"));
+		auto add = yyjson_obj_get(vval, "add_row_number");
+		if (add && !yyjson_is_bool(add)) {
+			PlanError(where + ".add_row_number must be a boolean");
+		}
+		spec.add_row_number = add && yyjson_get_bool(add);
 		plan.virtual_specs[yyjson_get_str(vkey)] = std::move(spec);
+	}
+	auto files = yyjson_obj_get(root, "files");
+	if (!yyjson_is_arr(files)) {
+		PlanError("files must be an array");
 	}
 	size_t idx, max;
 	yyjson_val *file;
-	yyjson_arr_foreach(yyjson_obj_get(root, "files"), idx, max, file) {
-		auto path = yyjson_get_str(yyjson_obj_get(file, "path"));
-		if (!path) {
-			throw IOException("fabricator file scan: a plan entry without a path");
+	yyjson_arr_foreach(files, idx, max, file) {
+		auto where = "files[" + std::to_string(idx) + "]";
+		if (!yyjson_is_obj(file)) {
+			PlanError(where + " must be an object");
+		}
+		auto path = PlanOptionalString(file, "path", where);
+		if (!path || !*path) {
+			PlanError(where + " has no path");
 		}
 		OpenFileInfo info(path);
 		info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
@@ -433,31 +498,39 @@ bool ParsePlan(const YyjsonDoc &doc, FileScanPlan &plan) {
 		// no validation of a cached copy
 		auto size = yyjson_obj_get(file, "size");
 		if (size) {
-			options["file_size"] = Value::UBIGINT(yyjson_get_uint(size));
+			options["file_size"] = Value::UBIGINT(uint64_t(PlanInteger(size, where + ".size", true)));
 		}
 		options["validate_external_file_cache"] = Value::BOOLEAN(false);
 		options["etag"] = Value("");
 		options["last_modified"] = Value::TIMESTAMP(timestamp_t(0));
 		options[FILE_KEY] = Value::UBIGINT(plan.files.size());
 		vector<int64_t> deleted;
+		auto dv = yyjson_obj_get(file, "dv");
+		if (dv && !yyjson_is_arr(dv)) {
+			PlanError(where + ".dv must be an array");
+		}
 		size_t di, dmax;
 		yyjson_val *pos;
-		yyjson_arr_foreach(yyjson_obj_get(file, "dv"), di, dmax, pos) {
-			deleted.push_back(yyjson_get_sint(pos));
+		yyjson_arr_foreach(dv, di, dmax, pos) {
+			deleted.push_back(PlanInteger(pos, where + ".dv", true));
 		}
 		std::sort(deleted.begin(), deleted.end());
 		case_insensitive_map_t<Value> constants;
 		size_t ci, cmax;
 		yyjson_val *ckey, *cval;
-		yyjson_obj_foreach(yyjson_obj_get(file, "constants"), ci, cmax, ckey, cval) {
+		yyjson_obj_foreach(PlanObject(file, "constants", where), ci, cmax, ckey, cval) {
+			if (!yyjson_is_null(cval) && !yyjson_is_str(cval)) {
+				PlanError(where + ".constants." + yyjson_get_str(ckey) + " must be a string or null");
+			}
 			constants[yyjson_get_str(ckey)] = yyjson_is_null(cval) ? Value() : Value(yyjson_get_str(cval));
 		}
 		case_insensitive_map_t<Value> virtual_values;
 		size_t fi, fmax;
 		yyjson_val *fkey, *fval;
-		yyjson_obj_foreach(yyjson_obj_get(file, "virtual"), fi, fmax, fkey, fval) {
+		yyjson_obj_foreach(PlanObject(file, "virtual", where), fi, fmax, fkey, fval) {
 			virtual_values[yyjson_get_str(fkey)] =
-			    yyjson_is_null(fval) ? Value() : Value::BIGINT(yyjson_get_sint(fval));
+			    yyjson_is_null(fval) ? Value()
+			                         : Value::BIGINT(PlanInteger(fval, where + ".virtual." + yyjson_get_str(fkey), false));
 		}
 		plan.files.push_back(std::move(info));
 		plan.deleted.push_back(std::move(deleted));
@@ -517,7 +590,7 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	plan->table = &table;
 	plan->at_unit = at_unit;
 	plan->at_value = at_value;
-	auto column_specs = yyjson_obj_get(doc.Root(), "columns");
+	auto column_specs = PlanObject(doc.Root(), "columns", "plan");
 	for (auto &column : table.GetColumns().Logical()) {
 		auto definition = MultiFileColumnDefinition::CreateFromNameAndType(column.Name(), column.Type());
 		SetNullDefaults(definition);
@@ -535,8 +608,17 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 				throw IOException("fabricator file scan: a constant for an unknown column '%s'", constant.first);
 			}
 			auto &column = logical_columns.GetColumn(Identifier(constant.first));
-			typed[column.Logical().index] =
-			    constant.second.IsNull() ? Value(column.Type()) : constant.second.DefaultCastAs(column.Type());
+			Value value(column.Type());
+			if (!constant.second.IsNull()) {
+				string error;
+				auto cast = constant.second.DefaultTryCastAs(column.Type(), &error);
+				if (!cast) {
+					PlanError("the constant '" + constant.second.ToString() + "' for column '" + constant.first +
+					          "' is not a " + column.Type().ToString() + (error.empty() ? "" : ": " + error));
+				}
+				value = std::move(*cast);
+			}
+			typed[column.Logical().index] = std::move(value);
 		}
 		plan->constants.push_back(std::move(typed));
 	}
