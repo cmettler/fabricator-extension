@@ -1249,13 +1249,19 @@ typedef struct FabricatorVTable {
 
 	// -------------------------------------------------------------------------
 	// The data files a table's scan would read — ABI v101, on the table session. ONE JSON doc in *out_json (host
-	// frees via free_error): {"version":V,"files":[{"path":"…","rowid_base":B,"size":S,"dv":[p,…]}…]}, or
-	// {"declined":"…"} when the table cannot be read that way. The host then plans the scan as DuckDB's own
-	// parquet reader over exactly these files (src/fabricator/fabricator_file_scan.cpp): "dv" are the deleted
-	// row positions of a file (sorted), "rowid_base" the row id of its first row (the row id is rowid_base +
-	// file_row_number), "size" its byte size when known. ⚠ The plan REPLACES the scan, so it must describe the
-	// snapshot the scan would read (the same pin) with nothing pending in the transaction — a provider declines
-	// otherwise. at_unit/at_value carry the scan's AT clause ("" = none).
+	// frees via free_error), or {"declined":"…"} when the table cannot be read that way. The host then reads exactly
+	// these files with DuckDB's own parquet reader (src/fabricator/fabricator_file_scan.cpp). FORMAT-NEUTRAL: the
+	// host knows nothing of Delta or Iceberg, the plan states everything:
+	//   {"row_count": N,                                   live rows (optional; the optimizer's cardinality)
+	//    "columns": {"<col>": {"stored": "<name in the files>", "members": {"<member>": {…}}}},  (optional)
+	//    "virtual": {"<virtual column>": {"stored": "<column in the files>", "add_row_number": true}},
+	//    "files": [{"path": "…", "size": S, "dv": [<deleted row positions>],
+	//               "constants": {"<col>": "<text>"|null},   a column the files lack (a partition value)
+	//               "virtual": {"<virtual column>": <int>|null}}]}
+	// A virtual column (one the table entry declares, e.g. rowid) reads COALESCE(the file's `stored` column, the
+	// file's value [+ file_row_number]); a constant's text is cast to the column type. ⚠ The plan REPLACES the scan,
+	// so it must describe the snapshot the scan would read (the same pin) with nothing pending in the transaction —
+	// a provider declines otherwise. at_unit/at_value carry the scan's AT clause ("" = none).
 	// -------------------------------------------------------------------------
 	int32_t (*table_file_plan)(FabricatorHandle table, const char *at_unit, const char *at_value, char **out_json,
 	                           char **err);

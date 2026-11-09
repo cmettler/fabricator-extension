@@ -14,7 +14,6 @@
 
 #include "fabricator/fabricator_file_scan.hpp"
 
-#include "fabricator/arrow_ingest.hpp" // ProviderVirtualBase
 #include "fabricator/clr_host.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -48,35 +47,37 @@ using namespace duckdb;
 
 namespace {
 
-//! Keys on each file's extended info: the index of its deleted positions in the plan, and its first row's row id.
+//! The key on each file's extended info: its index in the plan (deleted rows, constants, virtual values).
 constexpr const char *FILE_KEY = "fabricator_file";
-constexpr const char *ROWID_BASE_KEY = "fabricator_rowid_base";
-//! Row tracking per file: the first row's stable row id, and the default commit version (absent = unknown).
-constexpr const char *BASE_ROW_ID_KEY = "fabricator_base_row_id";
-constexpr const char *COMMIT_VERSION_KEY = "fabricator_commit_version";
-//! The provider's row-tracking virtual columns, by the names the table entry declares them under.
-constexpr const char *ROW_ID_VIRTUAL = "__delta_row_id";
-constexpr const char *ROW_VERSION_VIRTUAL = "__delta_row_commit_version";
 
-//! The plan, owned by the scan function (function_info) for the scan's life.
+//! How a virtual column is computed (the plan's "virtual"): the file's own column where it stores one and the row's
+//! value there is not NULL, else the file's value — plus file_row_number when `add_row_number` — else NULL.
+struct VirtualColumnSpec {
+	string stored;
+	bool add_row_number = false;
+};
+
+//! The plan, owned by the scan function (function_info) for the scan's life. Nothing in it is format-specific: the
+//! provider states files, deleted rows, constants, identifiers and virtual values; this reader only applies them.
 struct FileScanPlan : public TableFunctionInfo {
 	vector<OpenFileInfo> files;
 	//! per file (by FILE_KEY), the deleted row positions, sorted; empty = none
 	vector<vector<int64_t>> deleted;
-	//! per file (by FILE_KEY), its partition values as the log states them (text; NULL = a null partition)
-	vector<case_insensitive_map_t<Value>> partition_text;
-	//! per file, the partition values cast to their columns' types, by column index (filled at bind)
-	vector<unordered_map<idx_t, Value>> partition_values;
-	//! the table's columns, in order — the scan's schema; files are mapped onto it BY NAME
+	//! per file, column constants as the plan states them (text; NULL = the column is NULL for the whole file)
+	vector<case_insensitive_map_t<Value>> constant_text;
+	//! per file, the constants cast to their columns' types, by column index (filled at bind)
+	vector<unordered_map<idx_t, Value>> constants;
+	//! per file, each virtual column's value (BIGINT; NULL = none)
+	vector<case_insensitive_map_t<Value>> virtual_values;
+	//! the virtual columns the plan computes, by name
+	case_insensitive_map_t<VirtualColumnSpec> virtual_specs;
+	//! the table's columns, in order — the scan's schema; files are mapped onto it BY NAME (identifier = stored name)
 	vector<MultiFileColumnDefinition> columns;
 	optional_ptr<TableCatalogEntry> table;
-	//! the table's virtual columns (rowid, provider columns) plus the reader's own (filename, file_row_number)
+	//! the table's virtual columns plus the reader's own (filename, file_row_number)
 	virtual_column_map_t virtual_columns;
 	//! the live row count the provider reported (-1 = unknown)
 	int64_t row_count = -1;
-	//! the stored names of the materialized row-tracking columns (a file's value wins where non-NULL)
-	string row_id_column;
-	string row_version_column;
 	//! the AT clause the scan was bound with ("" = latest)
 	string at_unit;
 	string at_value;
@@ -112,15 +113,30 @@ private:
 	const vector<int64_t> &deleted; // owned by the plan, which outlives every reader of the scan
 };
 
-optional_idx ExtendedIndex(const OpenFileInfo &file, const char *key) {
-	if (!file.extended_info) {
-		return optional_idx();
+idx_t FileIndex(const OpenFileInfo &file, const FileScanPlan &plan) {
+	if (file.extended_info) {
+		auto entry = file.extended_info->options.find(FILE_KEY);
+		if (entry != file.extended_info->options.end()) {
+			auto index = entry->second.GetValue<uint64_t>();
+			if (index < plan.files.size()) {
+				return index;
+			}
+		}
 	}
-	auto entry = file.extended_info->options.find(key);
-	if (entry == file.extended_info->options.end()) {
-		return optional_idx();
+	throw InternalException("fabricator file scan: a file without its plan entry");
+}
+
+unique_ptr<Expression> AddRowNumber(ClientContext &context, Value value, const LogicalType &type, idx_t ref) {
+	vector<unique_ptr<Expression>> children;
+	children.push_back(make_uniq<BoundConstantExpression>(std::move(value)));
+	children.push_back(make_uniq<BoundReferenceExpression>(type, ref));
+	FunctionBinder binder(context);
+	ErrorData error;
+	auto sum = binder.BindScalarFunction(Identifier::DefaultSchema(), "+", std::move(children), error, true, nullptr);
+	if (error.HasError()) {
+		error.Throw();
 	}
-	return optional_idx(entry->second.GetValue<uint64_t>());
+	return sum;
 }
 
 struct FabricatorFileScanReader : public MultiFileReader {
@@ -169,26 +185,23 @@ struct FabricatorFileScanReader : public MultiFileReader {
 		if (!reader_data.reader) {
 			return;
 		}
-		auto index = ExtendedIndex(reader_data.reader->file, FILE_KEY);
-		if (!index.IsValid() || index.GetIndex() >= plan->deleted.size()) {
-			throw InternalException("fabricator file scan: a file without its plan entry");
-		}
+		auto index = FileIndex(reader_data.reader->file, *plan);
 		RefuseZoneDependentCasts(*reader_data.reader, global_columns);
-		auto &deleted = plan->deleted[index.GetIndex()];
+		auto &deleted = plan->deleted[index];
 		if (!deleted.empty()) {
 			reader_data.reader->deletion_filter = make_uniq<DeletedRowsFilter>(deleted);
 		}
-		// partition columns are not in the files: the file's value from the log, as a constant (a NULL partition
-		// adds nothing — the column is absent from the file, so it reads its NULL default)
-		auto &partition = plan->partition_values[index.GetIndex()];
-		if (!partition.empty()) {
+		// a column the plan states per file (a partition value): a constant of this file's read. A NULL constant adds
+		// nothing — the column is absent from the file, so it reads its NULL default.
+		auto &constants = plan->constants[index];
+		if (!constants.empty()) {
 			for (idx_t i = 0; i < global_column_ids.size(); i++) {
 				auto &id = global_column_ids[i];
 				if (id.IsVirtualColumn()) {
 					continue;
 				}
-				auto value = partition.find(id.GetPrimaryIndex());
-				if (value != partition.end() && !value->second.IsNull()) {
+				auto value = constants.find(id.GetPrimaryIndex());
+				if (value != constants.end() && !value->second.IsNull()) {
 					reader_data.constant_map.Add(MultiFileGlobalIndex(i), value->second);
 				}
 			}
@@ -197,8 +210,8 @@ struct FabricatorFileScanReader : public MultiFileReader {
 
 	//! A file whose timestamp column is naive where the table's is UTC-adjusted (or the reverse) — a DuckLake 'utc'
 	//! mirror, Spark INT96 — would be cast by the reader in the SESSION's time zone, and its filters too, before this
-	//! reader can intervene: a shifted value with no error. The native reader casts as UTC; until this one can, it
-	//! refuses such a file loudly.
+	//! reader can intervene: a shifted value with no error. Until a plan can say how to convert, such a file is
+	//! refused loudly.
 	static void RefuseZoneDependentCasts(const BaseFileReader &reader,
 	                                     const vector<MultiFileColumnDefinition> &global_columns) {
 		auto is_timestamp = [](const LogicalType &type) {
@@ -227,7 +240,7 @@ struct FabricatorFileScanReader : public MultiFileReader {
 				if (global_zoned != local_zoned) {
 					throw IOException("fabricator file scan: '%s' stores column '%s' as %s where the table declares %s; "
 					                  "the file scan cannot convert it independently of the session time zone yet "
-					                  "(set FABRICATOR_FILE_SCAN=0 for this table)",
+					                  "(SET fabricator_file_scan = false)",
 					                  reader.file.path, name, local.type.ToString(), global.type.ToString());
 				}
 			}
@@ -239,93 +252,66 @@ struct FabricatorFileScanReader : public MultiFileReader {
 	                                                               const vector<MultiFileColumnDefinition> &local_columns,
 	                                                               const idx_t column_id, const LogicalType &type,
 	                                                               MultiFileLocalIndex local_idx) override {
-		if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
-			// the provider's row id: the file's first row id + the row's position in the file
-			auto base = ExtendedIndex(reader_data.file_to_be_opened, ROWID_BASE_KEY);
-			if (!base.IsValid()) {
-				throw InternalException("fabricator file scan: a file without its row id base");
+		auto column = plan->virtual_columns.find(column_id);
+		if (column != plan->virtual_columns.end()) {
+			auto name = column->second.name.GetIdentifierName();
+			auto spec = plan->virtual_specs.find(name);
+			if (spec != plan->virtual_specs.end()) {
+				return VirtualBinding(context, reader_data, local_columns, name, spec->second, type, local_idx);
 			}
-			vector<unique_ptr<Expression>> children;
-			children.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(base.GetIndex()))));
-			children.push_back(make_uniq<BoundReferenceExpression>(type, local_idx.GetIndex()));
-			FunctionBinder binder(context);
-			ErrorData error;
-			auto sum = binder.BindScalarFunction(Identifier::DefaultSchema(), "+", std::move(children), error, true,
-			                                     nullptr);
-			if (error.HasError()) {
-				error.Throw();
+			if (column_id != COLUMN_IDENTIFIER_FILENAME && column_id != COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+				throw NotImplementedException("fabricator file scan: the plan does not compute the virtual column '%s'",
+				                              name);
 			}
-			vector<idx_t> column_ids {COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
-			return MultiFileReaderVirtualColumnBinding(std::move(sum), std::move(column_ids));
-		}
-		auto virtual_column = plan->virtual_columns.find(column_id);
-		if (column_id >= ProviderVirtualBase() && virtual_column != plan->virtual_columns.end()) {
-			return RowTrackingBinding(context, reader_data, local_columns,
-			                          virtual_column->second.name.GetIdentifierName(), type, local_idx);
 		}
 		return MultiFileReader::GetVirtualColumnExpression(context, reader_data, local_columns, column_id, type,
 		                                                   local_idx);
 	}
 
-	//! A row-tracking column, as DeltaNativeReader.RowTrackingExpr: COALESCE(the materialized column, the derived
-	//! value) where the file stores one, else the derived value — base_row_id + file_row_number for the id, the
-	//! file's default commit version for the version — else NULL.
-	MultiFileReaderVirtualColumnBinding RowTrackingBinding(ClientContext &context, MultiFileReaderData &reader_data,
-	                                                      const vector<MultiFileColumnDefinition> &local_columns,
-	                                                      const string &name, const LogicalType &type,
-	                                                      MultiFileLocalIndex local_idx) {
-		const bool is_id = name == ROW_ID_VIRTUAL;
-		if (!is_id && name != ROW_VERSION_VIRTUAL) {
-			throw NotImplementedException("fabricator file scan: the virtual column '%s' is not read by the file scan",
-			                              name);
+	//! COALESCE(the file's own column `stored`, the file's value [+ file_row_number]), the parts that exist; NULL
+	//! when neither does.
+	MultiFileReaderVirtualColumnBinding VirtualBinding(ClientContext &context, MultiFileReaderData &reader_data,
+	                                                  const vector<MultiFileColumnDefinition> &local_columns,
+	                                                  const string &name, const VirtualColumnSpec &spec,
+	                                                  const LogicalType &type, MultiFileLocalIndex local_idx) {
+		auto index = FileIndex(reader_data.file_to_be_opened, *plan);
+		Value value;
+		auto entry = plan->virtual_values[index].find(name);
+		if (entry != plan->virtual_values[index].end()) {
+			value = entry->second.DefaultCastAs(type);
 		}
-		auto &file = reader_data.file_to_be_opened;
-		auto derived_value = ExtendedIndex(file, is_id ? BASE_ROW_ID_KEY : COMMIT_VERSION_KEY);
-		const string &stored = is_id ? plan->row_id_column : plan->row_version_column;
-		optional_idx materialized;
-		for (idx_t i = 0; i < local_columns.size(); i++) {
-			if (local_columns[i].name.GetIdentifierName() == stored) {
-				materialized = i;
-				break;
+		optional_idx stored;
+		if (!spec.stored.empty()) {
+			for (idx_t i = 0; i < local_columns.size(); i++) {
+				if (local_columns[i].name.GetIdentifierName() == spec.stored) {
+					stored = i;
+					break;
+				}
 			}
 		}
-		// the derived expression; `ref` = where file_row_number lands among the binding's columns
+		// the file's value; `ref` = where file_row_number lands among the binding's columns
 		auto derived = [&](idx_t ref) -> unique_ptr<Expression> {
-			auto value = make_uniq<BoundConstantExpression>(Value::BIGINT(int64_t(derived_value.GetIndex())));
-			if (!is_id) {
-				return std::move(value);
+			if (spec.add_row_number) {
+				return AddRowNumber(context, value, type, ref);
 			}
-			vector<unique_ptr<Expression>> children;
-			children.push_back(std::move(value));
-			children.push_back(make_uniq<BoundReferenceExpression>(type, ref));
-			FunctionBinder binder(context);
-			ErrorData error;
-			auto sum = binder.BindScalarFunction(Identifier::DefaultSchema(), "+", std::move(children), error, true,
-			                                     nullptr);
-			if (error.HasError()) {
-				error.Throw();
-			}
-			return sum;
+			return make_uniq<BoundConstantExpression>(value);
 		};
-		if (materialized.IsValid()) {
-			vector<idx_t> column_ids {materialized.GetIndex()};
-			if (!derived_value.IsValid()) {
+		if (stored.IsValid()) {
+			vector<idx_t> column_ids {stored.GetIndex()};
+			if (value.IsNull()) {
 				return MultiFileReaderVirtualColumnBinding(
 				    make_uniq<BoundReferenceExpression>(type, local_idx.GetIndex()), std::move(column_ids));
 			}
 			auto coalesce = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE, type);
 			coalesce->GetChildrenMutable().push_back(make_uniq<BoundReferenceExpression>(type, local_idx.GetIndex()));
-			if (is_id) {
+			if (spec.add_row_number) {
 				column_ids.push_back(COLUMN_IDENTIFIER_FILE_ROW_NUMBER);
 			}
 			coalesce->GetChildrenMutable().push_back(derived(local_idx.GetIndex() + 1));
 			return MultiFileReaderVirtualColumnBinding(std::move(coalesce), std::move(column_ids));
 		}
-		if (!derived_value.IsValid()) {
-			return MultiFileReaderVirtualColumnBinding(Value(type));
-		}
-		if (!is_id) {
-			return MultiFileReaderVirtualColumnBinding(Value::BIGINT(int64_t(derived_value.GetIndex())));
+		if (value.IsNull() || !spec.add_row_number) {
+			return MultiFileReaderVirtualColumnBinding(value.IsNull() ? Value(type) : value);
 		}
 		vector<idx_t> column_ids {COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
 		return MultiFileReaderVirtualColumnBinding(derived(local_idx.GetIndex()), std::move(column_ids));
@@ -368,110 +354,23 @@ void Trace(const string &message) {
 	}
 }
 
-//! Sets the stored (physical) names of a mapped struct's members as their identifiers, recursively, from the
-//! plan's {"member": {"p": "…", "c": {…}}} tree.
-void ApplyPhysicalMembers(MultiFileColumnDefinition &column, yyjson_val *members) {
+//! Sets a column's stored name (the plan's {"stored": …, "members": {…}}) as its identifier, recursively through
+//! struct members: the reader matches the identifier, the scan still outputs the table's names.
+void ApplyStoredNames(MultiFileColumnDefinition &column, yyjson_val *spec) {
+	if (!spec) {
+		return;
+	}
+	auto stored = yyjson_get_str(yyjson_obj_get(spec, "stored"));
+	if (stored) {
+		column.identifier = Value(stored);
+	}
+	auto members = yyjson_obj_get(spec, "members");
 	if (!members) {
 		return;
 	}
 	for (auto &child : column.children) {
-		auto entry = yyjson_obj_get(members, child.name.GetIdentifierName().c_str());
-		if (!entry) {
-			continue;
-		}
-		auto stored = yyjson_get_str(yyjson_obj_get(entry, "p"));
-		if (stored) {
-			child.identifier = Value(stored);
-		}
-		ApplyPhysicalMembers(child, yyjson_obj_get(entry, "c"));
+		ApplyStoredNames(child, yyjson_obj_get(members, child.name.GetIdentifierName().c_str()));
 	}
-}
-
-//! Parses the plan JSON; false (with the reason traced) when the provider declined or the plan is empty.
-//! `physical` receives the name each column is stored under, where it differs (Delta column mapping 'name');
-//! `members` the stored names of struct members, as JSON (owned by the returned doc, freed by the caller).
-bool ParsePlan(const string &json, FileScanPlan &plan, case_insensitive_map_t<string> &physical) {
-	auto doc = yyjson_read(json.data(), json.size(), 0);
-	if (!doc) {
-		throw IOException("fabricator file scan: the provider's plan is not JSON");
-	}
-	auto root = yyjson_doc_get_root(doc);
-	auto declined = yyjson_obj_get(root, "declined");
-	if (declined) {
-		Trace(string("declined: ") + (yyjson_get_str(declined) ? yyjson_get_str(declined) : "?"));
-		yyjson_doc_free(doc);
-		return false;
-	}
-	auto row_id_column = yyjson_get_str(yyjson_obj_get(root, "row_id_column"));
-	auto row_version_column = yyjson_get_str(yyjson_obj_get(root, "row_version_column"));
-	plan.row_id_column = row_id_column ? row_id_column : "";
-	plan.row_version_column = row_version_column ? row_version_column : "";
-	auto rows = yyjson_obj_get(root, "row_count");
-	if (rows) {
-		plan.row_count = yyjson_get_sint(rows);
-	}
-	auto mapping = yyjson_obj_get(root, "physical");
-	size_t mi, mmax;
-	yyjson_val *key, *val;
-	yyjson_obj_foreach(mapping, mi, mmax, key, val) {
-		physical[yyjson_get_str(key)] = yyjson_get_str(val);
-	}
-	auto files = yyjson_obj_get(root, "files");
-	size_t idx, max;
-	yyjson_val *file;
-	yyjson_arr_foreach(files, idx, max, file) {
-		auto path = yyjson_get_str(yyjson_obj_get(file, "path"));
-		auto base = yyjson_obj_get(file, "rowid_base");
-		if (!path || !base) {
-			yyjson_doc_free(doc);
-			throw IOException("fabricator file scan: a plan entry without path or rowid_base");
-		}
-		OpenFileInfo info(path);
-		info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-		auto &options = info.extended_info->options;
-		// data files are immutable (Delta never rewrites one in place): the size from the log, no validation
-		auto size = yyjson_obj_get(file, "size");
-		if (size) {
-			options["file_size"] = Value::UBIGINT(yyjson_get_uint(size));
-		}
-		options["validate_external_file_cache"] = Value::BOOLEAN(false);
-		options["etag"] = Value("");
-		options["last_modified"] = Value::TIMESTAMP(timestamp_t(0));
-		options[FILE_KEY] = Value::UBIGINT(plan.files.size());
-		options[ROWID_BASE_KEY] = Value::UBIGINT(yyjson_get_uint(base));
-		auto base_row_id = yyjson_obj_get(file, "base_row_id");
-		if (base_row_id) {
-			options[BASE_ROW_ID_KEY] = Value::UBIGINT(yyjson_get_uint(base_row_id));
-		}
-		auto commit_version = yyjson_obj_get(file, "commit_version");
-		if (commit_version) {
-			options[COMMIT_VERSION_KEY] = Value::UBIGINT(yyjson_get_uint(commit_version));
-		}
-		vector<int64_t> deleted;
-		auto dv = yyjson_obj_get(file, "dv");
-		size_t di, dmax;
-		yyjson_val *pos;
-		yyjson_arr_foreach(dv, di, dmax, pos) {
-			deleted.push_back(yyjson_get_sint(pos));
-		}
-		std::sort(deleted.begin(), deleted.end());
-		case_insensitive_map_t<Value> partition;
-		auto values = yyjson_obj_get(file, "partition");
-		size_t pi, pmax;
-		yyjson_val *pkey, *pval;
-		yyjson_obj_foreach(values, pi, pmax, pkey, pval) {
-			partition[yyjson_get_str(pkey)] = yyjson_is_null(pval) ? Value() : Value(yyjson_get_str(pval));
-		}
-		plan.files.push_back(std::move(info));
-		plan.deleted.push_back(std::move(deleted));
-		plan.partition_text.push_back(std::move(partition));
-	}
-	yyjson_doc_free(doc);
-	if (plan.files.empty()) {
-		Trace("declined: no files");
-		return false;
-	}
-	return true;
 }
 
 //! A member a file lacks (added to a struct later) reads NULL, at every depth.
@@ -480,6 +379,96 @@ void SetNullDefaults(MultiFileColumnDefinition &column) {
 	for (auto &child : column.children) {
 		SetNullDefaults(child);
 	}
+}
+
+//! Frees a yyjson document at scope exit.
+struct YyjsonDoc {
+	explicit YyjsonDoc(const string &json) : doc(yyjson_read(json.data(), json.size(), 0)) {
+		if (!doc) {
+			throw IOException("fabricator file scan: the provider's plan is not JSON");
+		}
+	}
+	~YyjsonDoc() {
+		yyjson_doc_free(doc);
+	}
+	yyjson_val *Root() const {
+		return yyjson_doc_get_root(doc);
+	}
+	yyjson_doc *doc;
+};
+
+//! Reads the plan (see abi.h table_file_plan) into `plan`; false (with the reason traced) when the provider
+//! declined or listed no files.
+bool ParsePlan(const YyjsonDoc &doc, FileScanPlan &plan) {
+	auto root = doc.Root();
+	auto declined = yyjson_obj_get(root, "declined");
+	if (declined) {
+		Trace(string("declined: ") + (yyjson_get_str(declined) ? yyjson_get_str(declined) : "?"));
+		return false;
+	}
+	auto rows = yyjson_obj_get(root, "row_count");
+	if (rows) {
+		plan.row_count = yyjson_get_sint(rows);
+	}
+	size_t vi, vmax;
+	yyjson_val *vkey, *vval;
+	yyjson_obj_foreach(yyjson_obj_get(root, "virtual"), vi, vmax, vkey, vval) {
+		VirtualColumnSpec spec;
+		auto stored = yyjson_get_str(yyjson_obj_get(vval, "stored"));
+		spec.stored = stored ? stored : "";
+		spec.add_row_number = yyjson_get_bool(yyjson_obj_get(vval, "add_row_number"));
+		plan.virtual_specs[yyjson_get_str(vkey)] = std::move(spec);
+	}
+	size_t idx, max;
+	yyjson_val *file;
+	yyjson_arr_foreach(yyjson_obj_get(root, "files"), idx, max, file) {
+		auto path = yyjson_get_str(yyjson_obj_get(file, "path"));
+		if (!path) {
+			throw IOException("fabricator file scan: a plan entry without a path");
+		}
+		OpenFileInfo info(path);
+		info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+		auto &options = info.extended_info->options;
+		// a planned file is immutable (Delta and Iceberg never rewrite one in place): its size from the plan,
+		// no validation of a cached copy
+		auto size = yyjson_obj_get(file, "size");
+		if (size) {
+			options["file_size"] = Value::UBIGINT(yyjson_get_uint(size));
+		}
+		options["validate_external_file_cache"] = Value::BOOLEAN(false);
+		options["etag"] = Value("");
+		options["last_modified"] = Value::TIMESTAMP(timestamp_t(0));
+		options[FILE_KEY] = Value::UBIGINT(plan.files.size());
+		vector<int64_t> deleted;
+		size_t di, dmax;
+		yyjson_val *pos;
+		yyjson_arr_foreach(yyjson_obj_get(file, "dv"), di, dmax, pos) {
+			deleted.push_back(yyjson_get_sint(pos));
+		}
+		std::sort(deleted.begin(), deleted.end());
+		case_insensitive_map_t<Value> constants;
+		size_t ci, cmax;
+		yyjson_val *ckey, *cval;
+		yyjson_obj_foreach(yyjson_obj_get(file, "constants"), ci, cmax, ckey, cval) {
+			constants[yyjson_get_str(ckey)] = yyjson_is_null(cval) ? Value() : Value(yyjson_get_str(cval));
+		}
+		case_insensitive_map_t<Value> virtual_values;
+		size_t fi, fmax;
+		yyjson_val *fkey, *fval;
+		yyjson_obj_foreach(yyjson_obj_get(file, "virtual"), fi, fmax, fkey, fval) {
+			virtual_values[yyjson_get_str(fkey)] =
+			    yyjson_is_null(fval) ? Value() : Value::BIGINT(yyjson_get_sint(fval));
+		}
+		plan.files.push_back(std::move(info));
+		plan.deleted.push_back(std::move(deleted));
+		plan.constant_text.push_back(std::move(constants));
+		plan.virtual_values.push_back(std::move(virtual_values));
+	}
+	if (plan.files.empty()) {
+		Trace("declined: no files");
+		return false;
+	}
+	return true;
 }
 
 } // namespace
@@ -505,9 +494,8 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
                       const std::string &at_unit, const std::string &at_value, unique_ptr<FunctionData> &bind_data,
                       TableFunction &result) {
 	auto plan = make_shared_ptr<FileScanPlan>();
-	case_insensitive_map_t<string> physical;
-	auto plan_json = TableFilePlan(table_handle, at_unit, at_value);
-	if (!ParsePlan(plan_json, *plan, physical)) {
+	YyjsonDoc doc(TableFilePlan(table_handle, at_unit, at_value));
+	if (!ParsePlan(doc, *plan)) {
 		return false;
 	}
 
@@ -529,37 +517,28 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	plan->table = &table;
 	plan->at_unit = at_unit;
 	plan->at_value = at_value;
-	auto members_doc = yyjson_read(plan_json.data(), plan_json.size(), 0);
-	auto members = members_doc ? yyjson_obj_get(yyjson_doc_get_root(members_doc), "physical_members") : nullptr;
+	auto column_specs = yyjson_obj_get(doc.Root(), "columns");
 	for (auto &column : table.GetColumns().Logical()) {
 		auto definition = MultiFileColumnDefinition::CreateFromNameAndType(column.Name(), column.Type());
 		SetNullDefaults(definition);
-		// stored under another name: the reader matches the identifier, the scan still outputs the logical name
-		auto stored = physical.find(column.Name().GetIdentifierName());
-		if (stored != physical.end()) {
-			definition.identifier = Value(stored->second);
-		}
-		if (members) {
-			ApplyPhysicalMembers(definition, yyjson_obj_get(members, column.Name().GetIdentifierName().c_str()));
+		if (column_specs) {
+			ApplyStoredNames(definition, yyjson_obj_get(column_specs, column.Name().GetIdentifierName().c_str()));
 		}
 		plan->columns.push_back(std::move(definition));
 	}
-	if (members_doc) {
-		yyjson_doc_free(members_doc);
-	}
-	// partition values, typed: the log's text cast to the column type, as the native reader's literals are
+	// the per-file constants, typed: the plan's text cast to the column type
 	auto &logical_columns = table.GetColumns();
-	for (auto &partition : plan->partition_text) {
+	for (auto &file_constants : plan->constant_text) {
 		unordered_map<idx_t, Value> typed;
-		for (auto &entry : partition) {
-			if (!logical_columns.ColumnExists(Identifier(entry.first))) {
-				throw IOException("fabricator file scan: a partition value for an unknown column '%s'", entry.first);
+		for (auto &constant : file_constants) {
+			if (!logical_columns.ColumnExists(Identifier(constant.first))) {
+				throw IOException("fabricator file scan: a constant for an unknown column '%s'", constant.first);
 			}
-			auto &column = logical_columns.GetColumn(Identifier(entry.first));
+			auto &column = logical_columns.GetColumn(Identifier(constant.first));
 			typed[column.Logical().index] =
-			    entry.second.IsNull() ? Value(column.Type()) : entry.second.DefaultCastAs(column.Type());
+			    constant.second.IsNull() ? Value(column.Type()) : constant.second.DefaultCastAs(column.Type());
 		}
-		plan->partition_values.push_back(std::move(typed));
+		plan->constants.push_back(std::move(typed));
 	}
 	plan->virtual_columns = table.GetVirtualColumns();
 	plan->virtual_columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
@@ -570,7 +549,8 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	TableFunction function = *parquet;
 	function.get_multi_file_reader = FabricatorFileScanReader::CreateInstance;
 	function.function_info = plan;
-	// a copy of this plan cannot be rebuilt from parquet_scan's serialized form (it would read the placeholder path)
+	// a copy of this plan cannot be rebuilt from parquet_scan's serialized form (it would read the placeholder path);
+	// the caller installs its own pair, which rebuilds through the catalog entry
 	function.serialize = nullptr;
 	function.deserialize = nullptr;
 	// parquet's own statistics and partition stats read the files' footers, which know nothing of deleted rows

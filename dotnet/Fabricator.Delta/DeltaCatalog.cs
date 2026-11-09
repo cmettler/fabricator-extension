@@ -495,33 +495,34 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         {
             json.WriteStartObject();
             json.WriteNumber("version", listing.Version);
-            // row tracking: the stored names of the materialized row id / commit version (a file's value wins where
-            // non-NULL), else base_row_id + file_row_number / commit_version per file (as DeltaNativeReader.RowTrackingExpr)
-            json.WriteString("row_id_column", listing.MaterializedRowIdName);
-            json.WriteString("row_version_column", listing.MaterializedRowCommitVersionName);
-            if (listing.LogicalToPhysical is { } physical)
+            // where each column is stored, when it is not under its own name (column mapping 'name'), struct members too
+            if (listing.LogicalToPhysical is not null || listing.MappedSchema is not null)
             {
-                json.WriteStartObject("physical");
-                foreach (var pair in physical)
+                json.WriteStartObject("columns");
+                var fields = (listing.MappedSchema ?? listing.TableSchema)?.Fields
+                             ?? (IReadOnlyList<EngineeredWood.DeltaLake.Schema.StructField>)System.Array.Empty<EngineeredWood.DeltaLake.Schema.StructField>();
+                foreach (var field in fields)
                 {
-                    json.WriteString(pair.Key, pair.Value);
+                    json.WritePropertyName(field.Name);
+                    WriteStoredNames(json, field, listing.LogicalToPhysical?.GetValueOrDefault(field.Name));
                 }
                 json.WriteEndObject();
             }
-            if (listing.MappedSchema is { } mappedSchema)
-            {
-                // struct members are stored under physical names as well: {"col": {"member": {"p": "col-…", "c": {…}}}}
-                json.WriteStartObject("physical_members");
-                foreach (var field in mappedSchema.Fields)
-                {
-                    if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
-                    {
-                        json.WritePropertyName(field.Name);
-                        WritePhysicalMembers(json, s);
-                    }
-                }
-                json.WriteEndObject();
-            }
+            // the virtual columns the host computes per file: the row id (the file's first row id + file_row_number,
+            // engineered-wood's encoding) and row tracking (the materialized column where a file stores one and the row
+            // has a value, else baseRowId + file_row_number / the default commit version — DeltaNativeReader.RowTrackingExpr)
+            json.WriteStartObject("virtual");
+            json.WriteStartObject("rowid");
+            json.WriteBoolean("add_row_number", true);
+            json.WriteEndObject();
+            json.WriteStartObject(DeltaNativeReader.RowTrackingIdColumn);
+            json.WriteString("stored", listing.MaterializedRowIdName);
+            json.WriteBoolean("add_row_number", true);
+            json.WriteEndObject();
+            json.WriteStartObject(DeltaNativeReader.RowTrackingVersionColumn);
+            json.WriteString("stored", listing.MaterializedRowCommitVersionName);
+            json.WriteEndObject();
+            json.WriteEndObject();
             // the live row count from the log (records minus deleted), when every file states its records: the
             // optimizer's cardinality — parquet's own estimate is switched off, it would count deleted rows
             long rows = 0;
@@ -551,15 +552,14 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 }
                 json.WriteStartObject();
                 json.WriteString("path", f.Uri);
-                // the row id of the file's first row: the host adds file_row_number (engineered-wood owns the encoding)
-                json.WriteNumber("rowid_base", TransientRowAddress.Pack(f.Ordinal, 0));
                 if (f.SizeBytes is { } size && size > 0)
                 {
                     json.WriteNumber("size", size);
                 }
+                // partition columns are not in the data files: the file's values from the log, as constants
                 if (listing.PartitionColumns.Count > 0)
                 {
-                    json.WriteStartObject("partition");
+                    json.WriteStartObject("constants");
                     foreach (var column in listing.PartitionColumns)
                     {
                         string stored = listing.LogicalToPhysical?.GetValueOrDefault(column) ?? column;
@@ -574,14 +574,17 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     }
                     json.WriteEndObject();
                 }
+                json.WriteStartObject("virtual");
+                json.WriteNumber("rowid", TransientRowAddress.Pack(f.Ordinal, 0));
                 if (f.BaseRowId is { } baseRowId)
                 {
-                    json.WriteNumber("base_row_id", baseRowId);
+                    json.WriteNumber(DeltaNativeReader.RowTrackingIdColumn, baseRowId);
                 }
                 if (f.CommitVersion is { } commitVersion)
                 {
-                    json.WriteNumber("commit_version", commitVersion);
+                    json.WriteNumber(DeltaNativeReader.RowTrackingVersionColumn, commitVersion);
                 }
+                json.WriteEndObject();
                 if (f.Dv.Length > 0)
                 {
                     json.WriteStartArray("dv");
@@ -612,20 +615,24 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             _ => false,
         };
 
-    private static void WritePhysicalMembers(Utf8JsonWriter json, EngineeredWood.DeltaLake.Schema.StructType type)
+    /// <summary>A column's stored name and, for a struct, its members' — the plan's
+    /// <c>{"stored": "…", "members": {"m": {…}}}</c>; a name stored as itself is left out.</summary>
+    private static void WriteStoredNames(Utf8JsonWriter json, EngineeredWood.DeltaLake.Schema.StructField field,
+                                         string? stored)
     {
         json.WriteStartObject();
-        foreach (var field in type.Fields)
+        stored ??= field.Metadata?.GetValueOrDefault("delta.columnMapping.physicalName");
+        if (stored is { Length: > 0 } && stored != field.Name)
         {
-            json.WriteStartObject(field.Name);
-            if (field.Metadata?.GetValueOrDefault("delta.columnMapping.physicalName") is { Length: > 0 } stored)
+            json.WriteString("stored", stored);
+        }
+        if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
+        {
+            json.WriteStartObject("members");
+            foreach (var member in s.Fields)
             {
-                json.WriteString("p", stored);
-            }
-            if (field.Type is EngineeredWood.DeltaLake.Schema.StructType s)
-            {
-                json.WritePropertyName("c");
-                WritePhysicalMembers(json, s);
+                json.WritePropertyName(member.Name);
+                WriteStoredNames(json, member, null);
             }
             json.WriteEndObject();
         }
