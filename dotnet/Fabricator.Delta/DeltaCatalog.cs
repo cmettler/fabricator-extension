@@ -436,7 +436,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     /// scan. Resolves and seeds the version exactly as <see cref="PartitionStatistics"/> does.
     /// </summary>
     /// <remarks>Declines (the host then scans as before) for what the plan cannot express yet: a pending write in
-    /// the transaction, the codec engine, column mapping 'id' or with nested fields, partition columns, timestamps (a naive file timestamp
+    /// the transaction, the codec engine, column mapping 'id' or with nested fields, a binary partition column, timestamps (a naive file timestamp
     /// would be cast in the session zone) and VARIANT.</remarks>
     internal string FilePlanJson(string path, TableAt? at)
     {
@@ -469,9 +469,15 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         {
             return Declined("column mapping with nested fields");
         }
-        if (listing.PartitionColumns.Count > 0)
+        // partition columns are not in the data files: each file's values come from the log (as text; the host casts
+        // them to the column type). A binary partition value's text form is not its bytes.
+        foreach (var column in listing.PartitionColumns)
         {
-            return Declined("partition columns");
+            if (listing.TableSchema?.Fields.FirstOrDefault(f => f.Name == column)?.Type is
+                EngineeredWood.DeltaLake.Schema.PrimitiveType { TypeName: "binary" })
+            {
+                return Declined("binary partition column");
+            }
         }
         if (listing.TableSchema is { } schema && UnsupportedForFilePlan(schema) is { } type)
         {
@@ -533,6 +539,23 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 if (f.SizeBytes is { } size && size > 0)
                 {
                     json.WriteNumber("size", size);
+                }
+                if (listing.PartitionColumns.Count > 0)
+                {
+                    json.WriteStartObject("partition");
+                    foreach (var column in listing.PartitionColumns)
+                    {
+                        string stored = listing.LogicalToPhysical?.GetValueOrDefault(column) ?? column;
+                        if (DeltaNativeReader.LookupPartitionValue(f.PartitionValues, column, stored) is { } v)
+                        {
+                            json.WriteString(column, v);
+                        }
+                        else
+                        {
+                            json.WriteNull(column);
+                        }
+                    }
+                    json.WriteEndObject();
                 }
                 if (f.BaseRowId is { } baseRowId)
                 {

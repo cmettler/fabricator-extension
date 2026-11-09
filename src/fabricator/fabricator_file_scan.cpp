@@ -63,6 +63,10 @@ struct FileScanPlan : public TableFunctionInfo {
 	vector<OpenFileInfo> files;
 	//! per file (by FILE_KEY), the deleted row positions, sorted; empty = none
 	vector<vector<int64_t>> deleted;
+	//! per file (by FILE_KEY), its partition values as the log states them (text; NULL = a null partition)
+	vector<case_insensitive_map_t<Value>> partition_text;
+	//! per file, the partition values cast to their columns' types, by column index (filled at bind)
+	vector<unordered_map<idx_t, Value>> partition_values;
 	//! the table's columns, in order — the scan's schema; files are mapped onto it BY NAME
 	vector<MultiFileColumnDefinition> columns;
 	optional_ptr<TableCatalogEntry> table;
@@ -172,6 +176,21 @@ struct FabricatorFileScanReader : public MultiFileReader {
 		auto &deleted = plan->deleted[index.GetIndex()];
 		if (!deleted.empty()) {
 			reader_data.reader->deletion_filter = make_uniq<DeletedRowsFilter>(deleted);
+		}
+		// partition columns are not in the files: the file's value from the log, as a constant (a NULL partition
+		// adds nothing — the column is absent from the file, so it reads its NULL default)
+		auto &partition = plan->partition_values[index.GetIndex()];
+		if (!partition.empty()) {
+			for (idx_t i = 0; i < global_column_ids.size(); i++) {
+				auto &id = global_column_ids[i];
+				if (id.IsVirtualColumn()) {
+					continue;
+				}
+				auto value = partition.find(id.GetPrimaryIndex());
+				if (value != partition.end() && !value->second.IsNull()) {
+					reader_data.constant_map.Add(MultiFileGlobalIndex(i), value->second);
+				}
+			}
 		}
 	}
 
@@ -376,8 +395,16 @@ bool ParsePlan(const string &json, FileScanPlan &plan, case_insensitive_map_t<st
 			deleted.push_back(yyjson_get_sint(pos));
 		}
 		std::sort(deleted.begin(), deleted.end());
+		case_insensitive_map_t<Value> partition;
+		auto values = yyjson_obj_get(file, "partition");
+		size_t pi, pmax;
+		yyjson_val *pkey, *pval;
+		yyjson_obj_foreach(values, pi, pmax, pkey, pval) {
+			partition[yyjson_get_str(pkey)] = yyjson_is_null(pval) ? Value() : Value(yyjson_get_str(pval));
+		}
 		plan.files.push_back(std::move(info));
 		plan.deleted.push_back(std::move(deleted));
+		plan.partition_text.push_back(std::move(partition));
 	}
 	yyjson_doc_free(doc);
 	if (plan.files.empty()) {
@@ -445,6 +472,20 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 			definition.identifier = Value(stored->second);
 		}
 		plan->columns.push_back(std::move(definition));
+	}
+	// partition values, typed: the log's text cast to the column type, as the native reader's literals are
+	auto &logical_columns = table.GetColumns();
+	for (auto &partition : plan->partition_text) {
+		unordered_map<idx_t, Value> typed;
+		for (auto &entry : partition) {
+			if (!logical_columns.ColumnExists(Identifier(entry.first))) {
+				throw IOException("fabricator file scan: a partition value for an unknown column '%s'", entry.first);
+			}
+			auto &column = logical_columns.GetColumn(Identifier(entry.first));
+			typed[column.Logical().index] =
+			    entry.second.IsNull() ? Value(column.Type()) : entry.second.DefaultCastAs(column.Type());
+		}
+		plan->partition_values.push_back(std::move(typed));
 	}
 	plan->virtual_columns = table.GetVirtualColumns();
 	plan->virtual_columns.emplace(MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
