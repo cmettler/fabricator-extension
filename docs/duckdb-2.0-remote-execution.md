@@ -2442,7 +2442,7 @@ join filter as a `lookup` node in the filter tree, evaluated per batch as the en
 and got DuckDB's lookup back. It filtered correctly but runs serially on the scan's single managed producer stream,
 while the re-apply runs natively on every thread: 46.7 s with it, 43.0 s without (Q2 2.25 vs 0.76 s, Q5 3.76 vs
 1.89 s). It would pay only if engineered-wood decoded the key column first and the other columns only for the rows
-that survive. Pushdown extract works under re-apply: a filter on an extracted field is re-applied on the field the
+that survive. What that would take, and the removed code to start from: [ew-late-decoding-join-filters.md](ew-late-decoding-join-filters.md). Pushdown extract works under re-apply: a filter on an extracted field is re-applied on the field the
 scan emits, typed by it (after a folded CAST). Late materialization stays with the native engine (it needs
 `exact_filter_pushdown`). Gates: the codec section of `verify_delta_catalog_dynamic_filter` (99: the server_info rows,
 prefix-range and bloom joins with the probe scan's row count from the profile, a static filter only the re-application
