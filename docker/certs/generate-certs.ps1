@@ -54,6 +54,13 @@ $rustfsDir = Join-Path $dir 'rustfs'
 New-Item -ItemType Directory -Force -Path $rustfsDir | Out-Null
 Copy-Item -Force (Join-Path $dir 'public.crt') (Join-Path $rustfsDir 'rustfs_cert.pem')
 Copy-Item -Force (Join-Path $dir 'private.key') (Join-Path $rustfsDir 'rustfs_key.pem')
+# ⚠ RustFS runs as uid 10001, and openssl writes the key 0600 for the user running this script, so on Linux (CI) the
+# container cannot read it and exits at once ("TLS source I/O error ... Permission denied"); compose then reports it
+# unhealthy. A Windows bind mount shows every file as 0777, which is why it works there. Test-only key: world-readable.
+if ($IsLinux -or $IsMacOS) {   # both undefined (false) in Windows PowerShell 5.1
+    & chmod 0644 (Join-Path $rustfsDir 'rustfs_cert.pem') (Join-Path $rustfsDir 'rustfs_key.pem')
+    if ($LASTEXITCODE -ne 0) { throw "chmod failed ($LASTEXITCODE)" }
+}
 
 Write-Host "Generated $(Join-Path $dir 'public.crt') (CN=rustfs; SANs: rustfs, localhost, 127.0.0.1)"
 Write-Host "Copied    $(Join-Path $rustfsDir 'rustfs_cert.pem') + rustfs_key.pem (for RustFS)"
