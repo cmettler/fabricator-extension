@@ -436,7 +436,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     /// scan. Resolves and seeds the version exactly as <see cref="PartitionStatistics"/> does.
     /// </summary>
     /// <remarks>Declines (the host then scans as before) for what the plan cannot express yet: a pending write in
-    /// the transaction, the codec engine, column mapping 'id' or with nested fields, a binary partition column, timestamps (a naive file timestamp
+    /// the transaction, the codec engine, column mapping 'id' or with nested fields, a binary partition column, nested timestamps (a naive file timestamp
     /// would be cast in the session zone) and VARIANT.</remarks>
     internal string FilePlanJson(string path, TableAt? at)
     {
@@ -479,7 +479,9 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 return Declined("binary partition column");
             }
         }
-        if (listing.TableSchema is { } schema && UnsupportedForFilePlan(schema) is { } type)
+        if (listing.TableSchema is { } schema
+            && schema.Fields.Select(f => UnsupportedForFilePlan(f.Type, topLevel: true)).FirstOrDefault(t => t is not null)
+                is { } type)
         {
             return Declined("column type " + type);
         }
@@ -583,11 +585,16 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         return System.Text.Encoding.UTF8.GetString(buffer.ToArray());
     }
 
-    /// <summary>The first column type a file plan cannot read faithfully yet, or null.</summary>
-    private static string? UnsupportedForFilePlan(EngineeredWood.DeltaLake.Schema.DeltaDataType type) => type switch
+    /// <summary>The first column type a file plan cannot read faithfully yet, or null. A top-level timestamp is
+    /// fine — the host refuses a file whose timestamp kind differs from the column's (naive vs UTC-adjusted), since
+    /// that cast would depend on the session's time zone — but a nested one would be cast inside a struct where the
+    /// host cannot see it.</summary>
+    private static string? UnsupportedForFilePlan(EngineeredWood.DeltaLake.Schema.DeltaDataType type,
+                                                  bool topLevel = false) => type switch
     {
+        EngineeredWood.DeltaLake.Schema.PrimitiveType { TypeName: "variant" } => "variant",
         EngineeredWood.DeltaLake.Schema.PrimitiveType p
-            when p.TypeName is "timestamp" or "timestamp_ntz" or "variant" => p.TypeName,
+            when !topLevel && p.TypeName is "timestamp" or "timestamp_ntz" => "nested " + p.TypeName,
         EngineeredWood.DeltaLake.Schema.StructType s => s.Fields.Select(f => UnsupportedForFilePlan(f.Type))
                                                                .FirstOrDefault(t => t is not null),
         EngineeredWood.DeltaLake.Schema.ArrayType a => UnsupportedForFilePlan(a.ElementType),

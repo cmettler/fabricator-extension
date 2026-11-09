@@ -173,6 +173,7 @@ struct FabricatorFileScanReader : public MultiFileReader {
 		if (!index.IsValid() || index.GetIndex() >= plan->deleted.size()) {
 			throw InternalException("fabricator file scan: a file without its plan entry");
 		}
+		RefuseZoneDependentCasts(*reader_data.reader, global_columns);
 		auto &deleted = plan->deleted[index.GetIndex()];
 		if (!deleted.empty()) {
 			reader_data.reader->deletion_filter = make_uniq<DeletedRowsFilter>(deleted);
@@ -189,6 +190,45 @@ struct FabricatorFileScanReader : public MultiFileReader {
 				auto value = partition.find(id.GetPrimaryIndex());
 				if (value != partition.end() && !value->second.IsNull()) {
 					reader_data.constant_map.Add(MultiFileGlobalIndex(i), value->second);
+				}
+			}
+		}
+	}
+
+	//! A file whose timestamp column is naive where the table's is UTC-adjusted (or the reverse) — a DuckLake 'utc'
+	//! mirror, Spark INT96 — would be cast by the reader in the SESSION's time zone, and its filters too, before this
+	//! reader can intervene: a shifted value with no error. The native reader casts as UTC; until this one can, it
+	//! refuses such a file loudly.
+	static void RefuseZoneDependentCasts(const BaseFileReader &reader,
+	                                     const vector<MultiFileColumnDefinition> &global_columns) {
+		auto is_timestamp = [](const LogicalType &type) {
+			switch (type.id()) {
+			case LogicalTypeId::TIMESTAMP:
+			case LogicalTypeId::TIMESTAMP_SEC:
+			case LogicalTypeId::TIMESTAMP_MS:
+			case LogicalTypeId::TIMESTAMP_NS:
+			case LogicalTypeId::TIMESTAMP_TZ:
+				return true;
+			default:
+				return false;
+			}
+		};
+		for (auto &global : global_columns) {
+			if (!is_timestamp(global.type)) {
+				continue;
+			}
+			auto name = global.GetIdentifierName();
+			for (auto &local : reader.columns) {
+				if (!StringUtil::CIEquals(local.name.GetIdentifierName(), name) || !is_timestamp(local.type)) {
+					continue;
+				}
+				bool global_zoned = global.type.id() == LogicalTypeId::TIMESTAMP_TZ;
+				bool local_zoned = local.type.id() == LogicalTypeId::TIMESTAMP_TZ;
+				if (global_zoned != local_zoned) {
+					throw IOException("fabricator file scan: '%s' stores column '%s' as %s where the table declares %s; "
+					                  "the file scan cannot convert it independently of the session time zone yet "
+					                  "(set FABRICATOR_FILE_SCAN=0 for this table)",
+					                  reader.file.path, name, local.type.ToString(), global.type.ToString());
 				}
 			}
 		}
