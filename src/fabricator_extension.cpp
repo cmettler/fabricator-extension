@@ -744,6 +744,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(version_fn);
 	loader.RegisterFunction(
 	    ScalarFunction("fabricator_managed_dir", {}, LogicalType::VARCHAR, FabricatorManagedDirFunction));
+	// a hash join's filter, evaluated inside a Delta scan's inner query (arrow_ingest.cpp)
+	loader.RegisterFunction(fabricator::JoinFilterFunction());
 
 	RegisterProviderSettings(loader);
 	fabricator::RegisterOneLakeFileSystem(loader.GetDatabaseInstance()); // onelake:// VFS subsystem (docs/filesystem-bridge.md §3)

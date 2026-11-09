@@ -76,5 +76,190 @@ WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%optional:%';
 ----
 0
 
+# ---- A BUILD SIDE PAST dynamic_or_filter_threshold (50 keys). DuckDB then passes the probe scan only a
+#      prefix-range filter (a bitmap, no SQL form). The scan used to DROP it, so every larger join (all of TPC-H)
+#      read the whole table into the plan; now the inner read_parquet query evaluates it through
+#      fabricator_join_filter(<id>, col). 2026-11-08. ----
+
+statement ok
+CREATE TABLE lake.main.big2 AS SELECT CASE WHEN i % 1000 = 0 THEN NULL ELSE i END AS id, i % 7 AS g
+FROM range(1, 400001) AS r(i);
+
+statement ok
+CREATE TABLE lake.main.dim2 AS SELECT i * 199 AS id FROM range(1, 2001) AS r(i);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# one data file: the per-file SQL. 2000 keys (multiples of 199); the two that are also multiples of 1000 are NULL
+# in big2 and must not match. Expected values computed by plain DuckDB over the same rows.
+query III
+SELECT count(*), sum(b.id), sum(b.g) FROM lake.main.big2 b JOIN lake.main.dim2 d ON b.id = d.id;
+----
+1998	397602000	5997
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%read_parquet%fabricator_join_filter(%"id"%';
+----
+true
+
+# ...and beside the call the build side's key range as a plain condition: the function hides the key set from the
+# parquet reader, the range lets it skip whole row groups by their statistics (the build keys span 199..398000)
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%("id" >= 199) AND ("id" <= 398000)) AND fabricator_join_filter(%';
+----
+true
+
+# a second file: the batched form carries it too
+statement ok
+INSERT INTO lake.main.big2 SELECT i AS id, i % 7 AS g FROM range(390001, 390401) AS r(i);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(b.id) FROM lake.main.big2 b JOIN lake.main.dim2 d ON b.id = d.id;
+----
+2000	398382279
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%read_parquet%fabricator_join_filter(%"id"%';
+----
+true
+
+# ...and it FILTERS: the rows big2's scan hands to the join, from the query profile. Without the filter the scan
+# passes all 400400 rows up (the answer is the same either way, which is why this needs its own assertion); with
+# it about the 2000 that match. dim2's scan is the other FABRICATOR_SCAN (2000 rows).
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '${FABRICATOR_DELTA_WRITE_DIR}/join_filter_profile.json';
+
+statement ok
+SELECT count(*) FROM lake.main.big2 b JOIN lake.main.dim2 d ON b.id = d.id;
+
+statement ok
+PRAGMA disable_profiling;
+
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/join_filter_profile.json'));
+----
+2	true
+
+# the preserved side of an outer join must keep every row: big2 LEFT JOIN dim2 returns all 400400 rows
+query I
+SELECT count(*) FROM lake.main.big2 b LEFT JOIN lake.main.dim2 d ON b.id = d.id;
+----
+400400
+
+# and a semi join (IN) through the same filter
+query I
+SELECT count(*) FROM lake.main.big2 WHERE id IN (SELECT id FROM lake.main.dim2);
+----
+2000
+
+# the switch turns it off (and with it the key lists SQL Server receives): no call in the inner query, same answer
+statement ok
+SET fabricator_join_key_lists = false;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(b.id) FROM lake.main.big2 b JOIN lake.main.dim2 d ON b.id = d.id;
+----
+2000	398382279
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%fabricator_join_filter(%';
+----
+0
+
+statement ok
+RESET fabricator_join_key_lists;
+
+# ---- A key the prefix-range filter does not cover (random strings, a DOUBLE, ...): DuckDB hands the scan a BLOOM
+#      filter instead. It has no SQL form either; the inner query evaluates it through the same
+#      fabricator_join_filter(<id>, col), hashing the keys as DuckDB's own lookup does. Expected values computed by
+#      plain DuckDB over the same rows. 2026-11-08. ----
+
+statement ok
+CREATE TABLE lake.main.big3 AS SELECT CASE WHEN i % 1000 = 0 THEN NULL ELSE md5(i::VARCHAR) END AS h, i % 7 AS g,
+(i::DOUBLE / 4)::FLOAT AS f FROM range(1, 400001) AS r(i);
+
+statement ok
+CREATE TABLE lake.main.dim3 AS SELECT md5((i * 199)::VARCHAR) AS h, (i * 199)::DOUBLE / 4 AS f
+FROM range(1, 2001) AS r(i) UNION ALL SELECT NULL, NULL;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(b.g) FROM lake.main.big3 b JOIN lake.main.dim3 d ON b.h = d.h;
+----
+1998	5997
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE '%read_parquet%fabricator_join_filter(%"h"%';
+----
+true
+
+# it filters: the rows big3's scan hands to the join (about 2000 plus false positives, not 400000)
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '${FABRICATOR_DELTA_WRITE_DIR}/bloom_profile.json';
+
+statement ok
+SELECT count(*) FROM lake.main.big3 b JOIN lake.main.dim3 d ON b.h = d.h;
+
+statement ok
+PRAGMA disable_profiling;
+
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/bloom_profile.json'));
+----
+2	true
+
+# NULL keys: a NULL-safe join matches them (400 NULLs x 1 NULL on the build side)
+query II
+SELECT count(*), sum(b.g) FROM lake.main.big3 b JOIN lake.main.dim3 d ON b.h IS NOT DISTINCT FROM d.h;
+----
+2398	7200
+
+# the preserved side of an outer join keeps every row
+query II
+SELECT count(*), count(d.h) FROM lake.main.big3 b LEFT JOIN lake.main.dim3 d ON b.h = d.h;
+----
+400000	1998
+
+query I
+SELECT count(*) FROM lake.main.big3 WHERE h IN (SELECT h FROM lake.main.dim3);
+----
+1998
+
+query I
+SELECT count(*) FROM lake.main.big3 WHERE h NOT IN (SELECT h FROM lake.main.dim3 WHERE h IS NOT NULL);
+----
+397602
+
+# a FLOAT column joined to DOUBLE keys: the join hashes the CAST value, which the scan does not reproduce, so no
+# bloom is sent for it (a wrongly hashed key would drop rows); the answer is the join's
+query II
+SELECT count(*), sum(b.g) FROM lake.main.big3 b JOIN lake.main.dim3 d ON b.f = d.f;
+----
+2000	6002
+
 statement ok
 DETACH lake;

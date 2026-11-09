@@ -287,6 +287,10 @@ ArrowStreamInitLocal(duckdb::ExecutionContext &context, duckdb::TableFunctionIni
 
 void ArrowStreamScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output);
 
+//! fabricator_join_filter(id UBIGINT, key ANY) -> BOOLEAN: a Delta scan's inner query evaluates a hash join's
+//! prefix-range filter, registered under `id` while the scan runs (arrow_ingest.cpp, PrefixRangeAsExpression).
+duckdb::ScalarFunction JoinFilterFunction();
+
 // Reports the pulled batch's index as this chunk's partition (batch) index. Setting `get_partition_data` is
 // how a source DECLARES batch-index support (PhysicalTableScan::SupportsPartitioning is literally
 // `function.get_partition_data != nullptr`), and that declaration decides which RESULT COLLECTOR a plan gets:

@@ -2360,3 +2360,55 @@ them exactly, while our T-SQL rendering is a superset (a case-insensitive collat
 - **Worth it for:** ordinary joins of a SQL Server table against a small local or remote table without remote
   pushdown. **Not** a fix for DuckLake's `WHERE snapshot_id = (SELECT MAX(snapshot_id) …)`: the outer scan would get
   the filter, but the MAX side is still a full read — remote pushdown is what removes both (ducklake-catalog.md §9).
+
+### 5.8 The same join filters for Delta scans — BUILT (2026-11-08)
+
+A Delta scan with `PROVIDER 'delta'` reads through an inner DuckDB query (`read_parquet`), so a hash join's filter has
+to reach that query's WHERE. Below `dynamic_or_filter_threshold` (50 keys) DuckDB sends an IN list, which was always
+rendered. Above it DuckDB sends only the prefix-range filter, and the port had recorded that as unreadable and dropped
+it — while §5.5 had since learned to read it, for SQL Server only (`g_expand_prefix_ranges` was tied to
+`reapply_filters`). Every TPC-H join is above 50 keys, so on SF10 the probe-side `lineitem` scan of q8 passed all
+59,986,052 rows into the plan where Iceberg's passed 24,254 (per-scan row counts from the query profiles).
+
+**What the inner query gets: `fabricator_join_filter(<id>, "col")`, not the keys.** A key list in SQL text measured
+~0.3 s per 13k keys (parse + probe; the inner query alone 0.71–0.79 s against 0.42–0.44 s as a semi join), and a key
+set past 100k or a span past 2^24 can only be sent as its range, which on TPC-H covers the whole table. The inner
+query runs in the same process, so it asks the filter object itself: the scan registers it under an id while it
+renders the live filters (`PrefixRangeAsExpression`), the registered scalar looks it up (cached per thread — a lock
+per chunk made q8 SLOWER than no filter) and calls `LookupKeys`, the probe DuckDB's own parquet scan runs. The filter
+belongs to the join's hash table, which outlives the probe pipeline the scan is part of; the scan's global state
+removes the ids after releasing the inner stream. An unknown id or another key type lets every row through: a join
+filter may only widen, the join checks its keys itself. That is also why the expansion is now on for every provider
+(still behind `fabricator_join_key_lists`), not only for those that re-apply what they are sent.
+
+The WHERE stays short SQL, so every consumer of `ScanSpec.NativeFilter` takes it unchanged — the native reader's
+three forms, the codec engine's batch filter, the transaction overlay, `fabricator_delta_scan`, Fluid templates — as
+long as they run while the scan does, which they do.
+
+Measured, TPC-H SF10 local (sum of 22, round 1/2): native Delta 42.1/43.3 s -> 33.8/35.8 s; MinIO 48.7/50.7 ->
+42.5/40.6 s; Iceberg 14.0/15.0 and 15.1/13.7. q3/q8 scan row counts now equal Iceberg's (q3 lineitem 302,114, q8
+24,254); q5 2.15 -> 1.28 s, q9 3.75 -> 2.38, q12 1.10 -> 0.50. What remains is the pure scans (q1 6x, q6 6x): the row
+transport, unaffected by filters.
+
+**Beside the call, the key range as a plain condition.** The function hides the key set from the parquet reader, so
+by itself it filters rows but skips no row group. For an integer key the scan also renders the build side's range
+(the bisection of `ReadPrefixRangeKeys`, now `PrefixRangeBounds`): `(("id" >= lo) AND ("id" <= hi)) AND
+fabricator_join_filter(1, "id")`, which the reader prunes on by statistics. Measured on a key-clustered table (20M rows,
+2000 keys in one narrow band): 0.07 s against 0.26-0.29 s with the filter off. On data not clustered by the key the
+range covers every row group and costs nothing extra.
+
+**Bloom filters through the same function.** For a key the prefix-range filter does not cover (a DOUBLE, random
+strings), DuckDB sends a bloom filter instead, wrapped in a selectivity-optional filter. It was dropped as
+"probabilistic, no SQL form". Now `BloomAsExpression` registers it under an id too (the registry keeps the
+`shared_ptr<const BloomFilter>`; the per-thread cache holds only the raw pointer, so it keeps no large filter alive), and
+the function hashes the keys the way DuckDB's own lookup does: `VectorOperations::Hash` of the key-typed value, then
+`LookupHashes`; a NULL key gets `!filters_null_values`. Only for a filter on the column itself: when the join's key
+needs a cast (a FLOAT column against DOUBLE keys), DuckDB hashes the cast value, which the scan would have to reproduce
+bit for bit or drop rows, so that filter is left out. Measured: 20M rows joined on an md5 string, 2000 keys:
+0.51-0.57 s against 0.97-1.1 s without; a DOUBLE key 0.06 against 0.10 s (the range does most of it there). For
+VARCHAR keys DuckDB often sends a prefix-range filter, which on strings sharing prefixes passes most rows; that is
+DuckDB's choice, unchanged here.
+
+Gate: `verify_delta_catalog_dynamic_filter` 21 -> 47 -> 48 (the range row) -> 68 (the bloom section: md5 keys, NULL-safe,
+outer, semi, anti and a FLOAT/DOUBLE join; mutants: bloom never rendered dies at the log row, lookup passing every row dies at
+the profile row)

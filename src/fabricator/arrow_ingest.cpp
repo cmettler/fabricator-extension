@@ -30,6 +30,7 @@
 // incomplete types here (the old header only forward-declares them now).
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp" // the bloom filter's key hash
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -56,6 +57,8 @@
 namespace fabricator {
 
 using namespace duckdb;
+
+static void UnregisterJoinFilters(const vector<idx_t> &ids);
 
 namespace {
 
@@ -113,7 +116,13 @@ struct ArrowStreamGlobalState : public GlobalTableFunctionState {
 			stream.release(&stream);
 			stream.release = nullptr;
 		}
+		// After the release: no inner query can still evaluate them.
+		UnregisterJoinFilters(join_filter_ids);
 	}
+
+	//! The hash-join filters this scan's inner query evaluates through fabricator_join_filter (registered while
+	//! the live filters were rendered).
+	vector<idx_t> join_filter_ids;
 
 	//! Threads this scan may use, captured at InitGlobal (MaxThreads() gets no context). = the database's
 	//! thread count, i.e. whatever `SET threads` says — a GLOBAL-only setting ("option \"threads\" cannot be
@@ -507,6 +516,9 @@ static void RebindReferencesToColumn(Expression &e, const Expression &column) {
 	});
 }
 
+static unique_ptr<Expression> PrefixRangeAsExpression(const BoundFunctionExpression &f, const Expression &column);
+static unique_ptr<Expression> BloomAsExpression(const BoundFunctionExpression &f, const Expression &column);
+
 static unique_ptr<Expression> RecoverFilterFunction(const BoundFunctionExpression &f, const Expression &column) {
 	const auto name = f.Function().GetName();
 	if (name == DynamicFilterScalarFun::NAME) {
@@ -539,10 +551,10 @@ static unique_ptr<Expression> RecoverFilterFunction(const BoundFunctionExpressio
 			return nullptr;
 		}
 		auto &data = f.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>();
-		// ⚠ On 2.0 a HASH JOIN's bound arrives here as a PREFIX-RANGE child, which is probabilistic and has
-		// no readable bounds (`PrefixRangeFilter` exposes only `LookupRange`), so it drops one level down.
-		// That is upstream's choice of filter, not a gap in this recovery — a min/max dynamic filter (TopN,
-		// LIMIT) still recovers and still renders.
+		// ⚠ On 2.0 a HASH JOIN's bound arrives here as a PREFIX-RANGE child once the build side has more keys than
+		// dynamic_or_filter_threshold (50). Its keys CAN be read (LookupRange/LookupKeys) — PrefixRangeAsExpression,
+		// one level down. The port first dropped it as unreadable, which left Delta scans without any join filter
+		// on every larger join (TPC-H); the keys were read for SQL Server only until 2026-11-08.
 		if (!data.child_filter_expr) {
 			return nullptr;
 		}
@@ -550,7 +562,13 @@ static unique_ptr<Expression> RecoverFilterFunction(const BoundFunctionExpressio
 		RebindReferencesToColumn(*child, column);
 		return child;
 	}
-	return nullptr; // bloom / prefix-range: probabilistic, never exact SQL — drop
+	if (name == TableFilterPrefixRangeFun::Name) {
+		return PrefixRangeAsExpression(f, column);
+	}
+	if (name == TableFilterBloomFilterFun::Name) {
+		return BloomAsExpression(f, column); // no SQL form: only through the registry, else dropped
+	}
+	return nullptr;
 }
 
 //! Returns a copy of `e` with the internal filter functions pruned, or nullptr when nothing
@@ -850,6 +868,16 @@ static bool LiveExprSubject(const Expression &e, const LogicalType &type, vector
 // rather than through every signature.
 static thread_local bool g_expand_prefix_ranges = false;
 
+struct PrefixRangeScope {
+	explicit PrefixRangeScope(bool on) : saved(g_expand_prefix_ranges) {
+		g_expand_prefix_ranges = on;
+	}
+	~PrefixRangeScope() {
+		g_expand_prefix_ranges = saved;
+	}
+	bool saved;
+};
+
 //! The values a hash join's prefix-range filter admits, as an IN list (docs/duckdb-2.0-remote-execution.md §5.5).
 //! DuckDB passes a probe-side scan the build side's keys as an IN list only up to dynamic_or_filter_threshold
 //! (default 50); above it a bitmap over [min, max] — exact when the span is small, one bit per value — that has no
@@ -861,9 +889,9 @@ static thread_local bool g_expand_prefix_ranges = false;
 static constexpr idx_t PREFIX_RANGE_MAX_KEYS = 100000;
 static constexpr int64_t PREFIX_RANGE_MAX_SPAN = int64_t(1) << 24;
 
+//! The smallest and largest value the filter admits, by binary search over LookupRange. False: an empty build side.
 template <class T>
-static bool ReadPrefixRangeKeys(const PrefixRangeFilter &filter, const LogicalType &type, vector<Value> &keys,
-                                int64_t &lo, int64_t &hi) {
+static bool PrefixRangeBounds(const PrefixRangeFilter &filter, const LogicalType &type, int64_t &lo, int64_t &hi) {
 	const int64_t domain_lo = static_cast<int64_t>(NumericLimits<T>::Minimum());
 	const int64_t domain_hi = static_cast<int64_t>(NumericLimits<T>::Maximum());
 	auto any = [&](int64_t a, int64_t b) {
@@ -894,6 +922,15 @@ static bool ReadPrefixRangeKeys(const PrefixRangeFilter &filter, const LogicalTy
 		}
 	}
 	hi = a;
+	return true;
+}
+
+template <class T>
+static bool ReadPrefixRangeKeys(const PrefixRangeFilter &filter, const LogicalType &type, vector<Value> &keys,
+                                int64_t &lo, int64_t &hi) {
+	if (!PrefixRangeBounds<T>(filter, type, lo, hi)) {
+		return false;
+	}
 	if (static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) >= static_cast<uint64_t>(PREFIX_RANGE_MAX_SPAN)) {
 		return true; // too wide to read value by value: the range only
 	}
@@ -921,6 +958,24 @@ static bool ReadPrefixRangeKeys(const PrefixRangeFilter &filter, const LogicalTy
 	return true;
 }
 
+static bool ReadPrefixRangeBounds(const PrefixRangeFunctionData &data, int64_t &lo, int64_t &hi) {
+	if (!data.filter || !data.filter->IsInitialized()) {
+		return false;
+	}
+	switch (data.key_type.id()) {
+	case LogicalTypeId::TINYINT:
+		return PrefixRangeBounds<int8_t>(*data.filter, data.key_type, lo, hi);
+	case LogicalTypeId::SMALLINT:
+		return PrefixRangeBounds<int16_t>(*data.filter, data.key_type, lo, hi);
+	case LogicalTypeId::INTEGER:
+		return PrefixRangeBounds<int32_t>(*data.filter, data.key_type, lo, hi);
+	case LogicalTypeId::BIGINT:
+		return PrefixRangeBounds<int64_t>(*data.filter, data.key_type, lo, hi);
+	default:
+		return false;
+	}
+}
+
 static bool ReadPrefixRangeKeys(const PrefixRangeFunctionData &data, vector<Value> &keys, int64_t &lo, int64_t &hi) {
 	if (!data.filter || !data.filter->IsInitialized()) {
 		return false;
@@ -937,6 +992,245 @@ static bool ReadPrefixRangeKeys(const PrefixRangeFunctionData &data, vector<Valu
 	default:
 		return false;
 	}
+}
+
+//! The SQL channel's form of a hash join's prefix-range filter (RenderLiveFilters, the WHERE of a Delta scan's
+//! inner read_parquet query): `col IN (keys)`, or `col >= lo AND col <= hi` when the keys are too many to list.
+//! Without it a probe-side Delta scan got NO join filter once the build side passed dynamic_or_filter_threshold
+//! (50 keys — every TPC-H join), so the whole table crossed into the plan and the join discarded it (SF10 q8:
+//! 60M lineitem rows out of the scan where Iceberg's returned 24k). A bucket of a coarse bitmap admits keys the
+//! build side does not have: a superset, which the join removes. Only while g_expand_prefix_ranges is set.
+// ---- A hash join's prefix-range filter, evaluated by the scan's inner query --------------------------------
+// A Delta scan's rows come from an inner DuckDB query (read_parquet) in THIS process. Rather than copying the build
+// side's keys into its SQL text (an IN list costs ~0.3 s per 13k keys to parse and probe, and a key set past
+// 100k or a span past 2^24 can only be sent as its range, which on TPC-H covers the whole table), the inner query
+// calls fabricator_join_filter(<id>, <column>), which looks the filter object up by id and asks it — LookupKeys, the
+// probe DuckDB's own parquet scan runs. The filter is owned by the join's hash table, which lives as long as the
+// probe pipeline this scan belongs to; the scan's global state registers it and removes it after releasing the
+// inner stream (so no inner query can still be running).
+// A join may also hand out a BLOOM filter instead (a key type the prefix-range filter does not support, e.g.
+// DOUBLE or VARCHAR, or a join DuckDB builds no prefix-range filter for): the entry then carries that, and the
+// function hashes the keys the way DuckDB's own bloom lookup does (VectorOperations::Hash of the key-typed value).
+struct JoinFilterEntry {
+	optional_ptr<PrefixRangeFilter> filter;
+	//! raw: the shared_ptr that keeps it alive sits in g_join_bloom_owners, so a per-thread cache entry holds no
+	//! reference (a bloom filter can be large) and is only ever read for an id that is still registered
+	const BloomFilter *bloom = nullptr;
+	LogicalType key_type;
+	bool filters_null_values = false;
+};
+static mutex g_join_filters_lock;
+static unordered_map<idx_t, JoinFilterEntry> g_join_filters;
+static unordered_map<idx_t, shared_ptr<const BloomFilter>> g_join_bloom_owners;
+static atomic<idx_t> g_join_filter_next {1};
+//! Set while RenderLiveFilters runs: where the ids it registers are collected for the scan to remove.
+static thread_local vector<idx_t> *g_join_filter_ids = nullptr;
+
+static const char *const JOIN_FILTER_FUNCTION = "fabricator_join_filter";
+
+//! What DuckDB's own pushed filter answers for `count` keys, into out[]: true where a key may have a partner in the
+//! join. No filter (already removed), an unusable one, or a key of another type: every row true — a join filter may
+//! only ever widen, the join itself checks the keys.
+static void JoinFilterMatch(const JoinFilterEntry *entry_p, Vector &keys, idx_t count, bool *out) {
+	const bool usable = entry_p && keys.GetType() == entry_p->key_type &&
+	                    ((entry_p->filter && entry_p->filter->IsInitialized()) ||
+	                     (entry_p->bloom && entry_p->bloom->IsSealed()));
+	if (!usable) {
+		for (idx_t i = 0; i < count; i++) {
+			out[i] = true;
+		}
+		return;
+	}
+	auto &entry = *entry_p;
+	keys.Flatten(count);
+	SelectionVector found(STANDARD_VECTOR_SIZE);
+	idx_t hits;
+	if (entry.bloom) {
+		// DuckDB's own lookup (SelectBloomFilter): hash the key-typed values, then test the hashes. A NULL row's
+		// hash is tested too and overridden below, as there.
+		Vector hashes(LogicalType::HASH, count);
+		VectorOperations::Hash(keys, hashes, count);
+		hashes.Flatten(count);
+		hits = entry.bloom->LookupHashes(hashes, found, count);
+	} else {
+		hits = entry.filter->LookupKeys(keys, found, count);
+	}
+	for (idx_t i = 0; i < count; i++) {
+		out[i] = false;
+	}
+	for (idx_t i = 0; i < hits; i++) {
+		out[found.get_index(i)] = true;
+	}
+	// a NULL key: what DuckDB's own pushed filter does with it
+	auto &validity = FlatVector::Validity(keys);
+	if (!validity.AllValid()) {
+		for (idx_t i = 0; i < count; i++) {
+			if (!validity.RowIsValid(i)) {
+				out[i] = !entry.filters_null_values;
+			}
+		}
+	}
+}
+
+static void JoinFilterFunctionImpl(DataChunk &args, ExpressionState &state, Vector &result) {
+	const idx_t count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetDataMutable<bool>(result);
+	// The lookup is cached per thread: the function runs once per chunk on every thread of the inner query, and a
+	// shared lock per chunk made a 60M-row probe SLOWER than no filter at all (TPC-H SF10 q8, two filters). Ids are
+	// never reused, so a cached entry cannot name another filter; it is only consulted for the id it was found for,
+	// which no query uses once the scan that registered it has removed it.
+	// Several entries: one query may probe several filters in turn (q8: l_orderkey and l_partkey).
+	static constexpr idx_t CACHE_SIZE = 4;
+	static thread_local idx_t cached_ids[CACHE_SIZE] = {0, 0, 0, 0};
+	static thread_local JoinFilterEntry cached_entries[CACHE_SIZE];
+	static thread_local idx_t cache_next = 0;
+	JoinFilterEntry entry;
+	bool found_entry = false;
+	auto &id_vector = args.data[0];
+	if (id_vector.GetVectorType() == VectorType::CONSTANT_VECTOR && !ConstantVector::IsNull(id_vector)) {
+		idx_t id = ConstantVector::GetData<uint64_t>(id_vector)[0];
+		for (idx_t c = 0; c < CACHE_SIZE && !found_entry; c++) {
+			if (cached_ids[c] == id) {
+				entry = cached_entries[c];
+				found_entry = true;
+			}
+		}
+		if (!found_entry) {
+			lock_guard<mutex> guard(g_join_filters_lock);
+			auto it = g_join_filters.find(id);
+			if (it != g_join_filters.end()) {
+				entry = it->second;
+				found_entry = true;
+				cached_ids[cache_next] = id;
+				cached_entries[cache_next] = entry;
+				cache_next = (cache_next + 1) % CACHE_SIZE;
+			}
+		}
+	}
+	JoinFilterMatch(found_entry ? &entry : nullptr, args.data[1], count, out);
+}
+
+ScalarFunction JoinFilterFunction() {
+	ScalarFunction fn(JOIN_FILTER_FUNCTION, {LogicalType::UBIGINT, LogicalType::ANY}, LogicalType::BOOLEAN,
+	                  JoinFilterFunctionImpl);
+	fn.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	return fn;
+}
+
+static void UnregisterJoinFilters(const vector<idx_t> &ids) {
+	if (ids.empty()) {
+		return;
+	}
+	lock_guard<mutex> guard(g_join_filters_lock);
+	for (auto id : ids) {
+		g_join_filters.erase(id);
+		g_join_bloom_owners.erase(id);
+	}
+}
+
+//! Registers a join filter for the scan being rendered (its ids go to g_join_filter_ids, removed when the scan
+//! ends) and returns the id. `owner` keeps a bloom filter alive; a prefix-range filter belongs to the join's hash
+//! table, which outlives the probe pipeline this scan is part of.
+static idx_t RegisterJoinFilter(const JoinFilterEntry &entry, shared_ptr<const BloomFilter> owner) {
+	D_ASSERT(g_join_filter_ids);
+	idx_t id = g_join_filter_next++;
+	{
+		lock_guard<mutex> guard(g_join_filters_lock);
+		g_join_filters[id] = entry;
+		if (owner) {
+			g_join_bloom_owners[id] = std::move(owner);
+		}
+	}
+	g_join_filter_ids->push_back(id);
+	return id;
+}
+
+//! A hash join's BLOOM filter, as fabricator_join_filter(<id>, col) — only inside the SQL channel's registry (there
+//! is no SQL form of a bloom filter), and only when its argument is the scan column itself: DuckDB hashes the
+//! argument's value, so a filter whose argument is a cast of the column (a join on a column of another type)
+//! would need that cast reproduced bit for bit, or it would DROP rows. Such a filter is left out, which only widens.
+static unique_ptr<Expression> BloomAsExpression(const BoundFunctionExpression &f, const Expression &column) {
+	if (!g_expand_prefix_ranges || !g_join_filter_ids || !f.BindInfo() || f.GetChildren().size() != 1) {
+		return nullptr;
+	}
+	auto &data = f.BindInfo()->Cast<BloomFilterFunctionData>();
+	auto &arg = *f.GetChildren()[0];
+	// the wrapper's recovery has already rebound the argument onto the scan column, so a filter on the column itself
+	// arrives as that column (or still as the bare reference); anything else is an expression over it
+	const bool on_column = arg.GetExpressionClass() == ExpressionClass::BOUND_REF || arg.Equals(column);
+	// the type DuckDB hashes is the bloom function's argument type (the end of the join's cast chain); it must be the
+	// key type itself, i.e. no cast between the column and the hash. The scan column expression may carry no
+	// concrete type here (ANY); the inner query's actual column type is checked per chunk in the function.
+	auto &declared = f.Function().GetArguments();
+	const LogicalType input_type = declared.size() == 1 ? declared[0] : data.key_type;
+	if (!data.filter || !data.filter->IsSealed() || !on_column || input_type != data.key_type) {
+		return nullptr;
+	}
+	JoinFilterEntry entry;
+	entry.bloom = data.filter.get();
+	entry.key_type = input_type;
+	entry.filters_null_values = data.filters_null_values;
+	idx_t id = RegisterJoinFilter(entry, data.filter);
+	vector<unique_ptr<Expression>> args;
+	args.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(id)));
+	args.push_back(column.Copy());
+	return make_uniq<BoundFunctionExpression>(BoundScalarFunction(JoinFilterFunction()), std::move(args), nullptr);
+}
+
+static unique_ptr<Expression> PrefixRangeAsExpression(const BoundFunctionExpression &f, const Expression &column) {
+	if (!g_expand_prefix_ranges || !f.BindInfo()) {
+		return nullptr;
+	}
+	auto &data = f.BindInfo()->Cast<PrefixRangeFunctionData>();
+	if (g_join_filter_ids && data.filter && data.filter->IsInitialized()) {
+		JoinFilterEntry entry; // not brace-initialized: a struct with member initializers is no aggregate in C++11
+		entry.filter = data.filter;
+		entry.key_type = data.key_type;
+		entry.filters_null_values = data.filters_null_values;
+		idx_t id = RegisterJoinFilter(entry, nullptr);
+		vector<unique_ptr<Expression>> args;
+		args.push_back(make_uniq<BoundConstantExpression>(Value::UBIGINT(id)));
+		args.push_back(column.Copy());
+		unique_ptr<Expression> call =
+		    make_uniq<BoundFunctionExpression>(BoundScalarFunction(JoinFilterFunction()), std::move(args), nullptr);
+		// The keys' range beside it, as plain comparisons: those the parquet reader checks against each row group's
+		// min/max and skips the row group, which it cannot do for the call (DuckDB's own scan asks the filter's
+		// LookupRange per row group; for our function it has no statistics). Nothing on TPC-H, whose keys are
+		// spread over every row group; whole row groups on data clustered by the key. Integer keys only.
+		int64_t lo = 0, hi = 0;
+		if (ReadPrefixRangeBounds(data, lo, hi)) {
+			auto ge = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHANOREQUALTO, column.Copy(),
+			                                            make_uniq<BoundConstantExpression>(Value::Numeric(data.key_type, lo)));
+			auto le = BoundComparisonExpression::Create(ExpressionType::COMPARE_LESSTHANOREQUALTO, column.Copy(),
+			                                            make_uniq<BoundConstantExpression>(Value::Numeric(data.key_type, hi)));
+			auto range = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(ge), std::move(le));
+			return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(range), std::move(call));
+		}
+		return call;
+	}
+	// Outside the SQL channel's registry: the keys themselves, or their range.
+	vector<Value> keys;
+	int64_t lo = 0, hi = 0;
+	if (!ReadPrefixRangeKeys(data, keys, lo, hi)) {
+		return nullptr;
+	}
+	if (!keys.empty() && static_cast<uint64_t>(keys.size()) == static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1) {
+		keys.clear(); // every value of the range: the range says as much
+	}
+	if (keys.empty()) {
+		auto ge = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHANOREQUALTO, column.Copy(),
+		                                            make_uniq<BoundConstantExpression>(Value::Numeric(data.key_type, lo)));
+		auto le = BoundComparisonExpression::Create(ExpressionType::COMPARE_LESSTHANOREQUALTO, column.Copy(),
+		                                            make_uniq<BoundConstantExpression>(Value::Numeric(data.key_type, hi)));
+		return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(ge), std::move(le));
+	}
+	auto in = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN, LogicalType::BOOLEAN);
+	in->GetChildrenMutable().push_back(column.Copy());
+	for (auto &k : keys) {
+		in->GetChildrenMutable().push_back(make_uniq<BoundConstantExpression>(k));
+	}
+	return std::move(in);
 }
 
 
@@ -1416,21 +1710,29 @@ static string WithoutBindDuplicates(const string &bind_json, const string &live_
 	return json + "]}";
 }
 
+//! While a scan renders its live filters: where the join filters it registers are collected (null = no registry,
+//! a join filter is then rendered as its keys or dropped).
+struct JoinFilterIdsScope {
+	explicit JoinFilterIdsScope(vector<idx_t> *ids) : saved(g_join_filter_ids) {
+		g_join_filter_ids = ids;
+	}
+	~JoinFilterIdsScope() {
+		g_join_filter_ids = saved;
+	}
+	vector<idx_t> *saved;
+};
+
 static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input,
                                    vector<Value> &constants, bool join_key_lists) {
 	if (!input.filters) {
 		return string();
 	}
-	// a hash join's prefix-range filter becomes its keys only for a provider that re-applies what it is sent
-	struct ExpandScope {
-		explicit ExpandScope(bool on) : saved(g_expand_prefix_ranges) {
-			g_expand_prefix_ranges = on;
-		}
-		~ExpandScope() {
-			g_expand_prefix_ranges = saved;
-		}
-		bool saved;
-	} expand_scope(bind_data.reapply_filters && join_key_lists);
+	// no join filter registry in the tree: a hash join's filter goes as its keys or their range, never as a call
+	JoinFilterIdsScope ids_scope(nullptr);
+	// a hash join's prefix-range filter becomes its keys (or their range). Safe for every provider: it is a join
+	// filter, and the join checks its keys itself, so a superset never changes a result. It used to be limited to
+	// providers that re-apply what they are sent (SQL Server), which left Delta without join filters.
+	PrefixRangeScope expand_scope(join_key_lists);
 	vector<string> parts;
 	for (auto entry : *input.filters) {
 		idx_t key = entry.GetIndex();
@@ -1493,10 +1795,15 @@ static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFu
 // (read_parquet) path. Column keys map through the scanned column list to provider names (exactly as
 // PhysicalTableScan::GetFilterInfo does). Empty unless the scan advertised filter_pushdown (the exact-filter
 // native catalog) and DuckDB delivered filters. See docs/multifile-delta.md §"Batch 2 slice 2".
-static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input) {
+static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input,
+                                bool join_key_lists, vector<idx_t> &join_filter_ids) {
 	if (!input.filters) {
 		return string();
 	}
+	// a hash join's prefix-range filter as fabricator_join_filter(<id>, col) (PrefixRangeAsExpression); the ids
+	// it registers go to the scan's global state, which removes them when the scan ends
+	PrefixRangeScope expand_scope(join_key_lists);
+	JoinFilterIdsScope ids_scope(&join_filter_ids);
 	vector<string> conds;
 	for (auto entry : *input.filters) {
 		idx_t key = entry.GetIndex();
@@ -1853,16 +2160,20 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		// exact SQL the provider APPLIES (native_filter) and as the structured FilterNode tree it PRUNES
 		// with (file/row-group skipping; the constants extend a PER-EXECUTION copy of the bind constants —
 		// bind data is shared across executions and must not be mutated).
-		string live_filter_sql = RenderLiveFilters(bind_data, input);
-		vector<Value> filter_constants = bind_data.filter_constants;
 		// the switch for reading a hash join's prefix-range filter back as keys (§5.5): DuckDB's own structure, so
 		// the way out should DuckDB ever get it wrong
 		Value join_key_lists;
 		bool read_key_lists = !(context.TryGetCurrentSetting("fabricator_join_key_lists", join_key_lists) &&
 		                        !join_key_lists.IsNull() && !join_key_lists.GetValue<bool>());
+		string live_filter_sql = RenderLiveFilters(bind_data, input, read_key_lists, gstate->join_filter_ids);
+		vector<Value> filter_constants = bind_data.filter_constants;
 		string live_filter_json = WithoutBindDuplicates(
 		    bind_data.filter_json, SerializeLiveFilters(bind_data, input, filter_constants, read_key_lists),
 		    filter_constants);
+		if (getenv("FABRICATOR_DUMP_FILTERS")) {
+			// the pruning channel too: what the provider receives as its filter TREE
+			Printer::Print("FILTER JSON=" + (live_filter_json.empty() ? string("<none>") : live_filter_json));
+		}
 		// a filter the scan re-applies after the server's TOP must not be able to remove one of its rows
 		bool has_live_filters = false;
 		if (input.filters) {
