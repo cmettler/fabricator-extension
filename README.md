@@ -4861,6 +4861,9 @@ ALTER TABLE lake.main.t ALTER COLUMN s.a TYPE BIGINT;    -- a struct member
   has already written the table.
 - ⚠ Readers need the `typeWidening` feature: delta-spark 3.3+/4.0, engineered-wood, this extension. An older
   reader refuses the whole table once the feature is declared, so enable it only where every reader has it.
+- **Fabric reads it (measured 2026-11-08):** the Lakehouse SQL endpoint reads widened tables exactly, old files
+  included (it drops struct and `timestamp_ntz` columns as it always does), and Fabric Spark reads them, appends
+  to them, and its own `ALTER COLUMN … TYPE` tables read back here.
 - Like the other metadata ALTERs it commits immediately, even inside `BEGIN … COMMIT`.
 
 > ⚠ **Tables with a BOOLEAN column written before 2026-10-26 by `PROVIDER 'delta'`** recorded the column's maximum
