@@ -604,12 +604,10 @@ void ApplyStoredNames(MultiFileColumnDefinition &column, yyjson_val *spec) {
 	}
 }
 
-//! A member a file lacks (added to a struct later) reads NULL, at every depth.
+//! A column a file lacks (added later) reads NULL. Only the column itself: a struct MEMBER a file lacks reads NULL
+//! from the mapper already.
 void SetNullDefaults(MultiFileColumnDefinition &column) {
 	column.default_expression = ConstantExpression::FromValue(Value(column.type));
-	for (auto &child : column.children) {
-		SetNullDefaults(child);
-	}
 }
 
 //! Frees a yyjson document at scope exit.
@@ -832,9 +830,9 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	function.get_partition_stats = nullptr;
 	function.late_materialization = false;
 	function.cardinality = FileScanCardinality;
-	// ⚠ No struct-field pushdown extract: with it, a path into a member old files lack (a nested ADD COLUMN) raised
-	// INTERNAL "result vector of type INTEGER does not match expression type STRUCT(q INTEGER)" —
-	// verify_delta_catalog_nested_alter:239, 3 of 3 with it, 0 without. Costs join filters on struct fields.
+	// ⚠ No struct-field pushdown extract: a path into a member some files lack raises an INTERNAL error in DuckDB
+	// 2.0.0 itself (docs/duckdb-upstream-issues.md §17, verify_delta_catalog_nested_alter). Costs join filters on
+	// struct fields.
 	function.supports_pushdown_extract = nullptr;
 	function.get_bind_info = FileScanBindInfo;
 	function.get_table_entry = FileScanTableEntry;

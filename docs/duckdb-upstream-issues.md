@@ -1123,6 +1123,26 @@ shredded variant without `variantShredding`). Under column mapping the physical 
 case, so only `column_mapping 'none'` with a mixed-case variant column is affected. Pinned in
 `verify_delta_catalog_variant` (the `uppername` row fails the day upstream fixes it).
 
+## 17. A struct path into a member one file lacks raises an INTERNAL error under `union_by_name` — 2.0.0, invalidates the database
+
+Found 2026-11-10 through the file scan (`src/fabricator/fabricator_file_scan.cpp`), reproduced on the official
+`duckdb` 2.0.0 Python wheel without any extension:
+
+```sql
+COPY (SELECT 1 AS id, {'a': 10} AS s) TO 'f1.parquet';
+COPY (SELECT 2 AS id, {'a': 20, 'deep': {'q': 7}} AS s) TO 'f2.parquet';
+SELECT id, s.deep.q FROM read_parquet(['f1.parquet', 'f2.parquet'], union_by_name := true);
+-- INTERNAL Error: ExpressionExecutor::Execute called with a result vector of type INTEGER that does not match
+-- expression type STRUCT(q INTEGER)
+```
+
+Control: `SELECT id, s.deep …` (the whole member, no path below it) answers `(1, NULL), (2, {'q': 7})`. The path is
+pushed into the scan as an extract (`supports_pushdown_extract`), and for the file that lacks `deep` the reader
+substitutes a NULL of the member's type where the extract expects the field's. A table whose struct gained a member
+(Delta `ALTER TABLE … ADD COLUMN s.deep`, any `union_by_name` read over old and new files) hits it with an ordinary
+query. Ours: the file scan does not declare `supports_pushdown_extract` (costs join filters on struct fields;
+`verify_delta_catalog_nested_alter:222` with it, green without). Not filed.
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the
