@@ -138,7 +138,29 @@ services:
       retries: 12
       start_period: 10s
 
+  # RustFS (Apache-2.0, maintained) as the S3 test store -- a TRIAL beside MinIO, whose community image is no longer
+  # published (we run Bitnami's frozen 2025.7.23 mirror). Same keys and bucket name as MinIO, so the S3 suites run
+  # unchanged against it: FABRICATOR_S3_ENDPOINT=localhost:9100, FABRICATOR_S3_SQL_ENDPOINT=rustfs:9000.
+  # Measured 2026-11-08 on 1.0.4: put-if-absent (If-None-Match: *) is atomic -- 20 rounds of 32 concurrent writers,
+  # exactly one winner each -- which is what our S3 commits depend on. TLS from certs/rustfs (generate-certs.ps1).
+  # Nothing creates the bucket yet: create `fabricator` with any S3 client after the first start.
+  rustfs:
+    image: rustfs/rustfs:1.0.4
+    profiles: ["rustfs"]
+    restart: unless-stopped
+    container_name: rustfs-fabricator
+    ports:
+      - "9100:9000"   # S3 API (HTTPS)
+    environment:
+      - RUSTFS_ACCESS_KEY=miniouser
+      - RUSTFS_SECRET_KEY=miniosecret123
+      - RUSTFS_TLS_PATH=/certs
+    volumes:
+      - rustfs-data:/data
+      - ./certs/rustfs:/certs:ro
+
 volumes:
   mssql-data:
   minio-data:
+  rustfs-data:
   mssql-poly-data:

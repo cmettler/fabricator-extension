@@ -2,6 +2,7 @@
 #
 # SANs must cover every name a client uses to reach MinIO:
 #   - DNS:minio      -> SQL Server inside the compose network (LOCATION = 's3://minio:9000/')
+#   - DNS:rustfs     -> the same for the RustFS service (profile `rustfs`, LOCATION = 's3://rustfs:9000/')
 #   - DNS:localhost + IP:127.0.0.1 -> DuckDB tests on the host (ENDPOINT 'localhost:9000')
 #
 # Output (public.crt + private.key, PEM) lands next to this script and is GITIGNORED; the compose file
@@ -36,6 +37,7 @@ subjectAltName = @alt_names
 [alt_names]
 DNS.1 = minio
 DNS.2 = localhost
+DNS.3 = rustfs
 IP.1 = 127.0.0.1
 '@ | Set-Content -Path $cnf -Encoding ascii
 
@@ -55,5 +57,11 @@ $caDir = Join-Path $dir 'CAs'
 New-Item -ItemType Directory -Force -Path $caDir | Out-Null
 Copy-Item -Force (Join-Path $dir 'public.crt') (Join-Path $caDir 'public.crt')
 
-Write-Host "Generated $(Join-Path $dir 'public.crt') (CN=minio; SANs: minio, localhost, 127.0.0.1)"
+# RustFS reads its certificate from a directory under fixed names (RUSTFS_TLS_PATH): the same pair, renamed.
+$rustfsDir = Join-Path $dir 'rustfs'
+New-Item -ItemType Directory -Force -Path $rustfsDir | Out-Null
+Copy-Item -Force (Join-Path $dir 'public.crt') (Join-Path $rustfsDir 'rustfs_cert.pem')
+Copy-Item -Force (Join-Path $dir 'private.key') (Join-Path $rustfsDir 'rustfs_key.pem')
+
+Write-Host "Generated $(Join-Path $dir 'public.crt') (CN=minio; SANs: minio, localhost, rustfs, 127.0.0.1)"
 Write-Host "Copied    $(Join-Path $caDir 'public.crt') (trust store for the bundled mc client)"
