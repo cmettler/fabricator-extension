@@ -305,6 +305,11 @@ RESET threads;
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/plugpw' AS pw (TYPE fabricator, PROVIDER 'delta');
 
+# The provider scan: it hands out 2048-row morsels. The file scan reads parquet by ROW GROUP, and this source is one
+# file of one row group, so a single task would read it and the sink would have nothing to parallelize.
+statement ok
+SET fabricator_file_scan = false;
+
 statement ok
 CREATE TABLE pw.main.pw_src AS SELECT i AS id FROM range(8192) t(i);
 

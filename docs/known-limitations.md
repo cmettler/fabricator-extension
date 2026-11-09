@@ -375,8 +375,12 @@ a filter on a struct FIELD is applied above the scan rather than inside it, so a
 and a `WHERE s.a = …` no row-group pruning. Results are unchanged. The reason is upstream: with struct pushdown on,
 DuckDB 2.0.0 raises an INTERNAL error when the path reaches a member an older file lacks
 (docs/duckdb-upstream-issues.md §17). The provider's scan, the default, still pushes them
-(`verify_delta_struct_extract`). Also unwired under the file scan: late materialization (row-id filters selecting
-files). Everything the file scan cannot express — an explicit transaction, pending writes, VARIANT, nested
+(`verify_delta_struct_extract`).
+
+Parallelism is per parquet ROW GROUP under the file scan (DuckDB's reader), where the provider's scan hands out
+2048-row morsels. A small table of one row group is therefore read by one thread, which matters only when the work
+above the scan is expensive per row (a slow scalar function): `verify_plugin`'s parallel-sink timing section pins the
+provider's scan for this reason. Everything the file scan cannot express — an explicit transaction, pending writes, VARIANT, nested
 timestamps, column mapping `id` with a struct inside a list or map — falls back to the provider's scan by itself.
 
 ---

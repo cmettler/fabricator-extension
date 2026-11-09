@@ -429,3 +429,91 @@ NULL
 
 statement ok
 DETACH l11;
+
+# ============================================================================
+# 12. LATE MATERIALIZATION. A Top-N or LIMIT over a wide row reads the narrow columns first and fetches the rest only
+#     for the rows it keeps, joining the two scans on (filename, file_row_number). Not file_index: that is a file's
+#     position in the scan's list, and the list depends on the scan's filters (§11), which the second scan carries
+#     differently (optional, without the dynamic ones). Several files, a deletion vector, and a pruned partitioned
+#     table; the answers are the provider scan's.
+# ============================================================================
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/fs12' AS l12 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE TABLE l12.main.w (id INTEGER, b DOUBLE, s VARCHAR, t VARCHAR);
+
+statement ok
+INSERT INTO l12.main.w SELECT r, (r * 37) % 1000, 's' || r, repeat('t', 20) || r FROM range(0, 1000) t(r);
+
+statement ok
+INSERT INTO l12.main.w SELECT r, (r * 37) % 1000 + 0.5, 's' || r, repeat('t', 20) || r FROM range(1000, 2000) t(r);
+
+statement ok
+INSERT INTO l12.main.w SELECT r, (r * 37) % 1000 + 0.25, 's' || r, repeat('t', 20) || r FROM range(2000, 3000) t(r);
+
+statement ok
+DELETE FROM l12.main.w WHERE id IN (0, 1000, 27);
+
+statement ok
+SET fabricator_file_scan = true;
+
+query II
+EXPLAIN SELECT * FROM l12.main.w ORDER BY b LIMIT 4;
+----
+physical_plan	<REGEX>:(?s).*Join.*Fabricator File Scan.*Fabricator File Scan.*
+
+query IRTT
+SELECT * FROM l12.main.w ORDER BY b, id LIMIT 4;
+----
+2000	0.25	s2000	tttttttttttttttttttt2000
+973	1.0	s973	tttttttttttttttttttt973
+2973	1.25	s2973	tttttttttttttttttttt2973
+1973	1.5	s1973	tttttttttttttttttttt1973
+
+# the same Top-N through the provider's scan
+statement ok
+CREATE TEMP TABLE w_on AS SELECT * FROM l12.main.w ORDER BY b DESC, id LIMIT 7;
+
+statement ok
+SET fabricator_file_scan = false;
+
+statement ok
+CREATE TEMP TABLE w_off AS SELECT * FROM l12.main.w ORDER BY b DESC, id LIMIT 7;
+
+query I
+SELECT count(*) FROM (SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on));
+----
+0
+
+statement ok
+SET fabricator_file_scan = true;
+
+# a LIMIT without ORDER BY: any 5 live rows, each a real row of the table
+query I
+SELECT count(*) FROM (SELECT * FROM l12.main.w LIMIT 5) l JOIN (SELECT * FROM l12.main.w) r USING (id, b, s, t);
+----
+5
+
+# a pruned partitioned table: the filter rules a part out in the first scan and (as an optional filter) in the second
+statement ok
+CREATE TABLE l12.main.p (id INTEGER, k VARCHAR, b DOUBLE, s VARCHAR) PARTITIONED BY (k);
+
+statement ok
+INSERT INTO l12.main.p SELECT r, CASE WHEN r % 3 = 0 THEN 'x' WHEN r % 3 = 1 THEN 'y' ELSE 'z' END, r * 1.5, 's' || r FROM range(0, 300) t(r);
+
+query ITRT
+SELECT * FROM l12.main.p WHERE k <> 'x' ORDER BY b DESC LIMIT 3;
+----
+299	z	448.5	s299
+298	y	447.0	s298
+296	z	444.0	s296
+
+query ITRT
+SELECT * FROM l12.main.p WHERE k = 'z' ORDER BY b LIMIT 2;
+----
+2	z	3.0	s2
+5	z	7.5	s5
+
+statement ok
+DETACH l12;

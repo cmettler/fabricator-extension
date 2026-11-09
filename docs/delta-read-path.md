@@ -1584,12 +1584,21 @@ under such a column is refused by name.
 as the read set — `verify_delta_catalog_transactions:517` under serializable), pending writes in the transaction,
 column mapping `id` with a struct inside a list or map, a binary partition column, nested timestamps, VARIANT.
 
-### Not done, and why
+### Late materialization
+
+**Late materialization** (a Top-N or LIMIT reads the narrow columns, then fetches the rest for the rows it keeps) is
+DuckDB's own, joined on `(filename, file_row_number)` — not parquet_scan's `(file_index, file_row_number)`: a file's
+index is its position in the scan's list, part pruning makes that list depend on the scan's filters, and the second
+scan carries them differently (as optional filters, without the dynamic ones). A filename does not move. Gate §12,
+where a row id of `file_row_number` alone fails the differential against the provider scan.
+
+### Limits
 
 - **Struct field pushdown is off** in the file scan: with it, DuckDB 2.0.0 hits an INTERNAL error when a struct path
   reaches a member older files lack (`docs/duckdb-upstream-issues.md` §17). The cost is join filters on struct fields
   (`verify_delta_struct_extract`'s profile rows).
-- **Late materialization** (rowid filters selecting files) is not wired; the provider's scan does it.
+- **Parallelism is per row group**, DuckDB's reader's unit, where the provider's scan splits into 2048-row morsels:
+  a one-row-group table is read by one thread.
 
 ### Measured
 
@@ -1603,9 +1612,10 @@ costs nothing measurable).
 `test/verify_delta_file_scan.test` (hermetic): routing, a differential against the provider's scan over deletion
 vectors, schema evolution, row tracking, DML, partitions, timestamps, column mapping `none` / `name` / `id`, structs
 in lists and maps, the plan copy in a CTE, the explicit-transaction decline, naive timestamps under a non-UTC zone
-(§10) and pruning (§11 — a data file the filter rules out is overwritten with garbage, so the filtered read only
-succeeds if that part is never opened; the unfiltered read failing on it is the control). Mutants killed at their own
-rows: the type rewrite for naive timestamps (§10), no pruning (§11), and earlier the id-mode, list/map and
+(§10), pruning (§11 — a data file the filter rules out is overwritten with garbage, so the filtered read only
+succeeds if that part is never opened; the unfiltered read failing on it is the control) and late materialization
+(§12). Mutants killed at their own rows: the type rewrite for naive timestamps (§10), no pruning (§11), a row id of
+`file_row_number` alone (§12), and earlier the id-mode, list/map and
 row-number paths.
 
 Suites that test the provider scan's own routing, logs or plan markers set `fabricator_file_scan = false`, so they
