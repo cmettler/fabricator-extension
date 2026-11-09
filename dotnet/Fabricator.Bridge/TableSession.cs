@@ -226,8 +226,11 @@ internal sealed class TableSession
 
     /// <summary>The <c>table_file_plan</c> answer (ABI v101, <see cref="ITableBinding.PlanScan"/>). A binding that
     /// cannot plan files declines, and the host scans as before.</summary>
-    internal string FilePlanJson(TableAt? at) => With(
-        t => ScanPlanWire.ToJson(t.PlanScan() ?? ScanPlan.Decline("the provider does not plan scans")), at ?? _at);
+    internal (string Json, IArrowArrayStream? Parts) FilePlan(TableAt? at) => With(t =>
+    {
+        var plan = t.PlanScan() ?? ScanPlan.Decline("the provider does not plan scans");
+        return (ScanPlanWire.ToJson(plan), plan.DeclinedReason is null ? ScanPartsArrow.ToStream(plan) : null);
+    }, at ?? _at);
 
     /// <summary>The <c>table_part_scan</c> answer (ABI v101): the rows of a stream part the plan named.</summary>
     internal IArrowArrayStream PartScan(string part, IReadOnlyList<string> columns) =>

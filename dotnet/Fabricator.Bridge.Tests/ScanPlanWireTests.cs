@@ -9,9 +9,10 @@ using System.Text.Json;
 namespace Fabricator.Bridge.Tests;
 
 /// <summary>
-/// The scan plan on the wire (ABI v101 <c>table_file_plan</c>): what <see cref="ScanPlanWire"/> writes is what
-/// src/fabricator/fabricator_file_scan.cpp reads, and nothing short of a full build exercises the pair — these
-/// tests pin the producer half against the protocol documented in abi.h. Keep the two in step.
+/// The scan plan on the wire (ABI v101 <c>table_file_plan</c>): the table's half as JSON and the parts as columns
+/// (turned into one Arrow batch by ScanPartsArrow, which needs Arrow and is covered end to end by
+/// verify_delta_file_scan). What src/fabricator/fabricator_file_scan.cpp reads; these tests pin the producer half
+/// against the protocol documented in abi.h. Keep the two in step.
 /// </summary>
 public class ScanPlanWireTests
 {
@@ -28,63 +29,89 @@ public class ScanPlanWireTests
     [Fact]
     public void A_file_part_carries_path_size_and_deleted_rows()
     {
-        var root = Wire(new ScanPlan
+        var plan = new ScanPlan
         {
             Parts = new ScanPart[] { new FilePart("s3://b/t/f1.parquet") { Size = 1234, DeletedRows = new long[] { 3, 9 } } },
             RowCount = 98,
-        });
-        Assert.Equal(98, root.GetProperty("row_count").GetInt64());
-        var file = root.GetProperty("files")[0];
-        Assert.Equal("s3://b/t/f1.parquet", file.GetProperty("path").GetString());
-        Assert.Equal(1234, file.GetProperty("size").GetInt64());
-        Assert.Equal(new long[] { 3, 9 }, file.GetProperty("dv").EnumerateArray().Select(e => e.GetInt64()));
-        Assert.False(file.TryGetProperty("stream", out _));
+        };
+        Assert.Equal(98, Wire(plan).GetProperty("row_count").GetInt64());
+        var parts = ScanPlanWire.PartColumns(plan);
+        Assert.Equal(new[] { "s3://b/t/f1.parquet" }, parts.Paths);
+        Assert.Equal(new[] { false }, parts.Streams);
+        Assert.Equal(new long?[] { 1234 }, parts.Sizes);
+        Assert.Equal(new long[] { 3, 9 }, parts.Deleted[0]);
     }
 
     [Fact]
     public void What_is_unknown_or_empty_is_left_out()
     {
-        var root = Wire(new ScanPlan { Parts = new ScanPart[] { new FilePart("f") { DeletedRows = new long[0] } } });
+        var plan = new ScanPlan { Parts = new ScanPart[] { new FilePart("f") { DeletedRows = new long[0] } } };
+        var root = Wire(plan);
         Assert.False(root.TryGetProperty("row_count", out _));   // unknown: the host sets no cardinality
         Assert.False(root.TryGetProperty("columns", out _));
         Assert.False(root.TryGetProperty("virtual", out _));
-        var file = root.GetProperty("files")[0];
-        Assert.Equal(new[] { "path" }, file.EnumerateObject().Select(p => p.Name));
+        var parts = ScanPlanWire.PartColumns(plan);
+        Assert.Null(parts.Sizes[0]);
+        Assert.Null(parts.Deleted[0]);   // empty = none
+        Assert.Empty(parts.ConstantNames);
+        Assert.Empty(parts.VirtualNames);
     }
 
     [Fact]
     public void A_stream_part_is_named_and_marked_and_has_no_deleted_rows()
     {
-        var root = Wire(new ScanPlan { Parts = new ScanPart[] { new StreamPart("fragment-7@v3") } });
-        var part = root.GetProperty("files")[0];
-        Assert.Equal("fragment-7@v3", part.GetProperty("stream").GetString());
-        Assert.Equal("fragment-7@v3", part.GetProperty("path").GetString()); // the host names it in errors
-        Assert.False(part.TryGetProperty("dv", out _));
+        var parts = ScanPlanWire.PartColumns(new ScanPlan { Parts = new ScanPart[] { new StreamPart("fragment-7@v3") } });
+        Assert.Equal(new[] { "fragment-7@v3" }, parts.Paths);
+        Assert.Equal(new[] { true }, parts.Streams);
+        Assert.Null(parts.Deleted[0]);
     }
 
     [Fact]
     public void Constants_are_text_and_a_null_constant_stays_null()
     {
-        var root = Wire(new ScanPlan
+        var parts = ScanPlanWire.PartColumns(new ScanPlan
         {
             Parts = new ScanPart[]
             {
-                new FilePart("f")
+                new FilePart("f1")
                 {
-                    Constants = new Dictionary<string, string?> { ["region"] = "eu", ["day"] = "2024-01-02", ["k"] = null },
+                    Constants = new Dictionary<string, string?> { ["region"] = "eu", ["day"] = "2024-01-02" },
                 },
+                new FilePart("f2") { Constants = new Dictionary<string, string?> { ["day"] = null, ["region"] = "us" } },
             },
         });
-        var constants = root.GetProperty("files")[0].GetProperty("constants");
-        Assert.Equal("eu", constants.GetProperty("region").GetString());
-        Assert.Equal("2024-01-02", constants.GetProperty("day").GetString());
-        Assert.Equal(JsonValueKind.Null, constants.GetProperty("k").ValueKind);
+        Assert.Equal(new[] { "region", "day" }, parts.ConstantNames);
+        Assert.Equal(new string?[] { "eu", "us" }, parts.ConstantValues[0]);
+        Assert.Equal(new string?[] { "2024-01-02", null }, parts.ConstantValues[1]);
+    }
+
+    [Fact]
+    public void Every_part_must_state_the_same_constants_and_virtual_values()
+    {
+        // a part without a constant would read as NULL for that part, which is not "read it from the file"
+        var ex = Assert.Throws<System.InvalidOperationException>(() => ScanPlanWire.PartColumns(new ScanPlan
+        {
+            Parts = new ScanPart[]
+            {
+                new FilePart("f1") { Constants = new Dictionary<string, string?> { ["region"] = "eu" } },
+                new FilePart("f2"),
+            },
+        }));
+        Assert.Contains("part 1", ex.Message);
+        Assert.Throws<System.InvalidOperationException>(() => ScanPlanWire.PartColumns(new ScanPlan
+        {
+            Parts = new ScanPart[]
+            {
+                new FilePart("f1") { VirtualValues = new Dictionary<string, long?> { ["rowid"] = 0 } },
+                new FilePart("f2") { VirtualValues = new Dictionary<string, long?> { ["row_id"] = 0 } },
+            },
+        }));
     }
 
     [Fact]
     public void Virtual_columns_say_how_and_each_part_says_its_value()
     {
-        var root = Wire(new ScanPlan
+        var plan = new ScanPlan
         {
             VirtualColumns = new Dictionary<string, ScanVirtualColumn>
             {
@@ -102,17 +129,19 @@ public class ScanPlanWireTests
                     },
                 },
             },
-        });
+        };
+        var root = Wire(plan);
         var rowid = root.GetProperty("virtual").GetProperty("rowid");
         Assert.True(rowid.GetProperty("add_row_number").GetBoolean());
         Assert.False(rowid.TryGetProperty("stored", out _));
         var version = root.GetProperty("virtual").GetProperty("__delta_row_commit_version");
         Assert.Equal("_row-commit-version-col-1", version.GetProperty("stored").GetString());
         Assert.False(version.TryGetProperty("add_row_number", out _)); // false is the default, left out
-        var values = root.GetProperty("files")[0].GetProperty("virtual");
-        Assert.Equal(1L << 40, values.GetProperty("rowid").GetInt64());
-        Assert.Equal(500, values.GetProperty("__delta_row_id").GetInt64());
-        Assert.Equal(JsonValueKind.Null, values.GetProperty("__delta_row_commit_version").ValueKind);
+        var parts = ScanPlanWire.PartColumns(plan);
+        Assert.Equal(new[] { "rowid", "__delta_row_id", "__delta_row_commit_version" }, parts.VirtualNames);
+        Assert.Equal(new long?[] { 1L << 40 }, parts.VirtualValues[0]);
+        Assert.Equal(new long?[] { 500 }, parts.VirtualValues[1]);
+        Assert.Equal(new long?[] { null }, parts.VirtualValues[2]);
     }
 
     [Fact]
@@ -146,27 +175,20 @@ public class ScanPlanWireTests
     {
         var root = Wire(new ScanPlan
         {
-            Parts = new ScanPart[]
-            {
-                new FilePart("s3://b/t/a \"q\" \\ \u0001.parquet")
-                {
-                    Constants = new Dictionary<string, string?> { ["k\"ey"] = "v\nalue" },
-                },
-            },
+            StoredColumns = new Dictionary<string, StoredColumn> { ["k\"ey"] = new("col \"q\" \\ \u0001") },
+            Parts = new ScanPart[] { new FilePart("f") },
         });
-        var file = root.GetProperty("files")[0];
-        Assert.Equal("s3://b/t/a \"q\" \\ \u0001.parquet", file.GetProperty("path").GetString());
-        Assert.Equal("v\nalue", file.GetProperty("constants").GetProperty("k\"ey").GetString());
+        Assert.Equal("col \"q\" \\ \u0001", root.GetProperty("columns").GetProperty("k\"ey").GetProperty("stored").GetString());
     }
 
     [Fact]
     public void Parts_keep_their_order()
     {
-        var root = Wire(new ScanPlan
+        var parts = ScanPlanWire.PartColumns(new ScanPlan
         {
             Parts = new ScanPart[] { new FilePart("b"), new StreamPart("a"), new FilePart("c") },
         });
-        Assert.Equal(new[] { "b", "a", "c" },
-                     root.GetProperty("files").EnumerateArray().Select(f => f.GetProperty("path").GetString()));
+        Assert.Equal(new[] { "b", "a", "c" }, parts.Paths);
+        Assert.Equal(new[] { false, true, false }, parts.Streams);
     }
 }

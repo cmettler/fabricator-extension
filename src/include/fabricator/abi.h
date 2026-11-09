@@ -1248,23 +1248,25 @@ typedef struct FabricatorVTable {
 	                                 int32_t *exists, char **err);
 
 	// -------------------------------------------------------------------------
-	// The data files a table's scan would read — ABI v101, on the table session. ONE JSON doc in *out_json (host
-	// frees via free_error), or {"declined":"…"} when the table cannot be read that way. The host then reads exactly
-	// these files with DuckDB's own parquet reader (src/fabricator/fabricator_file_scan.cpp). FORMAT-NEUTRAL: the
-	// host knows nothing of Delta or Iceberg, the plan states everything:
+	// How a table's scan reads as PARTS — ABI v101, on the table session (Fabricator.Abstractions ScanPlan). The host
+	// reads every part in one parallel scan (src/fabricator/fabricator_file_scan.cpp): a file part with DuckDB's own
+	// parquet reader, a stream part through table_part_scan. FORMAT-NEUTRAL: the host knows nothing of Delta or
+	// Iceberg, the plan states everything. Two halves:
+	//  *out_json (host frees via free_error) — the table's, or {"declined":"…"} and *out_parts left unset:
 	//   {"row_count": N,                                   live rows (optional; the optimizer's cardinality)
-	//    "columns": {"<col>": {"stored": "<name in the files>", "members": {"<member>": {…}}}},  (optional)
-	//    "virtual": {"<virtual column>": {"stored": "<column in the files>", "add_row_number": true}},
-	//    "files": [{"path": "…", "size": S, "dv": [<deleted row positions>],
-	//               "constants": {"<col>": "<text>"|null},   a column the files lack (a partition value)
-	//               "virtual": {"<virtual column>": <int>|null}}]}
-	// A virtual column (one the table entry declares, e.g. rowid) reads COALESCE(the file's `stored` column, the
-	// file's value [+ file_row_number]); a constant's text is cast to the column type. ⚠ The plan REPLACES the scan,
-	// so it must describe the snapshot the scan would read (the same pin) with nothing pending in the transaction —
-	// a provider declines otherwise. at_unit/at_value carry the scan's AT clause ("" = none).
+	//    "columns": {"<col>": {"stored": "<name in the parts>", "members": {"<member>": {…}}}},  (optional)
+	//    "virtual": {"<virtual column>": {"stored": "<column in the parts>", "add_row_number": true}}}
+	//  *out_parts — one Arrow batch, a row per part, in scan order:
+	//    path VARCHAR, stream BOOLEAN (read by the provider), size BIGINT, deleted LIST<BIGINT> (row positions),
+	//    then "constant:<col>" VARCHAR per column the parts lack (a partition value; NULL = NULL for the part) and
+	//    "virtual:<name>" BIGINT per virtual column value.
+	// A virtual column (one the table entry declares, e.g. rowid) reads COALESCE(the part's `stored` column, the
+	// part's value [+ the row's position]); a constant's text is cast to the column type. ⚠ The plan REPLACES the
+	// scan, so it must describe the snapshot the scan would read (the same pin) with nothing pending in the
+	// transaction — a provider declines otherwise. at_unit/at_value carry the scan's AT clause ("" = none).
 	// -------------------------------------------------------------------------
 	int32_t (*table_file_plan)(FabricatorHandle table, const char *at_unit, const char *at_value, char **out_json,
-	                           char **err);
+	                           struct ArrowArrayStream *out_parts, char **err);
 
 	// The rows of a plan's STREAM part — ABI v101. A file entry with "stream": "<token>" (and no "dv") is read by the
 	// provider rather than by DuckDB: request_json = {"part": "<token>", "columns": ["<col>", …]} (the table's names,

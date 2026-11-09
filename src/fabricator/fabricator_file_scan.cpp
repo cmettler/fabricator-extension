@@ -26,6 +26,8 @@
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -147,6 +149,55 @@ unique_ptr<Expression> AddRowNumber(ClientContext &context, Value value, const L
 	return sum;
 }
 
+//! Reads an Arrow stream as DataChunks of at most STANDARD_VECTOR_SIZE rows, in the stream's own types. Owns the
+//! stream from construction. Shared by the plan's parts and by a stream part's rows.
+class ArrowChunkReader {
+public:
+	ArrowChunkReader(ClientContext &context, ArrowArrayStream &source) : state(nullptr, context) {
+		stream.arrow_array_stream = source;
+		source.release = nullptr; // ours now
+		ArrowSchemaWrapper schema;
+		stream.GetSchema(schema);
+		ArrowTableFunction::PopulateArrowTableSchema(context, table, schema.arrow_schema);
+		for (int64_t i = 0; i < schema.arrow_schema.n_children; i++) {
+			names.push_back(schema.arrow_schema.children[i]->name ? schema.arrow_schema.children[i]->name : "");
+		}
+	}
+
+	const vector<string> &Names() const {
+		return names;
+	}
+	vector<LogicalType> &Types() {
+		return table.GetTypes();
+	}
+
+	//! The next rows into `chunk`, whose columns are the stream's (or none, when only the row count matters);
+	//! false at the end of the stream.
+	bool Next(DataChunk &chunk) {
+		while (!state.chunk || state.chunk_offset >= idx_t(state.chunk->arrow_array.length)) {
+			auto next = stream.GetNextChunk();
+			if (!next || !next->arrow_array.release) {
+				return false;
+			}
+			state.chunk = std::move(next);
+			state.Reset();
+		}
+		auto count =
+		    MinValue<idx_t>(STANDARD_VECTOR_SIZE, idx_t(state.chunk->arrow_array.length) - state.chunk_offset);
+		chunk.Reset();
+		chunk.SetCardinality(count);
+		ArrowTableFunction::ArrowToDuckDB(state, table.GetColumns(), chunk);
+		state.chunk_offset += count;
+		return true;
+	}
+
+private:
+	ArrowArrayStreamWrapper stream;
+	ArrowTableSchema table;
+	ArrowScanLocalState state;
+	vector<string> names;
+};
+
 //! A part whose rows the PROVIDER produces (the plan's "stream"): an Arrow stream asked for with the columns the scan
 //! needs, read by one thread. Everything that maps rows onto the table — deleted rows aside, which the provider
 //! applies itself — stays with the multi-file reader: constants, stored names, NULL defaults, virtual columns.
@@ -155,7 +206,7 @@ public:
 	StreamPartReader(const OpenFileInfo &file, shared_ptr<FileScanPlan> plan_p, idx_t index_p)
 	    : BaseFileReader(file), plan(std::move(plan_p)), index(index_p) {
 		// the part's own columns: the table's, under their stored names (what the mapper matches), minus the ones the
-		// plan gives this file as constants (the provider does not produce them)
+		// plan gives this part as constants (the provider does not produce them)
 		auto &constants = plan->constants[index];
 		for (idx_t i = 0; i < plan->columns.size(); i++) {
 			if (constants.find(i) != constants.end()) {
@@ -190,27 +241,25 @@ public:
 			request += (i ? "," : "") + Quote(names[local]);
 		}
 		request += "]}";
-		stream = make_uniq<ArrowArrayStreamWrapper>();
-		TablePartScan(plan->table_handle, request, stream->arrow_array_stream);
-		ArrowSchemaWrapper schema;
-		stream->GetSchema(schema);
-		ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema.arrow_schema);
-		auto &arrow_columns = arrow_table.GetColumns();
+		ArrowArrayStream raw;
+		raw.release = nullptr;
+		TablePartScan(plan->table_handle, request, raw);
+		rows = make_uniq<ArrowChunkReader>(context, raw);
+		auto &types = rows->Types();
 		// no columns asked (a COUNT(*)): the provider sends a placeholder column only to carry the row count
-		if (!column_ids.empty() && arrow_columns.size() != column_ids.size()) {
+		if (!column_ids.empty() && types.size() != column_ids.size()) {
 			throw IOException("fabricator file scan: the provider's stream for '%s' has %d columns, the scan asked "
-			                  "for %d", file.path, arrow_columns.size(), column_ids.size());
+			                  "for %d", file.path, types.size(), column_ids.size());
 		}
 		for (idx_t i = 0; i < column_ids.size(); i++) {
 			auto &expected = columns[column_ids[MultiFileLocalIndex(i)].GetId()].type;
-			auto actual = arrow_columns.at(i)->GetDuckType();
-			if (actual != expected) {
+			if (types[i] != expected) {
 				throw IOException("fabricator file scan: the provider's stream for '%s' gives column '%s' as %s, the "
 				                  "table declares %s",
-				                  file.path, names[column_ids[MultiFileLocalIndex(i)].GetId()], actual.ToString(), expected.ToString());
+				                  file.path, names[column_ids[MultiFileLocalIndex(i)].GetId()], types[i].ToString(),
+				                  expected.ToString());
 			}
 		}
-		state = make_uniq<ArrowScanLocalState>(nullptr, context);
 		if (filters && filters->HasFilters()) {
 			vector<unique_ptr<Expression>> conjuncts;
 			for (auto &entry : *filters) {
@@ -237,24 +286,12 @@ public:
 			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
-			if (!state->chunk || state->chunk_offset >= idx_t(state->chunk->arrow_array.length)) {
-				auto next = stream->GetNextChunk();
-				if (!next || !next->arrow_array.release) {
-					// the end of the part: release the stream here, on the thread that drained it (see FinishFile)
-					state.reset();
-					stream.reset();
-					chunk.SetCardinality(0);
-					return SourceResultType::FINISHED;
-				}
-				state->chunk = std::move(next);
-				state->Reset();
+			if (!rows->Next(chunk)) {
+				// the end of the part: release the stream here, on the thread that drained it (see FinishFile)
+				rows.reset();
+				chunk.SetCardinality(0);
+				return SourceResultType::FINISHED;
 			}
-			auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE,
-			                             idx_t(state->chunk->arrow_array.length) - state->chunk_offset);
-			chunk.Reset();
-			chunk.SetCardinality(count);
-			ArrowTableFunction::ArrowToDuckDB(*state, arrow_table.GetColumns(), chunk);
-			state->chunk_offset += count;
 			if (!executor) {
 				return SourceResultType::HAVE_MORE_OUTPUT;
 			}
@@ -305,9 +342,7 @@ private:
 	//! the table's names of `columns` (what the provider is asked for), parallel to `columns`
 	vector<string> names;
 	std::atomic<bool> claimed {false};
-	unique_ptr<ArrowArrayStreamWrapper> stream;
-	ArrowTableSchema arrow_table;
-	unique_ptr<ArrowScanLocalState> state;
+	unique_ptr<ArrowChunkReader> rows;
 	unique_ptr<Expression> filter;
 	unique_ptr<ExpressionExecutor> executor;
 	SelectionVector selection {STANDARD_VECTOR_SIZE};
@@ -626,9 +661,9 @@ struct YyjsonDoc {
 	yyjson_doc *doc;
 };
 
-//! Reads the plan (see abi.h table_file_plan) into `plan`; false (with the reason traced) when the provider
-//! declined or listed no files.
-bool ParsePlan(const YyjsonDoc &doc, FileScanPlan &plan) {
+//! Reads the plan (see abi.h table_file_plan) into `plan`: the table's half from the JSON doc, the parts from the
+//! Arrow batch. False (with the reason traced) when the provider declined or listed no parts.
+bool ParsePlan(ClientContext &context, const YyjsonDoc &doc, ArrowArrayStream &parts, FileScanPlan &plan) {
 	auto root = doc.Root();
 	if (!yyjson_is_obj(root)) {
 		PlanError("the plan must be an object");
@@ -659,71 +694,119 @@ bool ParsePlan(const YyjsonDoc &doc, FileScanPlan &plan) {
 		spec.add_row_number = add && yyjson_get_bool(add);
 		plan.virtual_specs[yyjson_get_str(vkey)] = std::move(spec);
 	}
-	auto files = yyjson_obj_get(root, "files");
-	if (!yyjson_is_arr(files)) {
-		PlanError("files must be an array");
+	if (!parts.release) {
+		PlanError("no parts");
 	}
-	size_t idx, max;
-	yyjson_val *file;
-	yyjson_arr_foreach(files, idx, max, file) {
-		auto where = "files[" + std::to_string(idx) + "]";
-		if (!yyjson_is_obj(file)) {
-			PlanError(where + " must be an object");
-		}
-		auto path = PlanOptionalString(file, "path", where);
-		if (!path || !*path) {
-			PlanError(where + " has no path");
-		}
-		OpenFileInfo info(path);
-		info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-		auto &options = info.extended_info->options;
-		// a planned file is immutable (Delta and Iceberg never rewrite one in place): its size from the plan,
-		// no validation of a cached copy
-		auto size = yyjson_obj_get(file, "size");
-		if (size) {
-			options["file_size"] = Value::UBIGINT(uint64_t(PlanInteger(size, where + ".size", true)));
-		}
-		options["validate_external_file_cache"] = Value::BOOLEAN(false);
-		options["etag"] = Value("");
-		options["last_modified"] = Value::TIMESTAMP(timestamp_t(0));
-		options[FILE_KEY] = Value::UBIGINT(plan.files.size());
-		vector<int64_t> deleted;
-		auto dv = yyjson_obj_get(file, "dv");
-		if (dv && !yyjson_is_arr(dv)) {
-			PlanError(where + ".dv must be an array");
-		}
-		size_t di, dmax;
-		yyjson_val *pos;
-		yyjson_arr_foreach(dv, di, dmax, pos) {
-			deleted.push_back(PlanInteger(pos, where + ".dv", true));
-		}
-		std::sort(deleted.begin(), deleted.end());
-		case_insensitive_map_t<Value> constants;
-		size_t ci, cmax;
-		yyjson_val *ckey, *cval;
-		yyjson_obj_foreach(PlanObject(file, "constants", where), ci, cmax, ckey, cval) {
-			if (!yyjson_is_null(cval) && !yyjson_is_str(cval)) {
-				PlanError(where + ".constants." + yyjson_get_str(ckey) + " must be a string or null");
+
+	// the parts: a row each; the column names say what each column is (abi.h)
+	ArrowChunkReader reader(context, parts);
+	auto &names = reader.Names();
+	auto &types = reader.Types();
+	optional_idx path_col, stream_col, size_col, deleted_col;
+	vector<pair<string, idx_t>> constant_cols, virtual_cols;
+	for (idx_t c = 0; c < names.size(); c++) {
+		auto &name = names[c];
+		auto expect = [&](const LogicalType &type) {
+			if (types[c] != type) {
+				PlanError("parts column '" + name + "' must be " + type.ToString() + ", not " + types[c].ToString());
 			}
-			constants[yyjson_get_str(ckey)] = yyjson_is_null(cval) ? Value() : Value(yyjson_get_str(cval));
+		};
+		if (name == "path") {
+			expect(LogicalType::VARCHAR);
+			path_col = c;
+		} else if (name == "stream") {
+			expect(LogicalType::BOOLEAN);
+			stream_col = c;
+		} else if (name == "size") {
+			expect(LogicalType::BIGINT);
+			size_col = c;
+		} else if (name == "deleted") {
+			expect(LogicalType::LIST(LogicalType::BIGINT));
+			deleted_col = c;
+		} else if (StringUtil::StartsWith(name, "constant:")) {
+			expect(LogicalType::VARCHAR);
+			constant_cols.emplace_back(name.substr(9), c);
+		} else if (StringUtil::StartsWith(name, "virtual:")) {
+			expect(LogicalType::BIGINT);
+			virtual_cols.emplace_back(name.substr(8), c);
+		} else {
+			PlanError("unknown parts column '" + name + "'");
 		}
-		case_insensitive_map_t<Value> virtual_values;
-		size_t fi, fmax;
-		yyjson_val *fkey, *fval;
-		yyjson_obj_foreach(PlanObject(file, "virtual", where), fi, fmax, fkey, fval) {
-			virtual_values[yyjson_get_str(fkey)] =
-			    yyjson_is_null(fval) ? Value()
-			                         : Value::BIGINT(PlanInteger(fval, where + ".virtual." + yyjson_get_str(fkey), false));
+	}
+	if (!path_col.IsValid()) {
+		PlanError("the parts have no 'path' column");
+	}
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	while (reader.Next(chunk)) {
+		for (auto &vector : chunk.data) {
+			vector.Flatten();
 		}
-		auto stream = PlanOptionalString(file, "stream", where);
-		if (stream && !deleted.empty()) {
-			PlanError(where + " is a stream part with deleted rows: the provider applies its own deletes");
+		const list_entry_t *entries = nullptr;
+		const int64_t *positions = nullptr;
+		if (deleted_col.IsValid()) {
+			auto &list = chunk.data[deleted_col.GetIndex()];
+			entries = FlatVector::GetData<list_entry_t>(list);
+			auto &child = ListVector::GetChildMutable(list);
+			child.Flatten();
+			positions = FlatVector::GetData<int64_t>(child);
 		}
-		plan.stream_parts.push_back(stream ? stream : "");
-		plan.files.push_back(std::move(info));
-		plan.deleted.push_back(std::move(deleted));
-		plan.constant_text.push_back(std::move(constants));
-		plan.virtual_values.push_back(std::move(virtual_values));
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			auto where = "parts[" + std::to_string(plan.files.size()) + "]";
+			auto path_value = chunk.GetValue(path_col.GetIndex(), row);
+			if (path_value.IsNull() || StringValue::Get(path_value).empty()) {
+				PlanError(where + " has no path");
+			}
+			auto path = StringValue::Get(path_value);
+			OpenFileInfo info(path);
+			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+			auto &options = info.extended_info->options;
+			if (size_col.IsValid()) {
+				auto size = chunk.GetValue(size_col.GetIndex(), row);
+				if (!size.IsNull()) {
+					if (size.GetValue<int64_t>() < 0) {
+						PlanError(where + ".size must not be negative");
+					}
+					options["file_size"] = Value::UBIGINT(uint64_t(size.GetValue<int64_t>()));
+				}
+			}
+			// a planned file is immutable (Delta and Iceberg never rewrite one in place): its size from the plan,
+			// no validation of a cached copy
+			options["validate_external_file_cache"] = Value::BOOLEAN(false);
+			options["etag"] = Value("");
+			options["last_modified"] = Value::TIMESTAMP(timestamp_t(0));
+			options[FILE_KEY] = Value::UBIGINT(plan.files.size());
+			vector<int64_t> deleted;
+			if (entries && FlatVector::Validity(chunk.data[deleted_col.GetIndex()]).RowIsValid(row)) {
+				auto &entry = entries[row];
+				deleted.reserve(entry.length);
+				for (idx_t i = 0; i < entry.length; i++) {
+					auto position = positions[entry.offset + i];
+					if (position < 0) {
+						PlanError(where + ".deleted must not be negative");
+					}
+					deleted.push_back(position);
+				}
+				std::sort(deleted.begin(), deleted.end());
+			}
+			bool stream = stream_col.IsValid() && chunk.GetValue(stream_col.GetIndex(), row).GetValue<bool>();
+			if (stream && !deleted.empty()) {
+				PlanError(where + " is a stream part with deleted rows: the provider applies its own deletes");
+			}
+			case_insensitive_map_t<Value> constants;
+			for (auto &constant : constant_cols) {
+				constants[constant.first] = chunk.GetValue(constant.second, row);
+			}
+			case_insensitive_map_t<Value> virtual_values;
+			for (auto &value : virtual_cols) {
+				virtual_values[value.first] = chunk.GetValue(value.second, row);
+			}
+			plan.stream_parts.push_back(stream ? path : "");
+			plan.files.push_back(std::move(info));
+			plan.deleted.push_back(std::move(deleted));
+			plan.constant_text.push_back(std::move(constants));
+			plan.virtual_values.push_back(std::move(virtual_values));
+		}
 	}
 	if (plan.files.empty()) {
 		Trace("declined: no files");
@@ -755,8 +838,14 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
                       const std::string &at_unit, const std::string &at_value, unique_ptr<FunctionData> &bind_data,
                       TableFunction &result) {
 	auto plan = make_shared_ptr<FileScanPlan>();
-	YyjsonDoc doc(TableFilePlan(table_handle, at_unit, at_value));
-	if (!ParsePlan(doc, *plan)) {
+	ArrowArrayStream parts;
+	auto json = TableFilePlan(table_handle, at_unit, at_value, parts);
+	// the parts stream is released whatever happens below (a declined plan never set it)
+	ArrowArrayStreamWrapper parts_owner;
+	parts_owner.arrow_array_stream = parts;
+	parts.release = nullptr;
+	YyjsonDoc doc(json);
+	if (!ParsePlan(context, doc, parts_owner.arrow_array_stream, *plan)) {
 		return false;
 	}
 

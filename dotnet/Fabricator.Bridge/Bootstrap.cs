@@ -786,18 +786,24 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableFilePlan(nint table, byte* atUnit, byte* atValue, byte** outJson, byte** err)
+    private static int TableFilePlan(nint table, byte* atUnit, byte* atValue, byte** outJson,
+                                     CArrowArrayStream* outParts, byte** err)
     {
         try
         {
-            if (outJson is null || Handles.Resolve<TableSession>(table) is not { } session)
+            if (outJson is null || outParts is null || Handles.Resolve<TableSession>(table) is not { } session)
             {
                 return FabricatorStatus.InvalidArgument;
             }
             string unit = atUnit is null ? "" : Marshal.PtrToStringUTF8((nint)atUnit) ?? "";
             string value = atValue is null ? "" : Marshal.PtrToStringUTF8((nint)atValue) ?? "";
             TableAt? at = unit.Length == 0 ? null : new TableAt(unit, value);
-            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.FilePlanJson(at)); // host frees via free_error
+            var (json, parts) = session.FilePlan(at);
+            if (parts is not null)
+            {
+                CArrowArrayStreamExporter.ExportArrayStream(parts, outParts); // a declined plan leaves it unset
+            }
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

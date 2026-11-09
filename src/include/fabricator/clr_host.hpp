@@ -264,8 +264,10 @@ int64_t TableDmlWhere(FabricatorHandle table, const std::string &spec_json, Arro
 
 // Partition statistics (ABI v95): the per-file count/bounds doc, or "{}" from an older bridge (no stats).
 std::string TablePartitionStats(FabricatorHandle table, const std::string &at_unit, const std::string &at_value);
-//! ABI v101: the data files the table's scan would read, as JSON (abi.h table_file_plan); {"declined":…} otherwise.
-std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, const std::string &at_value);
+//! ABI v101: how the table's scan reads as parts (abi.h table_file_plan): the table's half as JSON ({"declined":…}
+//! when it cannot), the parts into `parts` (left unset when declined).
+std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, const std::string &at_value,
+                          ArrowArrayStream &parts);
 //! ABI v101: the rows of a plan's stream part (abi.h table_part_scan) into `out`.
 void TablePartScan(FabricatorHandle table, const std::string &request_json, ArrowArrayStream &out);
 

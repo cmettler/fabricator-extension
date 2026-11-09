@@ -356,7 +356,7 @@ public unsafe struct FabricatorVTable
     // ABI v100: whether a schema discovery did not return exists (catalog_schema_exists).
     public delegate* unmanaged[Cdecl]<nint, byte**, int, int*, byte**, int> CatalogSchemaExists;
     // ABI v101: the data files a table's scan would read, as a JSON doc (table_file_plan).
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte**, byte**, int> TableFilePlan;
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte**, CArrowArrayStream*, byte**, int> TableFilePlan;
     // ABI v101: the rows of a plan's stream part (table_part_scan).
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> TablePartScan;
 }

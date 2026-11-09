@@ -900,14 +900,16 @@ std::string TablePartitionStats(FabricatorHandle table, const std::string &at_un
 	return result;
 }
 
-std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, const std::string &at_value) {
+std::string TableFilePlan(FabricatorHandle table, const std::string &at_unit, const std::string &at_value,
+                          ArrowArrayStream &parts) {
 	const FabricatorVTable &vt = GetBridge();
+	parts.release = nullptr;
 	if (!vt.table_file_plan) {
-		return "{\"declined\":\"the bridge does not plan files\"}";
+		return "{\"declined\":\"the bridge does not plan scans\"}";
 	}
 	char *out_json = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.table_file_plan(table, at_unit.c_str(), at_value.c_str(), &out_json, &err);
+	int32_t rc = vt.table_file_plan(table, at_unit.c_str(), at_value.c_str(), &out_json, &parts, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: table_file_plan failed");
 	}
