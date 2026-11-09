@@ -14,6 +14,8 @@
 
 require fabricator
 
+require ducklake
+
 require parquet
 
 require icu
@@ -322,3 +324,58 @@ query III
 SELECT count(*), sum(ls[1].a), sum(mp['k1'].x) FROM l.main.lm;
 ----
 492	122430	40822
+
+# ============================================================================
+# 10. A FILE'S NAIVE TIMESTAMP UNDER A UTC-ADJUSTED COLUMN reads as its UTC instant, filters included, in a zone
+#     off UTC. A DuckLake 'utc' mirror writes naive TIMESTAMP files under a Delta `timestamp` column. The mapper
+#     would cast them (and convert pushed filters) in the session zone, a silent shift; the scan declares the
+#     file's column as the table's kind instead. epoch_us is zone-free: 2024-07-01 12:00Z = 1719835200000000.
+# ============================================================================
+statement ok
+SET TimeZone = 'Asia/Kathmandu';
+
+statement ok
+ATTACH 'ducklake:{FABRICATOR_DELTA_WRITE_DIR}/m10.ducklake' AS lake10 (DATA_PATH '{FABRICATOR_DELTA_WRITE_DIR}/dl10/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake10.tz (id INTEGER, ts TIMESTAMP);
+
+statement ok
+INSERT INTO lake10.tz SELECT r, TIMESTAMP '2024-07-01 12:00:00' + INTERVAL (r) HOUR FROM range(5) x(r);
+
+statement ok
+INSERT INTO lake10.tz SELECT r, TIMESTAMP '2025-01-01 00:00:00' + INTERVAL (r) HOUR FROM range(5, 10) x(r);
+
+statement ok
+SELECT * FROM ducklake_delta_sync('lake10');
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/dl10' AS d10 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query II
+EXPLAIN SELECT id FROM d10.main.tz WHERE ts = TIMESTAMPTZ '2024-07-01 14:00:00+00';
+----
+physical_plan	<REGEX>:.*Fabricator File Scan.*
+
+query II
+SELECT min(epoch_us(ts)), max(epoch_us(ts)) FROM d10.main.tz WHERE id < 5;
+----
+1719835200000000	1719849600000000
+
+query T
+SELECT list(id ORDER BY id) FROM d10.main.tz WHERE ts = TIMESTAMPTZ '2024-07-01 14:00:00+00';
+----
+[2]
+
+query T
+SELECT list(id ORDER BY id) FROM d10.main.tz WHERE ts < TIMESTAMPTZ '2024-07-01 13:30:00+00';
+----
+[0, 1]
+
+query T
+SELECT list(id ORDER BY id) FROM d10.main.tz WHERE ts >= TIMESTAMPTZ '2025-01-01 07:00:00+00';
+----
+[7, 8, 9]
+
+statement ok
+SET TimeZone = 'UTC';

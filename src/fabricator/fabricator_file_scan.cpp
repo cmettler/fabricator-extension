@@ -470,7 +470,7 @@ struct FabricatorFileScanReader : public MultiFileReader {
 			return;
 		}
 		auto index = FileIndex(reader_data.reader->file, *plan);
-		RefuseZoneDependentCasts(*reader_data.reader, global_columns);
+		ReadTimestampsAsUtc(*reader_data.reader, global_columns);
 		auto &deleted = plan->deleted[index];
 		if (!deleted.empty()) {
 			reader_data.reader->deletion_filter = make_uniq<DeletedRowsFilter>(deleted);
@@ -492,12 +492,13 @@ struct FabricatorFileScanReader : public MultiFileReader {
 		}
 	}
 
-	//! A file whose timestamp column is naive where the table's is UTC-adjusted (or the reverse) — a DuckLake 'utc'
-	//! mirror, Spark INT96 — would be cast by the reader in the SESSION's time zone, and its filters too, before this
-	//! reader can intervene: a shifted value with no error. Until a plan can say how to convert, such a file is
-	//! refused loudly.
-	static void RefuseZoneDependentCasts(const BaseFileReader &reader,
-	                                     const vector<MultiFileColumnDefinition> &global_columns) {
+	//! A file whose timestamp column is naive where the table's is UTC-adjusted, or the reverse — a DuckLake 'utc'
+	//! mirror, Spark INT96. The mapper would CAST it in the SESSION's time zone (and convert pushed filters the same
+	//! way, before this reader can step in): a shifted value with no error. Both kinds are microseconds since the
+	//! epoch, so the file's column is declared as the table's kind instead — the value is then read as UTC, as the
+	//! native reader does (SET TimeZone='UTC' on its own connection), with no cast and no filter conversion. Another
+	//! unit (TIMESTAMP_NS / _MS / _S) would need a real conversion: refused, loudly.
+	static void ReadTimestampsAsUtc(BaseFileReader &reader, const vector<MultiFileColumnDefinition> &global_columns) {
 		auto is_timestamp = [](const LogicalType &type) {
 			switch (type.id()) {
 			case LogicalTypeId::TIMESTAMP:
@@ -521,12 +522,17 @@ struct FabricatorFileScanReader : public MultiFileReader {
 				}
 				bool global_zoned = global.type.id() == LogicalTypeId::TIMESTAMP_TZ;
 				bool local_zoned = local.type.id() == LogicalTypeId::TIMESTAMP_TZ;
-				if (global_zoned != local_zoned) {
+				if (global_zoned == local_zoned) {
+					continue;
+				}
+				bool same_unit = local.type.id() == LogicalTypeId::TIMESTAMP || local.type.id() == LogicalTypeId::TIMESTAMP_TZ;
+				if (!same_unit) {
 					throw IOException("fabricator file scan: '%s' stores column '%s' as %s where the table declares %s; "
-					                  "the file scan cannot convert it independently of the session time zone yet "
+					                  "the file scan cannot convert that unit independently of the session time zone "
 					                  "(SET fabricator_file_scan = false)",
 					                  reader.file.path, name, local.type.ToString(), global.type.ToString());
 				}
+				local.type = global.type; // same microseconds, read as UTC
 			}
 		}
 	}
