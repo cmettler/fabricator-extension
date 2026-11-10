@@ -186,6 +186,11 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
                 IoLog, "host list {Pattern} -> {Count} entries", pattern, globbed.Count);
         }
+        // A local root reads size and time from ONE enumeration per directory: DuckDB's glob truncates the time to
+        // whole seconds, and a FileInfo per entry is a metadata call per file — on Windows ~1.2 ms each (measured
+        // 2026-11-10: a 595-entry _delta_log took 0.7 s per listing, eight listings per INSERT, against 17 ms for
+        // one enumeration of the directory). The enumeration's entries carry the same 100 ns time.
+        var local = _root.Contains("://") ? null : new LocalDirectoryStats();
         foreach (var entry in globbed)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -196,15 +201,7 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             long size = entry.Size;
             if (size < 0)
             {
-                try
-                {
-                    var fi = new System.IO.FileInfo(entry.Path);
-                    size = fi.Exists ? fi.Length : 0;
-                }
-                catch
-                {
-                    size = 0;
-                }
+                size = local?.Find(entry.Path)?.Length ?? 0;
             }
             // ⚠ THIS WAS A HARDCODED DateTimeOffset.UnixEpoch until 2026-08-08, i.e. every file claimed to
             // be from 1970. Harmless while nothing read it and a live hazard the moment something did:
@@ -219,17 +216,10 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
                 // A local glob reports whole seconds at best, and a local file has no ETag, so size and time are
                 // all engineered-wood has to recognise a log replaced under a held snapshot (#740). Two same-size
                 // commits written within one second would look identical; the file system's own time does not.
-                try
+                // (a file the enumeration no longer sees stays as the glob reported it)
+                if (local?.Find(entry.Path) is { } fi)
                 {
-                    var fi = new System.IO.FileInfo(entry.Path);
-                    if (fi.Exists)
-                    {
-                        modified = new DateTimeOffset(fi.LastWriteTimeUtc, TimeSpan.Zero);
-                    }
-                }
-                catch
-                {
-                    // stays as the glob reported it
+                    modified = new DateTimeOffset(fi.LastWriteTimeUtc, TimeSpan.Zero);
                 }
             }
             // An object store's listing carries the object's ETag (S3 fills it), which identifies the object better
@@ -242,6 +232,51 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
             yield return new TableFileInfo(ToRelative(entry.Path), size, modified) { ETag = etag };
         }
         await Task.CompletedTask.ConfigureAwait(false);
+    }
+
+    /// <summary>The files of the directories a local listing touches, each directory enumerated once: the entries of
+    /// a directory enumeration carry size and time without a call per file.</summary>
+    private sealed class LocalDirectoryStats
+    {
+        private static readonly StringComparer Names =
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        private readonly Dictionary<string, Dictionary<string, System.IO.FileInfo>> _dirs = new(Names);
+
+        public System.IO.FileInfo? Find(string path)
+        {
+            string? dir;
+            string name;
+            try
+            {
+                dir = System.IO.Path.GetDirectoryName(path);
+                name = System.IO.Path.GetFileName(path);
+            }
+            catch
+            {
+                return null;
+            }
+            if (dir is null)
+            {
+                return null;
+            }
+            if (!_dirs.TryGetValue(dir, out var files))
+            {
+                files = new Dictionary<string, System.IO.FileInfo>(Names);
+                try
+                {
+                    foreach (var file in new System.IO.DirectoryInfo(dir).EnumerateFiles())
+                    {
+                        files[file.Name] = file;
+                    }
+                }
+                catch
+                {
+                    // an unreadable directory: its entries keep what the glob reported
+                }
+                _dirs[dir] = files;
+            }
+            return files.TryGetValue(name, out var found) ? found : null;
+        }
     }
 
     public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)

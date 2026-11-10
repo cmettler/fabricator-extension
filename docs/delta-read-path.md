@@ -1622,10 +1622,16 @@ provider's scan:
 | a 281-file table, filtered and unfiltered | the same number of log listings (the part pruning reuses the snapshot) |
 | OneLake (live, five tables: deletion vectors, partitions, row tracking, clustering, TPC-H lineitem) | identical checksums; warm 0.14–0.17 s both ways |
 
-Found on the way, not the file scan's: an INSERT into a LOCAL Windows table of ~280 files takes ~5 s on both paths,
-almost all of it system time — ten log listings per statement at ~0.7 s each, where DuckDB's own glob of the same
-directory takes 0.04 s (`DuckDbTableFileSystem.ListAsync` stats every entry, twice on a local root). And the literal
-partition value `'__HIVE_DEFAULT_PARTITION__'` reads as NULL on both paths.
+Found on the way, not the file scan's, and FIXED: an INSERT into a LOCAL Windows table of ~280 files took 2–7 s on
+both paths, almost all of it system time. `DuckDbTableFileSystem.ListAsync` asked a `FileInfo` per log entry for the
+modification time (DuckDB's glob truncates it to seconds; engineered-wood needs the full time to recognise a log
+replaced under a held snapshot, #740) — ~1.2 ms each on this machine, 0.7 s per listing of 595 entries, six to eight
+listings per INSERT. It now reads size and time from ONE enumeration per directory (17 ms for the same 595 entries):
+INSERT 0.30–0.44 s, a full-table read 0.07–0.17 s (was 0.8–0.95 s). Not the Windows Restart Manager — the INSERT path
+opens no missing file (reads use `NULL_IF_NOT_EXISTS`, local existence `File.Exists`, local commits `File.Move`).
+Still six listings per INSERT in steady state (three in the write open, two in the commit open, one after the commit):
+the write and commit opens do not start from the stored snapshot. And the literal partition value
+`'__HIVE_DEFAULT_PARTITION__'` reads as NULL on both paths.
 
 ### Measured
 
