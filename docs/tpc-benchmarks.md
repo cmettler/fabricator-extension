@@ -197,6 +197,40 @@ their defaults: no thread or memory tuning, Sail with join reordering on (as in 
 clients (Polars, Sail) read with `allow_invalid_certificates`, because rustls refuses the rig's self-signed CA:TRUE
 certificate (docker/README.md).
 
+**Rerun 2026-11-10, with the file scan on by default** (`fabricator_file_scan`, see docs/delta-read-path.md "The
+file scan"). Best warm time per query, seconds; all seven engines correct on all 22 queries. Last column: the file scan
+the evening before, still opt-in. The provider's scan, the default until today, summed 34–40 s.
+
+| query | DuckDB Iceberg | Polars Iceberg | Polars Delta | Sail Iceberg | Sail Delta | fab. codec | fab. delta | fab. delta 11-09 |
+|---|---|---|---|---|---|---|---|---|
+| Q1 | 0.55 | 1.20 | 1.89 | 1.92 | 1.92 | 2.07 | 0.49 | 0.55 |
+| Q2 | 0.22 | 0.76 | 0.94 | 0.33 | 0.37 | 0.50 | 0.22 | 0.24 |
+| Q3 | 0.41 | 0.85 | 0.96 | 1.14 | 1.18 | 1.50 | 0.40 | 0.47 |
+| Q4 | 0.23 | 0.46 | 0.49 | 0.51 | 0.51 | 0.69 | 0.22 | 0.25 |
+| Q5 | 0.51 | 1.01 | 1.11 | 2.01 | 2.02 | 1.79 | 0.46 | 0.51 |
+| Q6 | 0.19 | 0.56 | 0.68 | 0.69 | 0.69 | 1.31 | 0.17 | 0.20 |
+| Q7 | 0.44 | 1.08 | 1.14 | 1.24 | 1.23 | 1.88 | 0.43 | 0.48 |
+| Q8 | 0.60 | 1.12 | 1.20 | 1.98 | 1.91 | 2.26 | 0.57 | 0.61 |
+| Q9 | 1.15 | 1.69 | 2.28 | 2.94 | 3.03 | 3.20 | 1.10 | 1.18 |
+| Q10 | 0.73 | 1.02 | 1.42 | 1.57 | 1.51 | 2.38 | 0.72 | 0.79 |
+| Q11 | 0.12 | 0.14 | 0.26 | 0.25 | 0.23 | 0.26 | 0.10 | 0.12 |
+| Q12 | 0.27 | 0.55 | 0.73 | 0.80 | 0.81 | 1.29 | 0.24 | 0.29 |
+| Q13 | 0.91 | 0.81 | 0.99 | 0.98 | 0.94 | 1.90 | 0.83 | 0.89 |
+| Q14 | 0.42 | 0.70 | 0.82 | 0.88 | 0.92 | 1.35 | 0.37 | 0.41 |
+| Q15 | 0.27 | 0.56 | 0.79 | 1.73 | 1.70 | 1.19 | 0.24 | 0.26 |
+| Q16 | 0.27 | 0.17 | 0.19 | 0.36 | 0.46 | 0.42 | 0.26 | 0.26 |
+| Q17 | 1.62 | 1.81 | 1.79 | 2.81 | 2.82 | 2.81 | 1.57 | 1.65 |
+| Q18 | 0.82 | 1.24 | 1.24 | 2.93 | 2.97 | 1.36 | 0.71 | 0.71 |
+| Q19 | 0.47 | 0.73 | 1.14 | 1.40 | 1.53 | 2.31 | 0.52 | 0.53 |
+| Q20 | 0.66 | 1.03 | 1.59 | 1.53 | 1.56 | 1.60 | 0.67 | 0.69 |
+| Q21 | 2.06 | 2.24 | 2.51 | 2.58 | 3.11 | 2.74 | 2.09 | 2.20 |
+| Q22 | 0.35 | 0.42 | 0.45 | 0.35 | 0.35 | 0.52 | 0.38 | 0.39 |
+| **sum** | **13.3** | **20.2** | **24.6** | **30.9** | **31.8** | **35.3** | **12.8** | **13.7** |
+
+Best warm ROUND sums (the other way to count): DuckDB Iceberg 13.5, Polars Iceberg 20.8, Polars Delta 25.4, Sail
+Iceberg 31.1, Sail Delta 32.5, fabricator codec 36.0, fabricator delta 13.1. The codec engine (`engineeredwooddelta`,
+no `native_read`) has no file scan and is unchanged.
+
 **Rerun.** The harness is local and gitignored: `scratchpad/rustfs-bench/` with `upload.py` (data to RustFS + Iceberg
 metadata), `bench.py <engine> [rounds]` (one engine per process, results to `results/<engine>.json`) and `compare.py`
 (sums and the correctness check). The Python side is a uv venv there (polars, deltalake, pysail, pyspark-client,
