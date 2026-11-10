@@ -5015,6 +5015,12 @@ COMMIT;                                  -- ONE commit; the change feed reports 
 - ⚠ In autocommit the **INSERT action commits LAST**, after the delete and update — it is the only action
   that routes through the transaction buffer, so it is flushed at statement end. The visible intermediate
   states are therefore "delete applied", then "delete + update applied", then all three.
+- The `INSERT` action runs **beside** one `UPDATE` or `DELETE` action, so an incremental load's new rows
+  stream straight into data files. With two or more `UPDATE`/`DELETE` actions, or with `RETURNING`, the
+  actions run one after the other, and DuckDB holds every row of the later actions (spilling to disk)
+  until the first one has finished. On SQL Server the actions always run one after the other: they share
+  the transaction's single connection. Measured on OneLake, 8.1M new rows through
+  `WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT`: 23 s side by side, 44 s one after the other.
 - `WHEN MATCHED THEN UPDATE` on rows **this same transaction inserted** is refused, as it is for a plain
   `UPDATE` — but a merge does not hit that: matched and not-matched rows are disjoint by construction, and
   the guard keys on the rowid's file ordinal, so matched rows carry committed ordinals.

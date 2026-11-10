@@ -81,6 +81,10 @@ struct FabricatorCapabilities {
 	bool parallel_table_open = false;
 	//! DELETE / UPDATE / MERGE … RETURNING: the provider returns the rows a rowid DML changed (ABI v98).
 	bool dml_returning = false;
+	//! The provider's write paths may run concurrently inside one transaction for one table, so the actions of a MERGE
+	//! (an INSERT beside an UPDATE or DELETE) run as concurrent pipelines instead of one after the other — which
+	//! otherwise buffers every row of all but the first action before any is written.
+	bool concurrent_merge_actions = false;
 	//! The provider reads files through a filesystem DuckDB 2.0's ExternalFileCache does not treat as remote
 	//! (it caches only its own fixed prefix list), so the host turns on the GLOBAL `cache_local_files` and raises
 	//! the cache's block size for such files to the remote one at ATTACH, each unless the user set it

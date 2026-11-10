@@ -95,6 +95,10 @@ public:
 	bool SupportsDmlReturning() const {
 		return dml_returning_;
 	}
+	//! Capability `concurrent_merge_actions` (see FabricatorCapabilities).
+	bool ConcurrentMergeActions() const {
+		return concurrent_merge_actions_;
+	}
 	//! Whether a table entry may reuse its first bind-time describe (capability `bind_schema_cacheable`).
 	bool BindSchemaCacheable() const {
 		return bind_schema_cacheable_;
@@ -260,6 +264,7 @@ private:
 	//! Capability `dml_returning`: DELETE / UPDATE / MERGE … RETURNING. Refused at PLANNING otherwise, before any
 	//! action has written anything.
 	bool dml_returning_ = false;
+	bool concurrent_merge_actions_ = false;
 	//! Capability `schema_by_name`: a schema discovery did not return is asked for by name (ABI v100).
 	bool schema_by_name_ = false;
 	bool supports_nested_schemas_ = false;

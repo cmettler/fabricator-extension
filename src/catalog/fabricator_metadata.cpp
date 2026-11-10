@@ -245,6 +245,7 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 		caps.bind_schema_cacheable = yyjson_get_bool(yyjson_obj_get(root, "bind_schema_cacheable"));
 		caps.parallel_table_open = yyjson_get_bool(yyjson_obj_get(root, "parallel_table_open"));
 		caps.dml_returning = yyjson_get_bool(yyjson_obj_get(root, "dml_returning"));
+		caps.concurrent_merge_actions = yyjson_get_bool(yyjson_obj_get(root, "concurrent_merge_actions"));
 		caps.cache_local_files = yyjson_get_bool(yyjson_obj_get(root, "cache_local_files"));
 		caps.schema_by_name = yyjson_get_bool(yyjson_obj_get(root, "schema_by_name"));
 		// Absent or not a string reads as "no default schema of its own" — DuckDB's `main` then stands, which

@@ -146,6 +146,14 @@ internal sealed class DeltaTableBinding : ITableBinding, IDeleteWhereShape
 
     // ── the buffered-write half (the former DeltaTxnBuffer.PendingAppends, verbatim) ─────────────────────
 
+    /// <summary>Serializes the statements that change this entry's buffered state. The actions of one
+    /// MERGE run as CONCURRENT pipelines (an INSERT beside an UPDATE or DELETE), and every field below,
+    /// the held engineered-wood transaction included, assumes one writer: two unguarded appends to
+    /// <see cref="Files"/> once left a null entry that failed the commit. Held only around state changes
+    /// and the work of a finalizing UPDATE/DELETE, never while an INSERT consumes its input stream: the
+    /// other action's pipeline feeds that stream, so waiting for it there would deadlock.</summary>
+    internal object Gate { get; } = new();
+
     public Schema? BatchSchema;
     public List<RecordBatch> Batches { get; } = new();
     public List<WrittenDataFile> Files { get; } = new();

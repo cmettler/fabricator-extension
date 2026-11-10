@@ -261,6 +261,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
 		parallel_table_open_ = caps.parallel_table_open;
 		dml_returning_ = caps.dml_returning;
+		concurrent_merge_actions_ = caps.concurrent_merge_actions;
 		schema_by_name_ = caps.schema_by_name;
 		default_schema_ = caps.default_schema;
 		pushdown_boundary_ = caps.pushdown_boundary;
@@ -277,6 +278,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		bind_schema_cacheable_ = false;
 		parallel_table_open_ = false;
 		dml_returning_ = false;
+		concurrent_merge_actions_ = false;
 		schema_by_name_ = false;
 		default_schema_.clear();
 		pushdown_boundary_.clear();

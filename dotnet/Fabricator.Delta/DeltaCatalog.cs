@@ -1633,6 +1633,9 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             }
             // DELETE / UPDATE / MERGE … RETURNING (DeltaCatalog.Returning.cs)
             caps += ",\"dml_returning\":true";
+            // `concurrent_merge_actions`: a MERGE's INSERT may run beside one UPDATE or DELETE action — every change
+            // to a table's buffered state in a transaction is taken under DeltaTableBinding.Gate.
+            caps += ",\"concurrent_merge_actions\":true";
             // `parallel_table_open`: table_open / table_schema / table_info for DIFFERENT tables may run at once
             // (per-transaction state is a ConcurrentDictionary of bindings, each pin behind its own lock), so a
             // catalog enumeration opens its tables in parallel. On OneLake each open is a log listing plus a few
@@ -3461,22 +3464,29 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         else
         {
             var pending = _txns.GetOrCreate(txnId).GetOrCreate(tablePath);
-            pending.HasAppend = true;
-            // slice C2: on a CDF table EVERY buffered statement writes its cdc counterpart (a commit
-            // carrying any cdc action is read cdc-ONLY — inference is disabled — so appends fused with
-            // DML would otherwise vanish from the feed). Probed once per (txn, table); partitioned CDF
-            // stays on inference (its appends commit cdc-less and its DML is rejected, so commits are
-            // never mixed). Insert-cdc needs the batches in hand -> CDF appends skip the streamed path.
-            if (IsExplicitTxn(txnId) && pending.CdfEnabled is null)
+            // pending.Gate: every change to the entry below happens under it. The input stream is consumed
+            // OUTSIDE it (TryWriteStreaming into a local list, Materialize before the lock), because a
+            // MERGE's other action is fed by the same producer — see DeltaTableBinding.Gate.
+            bool cdfAppend;
+            lock (pending.Gate)
             {
-                var prof = DeltaReader.GetTxnDmlProfile(opener, tablePath);
-                pending.CdfEnabled = prof.CdfEnabled && prof.SupportsExternalCommit;
-                if (pending.CdfEnabled == true)
+                pending.HasAppend = true;
+                // slice C2: on a CDF table EVERY buffered statement writes its cdc counterpart (a commit
+                // carrying any cdc action is read cdc-ONLY — inference is disabled — so appends fused with
+                // DML would otherwise vanish from the feed). Probed once per (txn, table); partitioned CDF
+                // stays on inference (its appends commit cdc-less and its DML is rejected, so commits are
+                // never mixed). Insert-cdc needs the batches in hand -> CDF appends skip the streamed path.
+                if (IsExplicitTxn(txnId) && pending.CdfEnabled is null)
                 {
-                    pending.PinnedVersion ??= prof.Version;
+                    var prof = DeltaReader.GetTxnDmlProfile(opener, tablePath);
+                    pending.CdfEnabled = prof.CdfEnabled && prof.SupportsExternalCommit;
+                    if (pending.CdfEnabled == true)
+                    {
+                        pending.PinnedVersion ??= prof.Version;
+                    }
                 }
+                cdfAppend = pending.CdfEnabled == true;
             }
-            bool cdfAppend = pending.CdfEnabled == true;
             bool tryStream = _nativeWrite && !cdfAppend;
             if (tryStream)
             {
@@ -3484,6 +3494,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 // (whose added columns already carry their column-mapping ids/physical names) drives the
                 // NOT NULL wrap + rename maps + FIELD_IDS inside TryWriteStreaming, and the streamed
                 // files fuse with the metaData action into the one commit at COMMIT.
+                var streamed = new List<EngineeredWood.DeltaLake.Table.WrittenDataFile>();
                 var deferred = DeltaWriter.TryWriteStreaming(
                     opener, tablePath, data, mode,
                     deletionVectors: flags.DeletionVectors,
@@ -3493,10 +3504,14 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     spec: spec,                    out var deferredRows,
                     columnMapping: flags.ColumnMapping,
                     pendingSchema: pending.PendingDeltaSchema,
-                    deferCommitTo: pending.Files, serializable: _serializable, snapshots: this);
+                    deferCommitTo: streamed, serializable: _serializable, snapshots: this);
                 if (deferred is not null)
                 {
-                    pending.Rows += deferredRows;
+                    lock (pending.Gate)
+                    {
+                        pending.Files.AddRange(streamed);
+                        pending.Rows += deferredRows;
+                    }
                     MemoryProbe.Mark("delta bulk: streamed to files, actions parked", pending.Rows);
                     _log.LogInformation("delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (streamed files)",
                         schemaName, tableName, deferredRows, txnId);
@@ -3520,44 +3535,47 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             if (!tryStream || pending.PendingMetadata is not null || IsExplicitTxn(txnId))
             {
                 var (bschema, bbatches, brows) = DeltaWriter.Materialize(data, default);
-                // ⚠ HOIST SLICE 5 deleted the pending-created IDENTITY pre-generation that stood here. It
-                // generated values from the PARKED create schema and chained the marks so the flush could
-                // bake the final high-water marks into commit-0 — only possible while the create waited for
-                // the whole transaction. With an immediate create the table's own schema is authoritative and
-                // an identity table created in this transaction takes the SAME path as one that already
-                // existed: engineered-wood generates the values on the write and the flush's metaData action
-                // carries the marks (BuildIdentityMetadataAction). This is "stop special-casing", not a lost
-                // guarantee — but it IS observable: v0 of such a table no longer shows the final mark.
-                if (cdfAppend)
+                lock (pending.Gate)
                 {
-                    WriteCdcFiles(opener, tablePath, pending, bbatches, "insert");
-                }
-                // slice C1: in an EXPLICIT transaction the statement's batches become a data file NOW
-                // (memory caps at one statement); autocommit keeps the batch park (flushes at statement
-                // end anyway — byte-identical to per-statement commits).
-                if (IsExplicitTxn(txnId)
-                    && TryEagerWriteBatches(opener, tablePath, pending, bbatches, tableName))
-                {
-                    foreach (var b in bbatches)
+                    // ⚠ HOIST SLICE 5 deleted the pending-created IDENTITY pre-generation that stood here. It
+                    // generated values from the PARKED create schema and chained the marks so the flush could
+                    // bake the final high-water marks into commit-0 — only possible while the create waited for
+                    // the whole transaction. With an immediate create the table's own schema is authoritative and
+                    // an identity table created in this transaction takes the SAME path as one that already
+                    // existed: engineered-wood generates the values on the write and the flush's metaData action
+                    // carries the marks (BuildIdentityMetadataAction). This is "stop special-casing", not a lost
+                    // guarantee — but it IS observable: v0 of such a table no longer shows the final mark.
+                    if (cdfAppend)
                     {
-                        b.Dispose();
+                        WriteCdcFiles(opener, tablePath, pending, bbatches, "insert");
                     }
+                    // slice C1: in an EXPLICIT transaction the statement's batches become a data file NOW
+                    // (memory caps at one statement); autocommit keeps the batch park (flushes at statement
+                    // end anyway — byte-identical to per-statement commits).
+                    if (IsExplicitTxn(txnId)
+                        && TryEagerWriteBatches(opener, tablePath, pending, bbatches, tableName))
+                    {
+                        foreach (var b in bbatches)
+                        {
+                            b.Dispose();
+                        }
+                        pending.Rows += brows;
+                        _log.LogInformation(
+                            "delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (eager file)",
+                            schemaName, tableName, brows, txnId);
+                        return brows;
+                    }
+                    pending.BatchSchema ??= bschema;
+                    pending.Batches.AddRange(bbatches);
                     pending.Rows += brows;
-                    _log.LogInformation(
-                        "delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (eager file)",
+                    // The one buffered-INSERT branch that RETAINS batches until COMMIT (identity/iceberg, or a
+                    // pending ALTER). Every other branch parks actions only, so this mark is where an explicit
+                    // transaction's memory actually grows with rows.
+                    MemoryProbe.Mark("delta bulk: batches PARKED until commit", pending.Rows);
+                    _log.LogInformation("delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (collected batches)",
                         schemaName, tableName, brows, txnId);
                     return brows;
                 }
-                pending.BatchSchema ??= bschema;
-                pending.Batches.AddRange(bbatches);
-                pending.Rows += brows;
-                // The one buffered-INSERT branch that RETAINS batches until COMMIT (identity/iceberg, or a
-                // pending ALTER). Every other branch parks actions only, so this mark is where an explicit
-                // transaction's memory actually grows with rows.
-                MemoryProbe.Mark("delta bulk: batches PARKED until commit", pending.Rows);
-                _log.LogInformation("delta bulk {Schema}.{Table}: buffered {Rows} row(s) for txn {Txn} (collected batches)",
-                    schemaName, tableName, brows, txnId);
-                return brows;
             }
         }
 
@@ -5720,7 +5738,12 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         // paths below (incl. copy-on-write and CDF capture).
         if (IsExplicitTxn(AmbientTransaction.Current))
         {
-            return BufferDeleteRows(AmbientTransaction.Current, path, schemaName, tableName, ids, forUpdate: false);
+            // Gate: a MERGE's INSERT action may be writing to this entry at the same time.
+            var bound = _txns.GetOrCreate(AmbientTransaction.Current).GetOrCreate(path);
+            lock (bound.Gate)
+            {
+                return BufferDeleteRows(AmbientTransaction.Current, path, schemaName, tableName, ids, forUpdate: false);
+            }
         }
         // Follow the TABLE's config: deletion-vector tables get the no-rewrite DV delete; everything else is
         // copy-on-write. (Honors external DV tables regardless of this catalog's create-time flag.)
@@ -6074,8 +6097,13 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         // copy-on-write / merge-on-read paths below.
         if (IsExplicitTxn(AmbientTransaction.Current))
         {
-            return BufferUpdateRows(AmbientTransaction.Current, path, schemaName, tableName,
-                                    updates, setSlotByColumn, userSchema);
+            // Gate: a MERGE's INSERT action may be writing to this entry at the same time.
+            var bound = _txns.GetOrCreate(AmbientTransaction.Current).GetOrCreate(path);
+            lock (bound.Gate)
+            {
+                return BufferUpdateRows(AmbientTransaction.Current, path, schemaName, tableName,
+                                        updates, setSlotByColumn, userSchema);
+            }
         }
 
         // 3. Per-file copy-on-write via EW master's host-join UPDATE shape (pr4-to-master guide §1):

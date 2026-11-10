@@ -251,9 +251,23 @@ PhysicalOperator &FabricatorCatalog::PlanMergeInto(ClientContext &context, Physi
 	//     1 here) left it flaky rather than fixing it.
 	// Both are Delta-provider only: the same statements on a DuckDB table are correct, which is what shows
 	// the loss is ours and not upstream's.
+	//
+	// ⚠⚠ AND SERIALIZING IS EXPENSIVE: only the FIRST action streams, every other one is buffered whole
+	// (BUFFER_ALL, spilling) before a row of it is written. For the commonest dbt shape, UPDATE + INSERT,
+	// the first action is the UPDATE, so an incremental load's inserts — usually nearly all its rows — waited
+	// in that buffer: 8.1M rows into a OneLake Delta table took 44 s against 25 s for the same MERGE with the
+	// INSERT action alone (2026-11-10). Hence the capability `concurrent_merge_actions`: a provider whose write
+	// paths are safe to run concurrently inside one transaction lets ONE row-addressing action run beside its
+	// INSERT. Delta declares it — the UPDATE + INSERT loss above was its buffered state being changed from two
+	// threads (two unguarded appends to the staged-file list left a null entry and failed the COMMIT), and a
+	// per-table lock now serializes those changes. SQL Server does not: both actions use the transaction's one
+	// connection, and running them at once failed with "The connection is closed" (MARS off, measured).
+	// Two row-addressing actions and RETURNING keep the serial form either way.
+	const bool serialize_actions =
+	    writing_actions >= 2 && (!ConcurrentMergeActions() || rowid_actions >= 2 || op.return_chunk);
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, plan, std::move(actions), op.row_id_start,
 	                                               op.source_marker, /*parallel=*/false, op.return_chunk,
-	                                               /*serialize_actions=*/writing_actions >= 2);
+	                                               serialize_actions);
 	return result;
 }
 
