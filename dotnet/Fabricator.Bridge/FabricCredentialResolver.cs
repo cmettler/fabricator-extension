@@ -60,8 +60,17 @@ public static class FabricCredentialResolver
         {
             return new StaticTokenCredential(accessToken);
         }
-        return Build(F("provider"), F("tenant_id"), F("client_id"), F("client_secret"), F("chain"));
+        // One credential per distinct secret, process-wide, with a token cache: a client is built per file opened and
+        // per catalog call, and each fresh credential would fetch its own token (CachingTokenCredential).
+        string key = string.Join("", F("provider"), F("tenant_id"), F("client_id"), F("chain"),
+                                 Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                                     System.Text.Encoding.UTF8.GetBytes(F("client_secret")))));
+        return Resolved.GetOrAdd(key, _ => new CachingTokenCredential(
+            Build(F("provider"), F("tenant_id"), F("client_id"), F("client_secret"), F("chain"))));
     }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TokenCredential> Resolved =
+        new(StringComparer.Ordinal);
 
     /// <summary>A fixed, pre-minted token served for every scope request (the token's audience must match
     /// what the caller needs — e.g. storage for OneLake). Expiry parsed from the JWT <c>exp</c> claim.</summary>
@@ -167,10 +176,13 @@ public static class FabricCredentialResolver
     /// <see cref="FabricNotebookCredential"/> (DefaultAzureCredential has NO source there — no IMDS, no env;
     /// validated live 2026-07-14), everywhere else <see cref="DefaultAzureCredential"/> (env / managed
     /// identity / VS / az CLI).</summary>
-    public static TokenCredential AmbientChain()
-        => FabricNotebookCredential.IsAvailable
+    public static TokenCredential AmbientChain() => Ambient.Value;
+
+    // One per process, with a token cache (see Resolve).
+    private static readonly Lazy<TokenCredential> Ambient = new(() => new CachingTokenCredential(
+        FabricNotebookCredential.IsAvailable
             ? new FabricNotebookCredential()
-            : new DefaultAzureCredential();
+            : new DefaultAzureCredential()));
 
     /// <summary>"Active Directory Default"-style fallback for a target with no attached secret: a remote
     /// (<c>scheme://</c>) endpoint with no inline password / user id gets a <see cref="DefaultAzureCredential"/>;
