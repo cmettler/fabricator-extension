@@ -21,8 +21,11 @@ namespace Fabricator.Bridge;
 /// OneLake, S3), else size and modification time, which is why our listings report both.</para>
 /// <para>Keyed by table location, as engineered-wood's host guide asks: a snapshot does not know which table it
 /// came from.</para>
-/// <para>Read paths only (<c>DeltaReader.OpenForReadAsync</c>). A transaction still reads one version per table: the
-/// first open publishes its table into the transaction's binding and later references are hits there.</para>
+/// <para>Used by the read path (<c>DeltaReader.OpenForReadAsync</c>), the streaming write
+/// (<c>DeltaWriter.TryWriteStreaming</c>) and the commit of deferred files (<c>FlushDeferredFilesAsync</c>): each
+/// opens with one log listing instead of two or three, and still at the latest version, which is what the commit's
+/// conflict check needs. A transaction still reads one version per table: the first open publishes its table into
+/// the transaction's binding and later references are hits there.</para>
 /// <para>On by default; the ATTACH option <c>snapshot_cache false</c> turns it off.</para>
 /// </remarks>
 public sealed partial class DeltaCatalog

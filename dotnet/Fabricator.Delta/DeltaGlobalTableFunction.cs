@@ -1272,14 +1272,14 @@ internal static class DeltaWriter
             EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
         List<WrittenDataFile>? deferCommitTo = null,
-        bool serializable = false, IReadOnlyList<string>? sortedBy = null)
+        bool serializable = false, IReadOnlyList<string>? sortedBy = null, DeltaCatalog? snapshots = null)
     {
         // The native path bypasses EW's own timestamp-unit guard entirely (DuckDB writes the files), so check
         // here — before anything is written — rather than committing a spec-invalid file. See the helper.
         EnsureTimestampUnitsWritable(data.Schema);
         var (result, rows) = TryWriteStreamingCoreAsync(opener, path, data, mode, deletionVectors,
             inCommitTimestamps, changeDataFeed, rowTracking, spec, columnMapping, pendingSchema,
-            deferCommitTo, serializable, sortedBy).GetAwaiter().GetResult();
+            deferCommitTo, serializable, sortedBy, snapshots).GetAwaiter().GetResult();
         rowsWritten = rows;
         return result;
     }
@@ -1291,7 +1291,7 @@ internal static class DeltaWriter
         EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema,
         List<WrittenDataFile>? deferCommitTo,
-        bool serializable, IReadOnlyList<string>? sortedBy = null)
+        bool serializable, IReadOnlyList<string>? sortedBy = null, DeltaCatalog? snapshots = null)
     {
         // Transaction-deferred commit: the caller (an explicit-transaction append) wants the files WRITTEN
         // but the Delta commit PARKED — CommitTransaction flushes everything as one atomic commit. Only a
@@ -1327,13 +1327,30 @@ internal static class DeltaWriter
         // Pass columnMapping so a NEW table is created WITH the mode (an existing table keeps its own mode). Only
         // id mode reaches here as a mapping table (name mode stays on the codec path, gated by the caller) — an
         // id-mode table's data files carry field_ids, which the external commit + native reader both handle.
-        var table = await DeltaTable.OpenOrCreateAsync(
+        // An existing table opens from the snapshot the catalog last saw (DeltaCatalog.SnapshotStore): one log
+        // listing instead of three (OpenOrCreateAsync lists for existence, then OpenAsync lists twice), and still
+        // the LATEST version — OpenAsync(fs, startFrom) rebuilds wherever continuing is not provably right. A table
+        // that has gone since falls back to OpenOrCreateAsync, as before.
+        DeltaTable? table = null;
+        if (snapshots?.StoredSnapshot(path) is { } stored)
+        {
+            try
+            {
+                table = await DeltaTable.OpenAsync(fs, stored, Options(spec)).ConfigureAwait(false);
+            }
+            catch (EngineeredWood.DeltaLake.DeltaTableNotFoundException)
+            {
+                table = null;
+            }
+        }
+        table ??= await DeltaTable.OpenOrCreateAsync(
             fs, ewSchema, Options(spec),
             partitionColumns: spec?.PartitionColumns,   // set on a partitioned CTAS create; ignored for an INSERT
             configuration: CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed, serializable, sortedBy, spec?.CreateProperties, ewSchema),
             columnMappingMode: columnMapping,
             cancellationToken: default,
             clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy).ConfigureAwait(false);
+        snapshots?.StoreSnapshot(path, table.CurrentSnapshot);
         try
         {
             // Fall back BEFORE writing any file / touching the log (so a fallback leaves no orphan): a table

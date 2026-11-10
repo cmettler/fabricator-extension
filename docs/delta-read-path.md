@@ -1629,8 +1629,9 @@ replaced under a held snapshot, #740) — ~1.2 ms each on this machine, 0.7 s pe
 listings per INSERT. It now reads size and time from ONE enumeration per directory (17 ms for the same 595 entries):
 INSERT 0.30–0.44 s, a full-table read 0.07–0.17 s (was 0.8–0.95 s). Not the Windows Restart Manager — the INSERT path
 opens no missing file (reads use `NULL_IF_NOT_EXISTS`, local existence `File.Exists`, local commits `File.Move`).
-Still six listings per INSERT in steady state (three in the write open, two in the commit open, one after the commit):
-the write and commit opens do not start from the stored snapshot. And the literal partition value
+The write and commit opens now start from the stored snapshot too (one listing each, still the latest version): three
+listings per INSERT in steady state instead of six (write, commit, and engineered-wood's update after the commit). On
+OneLake a warm listing costs 50–100 ms. And the literal partition value
 `'__HIVE_DEFAULT_PARTITION__'` reads as NULL on both paths.
 
 ### Measured

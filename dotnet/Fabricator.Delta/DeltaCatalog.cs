@@ -3493,7 +3493,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                     spec: spec,                    out var deferredRows,
                     columnMapping: flags.ColumnMapping,
                     pendingSchema: pending.PendingDeltaSchema,
-                    deferCommitTo: pending.Files, serializable: _serializable);
+                    deferCommitTo: pending.Files, serializable: _serializable, snapshots: this);
                 if (deferred is not null)
                 {
                     pending.Rows += deferredRows;
@@ -3610,7 +3610,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 changeDataFeed: flags.ChangeDataFeed,
                 rowTracking: flags.RowTracking,
                 spec: spec,                out var streamedRows,
-                columnMapping: flags.ColumnMapping, serializable: _serializable, sortedBy: sortColumns);
+                columnMapping: flags.ColumnMapping, serializable: _serializable, sortedBy: sortColumns,
+                snapshots: this);
             if (streamedVersion is not null)
             {
                 return streamedRows;
@@ -4224,7 +4225,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                                     bool? isBlindAppend)
         => FlushDeferredFilesAsync(opener, tablePath, files, isBlindAppend).GetAwaiter().GetResult();
 
-    private static async Task<long> FlushDeferredFilesAsync(nint opener, string tablePath,
+    private async Task<long> FlushDeferredFilesAsync(nint opener, string tablePath,
                                     System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files,
                                     bool? isBlindAppend)
     {
@@ -4244,13 +4245,21 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 retryAfterBackoff = false;
             }
             var fs = TableFileSystems.Create(opener, tablePath);
-            var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token)
-                .ConfigureAwait(false);
+            // FRESH, as the conflict rule needs (the base must be the latest version, see the catch below) — and
+            // from the stored snapshot, which gives exactly that with one log listing instead of two.
+            var stored = StoredSnapshot(tablePath);
+            var table = stored is null
+                ? await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, DeltaWriter.Options(), token)
+                    .ConfigureAwait(false)
+                : await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(fs, stored, DeltaWriter.Options(), token)
+                    .ConfigureAwait(false);
             try
             {
-                return await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: token,
+                long version = await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: token,
                         isBlindAppend: isBlindAppend)
                     .ConfigureAwait(false);
+                StoreSnapshot(tablePath, table.CurrentSnapshot);
+                return version;
             }
             // ⚠ `isBlindAppend != false` IS A CORRECTNESS GUARD, NOT A TUNING KNOB — retrying a
             // read-dependent append REPLAYS rows computed against a snapshot that has since moved.
