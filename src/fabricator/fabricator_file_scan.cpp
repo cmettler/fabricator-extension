@@ -672,6 +672,30 @@ virtual_column_map_t FileScanVirtualColumns(ClientContext &, optional_ptr<Functi
 //! is a file's position in the scan's list, and KeepMatchingParts makes that list depend on the scan's filters — the
 //! copy late materialization builds keeps the static filters (as optional ones) and drops the dynamic ones, so the
 //! two lists can differ and the same index name two different files. A file's name does not move.
+//! Struct-field pushdown (`s.a` read as its own column, so a join filter on it reaches the scan). DuckDB 2.0.0 raises
+//! an INTERNAL error when such a path goes THROUGH a member some file lacks and that member is itself a struct
+//! (docs/duckdb-upstream-issues.md §17); a missing member at the END of the path, a list or a map is fine. So: a
+//! struct column with no struct member. Our bind columns are the table's, the same list parquet_scan's own check reads.
+bool FileScanSupportsPushdownExtract(const FunctionData &bind_data_p, const LogicalIndex &col_idx) {
+	if (getenv("FABRICATOR_NO_PUSHDOWN_EXTRACT")) {
+		return false;
+	}
+	auto &bind_data = bind_data_p.Cast<MultiFileBindData>();
+	if (col_idx.index >= bind_data.columns.size()) {
+		return false;
+	}
+	auto &type = bind_data.columns[col_idx.index].type;
+	if (type.id() != LogicalTypeId::STRUCT) {
+		return false;
+	}
+	for (auto &child : StructType::GetChildTypes(type)) {
+		if (child.second.id() == LogicalTypeId::STRUCT) {
+			return false;
+		}
+	}
+	return true;
+}
+
 vector<column_t> FileScanRowIdColumns(ClientContext &, optional_ptr<FunctionData>) {
 	return {MultiFileReader::COLUMN_IDENTIFIER_FILENAME, MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
 }
@@ -1146,10 +1170,8 @@ bool TryBuildFileScan(ClientContext &context, TableCatalogEntry &table, Fabricat
 	function.late_materialization = true;
 	function.get_row_id_columns = FileScanRowIdColumns;
 	function.cardinality = FileScanCardinality;
-	// ⚠ No struct-field pushdown extract: a path into a member some files lack raises an INTERNAL error in DuckDB
-	// 2.0.0 itself (docs/duckdb-upstream-issues.md §17, verify_delta_catalog_nested_alter). Costs join filters on
-	// struct fields.
-	function.supports_pushdown_extract = nullptr;
+	// only for structs without a struct member: DuckDB 2.0.0 §17 (FileScanSupportsPushdownExtract)
+	function.supports_pushdown_extract = FileScanSupportsPushdownExtract;
 	function.get_bind_info = FileScanBindInfo;
 	function.get_table_entry = FileScanTableEntry;
 	function.get_virtual_columns = FileScanVirtualColumns;

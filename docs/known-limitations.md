@@ -368,14 +368,14 @@ row and column and pointing at `v::JSON` (which lands as `nvarchar(max)` / nativ
 conversion inside `sql_variant`. The CTAS must leave no table behind when that refusal fires — verify.
 2.0 line only; breaking (the column type changes from VARCHAR to VARIANT).
 
-### 1.33 The Delta file scan (`fabricator_file_scan`, experimental) does not push struct fields
+### 1.33 The Delta file scan (`fabricator_file_scan`, on by default) pushes struct fields only for flat structs
 
 Under the file scan (DuckDB's own parquet reader reading the Delta parts, docs/delta-read-path.md "The file scan")
-a filter on a struct FIELD is applied above the scan rather than inside it, so a join on `s.a` gets no join filter
-and a `WHERE s.a = …` no row-group pruning. Results are unchanged. The reason is upstream: with struct pushdown on,
-DuckDB 2.0.0 raises an INTERNAL error when the path reaches a member an older file lacks
-(docs/duckdb-upstream-issues.md §17). The provider's scan, the default, still pushes them
-(`verify_delta_struct_extract`).
+a struct field `s.a` is a scan column only when `s` has no struct member. For a struct WITH a struct member a filter
+on a field is applied above the scan, so a join on `s.n.x` (or on `s.a` of such a struct) gets no join filter and a
+`WHERE` on it no row-group pruning. Results are unchanged. The reason is upstream: DuckDB 2.0.0 raises an INTERNAL
+error when a path goes through a struct member an older file lacks (docs/duckdb-upstream-issues.md §17). The
+provider's scan (`SET fabricator_file_scan = false`) pushes every struct field (`verify_delta_struct_extract`).
 
 Parallelism is per parquet ROW GROUP under the file scan (DuckDB's reader), where the provider's scan hands out
 2048-row morsels. A small table of one row group is therefore read by one thread, which matters only when the work

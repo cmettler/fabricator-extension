@@ -517,3 +517,131 @@ SELECT * FROM l12.main.p WHERE k = 'z' ORDER BY b LIMIT 2;
 
 statement ok
 DETACH l12;
+
+# ============================================================================
+# 13. STRUCT FIELD PUSHDOWN, ONLY WHERE DuckDB 2.0.0 READS IT RIGHT. `s.a` is a scan column, so a join filter on it
+#     reaches the parquet reader. DuckDB 2.0.0 raises an INTERNAL error for a path THROUGH a member some file lacks
+#     that is itself a struct (docs/duckdb-upstream-issues.md §17), so a struct column with a struct member keeps the
+#     whole column. Join filters are read off the profile: the probe scan's rows.
+# ============================================================================
+statement ok
+SET fabricator_file_scan = true;
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/fs13' AS l13 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE TABLE l13.main.big AS SELECT {'a': i, 'b': md5(i::VARCHAR)} AS s, {'n': {'x': i % 13}, 'y': i} AS t, i % 7 AS g
+FROM range(1, 400001) r(i);
+
+statement ok
+CREATE TABLE l13.main.dim AS SELECT i * 199 AS k FROM range(1, 2001) r(i);
+
+query II
+EXPLAIN SELECT count(*) FROM l13.main.big b JOIN l13.main.dim d ON b.s.a = d.k;
+----
+physical_plan	<REGEX>:(?s).*Fabricator File Scan.*Projections: s\.a.*
+
+statement ok
+SET enable_profiling = 'json';
+
+statement ok
+SET profiling_output = '{FABRICATOR_DELTA_WRITE_DIR}/fs13_s.json';
+
+query II
+SELECT count(*), sum(b.g) FROM l13.main.big b JOIN l13.main.dim d ON b.s.a = d.k;
+----
+2000	6002
+
+statement ok
+SET profiling_output = '{FABRICATOR_DELTA_WRITE_DIR}/fs13_t.json';
+
+query II
+SELECT count(*), sum(b.g) FROM l13.main.big b JOIN l13.main.dim d ON b.t.y = d.k;
+----
+2000	6002
+
+statement ok
+SET enable_profiling = 'no_output';
+
+# the probe scan hands the join only rows matching its filter (about 2000 of 400000)
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_FILE_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/fs13_s.json'));
+----
+2	true
+
+# `t` has a struct member: no pushdown, the whole column, every row
+query I
+SELECT max(CAST(r AS BIGINT))
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_FILE_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/fs13_t.json'));
+----
+400000
+
+# a struct that gained a struct member: the old file lacks it, and projection, WHERE and join all read it right
+statement ok
+CREATE TABLE l13.main.e (id INTEGER, s STRUCT(a INTEGER));
+
+statement ok
+INSERT INTO l13.main.e VALUES (1, {'a': 10});
+
+statement ok
+ALTER TABLE l13.main.e ADD COLUMN s.deep STRUCT(q INTEGER);
+
+statement ok
+INSERT INTO l13.main.e VALUES (2, {'a': 20, 'deep': {'q': 7}});
+
+query II
+SELECT id, s.deep.q FROM l13.main.e ORDER BY id;
+----
+1	NULL
+2	7
+
+query I
+SELECT id FROM l13.main.e WHERE s.deep.q = 7;
+----
+2
+
+query I
+SELECT e.id FROM l13.main.e e JOIN (SELECT 7 AS q) k ON e.s.deep.q = k.q;
+----
+2
+
+# a struct that gained a scalar member: pushed down, and the old file's missing member reads as NULL
+statement ok
+CREATE TABLE l13.main.f (id INTEGER, s STRUCT(a INTEGER));
+
+statement ok
+INSERT INTO l13.main.f VALUES (1, {'a': 10});
+
+statement ok
+ALTER TABLE l13.main.f ADD COLUMN s.b INTEGER;
+
+statement ok
+INSERT INTO l13.main.f VALUES (2, {'a': 20, 'b': 5});
+
+query II
+EXPLAIN SELECT id FROM l13.main.f WHERE s.b = 5;
+----
+physical_plan	<REGEX>:(?s).*Fabricator File Scan.*s\.b.*
+
+query II
+SELECT id, s.b FROM l13.main.f ORDER BY id;
+----
+1	NULL
+2	5
+
+query I
+SELECT id FROM l13.main.f WHERE s.b = 5;
+----
+2
+
+query I
+SELECT f.id FROM l13.main.f f JOIN (SELECT 5 AS b) k ON f.s.b = k.b;
+----
+2
+
+statement ok
+DETACH l13;

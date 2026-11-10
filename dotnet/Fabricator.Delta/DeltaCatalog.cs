@@ -525,6 +525,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                      ?.GetValueOrDefault("delta.columnMapping.physicalName")
                  ?? c,
             StringComparer.Ordinal);
+        bool hasTimestamp = listing.TableSchema?.Fields.Any(f => f.Type is
+            EngineeredWood.DeltaLake.Schema.PrimitiveType { TypeName: "timestamp" }) == true;
         var parts = new List<ScanPart>(listing.Files.Count);
         long rows = 0;
         bool rowsKnown = true;
@@ -561,8 +563,11 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 [DeltaNativeReader.RowTrackingVersionColumn] = f.CommitVersion,
             };
             // ⚠ SPIKE (FABRICATOR_FILE_SCAN_STREAM_PARTS=1): every other DV-free file of an unmapped table is a stream
-            // part, read by this provider (ReadPart) instead of by DuckDB — the stand-in for a format DuckDB cannot read
-            ScanPart part = StreamPartsSpike && f.Dv.Length == 0 && listing.LogicalToPhysical is null && f.Ordinal % 2 == 1
+            // part, read by this provider (ReadPart) instead of by DuckDB — the stand-in for a format DuckDB cannot read.
+            // Unmapped means no stored names at all: id mode sets no LogicalToPhysical, and ScanFilePart reads by
+            // logical name. Nor a `timestamp` column: ScanFilePart returns the file's type, and a naive file under it
+            // (a DuckLake 'utc' mirror) needs the UTC reading the file scan gives a file part.
+            ScanPart part = StreamPartsSpike && f.Dv.Length == 0 && stored is null && !hasTimestamp && f.Ordinal % 2 == 1
                 ? new StreamPart(f.Uri)
                 : new FilePart(f.Uri) { Size = f.SizeBytes is > 0 ? f.SizeBytes : null, DeletedRows = f.Dv };
             parts.Add(part with { Constants = constants, VirtualValues = values });

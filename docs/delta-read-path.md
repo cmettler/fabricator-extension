@@ -1535,8 +1535,8 @@ the rows back over Arrow. On TPC-H SF10 that hand-back was the cost: the same qu
 (chunk passthrough measured ~6%, discarded). The file scan removes the hand-back: the provider describes the table,
 and DuckDB's own multi-file parquet reader reads it in the scan's own pipeline.
 
-**Switch:** `SET fabricator_file_scan = true` (default `false` while it is built; `FABRICATOR_FILE_SCAN=1` makes
-`true` the process default, and a `SET` still wins). Only for an autocommit statement on a catalog that declares
+**Switch:** `fabricator_file_scan`, **on by default since 2026-11-10** (`SET fabricator_file_scan = false` reads
+through the provider's scan; `FABRICATOR_FILE_SCAN=0` makes `false` the process default, and a `SET` still wins). Only for an autocommit statement on a catalog that declares
 the capability `file_scan` (Delta with `native_read`). Anything else, and anything the plan declines, takes the
 provider's scan as before. `EXPLAIN` shows `Fabricator File Scan` when it is used.
 
@@ -1594,11 +1594,38 @@ where a row id of `file_row_number` alone fails the differential against the pro
 
 ### Limits
 
-- **Struct field pushdown is off** in the file scan: with it, DuckDB 2.0.0 hits an INTERNAL error when a struct path
-  reaches a member older files lack (`docs/duckdb-upstream-issues.md` §17). The cost is join filters on struct fields
-  (`verify_delta_struct_extract`'s profile rows).
+- **Struct field pushdown only for a struct without a struct member.** DuckDB 2.0.0 raises an INTERNAL error when a
+  path goes THROUGH a member some file lacks and that member is itself a struct (`docs/duckdb-upstream-issues.md`
+  §17 — projection, WHERE and join alike); a missing member at the end of the path, a list or a map is fine. So
+  `s.a` is a scan column (a join on it gets its join filter) when `s` has no struct member; for a struct with one,
+  the scan reads the whole column. Expected to be lifted by a DuckDB 2.0 patch release.
 - **Parallelism is per row group**, DuckDB's reader's unit, where the provider's scan splits into 2048-row morsels:
   a one-row-group table is read by one thread.
+
+### Inversion pass before the default flip (2026-11-10)
+
+How could the file scan, now the default, answer wrong or break something? Each candidate measured against the
+provider's scan:
+
+| candidate | result |
+|---|---|
+| a PREPARED statement after INSERT, DELETE (deletion vector) and OPTIMIZE + VACUUM (the old files gone) | correct each time: the plan is made per execution |
+| timestamp / timestamp_ntz partition values under `TimeZone = 'Asia/Kathmandu'`, filter included | identical |
+| top-N per group (`QUALIFY row_number() … <= 2`): DuckDB rewrites it to a SEMI join on our row id columns | identical (EXPLAIN shows the join over two file scans) |
+| `AT (VERSION => n)` and the same table at two versions in one statement | identical |
+| a self-join with different partition filters on each side (part pruning per scan) | identical |
+| partition values with a space, `/`, `%`, non-ASCII, `''`, NULL | identical |
+| an empty table and a table whose rows are all deleted | declined, the provider's scan answers |
+| `INSERT INTO t SELECT … FROM t`: does the commit claim a blind append? | no — autocommit never claims one (`blind = null`), explicit transactions decline the file scan |
+| a column named `ID` in a file under a table column `id` | DuckDB's column mapper matches case-insensitively, as Delta |
+| 5M rows, 4M deleted (one deletion vector) | 343 MB peak / 0.54 s against 432 MB / 0.85 s |
+| a 281-file table, filtered and unfiltered | the same number of log listings (the part pruning reuses the snapshot) |
+| OneLake (live, five tables: deletion vectors, partitions, row tracking, clustering, TPC-H lineitem) | identical checksums; warm 0.14–0.17 s both ways |
+
+Found on the way, not the file scan's: an INSERT into a LOCAL Windows table of ~280 files takes ~5 s on both paths,
+almost all of it system time — ten log listings per statement at ~0.7 s each, where DuckDB's own glob of the same
+directory takes 0.04 s (`DuckDbTableFileSystem.ListAsync` stats every entry, twice on a local root). And the literal
+partition value `'__HIVE_DEFAULT_PARTITION__'` reads as NULL on both paths.
 
 ### Measured
 
@@ -1614,12 +1641,18 @@ vectors, schema evolution, row tracking, DML, partitions, timestamps, column map
 in lists and maps, the plan copy in a CTE, the explicit-transaction decline, naive timestamps under a non-UTC zone
 (§10), pruning (§11 — a data file the filter rules out is overwritten with garbage, so the filtered read only
 succeeds if that part is never opened; the unfiltered read failing on it is the control) and late materialization
-(§12). Mutants killed at their own rows: the type rewrite for naive timestamps (§10), no pruning (§11), a row id of
-`file_row_number` alone (§12), and earlier the id-mode, list/map and
-row-number paths.
+(§12) and struct field pushdown (§13 — the probe scan's profile rows, and §17's three query shapes on a struct that
+gained a struct member). Mutants killed at their own rows: the type rewrite for naive timestamps (§10), no pruning
+(§11), a row id of `file_row_number` alone (§12), no struct pushdown and pushdown for every struct (§13), and earlier
+the id-mode, list/map and row-number paths.
 
 Suites that test the provider scan's own routing, logs or plan markers set `fabricator_file_scan = false`, so they
-keep testing it when the default flips.
+keep testing it now that the default is on.
+
+`FABRICATOR_FILE_SCAN_STREAM_PARTS=1` is a test switch: every other file without deletion vectors of a table without
+column mapping and without a `timestamp` column becomes a stream part, read by the provider (`ScanFilePart`, a plain
+`read_parquet` by logical name) — the stand-in for a format DuckDB cannot read. `verify_delta_file_scan` passes with
+it on.
 
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 

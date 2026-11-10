@@ -77,8 +77,8 @@ internal static class HostSettings
     public const string BindSchemaCacheName = "fabricator_bind_schema_cache";
 
     /// <summary>Read a table whose provider can list its data files (capability <c>file_scan</c>, ABI v101) with
-    /// DuckDB's own parquet reader instead of the provider's scan. Off by default while it is being built; the
-    /// environment variable <c>FABRICATOR_FILE_SCAN=1</c> makes on the default for a whole process (a SET still wins).</summary>
+    /// DuckDB's own parquet reader instead of the provider's scan. On by default; the environment variable
+    /// <c>FABRICATOR_FILE_SCAN=0</c> makes off the default for a whole process (a SET still wins).</summary>
     public const string FileScanName = "fabricator_file_scan";
 
     public static IEnumerable<ProviderSetting> Settings { get; } = new[]
@@ -138,10 +138,10 @@ internal static class HostSettings
             FileScanName,
             ProviderSettingType.Bool,
             // the process default; a SET still wins either way (a suite pinning the provider's scan keeps it)
-            Default: Environment.GetEnvironmentVariable("FABRICATOR_FILE_SCAN") == "1",
+            Default: Environment.GetEnvironmentVariable("FABRICATOR_FILE_SCAN") != "0",
             Description: "Read a table whose provider lists its data files (Delta with native_read) with DuckDB's own " +
-                         "parquet reader, so no row crosses into the provider. Off by default while it is being built " +
-                         "(FABRICATOR_FILE_SCAN=1 makes on the process default); off is also the reference oracle."),
+                         "parquet reader, so no row crosses into the provider. On by default (FABRICATOR_FILE_SCAN=0 " +
+                         "makes off the process default); off is the provider's scan and the reference oracle."),
         new ProviderSetting(
             BindSchemaCacheName,
             ProviderSettingType.Bool,

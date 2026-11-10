@@ -1136,12 +1136,27 @@ SELECT id, s.deep.q FROM read_parquet(['f1.parquet', 'f2.parquet'], union_by_nam
 -- expression type STRUCT(q INTEGER)
 ```
 
+Which query shapes hit it (measured 2026-11-10 on our 2.0.0 shell, plain `read_parquet`):
+
+| query | result |
+|---|---|
+| `SELECT s.deep.q …` (projection) | INTERNAL error (above) |
+| `… WHERE s.deep.q = 7` (filter) | INTERNAL `Vector::Reference used on vector of different type (source INTEGER referenced STRUCT(q INTEGER))` |
+| `… JOIN k ON t.s.deep.q = k.q` (join) | the same INTERNAL error |
+| `SELECT s.deep …` (whole missing member) | correct: `NULL`, `{'q': 7}` |
+| `SELECT s.b …` / `WHERE s.b = 5`, `b` a missing SCALAR member | correct |
+| `WHERE s.a = 20`, `a` in every file | correct |
+
+So the bug needs a path that goes THROUGH a missing member which is itself a struct; projection, WHERE and join all
+hit it. A missing member at the END of the path is fine.
+
 Control: `SELECT id, s.deep …` (the whole member, no path below it) answers `(1, NULL), (2, {'q': 7})`. The path is
 pushed into the scan as an extract (`supports_pushdown_extract`), and for the file that lacks `deep` the reader
 substitutes a NULL of the member's type where the extract expects the field's. A table whose struct gained a member
 (Delta `ALTER TABLE … ADD COLUMN s.deep`, any `union_by_name` read over old and new files) hits it with an ordinary
-query. Ours: the file scan does not declare `supports_pushdown_extract` (costs join filters on struct fields;
-`verify_delta_catalog_nested_alter:222` with it, green without). Not filed.
+query. Ours: the file scan declares `supports_pushdown_extract` only for a struct column without a struct member
+(`FileScanSupportsPushdownExtract`; `verify_delta_file_scan` §13, and `verify_delta_catalog_nested_alter:222` fails
+with it declared for every struct). Not filed; expected to be fixed in a DuckDB 2.0 patch release.
 
 ## Not a bug, but pinned here because it wasted time three times
 
