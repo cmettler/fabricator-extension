@@ -1630,8 +1630,9 @@ listings per INSERT. It now reads size and time from ONE enumeration per directo
 INSERT 0.30–0.44 s, a full-table read 0.07–0.17 s (was 0.8–0.95 s). Not the Windows Restart Manager — the INSERT path
 opens no missing file (reads use `NULL_IF_NOT_EXISTS`, local existence `File.Exists`, local commits `File.Move`).
 The write and commit opens now start from the stored snapshot too (one listing each, still the latest version): three
-listings per INSERT in steady state instead of six (write, commit, and engineered-wood's update after the commit). On
-OneLake a warm listing costs 50–100 ms. And the literal partition value
+listings per INSERT in steady state instead of six (write, commit, and engineered-wood's update after the commit).
+Measured on S3 (local RustFS, a 30-commit table): a one-row INSERT 0.24–0.49 s before, 0.11–0.16 s after. On OneLake a
+warm listing costs 50–100 ms. And the literal partition value
 `'__HIVE_DEFAULT_PARTITION__'` reads as NULL on both paths.
 
 ### Measured
