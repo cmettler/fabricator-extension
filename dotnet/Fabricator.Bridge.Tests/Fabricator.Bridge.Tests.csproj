@@ -156,6 +156,9 @@
              Link="Linked\ArchivePath.cs" />
     <Compile Include="..\Fabricator.Installer.Core\InstallerException.cs"
              Link="Linked\InstallerException.cs" />
+    <!-- The CHAIN of a DuckDB azure secret (credential_chain): which sources, in which order. -->
+    <Compile Include="..\Fabricator.Bridge\AzureCredentialChain.cs"
+             Link="Linked\AzureCredentialChain.cs" />
   </ItemGroup>
 
 </Project>

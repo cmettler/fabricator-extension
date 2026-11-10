@@ -4657,6 +4657,7 @@ principal wins even if `PROVIDER` says something else:
 |---|---|
 | *(none, on Fabric compute)* | the ambient notebook token — **recommended** |
 | `PROVIDER credential_chain` | the ambient chain (notebook token on Fabric, `DefaultAzureCredential` elsewhere) |
+| `PROVIDER credential_chain, CHAIN 'cli'` (also `env`, `managed_identity`, `workload_identity`, `default`; `;`-separated, tried in order) | exactly those sources — e.g. your `az login` on a laptop, where `DefaultAzureCredential` may answer from a sign-in whose token lacks the Fabric scopes (403 `InsufficientScopes`). An unknown name is refused |
 | `PROVIDER service_principal` + `TENANT_ID`/`CLIENT_ID`/`CLIENT_SECRET` | that service principal |
 | `PROVIDER managed_identity` (+ `CLIENT_ID` for user-assigned) | that managed identity |
 | `PROVIDER access_token` + `ACCESS_TOKEN` | the token as-is, expiry read from the JWT |

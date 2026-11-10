@@ -60,7 +60,7 @@ public static class FabricCredentialResolver
         {
             return new StaticTokenCredential(accessToken);
         }
-        return Build(F("provider"), F("tenant_id"), F("client_id"), F("client_secret"));
+        return Build(F("provider"), F("tenant_id"), F("client_id"), F("client_secret"), F("chain"));
     }
 
     /// <summary>A fixed, pre-minted token served for every scope request (the token's audience must match
@@ -111,7 +111,8 @@ public static class FabricCredentialResolver
     public static TokenCredential MintCredential(string? tenantId, string? clientId, string? clientSecret)
         => Build(provider: string.Empty, tenantId ?? string.Empty, clientId ?? string.Empty, clientSecret ?? string.Empty);
 
-    private static TokenCredential Build(string provider, string tenantId, string clientId, string clientSecret)
+    private static TokenCredential Build(string provider, string tenantId, string clientId, string clientSecret,
+                                         string chain = "")
     {
         // Service principal first — the truest "same principal" as the warehouse's AD service-principal auth,
         // and it wins even if provider says something else (the fields are authoritative).
@@ -126,8 +127,40 @@ public static class FabricCredentialResolver
                 ? new ManagedIdentityCredential(clientId)
                 : new ManagedIdentityCredential();
         }
+        // credential_chain with an explicit CHAIN (DuckDB's azure secret: `CHAIN 'cli;env'`): exactly those sources,
+        // in that order. Without it DefaultAzureCredential may answer from a source the user did not mean — a Visual
+        // Studio sign-in whose token lacks the Fabric scopes (measured 2026-11-10: 403 InsufficientScopes on the
+        // lakehouse listing while `az login` worked).
+        if (chain.Length > 0 && provider.Equals("credential_chain", StringComparison.OrdinalIgnoreCase))
+        {
+            return Chain(chain, clientId);
+        }
         // credential_chain / default / no secret → the ambient chain.
         return AmbientChain();
+    }
+
+    /// <summary>The sources of a DuckDB azure <c>CHAIN</c>, semicolon-separated, in order.</summary>
+    internal static TokenCredential Chain(string chain, string clientId = "")
+    {
+        var sources = new List<TokenCredential>();
+        foreach (var part in AzureCredentialChain.Parse(chain))
+        {
+            sources.Add(part switch
+            {
+                "cli" => new AzureCliCredential(),
+                "env" => new EnvironmentCredential(),
+                "managed_identity" => clientId.Length > 0
+                    ? new ManagedIdentityCredential(clientId)
+                    : new ManagedIdentityCredential(),
+                "workload_identity" => new WorkloadIdentityCredential(),
+                _ => AmbientChain(), // "default"
+            });
+        }
+        if (sources.Count == 0)
+        {
+            return AmbientChain();
+        }
+        return sources.Count == 1 ? sources[0] : new ChainedTokenCredential(sources.ToArray());
     }
 
     /// <summary>The ambient credential: on Fabric notebook/Spark compute the token-service-backed

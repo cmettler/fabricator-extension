@@ -196,7 +196,8 @@ jobs:
           #   NULLABLE (null = REMOVE the comment), so an absent key would be indistinguishable from an
           #   instruction to remove one -- the same distinction again, on a third kind.
           # 455 since 2026-11-10: + ScanPlanWireTests (11), the scan plan's wire form (ABI v101).
-          EXPECTED_MINIMUM: 455
+          # 463 since 2026-11-10: + AzureCredentialChainTests (8), the CHAIN of a DuckDB azure secret.
+          EXPECTED_MINIMUM: 463
         run: |
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then
