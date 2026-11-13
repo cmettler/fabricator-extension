@@ -417,7 +417,7 @@ SELECT schema_path, kind FROM fabricator_functions('fx') WHERE name = 'fab_delta
 query I
 SELECT count(*) FROM fx.sales.eu.fab_delta_info();
 ----
-5
+6
 
 query RI
 SELECT fx.sales.eu.fab_pct(1, 4), fx.sales.eu.fab_clamp(500);

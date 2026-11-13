@@ -955,6 +955,20 @@ std::string TablePartsMatching(FabricatorHandle table, const std::string &at_uni
 	return result;
 }
 
+bool ScanNextUnit(int64_t scan_id, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.scan_next_unit) {
+		throw duckdb::IOException("Fabricator: bridge does not provide scan_next_unit");
+	}
+	char *err = nullptr;
+	int32_t got = 0;
+	int32_t rc = vt.scan_next_unit(scan_id, &out, &got, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: scan_next_unit failed");
+	}
+	return got != 0;
+}
+
 std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.remote_translate) {

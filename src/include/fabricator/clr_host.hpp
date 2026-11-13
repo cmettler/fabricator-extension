@@ -274,6 +274,8 @@ void TablePartScan(FabricatorHandle table, const std::string &request_json, Arro
 // filter_values is consumed.
 std::string TablePartsMatching(FabricatorHandle table, const std::string &at_unit, const std::string &at_value,
                                const std::string &filter_json, ArrowArrayStream *filter_values);
+//! ABI v102: the next unit of a scan read by units (abi.h scan_next_unit) into `out`; false when none are left.
+bool ScanNextUnit(int64_t scan_id, ArrowArrayStream &out);
 
 //! remote_translate (ABI v96): a Substrait plan to the provider's query, as the JSON doc in abi.h ("{}" = declined).
 std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan);

@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v100
+# ABI history — prior versions v16–v102
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,21 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v102 (2026-11-13) — `scan_next_unit`: a scan read as UNITS
+
+Appended to the vtable: `scan_next_unit(scan_id, out, got, err)`. Under `SET fabricator_scan_units` (default on) the
+host adds `"partitions": <its scan threads>` to a table scan's spec. A provider that can split its read answers with an
+EMPTY stream whose schema metadata names `fabricator.unit_scan` (an id) and `fabricator.unit_threads`; each host
+thread then calls `scan_next_unit` until `*got = 0`, draining every unit on its own thread without the scan's pull
+lock. A unit's batches carry a trailing Int64 `__fabricator_unit` (its number in plan order), which the host turns
+into batch indexes (`unit << 24 | place in the unit`), so order-preserving plans still see plan order. Managed:
+`ScanUnits` / `IScanUnitSource` (Fabricator.Bridge). First user: the Delta native read
+([delta-read-path.md](delta-read-path.md) §Scan units). Additive, but the version moves so a mismatched
+loadable/bridge pair fails loudly at boot.
+
+⚠ On the local branch `exp/ew-row-masks`, v102 is `join_filter_lookup` (engineered-wood #502 row masks) and its
+prototype took v103 (`scan_partition`) and v104 (`scan_next_unit`). Renumber when that branch moves over.
 
 ## v100 (2026-11-01) — `catalog_schema_exists`: a schema a discovery filter left out, named by a statement
 

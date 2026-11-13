@@ -1,0 +1,314 @@
+# name: test/verify_delta_scan_units.test
+# description: The Delta native read as SCAN UNITS (DeltaNativeReader.Units, ABI v102 scan_next_unit): each DuckDB
+#              scan thread pulls the next unit — a group of files, or a row-group slice of one file — and reads it
+#              through its own inner host query, instead of every thread sharing one stream. On by default
+#              (SET fabricator_scan_units, ATTACH scan_units). Every answer is compared with a local DuckDB copy of
+#              the same rows (EXCEPT ALL both ways); the routing is read from the reader's log line
+#              `delta native units <path>: files=F units=U threads=T`, since a row assertion passes either way.
+#              `scan_unit_min_bytes 1` lets these small tables split the way large ones do (default 32 MiB).
+#              Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require json
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# The provider's own scan (the file scan would take every autocommit read), and enough threads to ask for units.
+statement ok
+SET fabricator_file_scan = false;
+
+statement ok
+SET threads = 8;
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/su' AS su (TYPE fabricator, PROVIDER 'delta', scan_unit_min_bytes 1);
+
+# storage_buffer_size 1: duckdb_logs() does not flush, and the default buffer (2048 entries) would make a fresh entry
+# visible only by chance.
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory', storage_buffer_size := 1);
+
+# ============================================================================
+# 1. MANY FILES — whole files as units (6 files are not fewer than threads/4, so nothing is sliced).
+# ============================================================================
+
+statement ok
+CREATE TABLE ref_many AS SELECT i::BIGINT AS id, 'v' || (i % 7) AS s, (i * 1.5)::DOUBLE AS d FROM range(6000) r(i);
+
+statement ok
+CREATE TABLE su.main.many AS SELECT * FROM ref_many WHERE id < 1000;
+
+statement ok
+INSERT INTO su.main.many SELECT * FROM ref_many WHERE id >= 1000 AND id < 2000;
+
+statement ok
+INSERT INTO su.main.many SELECT * FROM ref_many WHERE id >= 2000 AND id < 3000;
+
+statement ok
+INSERT INTO su.main.many SELECT * FROM ref_many WHERE id >= 3000 AND id < 4000;
+
+statement ok
+INSERT INTO su.main.many SELECT * FROM ref_many WHERE id >= 4000 AND id < 5000;
+
+statement ok
+INSERT INTO su.main.many SELECT * FROM ref_many WHERE id >= 5000;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM su.main.many EXCEPT ALL SELECT * FROM ref_many)),
+       (SELECT count(*) FROM (SELECT * FROM ref_many EXCEPT ALL SELECT * FROM su.main.many));
+----
+0	0
+
+query III
+SELECT count(*), sum(id), count(DISTINCT s) FROM su.main.many WHERE d > 300;
+----
+5799	17976900	7
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %/many: files=6 units=6 %';
+----
+true
+
+# ============================================================================
+# 2. ONE FILE, SEVERAL ROW GROUPS — sliced at its row-group boundaries (one file is fewer than threads/4).
+#    Each slice is the plain form plus a file_row_number range; a misaligned range would read a row group twice,
+#    an off-by-one would drop or duplicate a row, and only the EXCEPT ALL in both directions catches both.
+# ============================================================================
+
+statement ok
+CREATE TABLE ref_big AS SELECT i::BIGINT AS id, 'k' || (i % 11) AS s, (i % 97)::INTEGER AS n FROM range(50000) r(i);
+
+statement ok
+CREATE TABLE su.main.big WITH (parquet_row_group_size = 10000) AS SELECT * FROM ref_big;
+
+# a parallel write cuts 5 or 6 row groups (measured), so the slice count is not pinned — only that there are several
+query I
+SELECT count(DISTINCT row_group_id) >= 2 FROM parquet_metadata('{FABRICATOR_DELTA_WRITE_DIR}/su/big/*.parquet');
+----
+true
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM su.main.big EXCEPT ALL SELECT * FROM ref_big)),
+       (SELECT count(*) FROM (SELECT * FROM ref_big EXCEPT ALL SELECT * FROM su.main.big));
+----
+0	0
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %/big: files=1 units=%'
+  AND message NOT LIKE '%units=1 %';
+----
+true
+
+# The slices are the plain form with a file_row_number range — no per-file path, so no footer probe per unit.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%/su/big/%' AND message LIKE '%schema = map%' AND message LIKE '%file_row_number >= %';
+----
+true
+
+# COUNT(*) reads no column: the zero-column plain form carries the range too.
+query I
+SELECT count(*) FROM su.main.big;
+----
+50000
+
+# A pushed filter rides every slice.
+query II
+SELECT count(*), sum(n) FROM su.main.big WHERE s = 'k3' AND id > 12345;
+----
+3423	164371
+
+query II
+SELECT count(*), sum(n) FROM ref_big WHERE s = 'k3' AND id > 12345;
+----
+3423	164371
+
+# ============================================================================
+# 3. SCHEMA EVOLUTION + COLUMN MAPPING — a renamed and an added column across the slices.
+# ============================================================================
+
+statement ok
+CREATE TABLE su.main.evo WITH (parquet_row_group_size = 10000) AS SELECT * FROM ref_big;
+
+statement ok
+ALTER TABLE su.main.evo RENAME COLUMN s TO tag;
+
+statement ok
+ALTER TABLE su.main.evo ADD COLUMN extra INTEGER;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT id, tag, n, extra FROM su.main.evo
+                              EXCEPT ALL SELECT id, s, n, NULL::INTEGER FROM ref_big)),
+       (SELECT count(*) FROM (SELECT id, s, n, NULL::INTEGER FROM ref_big
+                              EXCEPT ALL SELECT id, tag, n, extra FROM su.main.evo));
+----
+0	0
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %/evo: files=1 units=%'
+  AND message NOT LIKE '%units=1 %';
+----
+true
+
+# ============================================================================
+# 4. DELETION VECTORS — a sliced file that carries one takes the per-file path, with the slice as a position
+#    predicate beside the vector's own condition.
+# ============================================================================
+
+statement ok
+CREATE TABLE su.main.dv WITH (parquet_row_group_size = 10000) AS SELECT * FROM ref_big;
+
+statement ok
+DELETE FROM su.main.dv WHERE id % 13 = 0;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM su.main.dv EXCEPT ALL SELECT * FROM ref_big WHERE id % 13 <> 0)),
+       (SELECT count(*) FROM (SELECT * FROM ref_big WHERE id % 13 <> 0 EXCEPT ALL SELECT * FROM su.main.dv));
+----
+0	0
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %/dv: files=1 units=%'
+  AND message NOT LIKE '%units=1 %';
+----
+true
+
+# ============================================================================
+# 5. PARTITIONED — partition values come from the log beside each unit's files.
+# ============================================================================
+
+statement ok
+CREATE TABLE su.main.part PARTITIONED BY (p) AS SELECT id, s, n, (id % 4)::INTEGER AS p FROM ref_big;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT id, s, n, p FROM su.main.part
+                              EXCEPT ALL SELECT id, s, n, (id % 4)::INTEGER FROM ref_big)),
+       (SELECT count(*) FROM (SELECT id, s, n, (id % 4)::INTEGER FROM ref_big
+                              EXCEPT ALL SELECT id, s, n, p FROM su.main.part));
+----
+0	0
+
+query II
+SELECT p, count(*) FROM su.main.part WHERE p IN (1, 3) GROUP BY p ORDER BY p;
+----
+1	12500
+3	12500
+
+# ============================================================================
+# 6. INSIDE BEGIN — the dbt path. Without pending writes the read takes units; with them it reads one stream
+#    (the pending rows ride beside the committed files), and both must see the transaction's state.
+# ============================================================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+BEGIN;
+
+# a column read: a bare count(*) is answered from the log's statistics without a scan
+query II
+SELECT count(*), sum(n) FROM su.main.big;
+----
+50000	2398830
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %/big: %';
+----
+true
+
+statement ok
+INSERT INTO su.main.big VALUES (50000, 'k0', 1);
+
+query II
+SELECT count(*), max(id) FROM su.main.big;
+----
+50001	50000
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), max(id) FROM su.main.big;
+----
+50000	49999
+
+# ============================================================================
+# 7. SHAPES THAT STAY ONE STREAM — the rowid (DML reads) and a pushed LIMIT.
+# ============================================================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TABLE su.main.dml WITH (parquet_row_group_size = 10000) AS SELECT * FROM ref_big;
+
+statement ok
+UPDATE su.main.dml SET n = -1 WHERE id % 1000 = 0;
+
+query II
+SELECT count(*), sum(n) FROM su.main.dml WHERE n = -1;
+----
+50	-50
+
+query I
+SELECT count(*) FROM (SELECT * FROM su.main.big LIMIT 7);
+----
+7
+
+# ============================================================================
+# 8. THE SWITCHES — SET fabricator_scan_units = false and ATTACH scan_units false both read one stream.
+# ============================================================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SET fabricator_scan_units = false;
+
+query I
+SELECT count(*) FROM su.main.big WHERE n = 5;
+----
+516
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %';
+----
+0
+
+statement ok
+RESET fabricator_scan_units;
+
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/su' AS su_off (TYPE fabricator, PROVIDER 'delta', scan_unit_min_bytes 1,
+    scan_units false);
+
+query I
+SELECT count(*) FROM su_off.main.big WHERE n = 5;
+----
+516
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %';
+----
+0
+
+# ...and the positive control: the same query on the default catalog does take units.
+query I
+SELECT count(*) FROM su.main.big WHERE n = 5;
+----
+516
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE type LIKE 'Fabricator.Delta%' AND message LIKE 'delta native units %/big: %';
+----
+true

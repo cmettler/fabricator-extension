@@ -361,6 +361,8 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> TablePartScan;
     // table_parts_matching(table, at_unit, at_value, filter_json, filter_values, out_json, err) — ABI v101
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, CArrowArrayStream*, byte**, byte**, int> TablePartsMatching;
+    // ABI v102: the next unit of a scan read by units (scan_next_unit(scan_id, out, got, err)).
+    public delegate* unmanaged[Cdecl]<long, CArrowArrayStream*, int*, byte**, int> ScanNextUnit;
 }
 
 /// <summary>

@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 101;
+        vtable->AbiVersion = 102;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -183,6 +183,7 @@ public static unsafe class Bootstrap
         vtable->TableFilePlan = &TableFilePlan;
         vtable->TablePartScan = &TablePartScan;
         vtable->TablePartsMatching = &TablePartsMatching;
+        vtable->ScanNextUnit = &ScanNextUnit;
         return FabricatorStatus.Ok;
     }
 
@@ -832,6 +833,30 @@ public static unsafe class Bootstrap
                 : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
             string json = session.PartsMatchingJson(at, Marshal.PtrToStringUTF8((nint)filterJson) ?? "null", values);
             *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ScanNextUnit(long scanId, CArrowArrayStream* outStream, int* got, byte** err)
+    {
+        try
+        {
+            if (outStream is null || got is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var unit = ScanUnits.NextUnit(scanId);
+            *got = unit is null ? 0 : 1;
+            if (unit is not null)
+            {
+                CArrowArrayStreamExporter.ExportArrayStream(unit, outStream);
+            }
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

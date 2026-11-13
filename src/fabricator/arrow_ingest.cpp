@@ -20,6 +20,8 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp" // DatabaseInstance::NumberOfThreads — the scan's MaxThreads
+#include "duckdb/common/arrow/schema_metadata.hpp" // a partitioned scan's schema keys
+#include <atomic>
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp" // the schema-change error names the table
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -212,6 +214,14 @@ struct ArrowStreamGlobalState : public GlobalTableFunctionState {
 	//! propagating to it.
 	idx_t scan_max_threads = 1;
 
+	//! ABI v102 scan_next_unit: a scan read by UNITS. `stream` then carries no batches; each local state pulls a unit,
+	//! drains it without the pull lock and pulls the next. unit_threads = 0 for an ordinary scan.
+	int64_t unit_scan = 0;
+	idx_t unit_threads = 0;
+	std::atomic<idx_t> next_unit_thread {0};
+	//! The trailing "__fabricator_unit" column's position in a unit's batches.
+	idx_t unit_column = 0;
+
 	idx_t MaxThreads() const override {
 		// The old answer was a hardcoded 1, justified as "a single Arrow C stream is consumed serially" —
 		// TRUE of get_next, but too strong a conclusion. DuckDB's OWN arrow scan declares NumberOfThreads()
@@ -249,6 +259,18 @@ struct ArrowStreamLocalState : public ArrowScanLocalState {
 	//! every batch it gets, so a fast pull is never waited on and a slow one costs a bounded number of
 	//! wake-ups. See src/include/fabricator/scan_wait.hpp.
 	fabricator::ScanWaitBackoff backoff;
+
+	//! This thread's current unit of a unit scan (released here, after its last batch).
+	ArrowArrayStream part_stream {};
+	bool part_open = false;
+	int64_t part_unit = -1;
+	idx_t part_seq = 0;
+
+	~ArrowStreamLocalState() override {
+		if (part_open && part_stream.release) {
+			part_stream.release(&part_stream);
+		}
+	}
 };
 
 enum class BatchPull : uint8_t {
@@ -281,7 +303,61 @@ struct AnnounceProgressOnExit {
 // into managed code, which may be waiting on a network read). `park_on_lock` is what keeps those two facts from
 // costing every DuckDB worker: with it false, a thread that loses the lock returns WOULD_BLOCK so the caller
 // can hand its worker back instead of parking here. docs/scan-concurrency.md §5f.
+//! The batch indexes of one scan unit (its batches carry their unit): unit * stride + the batch's place in the unit.
+//! A thread takes units in ascending order, so its indexes ascend, and no two threads share one.
+static constexpr idx_t UNIT_BATCH_STRIDE = idx_t(1) << 24;
+
+//! A unit scan's pull: this thread's own unit stream, no lock (nothing else reads it).
+BatchPull GetNextUnitBatch(ArrowStreamGlobalState &gstate, ArrowStreamLocalState &lstate) {
+	if (!lstate.part_open) {
+		return BatchPull::END_OF_STREAM;
+	}
+	auto chunk = make_uniq<ArrowArrayWrapper>();
+	if (gstate.context) {
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(gstate.context),
+		                            fabricator::SessionKeyFor(gstate.context));
+	}
+	while (true) {
+		int ret = lstate.part_stream.get_next(&lstate.part_stream, &chunk->arrow_array);
+		if (ret != 0) {
+			const char *msg =
+			    lstate.part_stream.get_last_error ? lstate.part_stream.get_last_error(&lstate.part_stream) : nullptr;
+			throw IOException(string("Fabricator: failed to read next batch from a scan unit") +
+			                  (msg ? string(": ") + msg : string()));
+		}
+		if (chunk->arrow_array.release) {
+			break;
+		}
+		lstate.part_stream.release(&lstate.part_stream);
+		lstate.part_open = false;
+		// this thread takes the next unit (units are handed out in plan order, so its batch indexes keep ascending)
+		if (!fabricator::ScanNextUnit(gstate.unit_scan, lstate.part_stream)) {
+			return BatchPull::END_OF_STREAM;
+		}
+		lstate.part_open = true;
+	}
+	auto &arr = chunk->arrow_array;
+	int64_t unit = 0;
+	if ((idx_t)arr.n_children > gstate.unit_column && arr.length > 0) {
+		auto *child = arr.children[gstate.unit_column];
+		unit = static_cast<const int64_t *>(child->buffers[1])[child->offset];
+	}
+	if (unit != lstate.part_unit) {
+		lstate.part_unit = unit;
+		lstate.part_seq = 0;
+	}
+	lstate.batch_index = (idx_t)unit * UNIT_BATCH_STRIDE + lstate.part_seq++;
+	lstate.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
+	lstate.chunk_offset = 0;
+	lstate.Reset();
+	lstate.backoff.Reset();
+	return BatchPull::BATCH;
+}
+
 BatchPull GetNextBatch(ArrowStreamGlobalState &gstate, ArrowStreamLocalState &lstate, bool park_on_lock) {
+	if (gstate.unit_threads > 0) {
+		return GetNextUnitBatch(gstate, lstate);
+	}
 	std::unique_lock<mutex> lock(gstate.main_mutex, std::defer_lock);
 	if (park_on_lock) {
 		lock.lock();
@@ -2235,6 +2311,15 @@ static void BuildProjectionMapping(const ArrowStreamBindData &bind_data, const v
 	}
 }
 
+// SET fabricator_scan_units (default on; a registered host setting, so unset reads as its default)
+static bool ScanUnitsRequested(ClientContext &context) {
+	Value enabled;
+	if (context.TryGetCurrentSetting("fabricator_scan_units", enabled) && !enabled.IsNull()) {
+		return enabled.GetValue<bool>();
+	}
+	return true;
+}
+
 unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &context,
                                                            TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ArrowStreamBindData>();
@@ -2351,6 +2436,13 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		}
 		request.spec_json = BuildScanSpec(bind_data, input.column_ids, live_filter_sql, live_filter_json,
 		                                  has_live_filters);
+		// How many threads this scan can read with at once (ABI v102): a provider may answer with a unit scan. A hint
+		// only — a provider that cannot ignores it. SET fabricator_scan_units = false withholds it.
+		if (ScanUnitsRequested(context) && gstate->scan_max_threads > 1 && bind_data.push_projection &&
+		    !request.spec_json.empty() && request.spec_json.back() == '}') {
+			request.spec_json.pop_back();
+			request.spec_json += ",\"partitions\":" + to_string(gstate->scan_max_threads) + "}";
+		}
 		if (!filter_constants.empty()) {
 			// Owned by the scan's global state, NOT this frame — the consumer may release it lazily.
 			gstate->filter_value_producer = BuildFilterValues(context, filter_constants);
@@ -2387,6 +2479,18 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	}
 
 	BuildProjectionMapping(bind_data, scan_names, *gstate);
+
+	// ABI v102: the provider answered with a unit scan (an empty stream naming the scan and its thread count)
+	if (sch.metadata) {
+		auto meta = ArrowSchemaMetadata(sch.metadata);
+		auto id = meta.GetOption("fabricator.unit_scan");
+		auto count = meta.GetOption("fabricator.unit_threads");
+		if (!id.empty() && !count.empty()) {
+			gstate->unit_scan = std::stoll(id);
+			gstate->unit_threads = (idx_t)std::stoull(count);
+			gstate->unit_column = (idx_t)sch.n_children;
+		}
+	}
 	return std::move(gstate);
 }
 
@@ -2403,6 +2507,17 @@ unique_ptr<LocalTableFunctionState> ArrowStreamInitLocal(ExecutionContext &conte
 	// ACTUAL result schema (the projected subset when projection was pushed).
 	lstate->column_ids.clear();
 	lstate->all_columns.Initialize(context.client, gstate.scan_types);
+	if (gstate.unit_threads > 0) {
+		// this thread's first unit; a thread beyond the count takes none and ends at once
+		auto index = gstate.next_unit_thread++;
+		if (index < gstate.unit_threads) {
+			if (gstate.context) {
+				fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(gstate.context),
+				                            fabricator::SessionKeyFor(gstate.context));
+			}
+			lstate->part_open = fabricator::ScanNextUnit(gstate.unit_scan, lstate->part_stream);
+		}
+	}
 	return std::move(lstate);
 }
 

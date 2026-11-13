@@ -39,6 +39,12 @@ public sealed class ScanSpec
     [JsonPropertyName("top")]
     public long? Top { get; set; }
 
+    /// <summary>How many threads the host can read this scan with at once (its scan threads; sent only under
+    /// <c>SET fabricator_scan_units</c>). A provider that can split its read answers with a unit scan (see
+    /// <c>ScanUnits</c> in the bridge, ABI v102); absent or 1 = one stream.</summary>
+    [JsonPropertyName("partitions")]
+    public int? Partitions { get; set; }
+
     [JsonPropertyName("order_by")]
     public List<OrderKey>? OrderBy { get; set; }
 

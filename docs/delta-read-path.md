@@ -1662,6 +1662,65 @@ column mapping and without a `timestamp` column becomes a stream part, read by t
 `read_parquet` by logical name) — the stand-in for a format DuckDB cannot read. `verify_delta_file_scan` passes with
 it on.
 
+## Scan units — the native read on every scan thread (2026-11-13)
+
+The provider's native read used to answer a scan with ONE inner host query, i.e. one Arrow stream that every DuckDB
+scan thread pulled from under the scan's lock — about 3.8 cores busy whatever the thread count. Since 2026-11-13 it
+answers with UNITS (ABI v102 `scan_next_unit`, `DeltaNativeReader.Units.cs`): each scan thread pulls the next unit and
+reads it through its own inner host query.
+
+- **Switches.** `SET fabricator_scan_units` (default on) decides whether the host offers its thread count at all
+  (C++, `arrow_ingest.cpp`); the Delta ATTACH option `scan_units` (default true) turns it off per catalog;
+  `scan_unit_min_bytes` (default 32 MiB) is the smallest unit. Off is one stream, the reference oracle.
+- **What stays one stream:** a transaction's pending writes, a pushed `LIMIT`, row-id reads (DML), and a table that
+  yields fewer than two units (small tables: everything under 32 MiB is one unit).
+- **A unit is the plain form** (`read_parquet([files], schema = map {...})`) from ONE file on — the batched forms
+  otherwise start at two files, and a one-file unit on the per-file path probed its footer first
+  (`parquet_schema`). Only files with a deletion vector keep the per-file path.
+- **Row-group slices.** A file of at least twice the target unit size is cut at its ROW-GROUP BOUNDARIES, read from
+  one `parquet_metadata` query per scan over those files (42 ms for 9 footers on RustFS; the bytes then sit in
+  DuckDB's file cache for the read). A slice is the plain form plus `file_row_number => true` and
+  `file_row_number >= lo AND file_row_number < hi`; an aligned range scans exactly one row group (measured,
+  `Row Groups Scanned: 1 / 4`), a misaligned one would decode the shared row group twice. A file whose footer row sum
+  differs from the log's `numRecords` is not split. On the per-file path (deletion vectors) the range rides beside
+  the vector's condition as a position predicate.
+- **When to slice.** Only when the table has fewer files than a quarter of the scan threads. Measured: slicing every
+  large file helps tables with one or two files (TPC-H Q13 1.94 → 1.11 s, Q22 0.59 → 0.36 s: a unit also caps how
+  many threads run the plan above the scan) and costs on `lineitem` (9 files; Q1 1.14 → 1.26 s), because a whole
+  file's query already reads its row groups in parallel and the `file_row_number` filter costs ~25 % CPU on a bare
+  scan. The quarter is fitted to one dataset (TPC-H SF10, 20 threads) — a first rule, not a proven one.
+
+### Measured (TPC-H SF10, file scan off, best of 3, all 22 answers correct)
+
+| | RustFS | OneLake (LH_bench) |
+|---|---|---|
+| one stream | 33.2 / 39.6 s | 42.6 s |
+| units, one footer probe per unit | 19.1 s | 27.4 s |
+| units, plain form | 18.1 s (sum of best per query) | 27.0 s |
+| units, plain form + slices (rule) | 17.0 s (runs 17.2–18.0) | 24.8 s |
+| for comparison: the file scan | 12.9 s | 22.2 s |
+
+Inside `BEGIN … COMMIT` (the dbt path, where the file scan does not apply) the numbers are the same (RustFS 34 →
+19 s). On OneLake the footer probe costs nothing warm — DuckDB's file cache serves it, and the 1253 storage calls are
+identical in all four variants — so the plain form mainly saves a host query per unit. The cold round (~76 s) is the
+download and does not move. Logs: `logs/native_units.jsonl`, `logs/native_slices*.jsonl`, `logs/ol_native_units.jsonl`.
+
+### Gate
+
+`test/verify_delta_scan_units.test` (hermetic, 74): every answer against a local DuckDB copy with `EXCEPT ALL` in both
+directions, the routing from the log line `delta native units <path>: files=F units=U threads=T` (with
+`storage_buffer_size := 1` — `duckdb_logs()` does not flush, and the default 2048-entry buffer made fresh entries
+visible only by chance). A parallel write cuts 5 or 6 row groups, so the slice count is not pinned. Three mutants die
+at their own section: an off-by-one at the slice boundary (§2), the slice ignored on the per-file path (§4), units
+never taken (§1).
+
+### Open
+
+- One host query whose result arrives already partitioned (a parallel sink per DuckDB batch index, e.g. a COPY
+  function) instead of one inner query per unit — DuckDB would then choose the units itself, with no slicing logic and
+  no `file_row_number` filter. Not built; the Arrow transport per chunk would remain.
+- The remaining gap to the file scan is mostly that transport; closing it means the file scan inside `BEGIN`.
+
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 
 CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every

@@ -1282,6 +1282,13 @@ typedef struct FabricatorVTable {
 	int32_t (*table_parts_matching)(FabricatorHandle table, const char *at_unit, const char *at_value,
 	                                const char *filter_json, struct ArrowArrayStream *filter_values, char **out_json,
 	                                char **err);
+	// The next UNIT of a scan read by units — ABI v102. A table scan whose spec carries "partitions": N (the host's
+	// thread count, under SET fabricator_scan_units) may answer with an EMPTY stream whose schema metadata names
+	// "fabricator.unit_scan" (an id) and "fabricator.unit_threads" (how many threads may pull). Each host thread then
+	// pulls a unit, drains it without the scan's pull lock and pulls the next; *got = 0 when none are left (out
+	// untouched). A unit's batches carry the scan's columns plus a trailing Int64 "__fabricator_unit": the unit's
+	// number in plan order, which the host turns into batch indexes.
+	int32_t (*scan_next_unit)(int64_t scan_id, struct ArrowArrayStream *out, int32_t *got, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1519,7 +1526,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 101
+#define FABRICATOR_ABI_VERSION 102
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

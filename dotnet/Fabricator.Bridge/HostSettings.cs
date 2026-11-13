@@ -81,6 +81,12 @@ internal static class HostSettings
     /// <c>FABRICATOR_FILE_SCAN=0</c> makes off the default for a whole process (a SET still wins).</summary>
     public const string FileScanName = "fabricator_file_scan";
 
+    /// <summary>Read a provider scan as UNITS (ABI v102 <c>scan_next_unit</c>) when the provider can: each DuckDB
+    /// scan thread pulls the next unit (Delta native read: a group of files or a row-group slice of one, each its own
+    /// inner query) instead of all threads sharing one stream. On by default; off is one stream per scan, the
+    /// reference oracle. The catalog's ATTACH option <c>scan_units</c> can turn it off per catalog.</summary>
+    public const string ScanUnitsName = "fabricator_scan_units";
+
     public static IEnumerable<ProviderSetting> Settings { get; } = new[]
     {
         new ProviderSetting(
@@ -142,6 +148,13 @@ internal static class HostSettings
             Description: "Read a table whose provider lists its data files (Delta with native_read) with DuckDB's own " +
                          "parquet reader, so no row crosses into the provider. On by default (FABRICATOR_FILE_SCAN=0 " +
                          "makes off the process default); off is the provider's scan and the reference oracle."),
+        new ProviderSetting(
+            ScanUnitsName,
+            ProviderSettingType.Bool,
+            Default: true,
+            Description: "Read a provider scan as units, each scan thread pulling its own part of the table (Delta " +
+                         "native read: groups of files or row-group slices, each its own inner query) instead of all " +
+                         "threads sharing one stream. On by default; off is one stream per scan, the reference oracle."),
         new ProviderSetting(
             BindSchemaCacheName,
             ProviderSettingType.Bool,

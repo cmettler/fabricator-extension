@@ -323,6 +323,10 @@ public sealed partial class DeltaCatalog : IProviderCatalog
     private readonly bool _nativeRead;
     // ATTACH `snapshot_cache` (default true): see DeltaCatalog.SnapshotStore.cs.
     private readonly bool _snapshotCache;
+    // ATTACH `scan_units` (default true): the native read answers a scan as units when the host offers threads
+    // (SET fabricator_scan_units); `scan_unit_min_bytes` is the smallest unit (default 32 MiB) — DeltaNativeReader.Units.
+    private readonly bool _scanUnits;
+    private readonly long? _scanUnitMinBytes;
 
     /// <summary>Whether this catalog reads natively (read_parquet) — consulted by the bound table's
     /// virtual-columns answer, which only exists under the native reader.</summary>
@@ -878,6 +882,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         _mergeSchemaOnWrite = ParseBoolOption(optionsJson, "merge_schema");
         _nativeRead = ParseBoolOption(optionsJson, "native_read", nativeDefaults.Read);
         _snapshotCache = ParseBoolOption(optionsJson, "snapshot_cache", true);
+        _scanUnits = ParseBoolOption(optionsJson, "scan_units", true);
+        _scanUnitMinBytes = ParseLongOption(optionsJson, "scan_unit_min_bytes");
         _nativeWrite = ParseBoolOption(optionsJson, "native_write", nativeDefaults.Write);
         _deleteTrustsStatistics = ParseBoolOption(optionsJson, "delete_trusts_statistics");
         _columnMappingMode = ParseColumnMappingOption(optionsJson);
@@ -3092,12 +3098,21 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         // per-file loop (presence probe + WHERE apply per file); collect-path pending BATCHES concatenate
         // onto the stream (exact-mode WHERE applied per batch through a host query, HostBatchFilter). An explicit AT
         // excludes pending (committed history).
-        var native = DeltaNativeReader.Read(opener, path, userSchema, spec, filterVals, unit, value,
-                                            pendingFiles: pendingNative?.Files,
-                                            pendingDeletes: pendingNative?.DeletedByOrdinal,
-                                            pendingSchema: pendingNative?.PendingDeltaSchema,
-                                            bound: ReadBound(path),
-                                            batchRows: ScanBatchRows);
+        var prepared = DeltaNativeReader.Prepare(opener, path, userSchema, spec, filterVals, unit, value,
+                                                 pendingFiles: pendingNative?.Files,
+                                                 pendingDeletes: pendingNative?.DeletedByOrdinal,
+                                                 pendingSchema: pendingNative?.PendingDeltaSchema,
+                                                 bound: ReadBound(path),
+                                                 batchRows: ScanBatchRows);
+        // One inner host query per scan unit (a group of files or a row-group slice), each pulled by its own scan
+        // thread. Not for row ids (DML reads keep one stream), a pushed LIMIT, or a transaction's pending writes.
+        if (_scanUnits && spec?.Partitions is int parts && parts > 1
+            && pendingNative is null && spec.Top is null && !prepared.WantRowId
+            && DeltaNativeReader.ReadUnits(prepared, parts, _scanUnitMinBytes) is { } units)
+        {
+            return units;
+        }
+        var native = DeltaNativeReader.Open(prepared, prepared.Listing);
         ProbeSchemaSelfCheck(path, native.Schema, userSchema, spec);
         if (pendingNative is not { Batches.Count: > 0 })
         {
@@ -6828,6 +6843,7 @@ public sealed partial class DeltaCatalog : IProviderCatalog
                 new KeyValuePair<string, string>("root", _root),
                 new KeyValuePair<string, string>("native_read", _nativeRead ? "true" : "false"),
                 new KeyValuePair<string, string>("native_write", _nativeWrite ? "true" : "false"),
+                new KeyValuePair<string, string>("scan_units", _scanUnits ? "true" : "false"),
                 new KeyValuePair<string, string>("delete_trusts_statistics", _deleteTrustsStatistics ? "true" : "false"),
                 new KeyValuePair<string, string>("onelake", FabricLakehouse.IsOneLake(_root) ? "true" : "false"),
             }),

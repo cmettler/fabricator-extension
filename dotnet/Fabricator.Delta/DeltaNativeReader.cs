@@ -61,7 +61,7 @@ namespace Fabricator.Bridge;
 /// mapping. Each of those is a numbered, measured case on <see cref="BatchPlan"/>; read them there before
 /// widening the gate, because two of them fail SILENTLY rather than loudly.</para>
 /// </summary>
-internal static class DeltaNativeReader
+internal static partial class DeltaNativeReader
 {
     // One source of truth for the DuckDB-facing virtual rowid name (see DeltaCatalog.RowIdColumn for why
     // it is deliberately NOT engineered-wood's TransientRowAddress.ColumnName).
@@ -84,6 +84,41 @@ internal static class DeltaNativeReader
     /// by the catalog — this class is static and cannot reach the per-catalog manager; a global-function
     /// caller passes none and the listing open is owned + disposed, the pre-cache behaviour).</summary>
     public static IArrowArrayStream Read(
+        nint opener, string path, Schema userSchema, ScanSpec? spec,
+        IReadOnlyList<object?> filterValues, string? unit, string? value,
+        IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile>? pendingFiles = null,
+        IReadOnlyDictionary<int, HashSet<long>>? pendingDeletes = null,
+        EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
+        DeltaTableBinding? bound = null,
+        long batchRows = 0)
+    {
+        var scan = Prepare(opener, path, userSchema, spec, filterValues, unit, value, pendingFiles, pendingDeletes,
+                           pendingSchema, bound, batchRows);
+        return Open(scan, scan.Listing);
+    }
+
+    /// <summary>A native scan planned but not opened: the pruned file listing plus everything the generated
+    /// queries need. <see cref="Open"/> turns it, or any subset of its files, into a stream (a unit scan opens one
+    /// subset per unit, <see cref="ReadUnits"/>).</summary>
+    internal sealed class Prepared
+    {
+        internal required string Path;
+        internal required Schema UserSchema;
+        internal required ScanSpec? Spec;
+        internal required List<string> DataCols;
+        internal required bool WantRowId;
+        internal required string? Where;
+        internal required DeltaRowIdFilter? RowIdFilter;
+        internal required DeltaRowTrackingFilter? TrackingFilter;
+        internal required string? TopSuffix;
+        internal required bool BareLimit;
+        internal required string? OrderClause;
+        internal required bool HasOrder;
+        internal required long BatchRows;
+        internal required DeltaReader.NativeScanList Listing;
+    }
+
+    internal static Prepared Prepare(
         nint opener, string path, Schema userSchema, ScanSpec? spec,
         IReadOnlyList<object?> filterValues, string? unit, string? value,
         IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile>? pendingFiles = null,
@@ -230,10 +265,39 @@ internal static class DeltaNativeReader
                 OneLakeForwardFs.SeedKnownSize(f.Uri, sz);
             }
         }
+        return new Prepared
+        {
+            Path = path, UserSchema = userSchema, Spec = spec, DataCols = dataCols, WantRowId = wantRowId,
+            Where = where, RowIdFilter = rowIdFilter, TrackingFilter = trackingFilter, TopSuffix = topSuffix,
+            BareLimit = bareLimit, OrderClause = orderClause, HasOrder = hasOrder,
+            BatchRows = MorselRows(batchRows, listing.Files), Listing = listing,
+        };
+    }
+
+    /// <summary>Opens <paramref name="listing"/> (the prepared listing, or a subset of its files) as a stream.</summary>
+    internal static IArrowArrayStream Open(Prepared s, DeltaReader.NativeScanList listing, string? sliceCond = null,
+                                           bool unit = false)
+    {
+        string path = s.Path;
+        var userSchema = s.UserSchema;
+        var spec = s.Spec;
+        var dataCols = s.DataCols;
+        bool wantRowId = s.WantRowId;
+        string? where = s.Where;
+        var rowIdFilter = s.RowIdFilter;
+        var trackingFilter = s.TrackingFilter;
+        string? topSuffix = s.TopSuffix;
+        bool bareLimit = s.BareLimit;
+        string? orderClause = s.OrderClause;
+        bool hasOrder = s.HasOrder;
+        long batchRows = s.BatchRows;
         // Collapse the DV-free files into ONE read_parquet([…]) where that is expressible (see BatchPlan.Build);
         // whatever is left keeps the per-file loop unchanged.
-        var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter,
-                                    hasTop: bareLimit);
+        // A scan UNIT batches from one file on (the plain form declares its schema, so no footer is probed), and a
+        // row-group SLICE rides the plain form as a file_row_number range; what the plain form cannot serve falls
+        // back to the per-file loop, which carries the slice as a position predicate.
+        var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter, hasTop: bareLimit,
+                                    minOverride: unit ? 1 : -1, sliceCond: sliceCond);
         var loopFiles = batch?.LoopFiles ?? listing.Files;
 
         // THE BATCH QUERY IS OPENED ONCE, HERE — its schema is this scan's advertised schema AND its rows are
@@ -249,7 +313,6 @@ internal static class DeltaNativeReader
         // That reason is now gone; the factory is kept because it is harmless, not because it is still needed.
         // ⚠ The open is no longer gated by the pump's prefetch semaphore, only the DRAIN is. Immaterial: the
         // result is lazy, so opening it starts a bind, not a read.
-        batchRows = MorselRows(batchRows, listing.Files);
         IArrowArrayStream? batchStream = null;
         BatchQueryOwner? batchOwner = null;
         if (batch is not null)
@@ -292,7 +355,7 @@ internal static class DeltaNativeReader
         return new AsyncEnumerableArrowStream(
             schema,
             StreamFiles(listing, loopFiles, batch, batchStream, batchOwner, dataCols, wantRowId, where,
-                        prefetch, rowIdFilter, trackingFilter, topSuffix, batchRows),
+                        prefetch, rowIdFilter, trackingFilter, topSuffix, batchRows, sliceCond),
             owner: batchOwner);
     }
 
@@ -551,12 +614,28 @@ internal static class DeltaNativeReader
         /// pushed (consumed by the union form's remote gate — see <see cref="TryUnionForm"/>).</summary>
         internal static BatchPlan? Build(
             DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
-            DeltaRowIdFilter? rowIdFilter, DeltaRowTrackingFilter? trackingFilter, bool hasTop = false)
+            DeltaRowIdFilter? rowIdFilter, DeltaRowTrackingFilter? trackingFilter, bool hasTop = false,
+            int minOverride = -1, string? sliceCond = null)
         {
             int min = MinFiles();
             if (min == 0 || listing.Files.Count == 0)
             {
                 return null;
+            }
+            if (minOverride >= 0)
+            {
+                min = Math.Max(1, minOverride);
+            }
+            if (sliceCond is not null)
+            {
+                // A slice reads part of ONE file: only the plain form takes the range (the partition-only form would
+                // answer the whole file's rows from the log, the others carry no per-call position predicate).
+                if (rowIdFilter is not null || trackingFilter is not null)
+                {
+                    return null;
+                }
+                var sliced = TryPlainParts(listing, dataCols, wantRowId, wantsTracking: false, where, min, sliceCond);
+                return sliced is { LoopFiles.Count: 0 } ? PlainPlan(sliced, listing) : null;
             }
             // A per-file PREDICATE is the one thing neither form can carry (its whole value is per-file row-group
             // pruning, and one call has one WHERE).
@@ -810,7 +889,7 @@ internal static class DeltaNativeReader
 
         private static PlainParts? TryPlainParts(
             DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, bool wantsTracking,
-            string? where, int min)
+            string? where, int min, string? sliceCond = null)
         {
             if (wantRowId || wantsTracking)
             {
@@ -840,7 +919,8 @@ internal static class DeltaNativeReader
                 {
                     return null;
                 }
-                sb.Append("1 FROM ").Append(source).Append(')');
+                sb.Append("1 FROM ").Append(source)
+                  .Append(sliceCond is null ? ")" : ", file_row_number => true) WHERE " + sliceCond);
                 return new PlainParts { CoreSql = sb.ToString(), BatchFiles = batchFiles, LoopFiles = loopFiles };
             }
 
@@ -946,7 +1026,8 @@ internal static class DeltaNativeReader
             }
             string projection = string.Join(", ", dataCols.Select(Quote));
             string scan = source + ", schema = map {" + string.Join(", ", entries) + "}"
-                        + (partCols.Count > 0 ? ", filename => true" : "") + ")";
+                        + (partCols.Count > 0 ? ", filename => true" : "")
+                        + (sliceCond is not null ? ", file_row_number => true" : "") + ")";
             string? metaCte = null;
             string? metaView = null;
             if (partCols.Count > 0)
@@ -960,11 +1041,22 @@ internal static class DeltaNativeReader
             }
             // The WHERE goes ABOVE the rebuild so it binds logical names at every level (the per-file path's
             // outer-WHERE contract).
+            // A slice's range binds the RAW file_row_number, so it goes on the read itself (inner query or the bare scan).
+            string sliceWhere = sliceCond is null ? "" : " WHERE " + sliceCond;
             sb.Append(projection).Append(" FROM ")
-              .Append(needsInner ? $"(SELECT {string.Join(", ", inner)} FROM {scan})" : scan);
+              .Append(needsInner ? $"(SELECT {string.Join(", ", inner)} FROM {scan}{sliceWhere})" : scan);
+            var outerConds = new List<string>(2);
+            if (!needsInner && sliceCond is not null)
+            {
+                outerConds.Add(sliceCond);
+            }
             if (!string.IsNullOrEmpty(where))
             {
-                sb.Append(" WHERE ").Append(where);
+                outerConds.Add(where!);
+            }
+            if (outerConds.Count > 0)
+            {
+                sb.Append(" WHERE ").Append(string.Join(" AND ", outerConds));
             }
             return new PlainParts
             {
@@ -2293,7 +2385,8 @@ internal static class DeltaNativeReader
         BatchPlan? batch, IArrowArrayStream? batchStream, BatchQueryOwner? batchOwner,
         IReadOnlyList<string> dataCols, bool wantRowId, string? where,
         int prefetch, DeltaRowIdFilter? rowIdFilter = null, DeltaRowTrackingFilter? trackingFilter = null,
-        string? topSuffix = null, long batchRows = 0, [EnumeratorCancellation] CancellationToken ct = default)
+        string? topSuffix = null, long batchRows = 0, string? sliceCond = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (loopFiles.Count == 0 && batchStream is null)
         {
@@ -2391,9 +2484,14 @@ internal static class DeltaNativeReader
                                     return;
                                 }
                             }
+                            var posCond = rowIdFilter?.PositionCondition(file.Ordinal);
+                            if (sliceCond is not null)
+                            {
+                                posCond = posCond is null ? sliceCond : $"({posCond}) AND ({sliceCond})";
+                            }
                             var sql = FileSql(dataCols, wantRowId, where, file,
                                               fm, listing.TableSchema,
-                                              listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal),
+                                              listing.PartitionColumns, posCond,
                                               trackingCond, dvView: DvViewName);
                             if (topSuffix is not null)
                             {
