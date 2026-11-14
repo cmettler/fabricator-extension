@@ -52,4 +52,12 @@ public sealed class FilterNode
 
     [JsonPropertyName("vals")]
     public List<int>? Vals { get; set; }
+
+    /// <summary>
+    /// <c>lookup</c> only: the id under which the host registered a hash join's runtime filter for this scan. Sent only
+    /// to a provider that declares the <c>join_filter_lookup</c> capability; it asks the filter per batch through the
+    /// host (keys in, a match flag per key out). Superset-safe to ignore, like every node in an AND.
+    /// </summary>
+    [JsonPropertyName("id")]
+    public ulong? Id { get; set; }
 }

@@ -1520,13 +1520,27 @@ typedef struct FabricatorHostServices {
 	// while a stream is outstanding is safe rather than a use-after-free — the Connection dies with the
 	// last of them. The TEMPORARY catalog goes with it.
 	void (*host_connection_close)(FabricatorHandle connection);
+	// -------------------------------------------------------------------------
+	// JOIN FILTER LOOKUP (ABI v103) — ask a hash join's runtime filter about a batch of keys.
+	// -------------------------------------------------------------------------
+	// A scan of a provider that declares `join_filter_lookup` receives a hash join's prefix-range or bloom filter
+	// as a `lookup` node {"op":"lookup","id":N,"col"|"path":...} in its spec's filter tree; the filter object stays
+	// in the host, registered under `id` for as long as the scan runs. This asks it about `row_count` keys:
+	// `keys` is a ONE-column Arrow stream (consumed: the host releases it) and out_match[i] receives 1 when key i
+	// may have a partner in the join, 0 when it certainly has none. DuckDB's own lookup answers (LookupKeys, or
+	// the key hash against the bloom filter). A key of another type than the filter's, an id that is no longer
+	// registered, or a null client_context answers 1 for every row: a join filter may only ever widen.
+	// May be called from any thread, concurrently (the Delta codec engine asks it inside its parallel row-group
+	// reads); `client_context` is the scan's ClientContext, valid while the scan runs.
+	int32_t (*join_filter_lookup)(FabricatorHandle client_context, uint64_t id, struct ArrowArrayStream *keys,
+	                              uint8_t *out_match, int64_t row_count, char **err);
 } FabricatorHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 102
+#define FABRICATOR_ABI_VERSION 103
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

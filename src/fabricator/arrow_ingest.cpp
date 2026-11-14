@@ -451,6 +451,7 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 	copy->order_by_json = order_by_json;
 	copy->string_order_pushable = string_order_pushable;
 	copy->reapply_filters = reapply_filters;
+	copy->join_filter_lookup = join_filter_lookup;
 	copy->null_order_expressible = null_order_expressible;
 	copy->at_unit = at_unit;
 	copy->at_value = at_value;
@@ -930,6 +931,16 @@ static const char *LiveCmpToken(ExpressionType t) {
 
 // Emit the column reference body: `"col":"name"` for a plain column, `"path":["s","a"]` for a struct
 // member (mirrors the bind-time FilterSerializer contract in fabricator_table_entry.cpp).
+static void LiveJsonColumnRef(const vector<string> &path, string &out);
+
+//! A `lookup` node: the join filter registered under `id`, on the column (or struct field) at `path`. Read by a
+//! provider that declares join_filter_lookup; ignored (dropped from an AND) by any other reader of the tree.
+static void LiveJsonLookup(idx_t id, const vector<string> &path, string &out) {
+	out += "{\"op\":\"lookup\",\"id\":" + to_string(id) + ",";
+	LiveJsonColumnRef(path, out);
+	out += "}";
+}
+
 static void LiveJsonColumnRef(const vector<string> &path, string &out) {
 	if (path.size() == 1) {
 		out += "\"col\":";
@@ -1288,6 +1299,93 @@ ScalarFunction JoinFilterFunction() {
 	return fn;
 }
 
+// The join_filter_lookup host service (ABI v103): the managed side asks a registered join filter about one batch of
+// keys — the per-batch form of fabricator_join_filter, for a provider that reads `lookup` nodes and filters its own
+// rows (the Delta codec engine, through engineered-wood's DeltaReadOptions.RowMasks). Same answer, same core
+// (JoinFilterMatch). Called on engineered-wood's reader threads, concurrently: the registry is read under its lock,
+// the filter objects are read-only once built.
+static int32_t JoinFilterLookupHost(void *client_context, uint64_t id, ArrowArrayStream *keys, uint8_t *out_match,
+                                    int64_t row_count, char **err) {
+	// the stream is ours from here (the host releases what it is given), whatever happens below
+	ArrowArrayStream stream {};
+	if (keys) {
+		stream = *keys;
+		keys->release = nullptr;
+	}
+	auto release = [&]() {
+		if (stream.release) {
+			stream.release(&stream);
+		}
+	};
+	if (!out_match || row_count < 0) {
+		release();
+		if (err) {
+			*err = strdup("fabricator: join_filter_lookup needs an output buffer");
+		}
+		return FABRICATOR_INVALID_ARGUMENT;
+	}
+	auto fill = [&](idx_t from) {
+		for (idx_t i = from; i < (idx_t)row_count; i++) {
+			out_match[i] = 1;
+		}
+	};
+	JoinFilterEntry entry;
+	bool found = false;
+	{
+		lock_guard<mutex> guard(g_join_filters_lock);
+		auto it = g_join_filters.find((idx_t)id);
+		if (it != g_join_filters.end()) {
+			entry = it->second;
+			found = true;
+		}
+	}
+	if (!found || !client_context || !stream.release) {
+		release();
+		fill(0);
+		return FABRICATOR_OK;
+	}
+	try {
+		auto &context = *reinterpret_cast<ClientContext *>(client_context);
+		ArrowArrayStream owned = stream;
+		stream.release = nullptr; // the reader owns it now
+		fabricator::ArrowStreamReader reader(context, owned);
+		if (reader.Types().size() != 1) {
+			fill(0);
+			return FABRICATOR_OK;
+		}
+		DataChunk chunk;
+		chunk.Initialize(Allocator::Get(context), reader.Types());
+		bool match[STANDARD_VECTOR_SIZE];
+		idx_t offset = 0;
+		while (offset < (idx_t)row_count) {
+			chunk.Reset();
+			reader.Read(chunk);
+			idx_t n = chunk.size();
+			if (n == 0) {
+				break;
+			}
+			n = MinValue<idx_t>(n, (idx_t)row_count - offset);
+			JoinFilterMatch(&entry, chunk.data[0], n, match);
+			for (idx_t i = 0; i < n; i++) {
+				out_match[offset + i] = match[i] ? 1 : 0;
+			}
+			offset += n;
+		}
+		fill(offset); // fewer keys than announced: those rows pass
+		return FABRICATOR_OK;
+	} catch (std::exception &ex) {
+		release();
+		if (err) {
+			*err = strdup(ex.what());
+		}
+		return FABRICATOR_ERROR;
+	}
+}
+
+void RegisterJoinFilterLookupService() {
+	fabricator::SetJoinFilterLookupService(JoinFilterLookupHost);
+}
+
 static void UnregisterJoinFilters(const vector<idx_t> &ids) {
 	if (ids.empty()) {
 		return;
@@ -1425,10 +1523,29 @@ static bool LiveExprNode(const Expression &e, vector<string> &path, const Logica
 			int64_t lo = 0, hi = 0;
 			LogicalType leaf;
 			const idx_t base = path.size();
-			if (data.key_type != type || !ReadPrefixRangeKeys(data, keys, lo, hi) ||
-			    !LiveExprSubject(subject, type, path, leaf)) {
+			if (data.key_type != type || !LiveExprSubject(subject, type, path, leaf)) {
 				path.resize(base);
 				return false;
+			}
+			// a provider that reads `lookup` nodes also gets the filter itself, to ask per batch (ABI v103)
+			string lookup;
+			if (g_join_filter_ids && data.filter && data.filter->IsInitialized()) {
+				JoinFilterEntry entry; // not brace-initialized: a struct with member initializers is no aggregate in C++11
+				entry.filter = data.filter;
+				entry.key_type = data.key_type;
+				entry.filters_null_values = data.filters_null_values;
+				LiveJsonLookup(RegisterJoinFilter(entry, nullptr), path, lookup);
+			}
+			if (!ReadPrefixRangeKeys(data, keys, lo, hi)) {
+				path.resize(base);
+				if (lookup.empty()) {
+					return false;
+				}
+				out += lookup;
+				return true;
+			}
+			if (!lookup.empty()) {
+				out += "{\"op\":\"and\",\"children\":[" + lookup + ",";
 			}
 			if (!keys.empty() && static_cast<uint64_t>(keys.size()) == static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1) {
 				keys.clear(); // every value of the range: the range says as much, and costs no list
@@ -1455,6 +1572,9 @@ static bool LiveExprNode(const Expression &e, vector<string> &path, const Logica
 				}
 				out += "]}";
 			}
+			if (!lookup.empty()) {
+				out += "]}";
+			}
 			path.resize(base);
 			return true;
 		}
@@ -1466,6 +1586,25 @@ static bool LiveExprNode(const Expression &e, vector<string> &path, const Logica
 		return LiveExprNode(*recovered, path, type, constants, string_order_pushable, out);
 	}
 	const idx_t base = path.size();
+	// fabricator_join_filter(<id>, subject): a join filter the registry holds (a bloom filter, recovered by
+	// BloomAsExpression while a lookup provider's tree is rendered), for a provider that asks it per batch
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	    e.Cast<BoundFunctionExpression>().Function().GetName() == JOIN_FILTER_FUNCTION) {
+		auto &call = e.Cast<BoundFunctionExpression>();
+		if (!g_join_filter_ids || call.GetChildren().size() != 2 ||
+		    call.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return false;
+		}
+		auto id = call.GetChildren()[0]->Cast<BoundConstantExpression>().GetValue().GetValue<uint64_t>();
+		LogicalType leaf;
+		if (!LiveExprSubject(*call.GetChildren()[1], type, path, leaf)) {
+			path.resize(base);
+			return false;
+		}
+		LiveJsonLookup(id, path, out);
+		path.resize(base);
+		return true;
+	}
 	switch (e.GetExpressionClass()) {
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		const bool is_and = e.GetExpressionType() == ExpressionType::CONJUNCTION_AND;
@@ -1893,12 +2032,13 @@ struct JoinFilterIdsScope {
 };
 
 static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFunctionInitInput &input,
-                                   vector<Value> &constants, bool join_key_lists) {
+                                   vector<Value> &constants, bool join_key_lists, vector<idx_t> &join_filter_ids) {
 	if (!input.filters) {
 		return string();
 	}
-	// no join filter registry in the tree: a hash join's filter goes as its keys or their range, never as a call
-	JoinFilterIdsScope ids_scope(nullptr);
+	// a hash join's filter goes as its keys or their range; for a provider that reads `lookup` nodes
+	// (join_filter_lookup) also as the filter itself, registered for the scan's lifetime like the SQL channel's
+	JoinFilterIdsScope ids_scope(join_key_lists && bind_data.join_filter_lookup ? &join_filter_ids : nullptr);
 	// a hash join's prefix-range filter becomes its keys (or their range). Safe for every provider: it is a join
 	// filter, and the join checks its keys itself, so a superset never changes a result. It used to be limited to
 	// providers that re-apply what they are sent (SQL Server), which left Delta without join filters.
@@ -2421,7 +2561,7 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 		string live_filter_sql = RenderLiveFilters(bind_data, input, read_key_lists, gstate->join_filter_ids);
 		vector<Value> filter_constants = bind_data.filter_constants;
 		string live_filter_json = WithoutBindDuplicates(
-		    bind_data.filter_json, SerializeLiveFilters(bind_data, input, filter_constants, read_key_lists),
+		    bind_data.filter_json, SerializeLiveFilters(bind_data, input, filter_constants, read_key_lists, gstate->join_filter_ids),
 		    filter_constants);
 		if (getenv("FABRICATOR_DUMP_FILTERS")) {
 			// the pruning channel too: what the provider receives as its filter TREE

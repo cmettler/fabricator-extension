@@ -76,6 +76,12 @@ using HostHttpFn = int32_t (*)(FabricatorHandle opener, const char *method, cons
                                char **out_response_json, void **out_body, int64_t *out_body_length, char **err);
 void SetHostHttpService(HostHttpFn fn);
 
+// Register the join_filter_lookup callback (ABI v103): a scan's registered hash-join filter, asked per batch by
+// the managed side. See FabricatorHostServices::join_filter_lookup in abi.h.
+using JoinFilterLookupFn = int32_t (*)(FabricatorHandle client_context, uint64_t id, ArrowArrayStream *keys,
+                                       uint8_t *out_match, int64_t row_count, char **err);
+void SetJoinFilterLookupService(JoinFilterLookupFn fn);
+
 // SPIKE: ask the managed side to open `path` via the host FileSystem callbacks (using `opener` for secret
 // resolution) and return a short human-readable result (head/tail bytes + size). Proves C#->host FS reads.
 std::string FsSpike(FabricatorHandle opener, const std::string &path);

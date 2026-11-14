@@ -184,6 +184,9 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! The scan re-applies its live table filters (static ones DuckDB erased from the plan, the runtime join
 	//! filters) to every chunk it returns: the provider's rendering of them is only a superset.
 	bool reapply_filters = false;
+	//! The provider asks a hash join's runtime filter itself (capability `join_filter_lookup`): the scan's
+	//! filter tree then carries `lookup` nodes, and the filters stay registered while the scan runs.
+	bool join_filter_lookup = false;
 	//! A catalog-bound TABLE FUNCTION called with constant arguments (not a table scan): its schema path + name, its
 	//! positional arguments as bound, and its catalog — what a pushed query needs to call it on the server
 	//! (fabricator_remote_select.cpp). Empty for a table scan and for a function the pushdown cannot call.
@@ -292,6 +295,10 @@ void ArrowStreamScan(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 //! fabricator_join_filter(id UBIGINT, key ANY) -> BOOLEAN: a Delta scan's inner query evaluates a hash join's
 //! prefix-range filter, registered under `id` while the scan runs (arrow_ingest.cpp, PrefixRangeAsExpression).
 duckdb::ScalarFunction JoinFilterFunction();
+
+//! Patches the join_filter_lookup host service (ABI v103) onto the host-services block. At extension load, BEFORE
+//! the bridge boots (it copies the block at boot, so a later patch is never seen).
+void RegisterJoinFilterLookupService();
 
 // Reports the pulled batch's index as this chunk's partition (batch) index. Setting `get_partition_data` is
 // how a source DECLARES batch-index support (PhysicalTableScan::SupportsPartitioning is literally

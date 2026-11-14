@@ -526,6 +526,86 @@ internal static unsafe class HostFs
     /// <summary>True once the host registered the http_request callback.</summary>
     public static bool CanHttp => _set && _h.HttpRequest != null;
 
+    // ---- JOIN FILTER LOOKUP (ABI v103) ------------------------------------------------------------------
+    // A hash join's runtime filter (DuckDB's prefix-range or bloom filter), registered by the scan under an id that
+    // a `lookup` node of the scan's filter tree names. Asked per batch: DuckDB's own lookup answers.
+
+    /// <summary>True once the host registered the join_filter_lookup callback.</summary>
+    public static bool CanJoinFilterLookup => _set && _h.JoinFilterLookup != null;
+
+    /// <summary>
+    /// Asks join filter <paramref name="id"/> about every key of <paramref name="keys"/>: 1 where the key may have
+    /// a partner in the join, 0 where it certainly has none. The keys are handed over as Arrow C data (the host
+    /// reads the buffers in place, nothing is serialized). Every row is 1 when the host cannot answer (an id already
+    /// removed, a key of another type): a join filter may only ever widen. Thread-safe.
+    /// </summary>
+    public static byte[] JoinFilterLookup(nint clientContext, ulong id, IArrowArray keys)
+    {
+        int n = keys.Length;
+        var match = new byte[n];
+        if (!CanJoinFilterLookup || clientContext == 0 || n == 0)
+        {
+            System.Array.Fill(match, (byte)1);
+            return match;
+        }
+        var schema = new Schema(new[] { new Field("k", keys.Data.DataType, true) }, null);
+        var batch = new RecordBatch(schema, new[] { keys }, n);
+        var stream = CArrowArrayStream.Create();
+        bool handedOver = false;
+        try
+        {
+            CArrowArrayStreamExporter.ExportArrayStream(new BorrowedKeysStream(schema, batch), stream);
+            fixed (byte* p = match)
+            {
+                byte* err = null;
+                handedOver = true;
+                int rc = _h.JoinFilterLookup(clientContext, id, stream, p, n, &err);
+                if (rc != 0)
+                {
+                    throw HostError("join_filter_lookup", err);
+                }
+            }
+        }
+        finally
+        {
+            // the host MOVES the stream out first thing (our copy's release is null then): free only our allocation.
+            // Not handed over (the export failed): release it too.
+            if (handedOver)
+            {
+                Marshal.FreeHGlobal((nint)stream);
+            }
+            else
+            {
+                CArrowArrayStream.Free(stream);
+            }
+        }
+        return match;
+    }
+
+    /// <summary>One batch the stream does NOT own: the keys belong to the batch being filtered.</summary>
+    private sealed class BorrowedKeysStream : IArrowArrayStream
+    {
+        private RecordBatch? _pending;
+
+        internal BorrowedKeysStream(Schema schema, RecordBatch keys)
+        {
+            Schema = schema;
+            _pending = keys;
+        }
+
+        public Schema Schema { get; }
+
+        public System.Threading.Tasks.ValueTask<RecordBatch?> ReadNextRecordBatchAsync(
+            CancellationToken cancellationToken = default)
+        {
+            var next = _pending;
+            _pending = null;
+            return new System.Threading.Tasks.ValueTask<RecordBatch?>(next);
+        }
+
+        public void Dispose() => _pending = null;
+    }
+
     /// <summary>
     /// Performs one HTTP request through the host. BLOCKS — DuckDB's HTTP layer is synchronous, so the
     /// caller decides which thread pays (<see cref="DuckDbHttpHandler"/> puts it on the pool). Returns the

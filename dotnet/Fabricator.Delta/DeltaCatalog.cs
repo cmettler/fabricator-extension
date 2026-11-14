@@ -1632,6 +1632,13 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             {
                 // native_read applies the filters exactly; the codec engine prunes with them and the host re-applies
                 caps = (_nativeRead ? "\"exact_filter_pushdown\":true," : "\"superset_filter_pushdown\":true,") + caps;
+                // the codec engine asks a hash join's filter itself, inside engineered-wood's row-group reads
+                // (DeltaReadOptions.RowMasks), so the other columns of rejected rows go undecoded (EW #502).
+                // FABRICATOR_JOIN_FILTER_MASKS=0 turns it off (A/B).
+                if (!_nativeRead && DeltaJoinFilter.Enabled)
+                {
+                    caps += ",\"join_filter_lookup\":true";
+                }
             }
             if (NestedLayout)
             {
@@ -2796,12 +2803,15 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             }
         }
         System.Collections.Generic.IAsyncEnumerable<RecordBatch> stream;
+        // a hash join's runtime filters, asked inside the read (lookup nodes; reconcile = a pending ALTER renames
+        // columns, so the masks are left out there and the host's re-apply does the work)
+        var masks = reconcile ? null : DeltaJoinFilter.Masks(spec?.Filter, opener);
         if (needRowId)
         {
             stream = pinnedReadValue is null
-                ? DeltaReader.StreamWithRowIds(opener, path, ewProjCols, filter, default, startFrom)
+                ? DeltaReader.StreamWithRowIds(opener, path, ewProjCols, filter, default, masks, startFrom)
                 : DeltaReader.StreamWithRowIdsAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default,
-                                                 startFrom);
+                                                 masks, startFrom);
             if (hasDeletes)
             {
                 stream = DeltaTxnBuffer.ExcludeDeleted(
@@ -2811,8 +2821,12 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         else
         {
             stream = pinnedReadValue is null
-                ? DeltaReader.Stream(opener, path, ewProjCols, filter, default, startFrom)
-                : DeltaReader.StreamAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default, startFrom);
+                ? DeltaReader.Stream(opener, path, ewProjCols, filter, default, masks, startFrom)
+                : DeltaReader.StreamAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default, masks, startFrom);
+        }
+        if (masks is not null)
+        {
+            stream = DeltaJoinFilter.CountReturned(stream, path);
         }
         if (reconcile)
         {

@@ -442,6 +442,11 @@ public unsafe struct FabricatorHostServices
     // void host_connection_close(void* connection) — release the handle. Result streams opened on it hold
     // their own reference, so closing first is safe. Additive (ABI v84).
     public delegate* unmanaged[Cdecl]<nint, void> HostConnectionClose;
+    // int32 join_filter_lookup(void* client_context, uint64 id, ArrowArrayStream* keys, uint8* out_match,
+    //                          int64 row_count, char** err) — ask a hash join's filter (registered by the scan under
+    // `id`, named by a `lookup` node in the scan's filter tree) about one batch of keys: out_match[i] = 1 where key
+    // i may have a partner in the join. The host consumes the stream. Thread-safe. Additive (ABI v103).
+    public delegate* unmanaged[Cdecl]<nint, ulong, CArrowArrayStream*, byte*, long, byte**, int> JoinFilterLookup;
 }
 
 /// <summary>Mirrors <c>FabricatorHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in

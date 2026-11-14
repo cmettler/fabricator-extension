@@ -255,6 +255,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		exact_filter_pushdown_ = caps.exact_filter_pushdown;
 		file_scan_ = caps.file_scan;
 		superset_filter_pushdown_ = caps.superset_filter_pushdown && !caps.exact_filter_pushdown;
+		join_filter_lookup_ = caps.join_filter_lookup && superset_filter_pushdown_;
 		null_order_expressible_ = caps.null_order_expressible;
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
@@ -272,6 +273,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;
 		superset_filter_pushdown_ = false;
+		join_filter_lookup_ = false;
 		null_order_expressible_ = false;
 		supports_nested_schemas_ = false;
 		remote_select_ = false;

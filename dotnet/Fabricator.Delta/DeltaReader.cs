@@ -954,12 +954,12 @@ internal static class DeltaReader
     /// </summary>
     public static IAsyncEnumerable<RecordBatch> Stream(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct,
-        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
+        IReadOnlyList<DeltaRowMask>? masks = null, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamImpl(opener, fs, options, columns, filter, ct, startFrom);
+        return StreamImpl(opener, fs, options, columns, filter, ct, masks, startFrom);
     }
 
     // Returns the snapshot's mapped Delta schema when the table has column mapping AND nested (struct-carrying)
@@ -984,7 +984,7 @@ internal static class DeltaReader
     private static async IAsyncEnumerable<RecordBatch> StreamImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
         Predicate? filter, [EnumeratorCancellation] CancellationToken ct,
-        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
+        IReadOnlyList<DeltaRowMask>? masks, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         // Cancel long-running reads (a big OneLake/S3 row-group) when the query is interrupted (Ctrl+C /
         // timeout): the scope polls DuckDB's interrupt flag and trips this token, which engineered-wood honors
@@ -995,7 +995,10 @@ internal static class DeltaReader
         try
         {
             var nested = NestedMappedSchema(table.CurrentSnapshot);
-            await foreach (var batch in table.ReadAllAsync(columns, filter, token).ConfigureAwait(false))
+            var source = masks is { Count: > 0 }
+                ? table.ReadAsync(new DeltaReadOptions { Columns = columns, Filter = filter, RowMasks = masks }, token)
+                : table.ReadAllAsync(columns, filter, token);
+            await foreach (var batch in source.ConfigureAwait(false))
             {
                 var mapped = nested is null
                     ? batch
@@ -1054,18 +1057,18 @@ internal static class DeltaReader
     /// surface the DuckDB rowid for UPDATE/DELETE.</summary>
     public static IAsyncEnumerable<RecordBatch> StreamWithRowIds(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct,
-        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
+        IReadOnlyList<DeltaRowMask>? masks = null, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamWithRowIdsImpl(opener, fs, options, columns, filter, ct, startFrom);
+        return StreamWithRowIdsImpl(opener, fs, options, columns, filter, ct, masks, startFrom);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
         Predicate? filter, [EnumeratorCancellation] CancellationToken ct,
-        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
+        IReadOnlyList<DeltaRowMask>? masks, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
@@ -1077,6 +1080,7 @@ internal static class DeltaReader
                 new DeltaReadOptions
                 {
                     Columns = columns, Filter = filter, Metadata = DeltaRowMetadata.RowAddress,
+                    RowMasks = masks is { Count: > 0 } ? masks : null,
                 }, token).ConfigureAwait(false))
             {
                 var batch = RenameRowAddressToDuckDbRowId(raw);
@@ -1863,18 +1867,18 @@ internal static class DeltaReader
     /// snapshot is never written), so there is no rowid variant.</summary>
     public static IAsyncEnumerable<RecordBatch> StreamAt(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
-        CancellationToken ct, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
+        CancellationToken ct, IReadOnlyList<DeltaRowMask>? masks = null, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamAtImpl(opener, fs, options, columns, filter, unit, value, ct, startFrom);
+        return StreamAtImpl(opener, fs, options, columns, filter, unit, value, ct, masks, startFrom);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamAtImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
         string unit, string value, [EnumeratorCancellation] CancellationToken ct,
-        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
+        IReadOnlyList<DeltaRowMask>? masks, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
@@ -1883,8 +1887,13 @@ internal static class DeltaReader
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, token).ConfigureAwait(false);
             var nested = NestedMappedSchema(snap); // the AS-OF snapshot names the columns
-            await foreach (var batch in table.ReadAtVersionAsync(snap.Version, columns, filter, token)
-                               .ConfigureAwait(false))
+            var source = masks is { Count: > 0 }
+                ? table.ReadAsync(new DeltaReadOptions
+                {
+                    Snapshot = snap, Columns = columns, Filter = filter, RowMasks = masks,
+                }, token)
+                : table.ReadAtVersionAsync(snap.Version, columns, filter, token);
+            await foreach (var batch in source.ConfigureAwait(false))
             {
                 var mapped = nested is null
                     ? batch
@@ -2174,18 +2183,18 @@ internal static class DeltaReader
     /// <see cref="StreamWithRowIds"/>; a timestamp is resolved to its version first.</summary>
     public static IAsyncEnumerable<RecordBatch> StreamWithRowIdsAt(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
-        CancellationToken ct, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
+        CancellationToken ct, IReadOnlyList<DeltaRowMask>? masks = null, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamWithRowIdsAtImpl(opener, fs, options, columns, filter, unit, value, ct, startFrom);
+        return StreamWithRowIdsAtImpl(opener, fs, options, columns, filter, unit, value, ct, masks, startFrom);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsAtImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
         string unit, string value, [EnumeratorCancellation] CancellationToken ct,
-        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
+        IReadOnlyList<DeltaRowMask>? masks, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
@@ -2199,6 +2208,7 @@ internal static class DeltaReader
                 {
                     AtVersion = snap.Version, Columns = columns, Filter = filter,
                     Metadata = DeltaRowMetadata.RowAddress,
+                    RowMasks = masks is { Count: > 0 } ? masks : null,
                 }, token).ConfigureAwait(false))
             {
                 var batch = RenameRowAddressToDuckDbRowId(raw);

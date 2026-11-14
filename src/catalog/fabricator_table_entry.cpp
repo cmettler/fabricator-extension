@@ -1432,6 +1432,7 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	auto &parent_catalog = ParentCatalog().Cast<FabricatorCatalog>();
 	data->string_order_pushable = parent_catalog.StringOrderPushable();
 	data->reapply_filters = parent_catalog.SupersetFilterPushdown();
+	data->join_filter_lookup = parent_catalog.JoinFilterLookup();
 	data->null_order_expressible = parent_catalog.NullOrderExpressible();
 
 	// Build the Arrow column converters + verify the result schema.

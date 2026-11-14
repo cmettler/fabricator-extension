@@ -530,6 +530,11 @@ void SetHostHttpService(HostHttpFn fn) {
 	g_host_services.http_request = fn;
 }
 
+void SetJoinFilterLookupService(JoinFilterLookupFn fn) {
+	// Patches the join_filter_lookup field (ABI v103). At extension load, before the bridge boots.
+	g_host_services.join_filter_lookup = fn;
+}
+
 // -----------------------------------------------------------------------------
 // vtable convenience wrappers
 // -----------------------------------------------------------------------------

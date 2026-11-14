@@ -74,6 +74,10 @@ public:
 	bool SupersetFilterPushdown() const {
 		return superset_filter_pushdown_;
 	}
+	//! Whether the provider asks a hash join's runtime filter itself (capability `join_filter_lookup`, ABI v103).
+	bool JoinFilterLookup() const {
+		return join_filter_lookup_;
+	}
 	bool ExactFilterPushdown() const {
 		return exact_filter_pushdown_;
 	}
@@ -282,6 +286,7 @@ private:
 	bool exact_filter_pushdown_ = false;
 	bool file_scan_ = false;
 	bool superset_filter_pushdown_ = false;
+	bool join_filter_lookup_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> schemas_;
 	//! Schemas a discovery filter left out that a statement named and the provider confirmed (capability

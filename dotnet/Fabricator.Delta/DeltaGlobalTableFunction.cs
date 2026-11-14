@@ -510,6 +510,9 @@ internal static class DeltaWriter
                                               IDataFileReader? dataFileReader = null) => DeltaTableOptions.Default with
     {
         ParquetReadOptions = ReadOptions(),
+        // MEASUREMENT (step 3 of the codec read path): the scan's decode budget.
+        MaxBufferedReadBytes = long.TryParse(System.Environment.GetEnvironmentVariable("FABRICATOR_EW_BUFFERED_READ_BYTES"), out var budget)
+            ? budget : DeltaTableOptions.Default.MaxBufferedReadBytes,
         // ⚠⚠ WITHOUT THIS LISTENER A FAILING CHECKPOINT IS SILENT, and that is a change EW made in 987a0ce
         // (#226). A version checksum, an interval checkpoint and log cleanup all run AFTER the commit is
         // durable, so EW stopped throwing on them — failing a write that already succeeded was the wrong

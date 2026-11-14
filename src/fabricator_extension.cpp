@@ -726,6 +726,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// caller (above all a PLUGIN calling a REST API) inherits its secrets, TLS trust, proxy and retry
 	// configuration instead of carrying its own. See docs/http-transport.md.
 	RegisterHostHttp(loader);
+	fabricator::RegisterJoinFilterLookupService(); // ABI v103, before the bridge boots (RegisterProviderSecrets)
 	// CREATE SECRET ... (TYPE mssql, host '...', ...) — secret type(s) + fields declared in C#
 	RegisterProviderSecrets(loader);
 	// ATTACH '<connstr>' AS db (TYPE fabricator) — or ATTACH '' (TYPE fabricator, SECRET name)

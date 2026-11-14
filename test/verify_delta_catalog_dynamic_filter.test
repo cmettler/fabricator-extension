@@ -338,6 +338,46 @@ FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_SCA
 ----
 2	true
 
+# ---- engineered-wood row masks (EW #502, ABI v102): the codec engine hands a hash join's runtime filter to the
+#      read as a DeltaRowMask, which engineered-wood evaluates INSIDE its row-group reads, so the read itself returns
+#      only the rows that can join and the other columns of the rest go undecoded. The host's re-apply leaves the
+#      scan's output the same either way, which is why this reads the rows the READ returned from the log. ----
+statement ok
+CALL truncate_duckdb_logs();
+
+# an integer key (prefix-range filter)
+query II
+SELECT count(*), sum(b.g) FROM cod.main.big2 b JOIN cod.main.dim2 d ON b.id = d.id;
+----
+2000	6000
+
+query I
+SELECT max(CAST(regexp_extract(message, 'returned (\d+) rows', 1) AS BIGINT)) < 10000
+FROM duckdb_logs WHERE type = 'Fabricator.Delta' AND message LIKE 'delta join filter masks:%big2%returned%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# a random-string key (bloom filter)
+query II
+SELECT count(*), sum(b.g) FROM cod.main.big3 b JOIN cod.main.dim3 d ON b.h = d.h;
+----
+1998	5997
+
+query I
+SELECT max(CAST(regexp_extract(message, 'returned (\d+) rows', 1) AS BIGINT)) < 10000
+FROM duckdb_logs WHERE type = 'Fabricator.Delta' AND message LIKE 'delta join filter masks:%big3%returned%';
+----
+true
+
+# an outer join keeps every probe row: no filter reaches the scan, so no mask, and every row is read
+query II
+SELECT count(*), count(d.h) FROM cod.main.big3 b LEFT JOIN cod.main.dim3 d ON b.h = d.h;
+----
+400000	1998
+
 # a static filter: erased from the plan, so the scan's re-application is the only thing applying it
 query II
 SELECT count(*), sum(id) FROM cod.main.big2 WHERE id > 399000 AND g <> 1;

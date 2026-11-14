@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v102
+# ABI history — prior versions v16–v103
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,17 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v103 (2026-11-14) — `join_filter_lookup`: a hash join's runtime filter, asked by the provider
+
+Appended to `FabricatorHostServices`: `join_filter_lookup(client_context, id, keys, out_match, row_count, err)`. A
+provider declaring the capability `join_filter_lookup` gets each hash join's prefix-range or bloom filter as a `lookup`
+node in its scan's filter tree; the filter stays registered in the host while the scan runs, and the provider asks it
+about a batch of keys (`out_match[i] = 1` where key i may have a partner). Thread-safe; an unknown id, a key of another
+type or a null context answers 1 (a join filter may only widen). First user: the Delta codec engine, which passes each
+lookup to engineered-wood as a `DeltaRowMask` (#502), evaluated inside the row-group reads
+([ew-late-decoding-join-filters.md](ew-late-decoding-join-filters.md) §7-§8). Built as v102 on `exp/ew-row-masks`,
+renumbered here because v102 is `scan_next_unit` on the main line.
 
 ## v102 (2026-11-13) — `scan_next_unit`: a scan read as UNITS
 

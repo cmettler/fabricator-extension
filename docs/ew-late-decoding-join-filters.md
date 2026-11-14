@@ -137,3 +137,81 @@ selection (or row ranges, which `ReadRowRangesAsync` would take).
 4. Measure SF10 on MinIO against the 43.0 s baseline, and a clustered-key case where page skipping should show.
 5. Gates: the codec section of `verify_delta_catalog_dynamic_filter` (answers + the probe scan's row count from the
    profile), plus a mutant that lets every row through the mask.
+
+## 7. Built and measured on `exp/ew-row-masks` (2026-11-11)
+
+engineered-wood implemented #502 on `feature/row-level-filtering` (pinned at `53b8821`, not merged to `main` at the
+time). Its shape is what §3 asked for: `DeltaReadOptions.RowMasks`, a list of
+`DeltaRowMask(IReadOnlyList<string> Columns, Func<RecordBatch, BooleanArray> Mask)` with `ValueWise` for asking a
+dictionary instead of rows. The masks run inside the row-group reads and never see a row a deletion vector deletes.
+
+**What we built (ABI v102 on that branch; on the main line it is ABI v103, since v102 is `scan_next_unit` there):** the archive of §2 came back, with the mask in place of the C# post-filter.
+- Host service `join_filter_lookup` (as §2), registered at load before the bridge boots.
+- Capability `join_filter_lookup` (codec engine only; `FABRICATOR_JOIN_FILTER_MASKS=0` turns it off). The scan's
+  filter tree then carries a `lookup` node per prefix-range filter (beside its keys or range) and per bloom filter.
+- `DeltaJoinFilter.Masks` turns the top-level lookups into `DeltaRowMask { ValueWise = true }`, with the scan's client
+  context in the closure. A lookup on a struct member stays with the host's re-apply.
+- Gate: `verify_delta_catalog_dynamic_filter` reads, from the log, how many rows the READ returned (the host's re-apply
+  keeps the scan's output the same either way). The mutant that lets every row through dies there.
+
+**⚠ The first measurement showed nothing, and the reason was ours.** engineered-wood reads in two passes (the mask's
+columns first, the other columns only over 8192-row blocks that hold a selected row) only for a file that reports
+`IReadConcurrencyHint.PreferredConcurrentReads`. Without it a file counts as local: one pass, and at most
+`min(4, cores)` files and row groups at once. Our `DuckDbRandomAccessFile`, `OneLakeRandomAccessFile` and their
+filesystems reported nothing, so every S3/OneLake codec read was a local read. They report 4 now
+(`RemoteReadConcurrency`, `FABRICATOR_EW_READ_CONCURRENCY`; 0 reports nothing). 4 keeps the parallelism as it was and
+changes only the two-pass decision: 8 and 16 made full and scattered scans 10-40 % SLOWER against local RustFS.
+
+**Measured, TPC-H SF10 on RustFS, best warm sum of 22 queries, all results checked against the reference:**
+
+| codec engine, `pushdown_filters 'all'` | sum |
+|---|---|
+| before (`fc4a434`, EW `3dadb69`) | 41.6 s |
+| EW `53b8821`, masks off | 40.5 s |
+| masks on, no concurrency hint | 44.7 s |
+| masks on, hint 4 | **36.7 s** |
+| `'static'` (no join filters), hint 4 | 35.0 s |
+| masks on, hint 4, V2 layout (below) | **34.8 s** |
+| Delta native (control): before / after / V2 layout | 13.4 / 13.4 / 11.2 s |
+
+Largest per-query gains (masks off -> on): Q19 2.46 -> 1.45 s, Q10 2.42 -> 1.53, Q9 2.93 -> 2.17, Q7 2.63 -> 2.19.
+
+Micro test on lineitem (six columns, warm, hint 4): a join whose matches lie in blocks of consecutive `l_orderkey`
+(0.8 % of rows, spread over the whole key range) 3.55 -> 2.10 s and CPU 9.4 -> 3.1 s; scattered matches (0.5 %) wall
+unchanged 4.4 s, CPU 12.5 -> 6.8 s. Scattered matches touch every page, so every page is still fetched and
+decompressed; §3's e^-λ rule holds.
+
+**The benchmark's layout (parquet-rs 60.0.0, ZSTD):** lineitem 9 files, 36 row groups of ~1.67M rows, sorted by
+`l_orderkey`; key columns in RLE_DICTIONARY overflowing into PLAIN (the 1 MB dictionary page limit). A V2 copy
+(`s3://fabricator/tpch10v2`, our native writer, `parquet_version 'V2'`, same order and row-group sizes) writes the
+integer keys as DELTA_BINARY_PACKED: `l_orderkey` 47 -> 11 MB, `l_partkey` 224 -> 165 MB, `o_custkey` 56 -> 41 MB,
+lineitem 1612 -> 1393 MB; `l_suppkey` (100k distinct) stays a dictionary. Both engines got 8-16 % faster on it.
+
+Open: raise the hint on a real remote store (OneLake) after measuring; ask EW whether two passes could be decided by
+something other than the concurrency hint.
+
+## 8. On the main line, with EW `main` (2026-11-14)
+
+The masks are committed on `feat/codec-read-path` (ABI v103), on engineered-wood `main` `c1574081`, which carries #502.
+The concurrency hint and the codec's file cache came first, in their own commit
+([delta-read-path.md](delta-read-path.md#the-codec-engines-remote-reads-2026-11-14)).
+
+**They pay only together with a larger read budget.** TPC-H SF10 on RustFS with the host file cache, best warm sum of
+22 queries, three independent runs each, all results correct:
+
+| codec engine, `pushdown_filters 'all'` | masks off | masks on | peak working set |
+|---|---|---|---|
+| defaults (4 reads, `MaxBufferedReadBytes` 256 MiB) | 24.6 s | 27.1 s | ~9 GB |
+| 16 reads, 2 GiB | 24.9 s | **23.1 s** | ~13-14 GB (one run 18.5 GB) |
+
+- At the default budget the masks cost 10 %. A masked row group is read in two passes, and EW reserves the larger pass
+  (#846), so 256 MiB admits even fewer row groups at once.
+- With 2 GiB and 16 reads they save 7 %, and the larger budget alone (masks off) saves nothing.
+- On OneLake the runs scattered more than the differences (defaults 62.8 / 45.9 s, 16 reads and 2 GiB 40.8 / 44.5 s).
+- DuckDB itself needs about 9 GB at SF10 (its hash tables), and the larger budget adds about 4.5 GB.
+
+So the masks are on by default (the codec engine is not the main provider), and the budget stays at EW's default
+until engineered-wood's ordered scan admits work differently (the #861 review). Measurement knobs:
+`FABRICATOR_EW_READ_CONCURRENCY` (the hint), `FABRICATOR_EW_BUFFERED_READ_BYTES` (the budget),
+`FABRICATOR_JOIN_FILTER_MASKS=0` (masks off). Re-measure with each EW bump.
+

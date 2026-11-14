@@ -1755,10 +1755,11 @@ Measured on TPC-H SF10 (`pushdown_filters 'all'`, sum of 22 queries, best warm r
 On OneLake the stored snapshot is what matters: without it each scan replays the log and each data file costs a
 properties request (~40 ms per file).
 
-What comes next is in [docs/ew-late-decoding-join-filters.md](ew-late-decoding-join-filters.md) (join filters as row
-masks), followed by the read budget. The #861 measurements showed that a larger `MaxBufferedReadBytes` together with
-more concurrent reads brings the ordered read to the speed of reading by units (S3 27.4 → 23.5 s, OneLake
-49 → 38 s). A memory measurement per scan comes first.
+Join filters as engineered-wood row masks (ABI v103) and the read budget are in
+[docs/ew-late-decoding-join-filters.md](ew-late-decoding-join-filters.md) §8. The masks pay only together with a larger
+`MaxBufferedReadBytes` and more concurrent reads: at the defaults they cost about 10 % on S3, with 16 reads and 2 GiB
+they save about 7 %. The engineered-wood bump to `c1574081` alone took the codec engine on S3 from 27.8 to 24.6 s
+(masks off).
 
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 
