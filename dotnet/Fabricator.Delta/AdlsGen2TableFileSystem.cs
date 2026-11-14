@@ -158,7 +158,7 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem, IReadConcurren
         AsyncPageable<PathItem> pages;
         try
         {
-            pages = _readFs.GetPathsAsync(dirUnderFs, recursive: true, cancellationToken: cancellationToken);
+            pages = _readFs.GetPathsAsync(dirUnderFs, recursive: true, userPrincipalName: false, cancellationToken: cancellationToken);
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
         {

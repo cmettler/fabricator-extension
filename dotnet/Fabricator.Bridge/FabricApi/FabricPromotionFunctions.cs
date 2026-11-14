@@ -100,7 +100,7 @@ internal sealed class FabricGitStatusFunction : FabricRowsFunction
     {
         var ws = Api.ResolveWorkspace(args[0]);
         var status = FabricApiClient.Wrap("git_status",
-            () => Api.Client.Core.Git.GetStatus(ws, cancellationToken: ct).Value);
+            () => Api.Client.Core.Git.GetStatus(ws, includeFilesDetails: null, cancellationToken: ct).Value);
         var changes = status.Changes ?? (IReadOnlyList<ItemChange>)System.Array.Empty<ItemChange>();
         if (changes.Count == 0)
         {

@@ -19,7 +19,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
     <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
-    <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.114.0" />
+    <PackageReference Include="Microsoft.AnalysisServices.AdomdClient" Version="19.118.3" />
     <!-- Entra token acquisition for Fabric/AAS XMLA: mint a Power BI-scoped token from the same Azure
          principal the SqlServer warehouse uses (service principal / managed identity / default chain),
          set as AdomdConnection.AccessToken (ADOMD has no interactive flow in the CLR host). -->

@@ -54,7 +54,7 @@
          can ATTACH a OneLake root — DuckDB's azure glob can't enumerate a OneLake _delta_log tree (PR #174), so
          OneLake table discovery uses the Fabric API instead of a glob (local/S3/ADLS keep the glob). Auth via the
          ATTACH'd azure SP secret (ClientSecretCredential, Azure.Identity). -->
-    <PackageReference Include="Microsoft.Fabric.Api" Version="2.18.0" />
+    <PackageReference Include="Microsoft.Fabric.Api" Version="2.27.0" />
     <PackageReference Include="Azure.Identity" Version="1.21.0" />
     <!-- OneLake table discovery + DROP go through the ADLS Gen2 / OneLake DFS endpoint directly (the Azure SDK,
          NOT DuckDB's azure extension): GetPaths enumerates Tables/<table> (flat) or Tables/<schema>/<table>
@@ -62,7 +62,7 @@
          on schema-enabled lakehouses, and free of SQL-endpoint sync lag — and DeleteDirectory(recursive) powers
          DROP TABLE (DuckDB's azure FileSystem has no RemoveDirectory). The Fabric API is kept only for the
          schema-enabled flag (GetLakehouse.DefaultSchema) + name->GUID resolution. Same SP credential throughout. -->
-    <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.21.0" />
+    <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.28.0" />
     <!-- ⚠ Microsoft.Data.SqlClient + Microsoft.Data.SqlClient.Extensions.Azure were declared HERE until
          2026-08-18 and used by NOTHING in this assembly. The only two matches in Bridge source are a comment
          in Bootstrap.cs saying it duck-types the provider error number "rather than reference

@@ -227,7 +227,7 @@ internal static class OneLakeForwardFs
         bool firstItem = true;
         try
         {
-            await foreach (var item in client.GetPathsAsync(dir.Length == 0 ? null : dir, recursive: true)
+            await foreach (var item in client.GetPathsAsync(dir.Length == 0 ? null : dir, recursive: true, userPrincipalName: false, cancellationToken: default)
                                .ConfigureAwait(false))
             {
                 if (item.IsDirectory == true)

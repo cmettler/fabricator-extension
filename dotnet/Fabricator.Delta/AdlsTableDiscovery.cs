@@ -77,7 +77,7 @@ internal static class AdlsTableDiscovery
         var dirs = new List<string>();
         try
         {
-            await foreach (var item in fsClient.GetPathsAsync(path: pathUnderFs, recursive: false).ConfigureAwait(false))
+            await foreach (var item in fsClient.GetPathsAsync(path: pathUnderFs, recursive: false, userPrincipalName: false, cancellationToken: default).ConfigureAwait(false))
             {
                 if (item.IsDirectory == true && !string.IsNullOrEmpty(item.Name))
                 {

@@ -21,7 +21,7 @@
          routed to storage) and the four Delta global functions registered in CustomFunctions.cs. A real
          dependency, not an accident of the split — the external-table write path IS a Delta write. -->
     <ProjectReference Include="..\Fabricator.Delta\Fabricator.Delta.csproj" />
-    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.1.2" />
     <!-- ⚠ REQUIRED FROM SqlClient 7.0 FOR ENTRA (Azure AD) AUTH — it is not optional for us. 7.0 MOVED the
          Active Directory authentication providers out of the core package into this one, so every
          `Authentication=Active Directory ...` connection string (Fabric Warehouse via a service principal, the
@@ -33,7 +33,7 @@
          6.0.2 -> 7.0.2 bump.
          (Text moved here from Fabricator.Bridge.csproj on 2026-08-18, when Bridge stopped declaring these two
          packages: it used NEITHER, and this warning belongs with the assembly that actually calls them.) -->
-    <PackageReference Include="Microsoft.Data.SqlClient.Extensions.Azure" Version="7.0.2" />
+    <PackageReference Include="Microsoft.Data.SqlClient.Extensions.Azure" Version="7.1.2" />
   </ItemGroup>
 
 </Project>

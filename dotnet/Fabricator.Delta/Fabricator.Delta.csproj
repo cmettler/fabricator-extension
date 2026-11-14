@@ -33,12 +33,12 @@
   <ItemGroup>
     <!-- Fabric REST API: OneLake lakehouse table discovery (FabricLakehouse) — DuckDB's azure glob cannot
          enumerate a OneLake _delta_log tree, so the table list comes from the REST catalog. -->
-    <PackageReference Include="Microsoft.Fabric.Api" Version="2.18.0" />
+    <PackageReference Include="Microsoft.Fabric.Api" Version="2.27.0" />
     <PackageReference Include="Azure.Identity" Version="1.21.0" />
     <!-- ADLS Gen2 DFS: the Delta LOG filesystem for a credentialed abfss:// root. The direct SDK is what
          makes the commit CONDITIONAL (put-if-absent / If-None-Match); duckdb-azure's ExclusiveCreate is a
          client-side existence check and races — measured 41 of 48 commits landing, six losses silent. -->
-    <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.21.0" />
+    <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.28.0" />
     <!-- S3: the conditional-PUT commit filesystem (S3CommitFileSystem). Same reason as the ADLS one — the
          host-FS EXCLUSIVE_CREATE emulation is unguarded on s3, which loses commits SILENTLY. -->
     <PackageReference Include="AWSSDK.S3" Version="4.*" />

@@ -270,7 +270,7 @@ public static class FabricLakehouse
         var names = new List<string>();
         try
         {
-            await foreach (var item in fsClient.GetPathsAsync(path: pathUnderFs, recursive: false)
+            await foreach (var item in fsClient.GetPathsAsync(path: pathUnderFs, recursive: false, userPrincipalName: false, cancellationToken: default)
                                .ConfigureAwait(false))
             {
                 if (item.IsDirectory == true && !string.IsNullOrEmpty(item.Name))
