@@ -71,6 +71,9 @@ internal static class FabricPromotionFunctions
 /// wrapped in a struct, per the D4 output rule. A CLEAN workspace still returns ONE row — with the change columns
 /// NULL — because the heads are the useful answer in that case, and emitting nothing would make "in sync" and
 /// "not connected" indistinguishable (they differ: the latter throws).
+/// <para><c>files := true</c> (Fabric.Api 2.27, <c>includeFilesDetails</c>) asks for the changed FILES of each item:
+/// one row per file, with the item's columns repeated and the <c>file_*</c> columns filled. An item the service
+/// reports no file changes for keeps one row with NULL file columns. Without it the file columns are NULL.</para>
 /// </remarks>
 internal sealed class FabricGitStatusFunction : FabricRowsFunction
 {
@@ -80,8 +83,14 @@ internal sealed class FabricGitStatusFunction : FabricRowsFunction
 
     public override string Name => "git_status";
 
-    public override Schema NamedParameters { get; } =
-        new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
+    // A nullable enum-like value as text, NULL staying NULL (Convert.ToString would give "").
+    private static string? Text(object? value) => value?.ToString();
+
+    public override Schema NamedParameters { get; } = new Schema(new[]
+    {
+        FabricApiFunctions.Str("workspace"),
+        new Field("files", Apache.Arrow.Types.BooleanType.Default, nullable: true),
+    }, null);
 
     protected override Schema Columns { get; } = new(new[]
     {
@@ -94,13 +103,18 @@ internal sealed class FabricGitStatusFunction : FabricRowsFunction
         FabricApiFunctions.Str("remote_change"),
         FabricApiFunctions.Str("workspace_change"),
         FabricApiFunctions.Str("conflict_type"),
+        FabricApiFunctions.Str("file_path"),
+        FabricApiFunctions.Str("file_remote_change"),
+        FabricApiFunctions.Str("file_workspace_change"),
+        FabricApiFunctions.Str("file_conflict_type"),
     }, null);
 
     protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
     {
         var ws = Api.ResolveWorkspace(args[0]);
+        bool files = args[1] == "true";
         var status = FabricApiClient.Wrap("git_status",
-            () => Api.Client.Core.Git.GetStatus(ws, includeFilesDetails: null, cancellationToken: ct).Value);
+            () => Api.Client.Core.Git.GetStatus(ws, includeFilesDetails: files ? true : null, cancellationToken: ct).Value);
         var changes = status.Changes ?? (IReadOnlyList<ItemChange>)System.Array.Empty<ItemChange>();
         if (changes.Count == 0)
         {
@@ -115,16 +129,26 @@ internal sealed class FabricGitStatusFunction : FabricRowsFunction
         foreach (var change in changes)
         {
             var md = change.ItemMetadata;
-            row.Str(0, status.WorkspaceHead)
-               .Str(1, status.RemoteCommitHash)
-               .Str(2, md?.ItemIdentifier?.ObjectId?.ToString())
-               .Str(3, md?.ItemIdentifier?.LogicalId?.ToString())
-               .Str(4, md?.ItemType.ToString())
-               .Str(5, md?.DisplayName)
-               .Str(6, change.RemoteChange?.ToString())
-               .Str(7, change.WorkspaceChange?.ToString())
-               .Str(8, change.ConflictType.ToString())
-               .EndRow();
+            var fileChanges = files ? change.FileChanges : null;
+            int rows = fileChanges is { Count: > 0 } ? fileChanges.Count : 1;
+            for (int f = 0; f < rows; f++)
+            {
+                var file = fileChanges is { Count: > 0 } ? fileChanges[f] : null;
+                row.Str(0, status.WorkspaceHead)
+                   .Str(1, status.RemoteCommitHash)
+                   .Str(2, md?.ItemIdentifier?.ObjectId?.ToString())
+                   .Str(3, md?.ItemIdentifier?.LogicalId?.ToString())
+                   .Str(4, md?.ItemType.ToString())
+                   .Str(5, md?.DisplayName)
+                   .Str(6, change.RemoteChange?.ToString())
+                   .Str(7, change.WorkspaceChange?.ToString())
+                   .Str(8, change.ConflictType.ToString())
+                   .Str(9, file?.Path)
+                   .Str(10, Text(file?.RemoteChange))
+                   .Str(11, Text(file?.WorkspaceChange))
+                   .Str(12, Text(file?.ConflictType))
+                   .EndRow();
+            }
         }
     }
 }

@@ -1712,6 +1712,44 @@ tenant. **That paid for itself immediately: the tests failed on first run and ca
 extraction took the substring after the *last* dot, yielding `datawarehouse` instead of the encoded pair. Live
 validation would have caught it too, at the cost of a round trip and a confusing symptom.
 
+## 9o. SDK pin 2.18.0 → 2.27.0 (2026-11-14)
+
+`Microsoft.Fabric.Api` 2.27.0. Measured by diffing the documented members of both packages (the
+`<member name>` entries of `Microsoft.Fabric.Api.xml`): 2,417 added, 155 removed or changed. The removed ones are
+model constructors that gained parameters, plus three operations whose signature changed: `GitClient.GetStatus`
+and `UpdateFromGit` (a new `includeFilesDetails`) and `DeploymentPipelinesClient.DeployStageContent`. Only
+`GetStatus` broke our build, as an ambiguous call; it passes `includeFilesDetails: null` (the server's default).
+
+**Taken into existing functions (live-validated on workspace Test, lakehouse LH):**
+
+| function | new | from the SDK |
+|---|---|---|
+| `refresh_sql_endpoint` | `tables := 'dbo.a, b'`: refresh only those tables; more than 25 go in several requests | `SqlEndpointRefreshMetadataRequest.Tables` (max 25 per request) |
+| `git_status` | `files := true`: one row per changed file | `includeFilesDetails`, `ItemChange.FileChanges` |
+| `items()` | column `logical_id` | `Item.LogicalId` |
+| `connections()` | column `my_role` | `Connection.MyRole` |
+
+- `refresh_sql_endpoint(tables := 'dbo.arrownet_ckpt, arrownet_rtcdf')` returned exactly those two rows
+  (`NotRun`, already in sync); an unknown table returns `Failure` / `DeltaTableNotFound`; without `tables` all 30
+  rows came back. The parsing (`FabricRefreshTables`, BCL-only) has 11 offline tests.
+- `logical_id` was NULL for all 23 items of the test workspace, which matches the API doc ("null when no logical
+  ID has been assigned"): logical ids come with git or deployment pipelines. `connections()` returns no rows for
+  the service principal on this tenant, so `my_role` is unmeasured. `git_status(files := true)` is unmeasured too,
+  as before: no git-connected workspace.
+- A BOOLEAN named parameter of a `FabricRowsFunction` used to reach `Fill` as NULL (`FabricArgs.Str` reads only
+  strings). It arrives as `"true"`/`"false"` now; `files` is the first such parameter.
+- The two absences §9i records were re-probed on 2.27 with the same controls: `ExitValue`/`exitValue` and
+  `RefreshSemanticModel`/`EnhancedRefresh`/`RefreshSchedule` are still absent (0 hits each), while
+  `RefreshSqlEndpointMetadata` has 11 and a nonsense symbol 0. So the raw-HTTP exit value and the Power BI REST
+  refresh stay.
+
+**New in the SDK, not built** (candidates): the item recycle bin (`ListRecoverableItems`, `RecoverItem`,
+`DeleteRecoverableItem`), `BulkExportItemDefinitions` / `BulkImportItemDefinitions`, workspace relations,
+`CopyJob.RunOnDemandExecute`, `Dataflow.ListReadiness` / `UpgradeDataflows`, `Warehouse.GetSQLPoolsConfiguration`,
+Environment pool activations, `Reflex.QueryActivations`, capacity surge protection and overage, blocked and
+mission-critical actors, admin connection management, and the new item types `DeploymentPlan`, `Plan`,
+`Monitoring` and `PolicySet`.
+
 ## 10. The full API sweep — every area, with a verdict
 
 The complete Fabric REST surface (Core services + workload APIs), each with implement/defer/skip and

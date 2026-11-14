@@ -105,6 +105,9 @@
     -->
     <Compile Include="..\Fabricator.Bridge\FabricTokenServiceUrl.cs"
              Link="Linked\FabricTokenServiceUrl.cs" />
+    <!-- fabric.refresh_sql_endpoint's `tables` argument (Fabric.Api 2.27): BCL-only parsing into batches of 25. -->
+    <Compile Include="..\Fabricator.Bridge\FabricApi\FabricRefreshTables.cs"
+             Link="Linked\FabricRefreshTables.cs" />
     <!--
       The table_alter request doc (ABI v74). Admissible because the spec is a plain record over
       System.Text.Json — the new column's TYPE deliberately does not live in it (it rides beside the doc as

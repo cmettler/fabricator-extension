@@ -251,6 +251,11 @@ internal abstract class FabricTableBinding : ITableFunctionBinding
 /// simply returns when the sync is done, which is what a hook needs.</para>
 /// <para><b>The dbt trap</b>: our Delta writes commit the log at DuckDB COMMIT, so an in-transaction post-hook
 /// would refresh BEFORE the table exists. Use <c>transaction: false</c> or an <c>on-run-end</c> hook.</para>
+/// <para><c>tables := 'dbo.orders, sales.customers'</c> (Fabric.Api 2.27) refreshes only those tables: a
+/// comma-separated list of <c>schema.table</c> or a bare <c>table</c> (schema <c>dbo</c>). The service takes at most
+/// 25 tables per request, so a longer list is sent in several requests and their rows are concatenated. On a
+/// lakehouse without schemas every table resolves under the default schema, and a table under another schema is
+/// reported as <c>DeltaTableNotFound</c>.</para>
 /// </remarks>
 internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
 {
@@ -280,9 +285,18 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
         new Field("timeout_seconds", Int64Type.Default, nullable: true),
         FabricApiFunctions.Str("workspace"),
         FabricApiFunctions.Str("item"),
+        FabricApiFunctions.Str("tables"),
     }, null);
 
     public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+
+    /// <summary>
+    /// <c>tables</c> as the service's table definitions, in batches of at most
+    /// <see cref="FabricRefreshTables.MaxTablesPerRequest"/> tables. Null refreshes every table.
+    /// </summary>
+    internal static List<List<Microsoft.Fabric.Api.SQLEndpoint.Models.TableDefinition>>? TableBatches(string? tables)
+        => FabricRefreshTables.Parse(tables)?.ConvertAll(batch => batch.ConvertAll(
+            group => new Microsoft.Fabric.Api.SQLEndpoint.Models.TableDefinition(group.Schema, group.Tables)));
 
     private sealed class Binding : FabricTableBinding
     {
@@ -310,7 +324,10 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
             _timeoutSeconds = FabricArgs.Int(args, 1);
             _workspace = FabricArgs.Str(args, 2);
             _item = FabricArgs.Str(args, 3);
+            _tables = TableBatches(FabricArgs.Str(args, 4));
         }
+
+        private readonly List<List<Microsoft.Fabric.Api.SQLEndpoint.Models.TableDefinition>>? _tables;
 
         public override Schema OutputSchema => Columns;
 
@@ -321,20 +338,38 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
             var lh = _api.ResolveItem(_item, "Lakehouse", ws);
             var ep = _api.ResolveSqlEndpointId(ws, lh);
 
-            Microsoft.Fabric.Api.SQLEndpoint.Models.SqlEndpointRefreshMetadataRequest? request = null;
-            if (_recreate is not null || _timeoutSeconds is not null)
+            // One request per batch of tables, or one request for the whole endpoint.
+            var batches = _tables is null
+                ? new List<List<Microsoft.Fabric.Api.SQLEndpoint.Models.TableDefinition>?> { null }
+                : _tables.ConvertAll(b => (List<Microsoft.Fabric.Api.SQLEndpoint.Models.TableDefinition>?)b);
+            var tableStatuses = new List<Microsoft.Fabric.Api.SQLEndpoint.Models.TableSyncStatus>();
+            foreach (var batch in batches)
             {
-                request = new Microsoft.Fabric.Api.SQLEndpoint.Models.SqlEndpointRefreshMetadataRequest();
-                if (_recreate is not null) { request.RecreateTables = _recreate; }
-                if (_timeoutSeconds is not null)
+                Microsoft.Fabric.Api.SQLEndpoint.Models.SqlEndpointRefreshMetadataRequest? request = null;
+                if (_recreate is not null || _timeoutSeconds is not null || batch is not null)
                 {
-                    request.Timeout = new Microsoft.Fabric.Api.SQLEndpoint.Models.Duration(
-                        _timeoutSeconds.Value, Microsoft.Fabric.Api.SQLEndpoint.Models.TimeUnit.Seconds);
+                    request = new Microsoft.Fabric.Api.SQLEndpoint.Models.SqlEndpointRefreshMetadataRequest();
+                    if (_recreate is not null) { request.RecreateTables = _recreate; }
+                    if (_timeoutSeconds is not null)
+                    {
+                        request.Timeout = new Microsoft.Fabric.Api.SQLEndpoint.Models.Duration(
+                            _timeoutSeconds.Value, Microsoft.Fabric.Api.SQLEndpoint.Models.TimeUnit.Seconds);
+                    }
+                    if (batch is not null)
+                    {
+                        foreach (var definition in batch)
+                        {
+                            request.Tables.Add(definition);
+                        }
+                    }
+                }
+                var statuses = FabricApiClient.Wrap("refresh_sql_endpoint", () =>
+                    _api.Client.SQLEndpoint.Items.RefreshSqlEndpointMetadata(ws, ep, request!, ct).Value);
+                if (statuses.Value is { } value)
+                {
+                    tableStatuses.AddRange(value);
                 }
             }
-
-            var statuses = FabricApiClient.Wrap("refresh_sql_endpoint", () =>
-                _api.Client.SQLEndpoint.Items.RefreshSqlEndpointMetadata(ws, ep, request!, ct).Value);
 
             var names = new StringArray.Builder();
             var status = new StringArray.Builder();
@@ -344,8 +379,7 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
             var errCode = new StringArray.Builder();
             var errMsg = new StringArray.Builder();
             int n = 0;
-            foreach (var t in statuses.Value ?? (IReadOnlyList<Microsoft.Fabric.Api.SQLEndpoint.Models.TableSyncStatus>)
-                         System.Array.Empty<Microsoft.Fabric.Api.SQLEndpoint.Models.TableSyncStatus>())
+            foreach (var t in tableStatuses)
             {
                 names.Append(t.TableName);
                 status.Append(t.Status.ToString());

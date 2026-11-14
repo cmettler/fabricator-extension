@@ -3666,11 +3666,13 @@ which is the common case for a dbt project that writes to more than one:
 ```sql
 SELECT * FROM lake.fabric.refresh_sql_endpoint();                  -- the attached lakehouse
 SELECT * FROM lake.fabric.refresh_sql_endpoint(item := 'OtherLH'); -- a different one
+-- only the tables a model wrote (comma-separated; a bare name is in dbo; more than 25 go in several requests)
+SELECT * FROM lake.fabric.refresh_sql_endpoint(tables := 'dbo.orders, dbo.order_lines');
 ```
 
 | function | kind | what it does |
 |---|---|---|
-| `refresh_sql_endpoint([recreate := …] [, timeout_seconds := …] [, workspace := …] [, item := …])` | table | Syncs a lakehouse's **SQL analytics endpoint** now; one row per table |
+| `refresh_sql_endpoint([recreate := …] [, timeout_seconds := …] [, workspace := …] [, item := …] [, tables := …])` | table | Syncs a lakehouse's **SQL analytics endpoint** now; one row per table. `tables := 'dbo.a, b'` syncs only those (an unknown one reports `DeltaTableNotFound`) |
 | `list_shortcuts([parent_path := …] [, workspace := …] [, item := …])` | table | A lakehouse's OneLake shortcuts, optionally under one path |
 | `create_shortcut(path, name, target_workspace, target_item, target_path)` | scalar | Creates a shortcut to another OneLake item; returns its full path. Fails if the name exists |
 | `alter_shortcut(…same args…)` | scalar | Re-points an **existing** shortcut (fails if absent) |
@@ -3678,10 +3680,10 @@ SELECT * FROM lake.fabric.refresh_sql_endpoint(item := 'OtherLH'); -- a differen
 | `create_shortcut_json(path, name, target_json [, conflict_policy])` | scalar | Any target type (ADLS Gen2, S3, GCS, Blob, Dataverse, SharePoint) as the REST `target` object |
 | `drop_shortcut(path, name [, if_exists])` | scalar | Deletes a shortcut; `if_exists := true` returns `false` instead of erroring |
 | `workspaces()` | table | Every workspace this identity can see (id, name, type, capacity) |
-| `items([item_type := …] [, workspace := …])` | table | Items in a workspace, optionally filtered (`'Notebook'`, `'Lakehouse'`, …) |
+| `items([item_type := …] [, workspace := …])` | table | Items in a workspace, optionally filtered (`'Notebook'`, `'Lakehouse'`, …), with their `logical_id` (shared by corresponding items across workspaces; NULL when none was assigned) |
 | `lakehouses([workspace := …])` | table | Lakehouses **with their SQL endpoint id, status and connection string** |
 | `warehouses([workspace := …])` | table | Warehouses with their T-SQL connection strings |
-| `connections()` | table | Cloud connections — the `id` an external shortcut target needs |
+| `connections()` | table | Cloud connections — the `id` an external shortcut target needs — and `my_role`, the calling identity's role on each |
 | `run_notebook(notebook [, params_json := …] [, config_json := …] [, wait_seconds := …] [, workspace := …])` | table | **Runs a notebook with parameters and blocks** until it finishes; one row of final state |
 | `notebook_parameters(notebook)` | table | Names/defaults from a notebook's `parameters`-tagged cell |
 | `table_maintenance(table [, schema := …] [, v_order := …] [, z_order_by := …] [, vacuum_retention := …] [, purge_deletion_vectors := …])` | table | Runs Fabric's maintenance job — **V-Order**, Z-order, VACUUM, purge deletion vectors |
@@ -3696,7 +3698,7 @@ SELECT * FROM lake.fabric.refresh_sql_endpoint(item := 'OtherLH'); -- a differen
 | `semantic_models()` | table | The workspace's semantic models, incl. each lakehouse's and warehouse's default |
 | `refresh_semantic_model(model [, type := …] [, objects_json := …] [, commit_mode := …] [, timeout := …])` | table | **Refreshes a semantic model** (enhanced refresh) and blocks until it settles |
 | `semantic_model_refreshes(model [, top := …])` | table | That model's refresh history |
-| `git_status()` | table | Uncommitted/unpulled changes vs the connected branch, plus both heads. A clean workspace still returns one row (change columns NULL) |
+| `git_status([workspace := …] [, files := …])` | table | Uncommitted/unpulled changes vs the connected branch, plus both heads. A clean workspace still returns one row (change columns NULL). `files := true` gives one row per changed file (`file_path`, `file_remote_change`, `file_workspace_change`, `file_conflict_type`) |
 | `git_connection()` | table | Which repository/branch/directory the workspace is connected to, and its last sync |
 | `git_commit([mode := 'All'] [, comment := …] [, items_json := …] [, workspace_head := …])` | table | Commits the workspace to the branch. `mode := 'Selective'` needs `items_json` |
 | `git_update(remote_commit_hash [, conflict_resolution := …] [, allow_override := …])` | table | Pulls that commit into the workspace (`PreferRemote` / `PreferWorkspace`) |

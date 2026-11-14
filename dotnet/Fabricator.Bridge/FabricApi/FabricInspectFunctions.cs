@@ -86,10 +86,14 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
     public ITableFunctionBinding Bind(RecordBatch args)
     {
         int n = Parameters.FieldsList.Count + NamedParameters.FieldsList.Count;
+        var all = ((ITableFunction)this).Parameters.FieldsList;
         var values = new string?[n];
         for (int i = 0; i < n; i++)
         {
-            values[i] = FabricArgs.Str(args, i, 0);
+            // A BOOLEAN parameter arrives as "true"/"false" (Fill reads strings); everything else as text.
+            values[i] = i < all.Count && all[i].DataType is Apache.Arrow.Types.BooleanType
+                ? FabricArgs.Bool(args, i, 0) is bool b ? (b ? "true" : "false") : null
+                : FabricArgs.Str(args, i, 0);
         }
         return new Binding(this, values);
     }
@@ -173,6 +177,9 @@ internal sealed class FabricItemsFunction : FabricRowsFunction
         FabricApiFunctions.Str("name"),
         FabricApiFunctions.Str("type"),
         FabricApiFunctions.Str("description"),
+        // The logical id corresponding items share across workspaces (git, deployment pipelines); NULL when none
+        // was assigned. Fabric.Api 2.27.
+        FabricApiFunctions.Str("logical_id"),
     }, null);
 
     protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
@@ -185,6 +192,7 @@ internal sealed class FabricItemsFunction : FabricRowsFunction
             row.Str(1, i.DisplayName);
             row.Str(2, i.Type.ToString());
             row.Str(3, i.Description);
+            row.Str(4, i.LogicalId?.ToString());
             row.EndRow();
         }
     }
@@ -311,6 +319,9 @@ internal sealed class FabricConnectionsFunction : FabricRowsFunction
         FabricApiFunctions.Str("path"),
         FabricApiFunctions.Str("privacy_level"),
         FabricApiFunctions.Str("credential_type"),
+        // The caller's effective role on the connection (the highest across its groups); NULL when it has none.
+        // Fabric.Api 2.27.
+        FabricApiFunctions.Str("my_role"),
     }, null);
 
     protected override void Fill(FabricRowBuilder row, string?[] args, CancellationToken ct)
@@ -325,6 +336,7 @@ internal sealed class FabricConnectionsFunction : FabricRowsFunction
             row.Str(3, d?.Path);
             row.Str(4, conn.PrivacyLevel?.ToString());
             row.Str(5, conn.CredentialDetails?.CredentialType?.ToString());
+            row.Str(6, conn.MyRole?.ToString());
             row.EndRow();
         }
     }
