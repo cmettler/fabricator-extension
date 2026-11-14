@@ -240,13 +240,11 @@ internal static class FluidHostQuery
     /// Fluid value.
     /// </summary>
     /// <remarks>
-    /// ⚠⚠ <b>FORCING IT IS A FULL COPY, and this remark used to claim the opposite</b> ("without being copied
-    /// into either"). It is not copied into SQL — the relation is already there — but the Fluid side runs
-    /// <c>SELECT * FROM &lt;name&gt;</c> and materialises EVERY CELL into a <see cref="EagerStruct"/>, which
-    /// has to be eager because the batch is disposed as the result is consumed. So a template that touches
-    /// the relation in Liquid pays a round trip plus one <c>FluidValue</c> per cell, capped at
-    /// <see cref="MaxRows"/>. The laziness means an untouched relation costs NOTHING; it does not mean a
-    /// touched one is cheap.
+    /// ⚠ Forcing it runs <c>SELECT * FROM &lt;name&gt;</c> and keeps the result's Arrow batches for the render
+    /// (capped at <see cref="MaxRows"/>); since 2026-11-14 the rows and their cells are made only as the
+    /// template reads them (<see cref="ArrowRowList"/>). Until then every cell was copied into an
+    /// <see cref="EagerStruct"/> at the first touch, which made a touched relation cost one <c>FluidValue</c>
+    /// per cell.
     /// </remarks>
     /// <remarks>
     /// ⚠ <c>fluid_aggregate</c> deliberately does NOT use this: its rows are retained Arrow that it owns, so
@@ -300,40 +298,42 @@ internal static class FluidHostQuery
     private static FluidValue ReadRows(string caller, string surface, string sql, RecordBatch? parameters,
                                        FluidRenderSession run)
     {
-        using var stream = run.Query(sql, parameters);
-        var rows = new List<FluidValue>();
-        while (true)
+        // ⚠ The BATCHES are kept, not copied into FluidValues: the rows are made on first read by index
+        // (Fluid #1057, ArrowRowList), so `r[0].a`, `r | size`, `for … limit:` and `first` touch only what they
+        // read. Until 2026-11-14 every cell of every row was read here (EagerStruct), because the batch was
+        // disposed at the end of this loop — Apache.Arrow nulls a disposed batch's arrays, so a lazy row then
+        // failed LOUDLY with a NullReferenceException. The lease below is what keeps them alive instead: it is
+        // held by the session and released when the render that ran the query ends (FluidEngine).
+        var batches = new List<RecordBatch>();
+        var lease = new RowLease(batches);
+        try
         {
-            var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            if (batch is null)
+            using var stream = run.Query(sql, parameters);
+            long total = 0;
+            while (true)
             {
-                break;
-            }
-            using (batch)
-            {
-                if (rows.Count + batch.Length > MaxRows)
+                var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                if (batch is null)
+                {
+                    break;
+                }
+                batches.Add(batch);
+                total += batch.Length;
+                if (total > MaxRows)
                 {
                     throw new InvalidOperationException(
                         $"{caller}: {surface} returned more than {MaxRows} rows. Narrow the query — "
                         + "the rows are all held in memory, because a template may iterate them repeatedly.");
                 }
-                // ⚠ Hoisted out of the row loop: batch.Arrays is an enumerable, so materialising it per
-                // row would allocate one list per row on a path whose whole point is many rows.
-                var columns = batch.Arrays.ToList();
-                var fields = batch.Schema.FieldsList;
-                for (int r = 0; r < batch.Length; r++)
-                {
-                    // ⚠ The cells are read EAGERLY rather than holding the batch, because the batch is
-                    // disposed at the end of this block while the rows live for the whole render.
-                    // ⚠ MEASURED, and NOT the silent native use-after-free class this project usually warns
-                    // about: Apache.Arrow nulls a disposed RecordBatch's arrays, so holding it fails LOUDLY
-                    // with a NullReferenceException on the first cell read, deterministically and on every
-                    // platform. Mutation-tested — it dies at the very first query() assertion.
-                    rows.Add(DictionaryValue.Create(new EagerStruct(fields, columns, r)));
-                }
             }
+            run.Hold(lease);
         }
-        return ArrayValue.Create(rows);
+        catch
+        {
+            lease.Release();
+            throw;
+        }
+        return FluidValueModel.RowsOver(batches, lease);
     }
 
 
@@ -985,7 +985,7 @@ internal sealed class EagerStruct : IFluidIndexable
 /// cost this class exists to avoid.
 /// </para>
 /// </remarks>
-internal sealed class LazyRowsValue : FluidValue
+internal sealed class LazyRowsValue : FluidValue, IFluidArray
 {
     private readonly Func<FluidValue> _read;
     private FluidValue? _rows;
@@ -998,6 +998,16 @@ internal sealed class LazyRowsValue : FluidValue
     public override FluidValues Type => FluidValues.Array;
 
     public override bool Equals(FluidValue other) => Rows.Equals(other);
+
+    public override int GetHashCode() => Rows.GetHashCode();
+
+    // ⚠ IFluidArray (Fluid #1057) is what lets `for … limit:`, `offset`, `first`, `last` and `slice` read by
+    // index. Without it Fluid ENUMERATES this value into a new array first — every row made — because only a
+    // value implementing the interface is read by index; forwarding the async members above is not enough.
+    // ⚠ Count forces the read, like every member but Type: there is no row count without running the query.
+    int IFluidArray.Count => ((IFluidArray)Rows).Count;
+
+    FluidValue IFluidArray.this[int index] => ((IFluidArray)Rows)[index];
 
     // Fluid 3.0.0-beta.9 removed the parameterless To*Value forms, Contains and Enumerate (beta.7 had marked
     // them obsolete), and WriteToAsync takes the TemplateContext instead of a CultureInfo. Every member here

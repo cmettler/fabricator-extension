@@ -64,6 +64,7 @@ internal sealed class FluidRenderSession : IDisposable
     private readonly IHostQuery _host;
     private IHostConnection? _pinned;
     private bool _disposed;
+    private readonly List<RowLease> _held = new();
     private string? _variableName;
     private Func<RecordBatch?>? _variableRows;
     private bool _variableApplied;
@@ -245,10 +246,63 @@ internal sealed class FluidRenderSession : IDisposable
         }
     }
 
-    /// <summary>Closes this render's connection, destroying its temporary catalog. Idempotent.</summary>
+    /// <summary>How many query results are held right now: the mark a render takes before it starts, so it
+    /// can release exactly the ones it read (<see cref="ReleaseHeld"/>).</summary>
+    internal int HoldMark
+    {
+        get
+        {
+            lock (_held)
+            {
+                return _held.Count;
+            }
+        }
+    }
+
+    /// <summary>Keeps a query result's batches alive until the render that read them ends.</summary>
+    /// <remarks>
+    /// ⚠ PER RENDER, not per session: <c>fluid_query_lateral</c> and <c>fluid_aggregate</c> keep ONE session
+    /// across many renders, so holding until <see cref="Dispose"/> would keep every chunk's query results until
+    /// the call ends. Dispose still releases whatever is left, as the backstop.
+    /// </remarks>
+    internal void Hold(RowLease lease)
+    {
+        lock (_held)
+        {
+            if (_disposed)
+            {
+                lease.Release();
+                throw new ObjectDisposedException(nameof(FluidRenderSession));
+            }
+            _held.Add(lease);
+        }
+    }
+
+    /// <summary>Releases every result held since <paramref name="mark"/>, newest first.</summary>
+    internal void ReleaseHeld(int mark)
+    {
+        RowLease[] drop;
+        lock (_held)
+        {
+            if (mark >= _held.Count)
+            {
+                return;
+            }
+            drop = _held.GetRange(mark, _held.Count - mark).ToArray();
+            _held.RemoveRange(mark, _held.Count - mark);
+        }
+        for (int i = drop.Length - 1; i >= 0; i--)
+        {
+            drop[i].Release();
+        }
+    }
+
+    /// <summary>Closes this render's connection, destroying its temporary catalog, and releases every query
+    /// result still held. Idempotent.</summary>
     public void Dispose()
     {
         _disposed = true;
+        ReleaseHeld(0);
         var pin = _pinned;
         _pinned = null;
         pin?.Dispose();

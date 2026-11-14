@@ -2175,8 +2175,10 @@ distinguishes the two.
 
 > ⚠ **`query()` reads COMMITTED data.** It runs on its own connection, so inside an explicit transaction it
 > does **not** see that transaction's uncommitted rows — a template cannot observe the writes of the
-> statement running it. Rows are held in memory (a template may loop over them repeatedly), and a result
-> above one million rows is refused rather than truncated.
+> statement running it. Rows are held in memory as Arrow for the render (a template may loop over them
+> repeatedly), and a result above one million rows is refused rather than truncated. A row and its values are
+> made only when the template reads them, so `r[0].a`, `r.size`, `first` and `for … limit:` over a large result
+> stay cheap — and a value a template cannot hold (a NaN, say) fails only if the template reads it.
 >
 > It *does* inherit your session: every setting you `SET` (`TimeZone`, `default_null_order`, …), your
 > **`search_path`** (and with it `current_catalog()` and `current_schema()`) and your variables (`SET VARIABLE`),

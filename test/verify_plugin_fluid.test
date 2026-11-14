@@ -5221,3 +5221,66 @@ SELECT * FROM fluid_replacement_query('SELECT
              'd': '"a"."b"', 'e': 'memory.main.px_two'});
 ----
 px_one	odd name	od"d	"a"."b"	memory.main.px_two	"od""d"
+
+# =====================================================================================================
+# §41 — LAZY ROWS (Fluid #1057): a query result and an input relation are read BY INDEX, so a template
+# makes only the rows — and only the cells — it reads.
+#
+# ⚠ The discriminator is a NaN in row 3 of column `d`: a template value cannot hold a NaN (ReadCell refuses
+# it, naming it), so any read of every cell FAILS while a read that never touches that cell works. Until
+# 2026-11-14 a query result read every cell of every row up front (EagerStruct), so every row of §41.1
+# failed with the NaN message; §41.2 is the control that the refusal still fires when the cell IS read.
+# ⚠ Row laziness itself has no SQL-visible effect (a row is a cheap wrapper whose cells are lazy anyway);
+# it is a speed property, measured in docs/fluid-templating.md §46: `{{ r[999999].s }}` over a million
+# rows 1.82 s -> 0.09 s.
+# =====================================================================================================
+
+# --- §41.1 index, size, a negative index, `for … limit:` / `offset:`, first/last and a repeated loop —
+# none of them touch row 3's `d`. ---
+query T
+SELECT fluid_render('{% query r %}SELECT range AS i, CASE WHEN range = 3 THEN ''nan''::DOUBLE ELSE range END AS d FROM range(5){% endquery %}{{ r[0].d }}|{{ r[4].i }}|{{ r.size }}|{{ r[-1].i }}|{{ r | size }}|{% for x in r limit: 3 %}{{ x.d }}{% endfor %}|{% for x in r offset: 4 %}{{ x.d }}{% endfor %}|{{ r.first.i }}{{ r.last.i }}|{% for x in r %}{{ x.i }}{% endfor %}{% for x in r %}{{ x.i }}{% endfor %}', NULL);
+----
+0|4|5|4|5|012|4|04|0123401234
+
+# --- §41.2 the CONTROL: a loop that does read row 3's `d` still fails, naming the value. ---
+statement error
+SELECT fluid_render('{% query r %}SELECT range AS i, CASE WHEN range = 3 THEN ''nan''::DOUBLE ELSE range END AS d FROM range(5){% endquery %}{% for x in r %}{{ x.d }}{% endfor %}', NULL);
+----
+the number NaN
+
+# --- §41.3 several Arrow batches behind one result (2048 rows each): the batch boundary, the last row,
+# and a slice spanning a boundary. ---
+query T
+SELECT fluid_render('{% query r %}SELECT range AS i FROM range(5000){% endquery %}{{ r[2047].i }} {{ r[2048].i }} {{ r[4999].i }} {{ r.size }} {% assign s = r | slice: 4095, 3 %}{% for x in s %}{{ x.i }},{% endfor %}', NULL);
+----
+2047 2048 4999 5000 4095,4096,4097,
+
+# --- §41.4 a nested STRUCT cell, and an empty result. ---
+query TT
+SELECT fluid_render('{% query r %}SELECT {''a'': range} AS s FROM range(3){% endquery %}{{ r[2].s.a }}', NULL),
+       fluid_render('{% query r %}SELECT 1 AS i WHERE false{% endquery %}[{{ r.size }}]{% for x in r %}x{% endfor %}', NULL);
+----
+2	[0]
+
+# --- §41.5 a MATERIALIZED block binds a LAZY value; it reads by index too (LazyRowsValue is an
+# IFluidArray), so `limit:` stops before the NaN. ---
+query T
+SELECT fluid_render('{% query t materialize: ''table'' %}SELECT range AS i, CASE WHEN range = 3 THEN ''nan''::DOUBLE ELSE range END AS d FROM range(5){% endquery %}{{ t[4].i }}{% for x in t limit: 2 %}{{ x.d }}{% endfor %}', NULL);
+----
+401
+
+# --- §41.6 `input_table` on fluid_scalar: index, size and `limit:` over a chunk whose row 3 is NaN. ---
+query T
+SELECT DISTINCT fluid_scalar('{% if is_bind %}select NULL::VARCHAR{% else %}select ''{{ input_table.size }}/{{ input_table[1].i }}/{% for x in input_table limit: 2 %}{{ x.d }}{% endfor %}'' FROM input_table{% endif %}', NULL, i, d)
+FROM (SELECT range AS i, CASE WHEN range = 3 THEN 'nan'::DOUBLE ELSE range END AS d FROM range(5));
+----
+5/1/01
+
+# --- §41.7 ⚠ A query's batches live for ONE RENDER, and fluid_query_lateral keeps one session across
+# every chunk it renders. Each chunk's query must see its own rows, never a previous chunk's (released)
+# ones: every input row counts its own chunk, so the sum of distinct counts per chunk is the row count. ---
+query II
+SELECT count(*), sum(c) > 0 FROM range(10000) t(i),
+  fluid_query_lateral('{% query q %}SELECT count(*) AS c FROM input_table{% endquery %}SELECT __fab_row, {{ q[0].c }} AS c FROM input_table', '{}', t.i);
+----
+10000	true

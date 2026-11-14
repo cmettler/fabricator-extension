@@ -525,6 +525,12 @@ internal static class FluidEngine
         // A template is evaluated in a child scope so the caller's context stays immutable. Fluid 3.0.0-beta.9's
         // lease: a Local scope inherits values and keeps assignments local, as EnterChildScope did.
         using var scope = ctx.EnterScope(ScopeBehavior.Local);
+        // ⚠ The query results this render reads keep their Arrow batches until it ends (FluidHostQuery.ReadRows);
+        // this is where they are released. A mark rather than "everything": a session can outlive one render
+        // (fluid_query_lateral, fluid_aggregate), and a nested render must not release its caller's results.
+        var session = FluidRenderSession.For(ctx);
+        var mark = session?.HoldMark ?? 0;
+        try
         {
             using var text = new StringWriter();
             var bufferSize = ctx.Options?.OutputBufferSize ?? 0;
@@ -547,6 +553,10 @@ internal static class FluidEngine
             }
             await output.FlushAsync();
             return text.ToString();
+        }
+        finally
+        {
+            session?.ReleaseHeld(mark);
         }
     }
 }

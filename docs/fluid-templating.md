@@ -5199,10 +5199,47 @@ A port rather than a bump: beta.9 changed the API broadly (46 compile errors), a
   bare tag opener, is a parse error now. Three comments in our own macros (`decision_eval`, `query_zip`,
   `table_zip`) had to be reworded; a user template with such a comment needs the same.
 
-Not taken yet (Fluid #1057, in beta.9): `IFluidArray`, an array value read by index, so that `limit`, `offset`,
-`first`, `last` and `slice` only touch the items they need. Candidates here: `input_table` (`LazyRowsValue` over a
-batch that lives for the render) and `{% query %}` results, which today copy every row eagerly because their batches
-are disposed when the call returns.
+Taken right after the port: Fluid #1057's `IFluidArray` for `input_table` and `{% query %}` results, §46.
+
+## 46. Lazy rows: `input_table` and query results read by index (2026-11-14)
+
+Fluid #1057 (in beta.9) lets an array value be read by index: `for`, `tablerow`, `first`, `last` and `slice` read the
+items of a value implementing `IFluidArray` through `Count` and `this[i]`, and with `limit`, `offset` or `reversed` only
+the items in the range. Fluid's own `ArrayValue` implements it over its list, so a lazy list behind
+`ArrayValue.Create` is enough.
+
+**What changed:**
+
+- `ArrowRowList` (FluidValueModel.cs) is that lazy list over one or more Arrow batches. Row `i` is made the first time
+  it is read (an `ArrowStruct`, whose cells are read on access) and kept. `RowsOver(batch)`, which `input_table`
+  binds, and query results both use it.
+- **Query results keep their batches.** `FluidHostQuery.ReadRows` used to copy every cell of every row into an
+  `EagerStruct`, because the batches were disposed when the read finished. It now keeps them in a `RowLease`, which
+  the render session holds (`FluidRenderSession.Hold`) and releases when the render that ran the query ends
+  (`FluidEngine.RenderToStringAsync`, from a mark taken before it starts). Per render, not per session:
+  `fluid_query_lateral` and `fluid_aggregate` keep one session across many renders. `Dispose` releases what is left.
+  A read through a released lease is refused with a message, not left to fail inside Apache.Arrow.
+- `LazyRowsValue` (a `materialize:` block, `input_table` on the call-scoped surfaces) implements `IFluidArray`.
+  Forwarding the async members is not enough: Fluid reads only a value that implements the interface by index, and
+  enumerates any other array into a new one first.
+- `MaxRows` (1,000,000) still caps a query result; the cap now bounds Arrow batches instead of `FluidValue`s.
+- A nested STRUCT cell is still copied (`EagerStruct` via `ReadCell`); a nested struct is one cell.
+
+**What a template author notices:** a query whose result has a cell a template value cannot hold (a NaN, an
+unsupported type) no longer fails when the template never reads that cell. Reading it still fails, naming it.
+
+**Measured** (`build/release-v2`, a 1,000,000-row result of three columns, warm):
+
+| template | eager (beta.9 port) | lazy |
+|---|---|---|
+| `{{ r[999999].s }} {{ r.size }}` | 1.82 s | 0.09 s |
+| `{% for x in r limit: 3 %}…` | 1.36 s | 0.08 s |
+| a loop over every row, summing one column | 1.95 s | 0.88 s |
+
+Gate: `verify_plugin_fluid` §41 (994 → 1003). A NaN in row 3 discriminates: every row of §41.1 failed on the eager
+build, §41.2 is the control that reading it still fails. Mutant: releasing the lease right after the read dies at the
+first `query()` assertion (line 715) with the lease's message. Row laziness itself (as opposed to cell laziness) has
+no SQL-visible effect; it is the speed in the table.
 
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 

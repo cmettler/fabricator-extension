@@ -301,21 +301,18 @@ internal static class FluidValueModel
     /// (Apache.Arrow nulls a disposed batch's arrays) — loud and deterministic, not the silent native class.
     /// </para>
     /// <para>
-    /// ⚠ <c>columns</c> is hoisted out of the row loop: <c>batch.Arrays</c> is an enumerable, so
-    /// materialising it per row would allocate one list per row on a path whose whole point is many rows.
+    /// ⚠ The rows are made ON FIRST READ (<see cref="ArrowRowList"/>, Fluid #1057): Fluid's
+    /// <see cref="ArrayValue"/> reads its items by index (<c>IFluidArray</c>), so <c>for … limit:</c>,
+    /// <c>offset</c>, <c>first</c>, <c>last</c>, <c>[i]</c>, <c>size</c> and <c>slice</c> touch only the rows they
+    /// need, while output, equality and <c>contains</c> keep Fluid's own semantics.
     /// </para>
     /// </remarks>
-    internal static FluidValue RowsOver(RecordBatch batch)
-    {
-        var fields = batch.Schema.FieldsList;
-        var columns = batch.Arrays.ToList();
-        var rows = new List<FluidValue>(batch.Length);
-        for (int r = 0; r < batch.Length; r++)
-        {
-            rows.Add(DictionaryValue.Create(new ArrowStruct(fields, columns, r)));
-        }
-        return ArrayValue.Create(rows);
-    }
+    internal static FluidValue RowsOver(RecordBatch batch) => RowsOver(new[] { batch });
+
+    /// <summary><see cref="RowsOver(RecordBatch)"/> over several batches, in order: a query's result, whose
+    /// <paramref name="lease"/> says when the batches are gone.</summary>
+    internal static FluidValue RowsOver(IReadOnlyList<RecordBatch> batches, RowLease? lease = null) =>
+        ArrayValue.Create(new ArrowRowList(batches, lease));
 
     internal static void SetVariable(TemplateContext ctx, string name, object? value)
     {
@@ -585,6 +582,135 @@ internal static class FluidValueModel
                 $"fabricator: {surface} cannot render a {clr?.GetType().Name ?? "null"} as a SQL "
                 + "literal — apply it to a number, a string, a boolean, a date/time or nil. For a list, loop "
                 + "and quote each element.");
+        }
+    }
+}
+
+/// <summary>
+/// The rows of one or more Arrow batches as a list Fluid's <see cref="ArrayValue"/> reads by index: row <c>i</c> is
+/// made (an <see cref="ArrowStruct"/>, whose cells are read on access) the first time it is read and kept, so a
+/// template that touches three rows of a million makes three (Fluid #1057, <c>IFluidArray</c>).
+/// </summary>
+/// <remarks>
+/// ⚠ The batches must outlive every read, as for <see cref="ArrowStruct"/>: the caller owes their lifetime (an
+/// input relation lives for the call; a query's batches for the render, <see cref="RowLease"/>). A read through
+/// a released lease is REFUSED with a message rather than left to fail inside Apache.Arrow.
+/// <para>⚠ Cells stay lazy too: a row is an <see cref="ArrowStruct"/>, so <c>{{ r[0].a }}</c> reads one cell of one
+/// row. Only a nested STRUCT cell is copied (<see cref="EagerStruct"/>, via <c>ReadCell</c>).</para>
+/// </remarks>
+internal sealed class ArrowRowList : IReadOnlyList<FluidValue>
+{
+    private readonly IReadOnlyList<RecordBatch> _batches;
+    private readonly RowLease? _lease;
+    private readonly int[] _starts;
+    private readonly List<IArrowArray>?[] _columns;
+    private readonly FluidValue?[] _rows;
+
+    internal ArrowRowList(IReadOnlyList<RecordBatch> batches, RowLease? lease = null)
+    {
+        _batches = batches;
+        _lease = lease;
+        _starts = new int[batches.Count];
+        _columns = new List<IArrowArray>?[batches.Count];
+        long total = 0;
+        for (int b = 0; b < batches.Count; b++)
+        {
+            _starts[b] = (int)total;
+            total += batches[b].Length;
+        }
+        if (total > int.MaxValue)
+        {
+            throw new InvalidOperationException($"{total} rows are more than a template can index.");
+        }
+        _rows = new FluidValue?[(int)total];
+    }
+
+    public int Count => _rows.Length;
+
+    public FluidValue this[int index]
+    {
+        get
+        {
+            if ((uint)index >= (uint)_rows.Length)
+            {
+                throw new ArgumentOutOfRangeException(nameof(index));
+            }
+            _lease?.EnsureLive();
+            return _rows[index] ??= Make(index);
+        }
+    }
+
+    private FluidValue Make(int index)
+    {
+        // The batch holding the row: the last one starting at or before it.
+        int b = System.Array.BinarySearch(_starts, index);
+        if (b < 0)
+        {
+            b = ~b - 1;
+        }
+        // An empty batch shares its start with the next one; step to the one that holds rows.
+        while (b + 1 < _starts.Length && _starts[b + 1] <= index)
+        {
+            b++;
+        }
+        var batch = _batches[b];
+        // Hoisted per batch, not per row: batch.Arrays is an enumerable.
+        var columns = _columns[b] ??= batch.Arrays.ToList();
+        return DictionaryValue.Create(new ArrowStruct(batch.Schema.FieldsList, columns, index - _starts[b]));
+    }
+
+    public IEnumerator<FluidValue> GetEnumerator()
+    {
+        for (int i = 0; i < _rows.Length; i++)
+        {
+            yield return this[i];
+        }
+    }
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
+/// <summary>
+/// The batches of one query result, kept alive while a template may read its rows and disposed when the render
+/// that ran the query ends (<c>FluidRenderSession.Hold</c> / <c>ReleaseHeld</c>).
+/// </summary>
+/// <remarks>
+/// ⚠ A row already made keeps reading the batch lazily (<see cref="ArrowStruct"/>), so a row value that escaped
+/// its render would read disposed memory. Nothing hands one out of a render today — the render's scope is LOCAL
+/// and its result is a string — and <see cref="EnsureLive"/> turns the remaining route (an indexed read of the
+/// list itself) into a clear error.
+/// </remarks>
+internal sealed class RowLease
+{
+    private readonly List<RecordBatch> _batches;
+
+    internal RowLease(List<RecordBatch> batches) => _batches = batches;
+
+    internal IReadOnlyList<RecordBatch> Batches => _batches;
+
+    internal bool Released { get; private set; }
+
+    internal void EnsureLive()
+    {
+        if (Released)
+        {
+            throw new InvalidOperationException(
+                "fabricator: the rows of a query were read after the render that ran the query ended; "
+                + "a query's rows live for one render.");
+        }
+    }
+
+    /// <summary>Disposes the batches. Idempotent.</summary>
+    internal void Release()
+    {
+        if (Released)
+        {
+            return;
+        }
+        Released = true;
+        foreach (var b in _batches)
+        {
+            b.Dispose();
         }
     }
 }
