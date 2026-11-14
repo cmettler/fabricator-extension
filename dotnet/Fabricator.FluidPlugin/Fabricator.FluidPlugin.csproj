@@ -36,6 +36,10 @@
       published form is a beta. A prerelease is not a stable contract — the API may move between betas — so
       a bump here is a CODE-COMPATIBILITY question, not a routine version bump, and the gate that answers it
       is test/verify_plugin_fluid.test. Move to the stable 3.0.0 as soon as it ships.
+      beta.7 -> beta.9 (2026-11-14) was such a port: immutable TemplateOptions built with TemplateOptionsBuilder,
+      value types built with Create(...) (StringValue.Create(null) is NilValue), every conversion takes the
+      TemplateContext, scopes are leases (EnterScope(ScopeBehavior.Local)), and Parlot 2.2's ZeroOrOne yields a
+      list (FabricatorFluidParser.OptionalValue keeps the old value-or-default form).
       ⚠ Being a built-in raises the stakes: this now loads in every payload rather than only where a plugin
       root was configured. It already shipped in every RELEASE artifact (pack-distribution staged it as a
       bundled plugin), so the bytes are not new — what is new is that a dev build carries it too.
@@ -52,7 +56,7 @@
       this repo converted engineered-wood and DuckDB.ExtensionKit away from - and it would leave CI
       silently gating a DIFFERENT Fluid than the developer runs.
     -->
-    <PackageReference Include="Fluid.Core" Version="3.0.0-beta.7" />
+    <PackageReference Include="Fluid.Core" Version="3.0.0-beta.9" />
   </ItemGroup>
 
 </Project>

@@ -329,11 +329,11 @@ internal static class FluidHostQuery
                     // about: Apache.Arrow nulls a disposed RecordBatch's arrays, so holding it fails LOUDLY
                     // with a NullReferenceException on the first cell read, deterministically and on every
                     // platform. Mutation-tested — it dies at the very first query() assertion.
-                    rows.Add(new DictionaryValue(new EagerStruct(fields, columns, r)));
+                    rows.Add(DictionaryValue.Create(new EagerStruct(fields, columns, r)));
                 }
             }
         }
-        return new ArrayValue(rows);
+        return ArrayValue.Create(rows);
     }
 
 
@@ -495,7 +495,7 @@ internal static class FluidHostQuery
         {
             if (pair is ArrayValue kv && kv.Values.Count == 2)
             {
-                members.Add((kv.Values[0].ToStringValue(), kv.Values[1]));
+                members.Add((kv.Values[0].ToStringValue(ctx), kv.Values[1]));
             }
             else
             {
@@ -531,7 +531,7 @@ internal static class FluidHostQuery
                 // Fluid's number model IS decimal, so even `10` arrives as one. The integral case is
                 // narrowed back to BIGINT so the ordinary spelling behaves like the literal it replaced; a
                 // fractional value keeps its own scale, so 19.99 stays 19.99.
-                var n = v.ToNumberValue();
+                var n = v.ToNumberValue(ctx);
                 return decimal.Truncate(n) == n && n >= long.MinValue && n <= long.MaxValue
                     ? Int64Type.Default
                     : new Decimal128Type(38, (int)((decimal.GetBits(n)[3] >> 16) & 0x7F));
@@ -641,7 +641,7 @@ internal static class FluidHostQuery
                 var b = new BooleanArray.Builder();
                 foreach (var v in values)
                 {
-                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append(v.ToBooleanValue()); }
+                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append(v.ToBooleanValue(ctx)); }
                 }
                 return b.Build();
             }
@@ -650,7 +650,7 @@ internal static class FluidHostQuery
                 var b = new Int64Array.Builder();
                 foreach (var v in values)
                 {
-                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append((long)v.ToNumberValue()); }
+                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append((long)v.ToNumberValue(ctx)); }
                 }
                 return b.Build();
             }
@@ -659,7 +659,7 @@ internal static class FluidHostQuery
                 var b = new Decimal128Array.Builder(dec);
                 foreach (var v in values)
                 {
-                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append(v.ToNumberValue()); }
+                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append(v.ToNumberValue(ctx)); }
                 }
                 return b.Build();
             }
@@ -675,7 +675,7 @@ internal static class FluidHostQuery
                     }
                     // Stamped UTC: an Unspecified DateTime is otherwise resolved against the MACHINE's
                     // zone, which silently shifts the value.
-                    var o = v.ToObjectValue();
+                    var o = v.ToObjectValue(ctx);
                     var d = o is DateTimeOffset dto
                         ? dto.UtcDateTime
                         : DateTime.SpecifyKind((DateTime)(o ?? default(DateTime)), DateTimeKind.Utc);
@@ -999,19 +999,9 @@ internal sealed class LazyRowsValue : FluidValue
 
     public override bool Equals(FluidValue other) => Rows.Equals(other);
 
-    // ⚠ Fluid marks the parameterless To*Value forms, Contains and Enumerate OBSOLETE while still
-    // declaring them abstract/virtual, so a complete forwarder must implement them and can only silence
-    // the warnings. Forwarding to the same obsolete member is the correct thing to do — this class adds
-    // laziness, not a policy about which overload a caller should reach for.
-#pragma warning disable CS0618, CS0672
-    public override bool ToBooleanValue() => Rows.ToBooleanValue();
-
-    public override decimal ToNumberValue() => Rows.ToNumberValue();
-
-    public override string ToStringValue() => Rows.ToStringValue();
-
-    public override object ToObjectValue() => Rows.ToObjectValue();
-
+    // Fluid 3.0.0-beta.9 removed the parameterless To*Value forms, Contains and Enumerate (beta.7 had marked
+    // them obsolete), and WriteToAsync takes the TemplateContext instead of a CultureInfo. Every member here
+    // forwards: this class adds laziness, not a policy.
     public override bool ToBooleanValue(TemplateContext context) => Rows.ToBooleanValue(context);
 
     public override decimal ToNumberValue(TemplateContext context) => Rows.ToNumberValue(context);
@@ -1020,8 +1010,8 @@ internal sealed class LazyRowsValue : FluidValue
 
     public override object ToObjectValue(TemplateContext context) => Rows.ToObjectValue(context);
 
-    public override ValueTask WriteToAsync(IFluidOutput output, TextEncoder encoder, CultureInfo cultureInfo)
-        => Rows.WriteToAsync(output, encoder, cultureInfo);
+    public override ValueTask WriteToAsync(IFluidOutput output, TextEncoder encoder, TemplateContext context)
+        => Rows.WriteToAsync(output, encoder, context);
 
     public override ValueTask<FluidValue> GetValueAsync(string name, TemplateContext context)
         => Rows.GetValueAsync(name, context);
@@ -1034,14 +1024,9 @@ internal sealed class LazyRowsValue : FluidValue
 
     public override bool IsNil() => Rows.IsNil();
 
-    public override bool Contains(FluidValue value) => Rows.Contains(value);
-
     public override ValueTask<bool> ContainsAsync(FluidValue value, TemplateContext context)
         => Rows.ContainsAsync(value, context);
 
     public override IAsyncEnumerable<FluidValue> EnumerateAsync(TemplateContext context)
         => Rows.EnumerateAsync(context);
-
-    public override IEnumerable<FluidValue> Enumerate(TemplateContext context) => Rows.Enumerate(context);
-#pragma warning restore CS0618, CS0672
 }

@@ -90,9 +90,10 @@ SELECT NULL::JSON
   is the one place that flag's usual trap does not apply: `exec()` runs on THIS render session's own
   connection, which is also the connection that will run the SELECT below — so the macro is visible
   exactly where it is needed and is gone afterwards, leaving no catalog behind.
-  ⚠ The rendered text is passed to `exec()` as a VALUE rather than pasted into an `{% exec %}` body,
-  so Liquid never re-reads it. A decision cell containing `{{` or `{%` would otherwise be interpreted
-  as template syntax.
+  ⚠ The rendered text is passed to `exec()` as a VALUE rather than pasted into an exec block's body,
+  so Liquid never re-reads it. A decision cell containing Liquid's output or tag delimiters would
+  otherwise be interpreted as template syntax. (Written in words: since Fluid 3.0.0-beta.9 a tag
+  delimiter inside a comment is parsed.)
 {%- endcomment -%}
 {%- for d in defs -%}
     {%- capture nm -%}fab_dmn_{{ d.h }}{%- endcapture -%}

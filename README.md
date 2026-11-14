@@ -1819,6 +1819,11 @@ The **Fluid / Liquid template engine** is **built in** — it ships inside the e
 configuration. It contributes eight global functions, all taking a params bag that is a DuckDB `STRUCT`
 (preferred — typed, no quoting), a `MAP`, a JSON string, a `LIST`, or a plain scalar.
 
+> ⚠ **Fluid 3.0.0-beta.9 (since 2026-11-14) changed three things a template can notice:** a tag delimiter
+> inside a `{% comment %}` block is parsed (a comment that mentions a raw block or a bare tag opener is now
+> a parse error — write it in words); a dictionary rendered whole looks like Shopify Liquid's hash
+> (`{"k"=>"v"}`); and a top-level `{% break %}` ends the render, as `{% ret %}` does.
+
 **`fluid_render(template, params)`** renders a template to **text**:
 
 ```sql

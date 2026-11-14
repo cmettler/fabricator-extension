@@ -3048,12 +3048,13 @@ dot=3 bare=[]
 # --- ⚠⚠ A MEMBER LITERALLY NAMED `params`: THE BAG WINS at the top level, and the member stays reachable
 # one level down. Appended last, deliberately — `params` meaning the bag ALWAYS is readable, whereas a
 # `params` that is sometimes the bag and sometimes a member is not. The alternative precedence loses
-# nothing measurable, so predictability decides it. ---
+# nothing measurable, so predictability decides it. ⚠ How a whole dictionary RENDERS is Fluid's: since
+# 3.0.0-beta.9 it is Shopify Liquid's hash form (`"k"=>"v"`, strings quoted); beta.7 wrote `{"k":v}`. ---
 query I
 SELECT fluid_render('top={{ params }} nested={{ params.params }} other={{ params.x }}',
                     {'params': 'inner', 'x': 1});
 ----
-top={"params":inner,"x":1} nested=inner other=1
+top={"params"=>"inner", "x"=>1} nested=inner other=1
 
 # --- it is the SAME bag on every surface, because all three go through one walk. fluid_replacement_query renders at
 # BIND from constants ... ---
@@ -3440,13 +3441,14 @@ DROP TABLE lat_t;
 # what §29's exec rows pin.
 # ============================================================================================
 
-# --- THE PAIR. `ret` stops; `break` does not, and never did. The second row is a CHARACTERIZATION test of
-# Fluid that no mutant of ours can kill — it is here because it is the whole reason the tag exists. ---
+# --- THE PAIR. The second row is a CHARACTERIZATION test of Fluid that no mutant of ours can kill. Up to
+# 3.0.0-beta.7 a top-level `{% break %}` was SILENTLY IGNORED (`AB`), which is why `ret` exists; since beta.9
+# Fluid's root stops on it too (`A`). `ret` stays: templates use it, and it is what the exec rows below pin. ---
 query II
 SELECT fluid_render('A{% ret %}B', NULL) AS ret,
        fluid_render('A{% break %}B', NULL) AS brk;
 ----
-A	AB
+A	A
 
 # --- it takes no arguments, and Fluid says so at PARSE. ---
 statement error

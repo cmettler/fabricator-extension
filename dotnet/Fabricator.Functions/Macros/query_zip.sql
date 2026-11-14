@@ -71,7 +71,7 @@ SELECT * FROM fluid_replacement_query($$
                   is not a valid one. It is therefore plain TEMPLATE TEXT here, which is also why the
                   alias is escaped with `replace` rather than `sql_ident`: sql_ident would wrap it in
                   its own quotes, and the prefix needs the alias INSIDE one pair with `_` appended.
-                  ⚠ `{% raw %}` does NOT solve this — MEASURED: inside raw the alias is not
+                  ⚠ a raw block does NOT solve this — MEASURED: inside raw the alias is not
                   interpolated either, so the fragment loses the very thing it is there to insert.
             {%- endcomment -%}
             {%- if params.as_structs %}

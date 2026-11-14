@@ -54,41 +54,42 @@ internal static class FluidValueModel
 
     private static TemplateOptions Build()
     {
-        var o = new TemplateOptions();
+        // Fluid 3.0.0-beta.9: options are immutable and built once with a TemplateOptionsBuilder.
+        var o = new TemplateOptionsBuilder();
 
         // Leaves ONLY: returning null means "not handled", so JsonObject/JsonArray keep Fluid's own native
         // handling — member access, iteration, .size, indexing, all MEASURED correct without us.
-        o.ValueConverters.Add(v => v is JsonValue jv ? JsonLeaf(jv) : null);
+        o.AddValueConverter(v => v is JsonValue jv ? JsonLeaf(jv) : null);
 
         // Rendered text becomes SQL in fluid_replacement_query, so give the author an explicit way to say "quote this".
         // NOT automatic: a template must be able to emit raw SQL fragments — that is the entire point of a
         // SQL-generating function — so quoting is opt-in per interpolation and loudly documented.
-        o.Filters.AddFilter("sql", (input, _, ctx) =>
-            new ValueTask<FluidValue>(new StringValue(SqlLiteral(input, ctx), encode: false)));
+        o.AddFilter("sql", (input, _, ctx) =>
+            new ValueTask<FluidValue>(StringValue.Create(SqlLiteral(input, ctx), encode: false)));
         // ⚠ `query` is registered ONCE, HERE, rather than per context: this TemplateOptions is a static
         // singleton, so a per-render AddFilter would mutate shared state on every call. The function form
         // of the same name is per-context (FluidEngine); the caller travels in AmbientValues.
-        o.Filters.AddFilter(FluidHostQuery.FunctionName, FluidHostQuery.Filter);
+        o.AddFilter(FluidHostQuery.FunctionName, FluidHostQuery.Filter);
         // ⚠ The write-side twin, registered unconditionally on the SHARED options like query's. It is
         // available on BOTH surfaces; in fluid_replacement_query that means it writes during BINDING, which repeats —
         // see FluidHostExec.
-        o.Filters.AddFilter(FluidHostExec.FunctionName, FluidHostExec.Filter);
-        o.Filters.AddFilter("sql_ident", (input, _, ctx) =>
-            new ValueTask<FluidValue>(new StringValue(DuckSql.QuoteIdent(input.ToStringValue(ctx)), encode: false)));
+        o.AddFilter(FluidHostExec.FunctionName, FluidHostExec.Filter);
+        o.AddFilter("sql_ident", (input, _, ctx) =>
+            new ValueTask<FluidValue>(StringValue.Create(DuckSql.QuoteIdent(input.ToStringValue(ctx)), encode: false)));
         // The inverse, for a name that arrives ALREADY quoted — `{{ n | unquote_ident | sql_ident }}` is how
         // a template normalises a caller-supplied identifier. ⚠ It declines the ambiguous shapes rather than
         // guessing (`"a"."b"` is two identifiers, not one); see DuckSql.UnquoteIdent.
-        o.Filters.AddFilter("unquote_ident", (input, _, ctx) =>
+        o.AddFilter("unquote_ident", (input, _, ctx) =>
             new ValueTask<FluidValue>(
-                new StringValue(DuckSql.UnquoteIdent(input.ToStringValue(ctx)), encode: false)));
+                StringValue.Create(DuckSql.UnquoteIdent(input.ToStringValue(ctx)), encode: false)));
 
         // {% include %} / {% render %} resolve through DuckDB's FileSystem against fluid_template_root.
         // ⚠ ONE instance on the shared static, and safe here where a per-render FILTER would not be: Fluid
         // passes the TemplateContext to the provider, so the root, the read cache and the failure record all
         // travel per call rather than on this object. See HostTemplateFileProvider.
-        o.FileProvider = new HostTemplateFileProvider();
+        o.WithFileProvider(new HostTemplateFileProvider());
 
-        return o;
+        return o.Build();
     }
 
     /// <summary>Binds the params bag as the single template variable <see cref="BagVariable"/>.</summary>
@@ -311,9 +312,9 @@ internal static class FluidValueModel
         var rows = new List<FluidValue>(batch.Length);
         for (int r = 0; r < batch.Length; r++)
         {
-            rows.Add(new DictionaryValue(new ArrowStruct(fields, columns, r)));
+            rows.Add(DictionaryValue.Create(new ArrowStruct(fields, columns, r)));
         }
-        return new ArrayValue(rows);
+        return ArrayValue.Create(rows);
     }
 
     internal static void SetVariable(TemplateContext ctx, string name, object? value)
@@ -481,13 +482,13 @@ internal static class FluidValueModel
             // SharedMemoryHandle.get_Memory(). The eagerness `EagerStruct` gives a ROW has to reach all the
             // way down, or it only holds for the first level.
             case StructArray s:
-                return new DictionaryValue(
+                return DictionaryValue.Create(
                     new EagerStruct(((StructType)s.Data.DataType).Fields, s.Fields, index));
             // ⚠ MapArray BEFORE ListArray, and the compiler is what caught it: Apache.Arrow declares
             // `MapArray : ListArray`, so the list case matches a MAP first. Ordered the other way this is
             // not an error but a silently WRONG SHAPE - a MAP would arrive as a list of key/value structs,
             // which renders and iterates happily while every lookup by key fails.
-            case MapArray m: return new DictionaryValue(new ArrowMap(m, index));
+            case MapArray m: return DictionaryValue.Create(new ArrowMap(m, index));
             case ListArray l: return ReadList(l.GetSlicedValues(index));
             case LargeListArray l: return ReadList(l.GetSlicedValues(index));
             case FixedSizeListArray l: return ReadList(l.GetSlicedValues(index));

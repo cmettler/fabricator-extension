@@ -118,6 +118,6 @@ internal static class FluidHostPublish
         // ⚠ The SELECT is OURS, built from a quoted identifier — so the published relation is exactly the
         // staged table and there is nothing for a caller to inject. The host registers it and returns a token.
         var token = session.Publish($"SELECT * FROM {DuckSql.QuoteIdent(name)}");
-        return new StringValue($"{ScanFunction}({DuckSql.Literal(token)})");
+        return StringValue.Create($"{ScanFunction}({DuckSql.Literal(token)})");
     }
 }

@@ -88,8 +88,8 @@ SELECT * FROM fluid_replacement_query($$
 {%- if params.similar_to -%}
 
     {%- comment -%}
-      DuckDB has no quote_ident. A TEMP macro on the render's OWN pinned connection: {% exec %} and
-      {% query %} share it, so the helper is in scope below — and nothing lands in the caller's catalog.
+      DuckDB has no quote_ident. A TEMP macro on the render's OWN pinned connection: the exec and
+      query blocks share it, so the helper is in scope below — and nothing lands in the caller's catalog.
     {%- endcomment -%}
     {%- exec -%}
         CREATE OR REPLACE TEMP MACRO qi(s) AS '"' || replace(s, '"', '""') || '"'

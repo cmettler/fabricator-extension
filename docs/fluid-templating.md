@@ -5174,6 +5174,36 @@ could afford — dies at an EXISTING row, `verify_plugin_fluid` line 3178 after 
 Liquid value and the SQL relation are the SAME batch, so they cannot disagree. `BindLazyRelation` re-queried
 DuckDB and could in principle have answered about something else.
 
+## 45. Fluid 3.0.0-beta.7 → 3.0.0-beta.9 (2026-11-14)
+
+A port rather than a bump: beta.9 changed the API broadly (46 compile errors), and its parser library Parlot moved from
+1.5.8 to 2.2.1. What changed in the plugin:
+
+- `TemplateOptions` is immutable and built once with a `TemplateOptionsBuilder` (`AddValueConverter`, `AddFilter`,
+  `WithFileProvider`).
+- The built-in values are created with `StringValue.Create`, `ArrayValue.Create`, `DictionaryValue.Create` and
+  `FunctionValue.Create` (Fluid #1023). ⚠ `StringValue.Create(null)` is `NilValue`, not an empty string; none of our
+  call sites passes null.
+- Every conversion takes the `TemplateContext` (`ToStringValue(ctx)` …), `WriteToAsync` takes the context instead of
+  a `CultureInfo`, and the parameterless forms, `Contains` and `Enumerate` are gone (`LazyRowsValue` forwards less).
+- A child scope is a lease: `using var scope = ctx.EnterScope(ScopeBehavior.Local)` (inherits values, keeps
+  assignments local, as `EnterChildScope` did).
+- Parlot 2.2's `ZeroOrOne` yields a list of zero or one values. `FabricatorFluidParser.OptionalValue` keeps the
+  value-or-default form every optional part of our block headers expects.
+
+**What a template author notices**, each pinned by `verify_plugin_fluid` or a macro suite:
+
+- A dictionary rendered whole uses Shopify Liquid's hash form: `{"k"=>"v", "n"=>1}` (beta.7: `{"k":v,"n":1}`).
+- A top-level `{% break %}` now ends the render, as `{% ret %}` does (beta.7 ignored it). `{% ret %}` stays.
+- **Tag delimiters inside a `{% comment %}` block are parsed.** A comment that mentions a raw block, or contains a
+  bare tag opener, is a parse error now. Three comments in our own macros (`decision_eval`, `query_zip`,
+  `table_zip`) had to be reworded; a user template with such a comment needs the same.
+
+Not taken yet (Fluid #1057, in beta.9): `IFluidArray`, an array value read by index, so that `limit`, `offset`,
+`first`, `last` and `slice` only touch the items they need. Candidates here: `input_table` (`LazyRowsValue` over a
+batch that lives for the render) and `{% query %}` results, which today copy every row eagerly because their batches
+are disposed when the call returns.
+
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 
 CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every

@@ -70,15 +70,15 @@ internal static class FluidHostPrint
         {
             if (string.Equals(arg.Name, DelimArg, StringComparison.OrdinalIgnoreCase))
             {
-                delim = (await arg.Expression.EvaluateAsync(ctx)).ToStringValue();
+                delim = (await arg.Expression.EvaluateAsync(ctx)).ToStringValue(ctx);
             }
             else if (string.Equals(arg.Name, RowDelimArg, StringComparison.OrdinalIgnoreCase))
             {
-                rowDelim = (await arg.Expression.EvaluateAsync(ctx)).ToStringValue();
+                rowDelim = (await arg.Expression.EvaluateAsync(ctx)).ToStringValue(ctx);
             }
             else if (string.Equals(arg.Name, SqlLiteralArg, StringComparison.OrdinalIgnoreCase))
             {
-                sqlLiteral = (await arg.Expression.EvaluateAsync(ctx)).ToBooleanValue();
+                sqlLiteral = (await arg.Expression.EvaluateAsync(ctx)).ToBooleanValue(ctx);
             }
             else
             {
@@ -135,7 +135,7 @@ internal static class FluidHostPrint
                 }
                 else
                 {
-                    await cell.WriteToAsync(output, encoder, ctx.CultureInfo);
+                    await cell.WriteToAsync(output, encoder, ctx);
                 }
             }
         }

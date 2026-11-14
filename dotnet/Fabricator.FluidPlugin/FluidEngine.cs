@@ -82,7 +82,7 @@ internal static class FluidEngine
         // cleanly and `{% exec retcode x: 7 %}` reads like `{% query t x: 7 %}` — no comma, same shape.
         parser.RegisterParserBlock(
             FluidHostExec.BlockName,
-            ZeroOrOne(parser.Ident.AndSkip(Not(Terms.Char(':')))).And(ZeroOrOne(parser.NamedArguments)),
+            FabricatorFluidParser.OptionalValue(parser.Ident.AndSkip(Not(Terms.Char(':')))).And(FabricatorFluidParser.OptionalValue(parser.NamedArguments)),
             static async (head, statements, output, encoder, ctx) =>
         {
             var (completion, sql) = await CaptureBodyAsync(statements, ctx);
@@ -118,7 +118,7 @@ internal static class FluidEngine
         //
         // ⚠ No IDENTIFIER, unlike {% query name %} and {% exec name %}: there is nothing to bind, so the
         // header is arguments-only and needs none of the lookahead the exec block does.
-        parser.RegisterParserBlock(FluidHostPrint.BlockName, ZeroOrOne(parser.NamedArguments),
+        parser.RegisterParserBlock(FluidHostPrint.BlockName, FabricatorFluidParser.OptionalValue(parser.NamedArguments),
                                    static async (args, statements, output, encoder, ctx) =>
         {
             var (completion, sql) = await CaptureBodyAsync(statements, ctx);
@@ -149,7 +149,7 @@ internal static class FluidEngine
         // `{% query t region: 'eu' %}SELECT … WHERE region = $region{% endquery %}`. Composed from Fluid's
         // own `Identifier` and `ArgumentsList`, both `protected` on FluidParser — hence the subclass below.
         parser.RegisterParserBlock(FluidHostQuery.BlockName,
-                                   parser.Ident.And(ZeroOrOne(parser.NamedArguments)),
+                                   parser.Ident.And(FabricatorFluidParser.OptionalValue(parser.NamedArguments)),
                                    static async (head, statements, output, encoder, ctx) =>
         {
             var (completion, sql) = await CaptureBodyAsync(statements, ctx);
@@ -207,7 +207,7 @@ internal static class FluidEngine
         // FluidProviderTags for the precedent that settles it.
         parser.RegisterParserBlock(
             FluidProviderTags.QueryBlockName,
-            parser.Expression.And(parser.Ident).And(ZeroOrOne(parser.NamedArguments)),
+            parser.Expression.And(parser.Ident).And(FabricatorFluidParser.OptionalValue(parser.NamedArguments)),
             static async (head, statements, output, encoder, ctx) =>
         {
             var (completion, body) = await CaptureBodyAsync(statements, ctx);
@@ -218,7 +218,7 @@ internal static class FluidEngine
             var caller = FluidHostQuery.CallerOf(ctx);
             var tag = FluidProviderTags.QueryBlockName;
             var catalog = FluidProviderTags.RequireCatalog(
-                caller, tag, (await head.Item1.EvaluateAsync(ctx)).ToStringValue());
+                caller, tag, (await head.Item1.EvaluateAsync(ctx)).ToStringValue(ctx));
             FluidProviderTags.RequireBody(caller, tag, body);
             var parameters = await FluidHostQuery.BuildBlockParametersAsync(caller, tag, head.Item3, ctx);
             var sql = FluidProviderTags.BuildStatement(
@@ -235,8 +235,8 @@ internal static class FluidEngine
         // then fail on the `: 7`, because ZeroOrOne does not retry its empty branch once the sequence fails.
         parser.RegisterParserBlock(
             FluidProviderTags.ExecBlockName,
-            parser.Expression.And(ZeroOrOne(parser.Ident.AndSkip(Not(Terms.Char(':')))))
-                  .And(ZeroOrOne(parser.NamedArguments)),
+            parser.Expression.And(FabricatorFluidParser.OptionalValue(parser.Ident.AndSkip(Not(Terms.Char(':')))))
+                  .And(FabricatorFluidParser.OptionalValue(parser.NamedArguments)),
             static async (head, statements, output, encoder, ctx) =>
         {
             var (completion, body) = await CaptureBodyAsync(statements, ctx);
@@ -247,7 +247,7 @@ internal static class FluidEngine
             var caller = FluidHostQuery.CallerOf(ctx);
             var tag = FluidProviderTags.ExecBlockName;
             var catalog = FluidProviderTags.RequireCatalog(
-                caller, tag, (await head.Item1.EvaluateAsync(ctx)).ToStringValue());
+                caller, tag, (await head.Item1.EvaluateAsync(ctx)).ToStringValue(ctx));
             FluidProviderTags.RequireBody(caller, tag, body);
             var parameters = await FluidHostQuery.BuildBlockParametersAsync(caller, tag, head.Item3, ctx);
             var sql = FluidProviderTags.BuildStatement(
@@ -367,16 +367,16 @@ internal static class FluidEngine
         // ⚠ Registered PER CONTEXT, and `caller` is captured so a refusal names the SQL function the user
         // actually called rather than the template machinery.
         ctx.SetValue(FluidHostQuery.FunctionName,
-                     new FunctionValue((args, c) => FluidHostQuery.Execute(caller, args, c)));
+                     FunctionValue.Create((args, c) => FluidHostQuery.Execute(caller, args, c)));
         // ⚠ Available on BOTH surfaces by user decision. In fluid_replacement_query it therefore writes during BINDING,
         // which repeats — see FluidHostExec for the measured 1 -> 2 -> 3.
         ctx.SetValue(FluidHostExec.FunctionName,
-                     new FunctionValue((args, c) => FluidHostExec.Execute(caller, args, c)));
+                     FunctionValue.Create((args, c) => FluidHostExec.Execute(caller, args, c)));
         // ⚠ publish() RENDERS SQL (a fabricator_scan call), so it is only meaningful where the render IS a
         // statement — i.e. in fluid_replacement_query. Registered on both surfaces anyway: branching on the caller name
         // is what the exec() decision rejected, and in fluid_render the result is merely inert text.
         ctx.SetValue(FluidHostPublish.FunctionName,
-                     new FunctionValue((args, c) => FluidHostPublish.Execute(caller, args, c)));
+                     FunctionValue.Create((args, c) => FluidHostPublish.Execute(caller, args, c)));
         // ⚠⚠ The FILTER of the same name is registered ONCE, in the shared TemplateOptions (see
         // FluidValueModel.Build) — NOT here. `ctx.Options` IS that shared static, so registering per render
         // would mutate global state on every call and capture whichever `caller` happened to register last,
@@ -465,7 +465,7 @@ internal static class FluidEngine
                 // so a template can choose the destination from a variable without branching.
                 if (v is not NilValue)
                 {
-                    var text = v.ToStringValue();
+                    var text = v.ToStringValue(ctx);
                     kind = text.ToLowerInvariant() switch
                     {
                         "view" => "VIEW",
@@ -522,9 +522,9 @@ internal static class FluidEngine
     /// </remarks>
     private static async ValueTask<string> RenderToStringAsync(IFluidTemplate parsed, TemplateContext ctx)
     {
-        // A template is evaluated in a child scope so the caller's context stays immutable.
-        ctx.EnterChildScope();
-        try
+        // A template is evaluated in a child scope so the caller's context stays immutable. Fluid 3.0.0-beta.9's
+        // lease: a Local scope inherits values and keeps assignments local, as EnterChildScope did.
+        using var scope = ctx.EnterScope(ScopeBehavior.Local);
         {
             using var text = new StringWriter();
             var bufferSize = ctx.Options?.OutputBufferSize ?? 0;
@@ -547,10 +547,6 @@ internal static class FluidEngine
             }
             await output.FlushAsync();
             return text.ToString();
-        }
-        finally
-        {
-            ctx.ReleaseScope();
         }
     }
 }
@@ -602,6 +598,14 @@ internal sealed class FluidEarlyReturn : Exception
 /// </remarks>
 internal sealed class FabricatorFluidParser : FluidParser
 {
+    /// <summary>
+    /// An optional <paramref name="parser"/>: its value, or default when it does not match. Parlot's
+    /// <c>ZeroOrOne</c> yields a list of zero or one values since Fluid 3.0.0-beta.9; every optional part of our
+    /// block headers wants the value itself, as before.
+    /// </summary>
+    internal static Parser<T?> OptionalValue<T>(Parser<T> parser) =>
+        Parlot.Fluent.Parsers.ZeroOrOne(parser).Then(static values => values.Count > 0 ? values[0] : default);
+
     internal FabricatorFluidParser(FluidParserOptions options) : base(options)
     {
     }
