@@ -10,6 +10,7 @@
 
 #include "fabricator/clr_host.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/storage/caching_mode.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -64,6 +65,46 @@ int32_t HostFsOpenRead(FabricatorHandle opener, const char *path, FabricatorHand
 		// FileOpener (secret resolution for az://, s3://, …) — so we must NOT pass an explicit opener.
 		auto &ctx_ref = OpenerContext(opener, "fs_open_read");
 		auto &fs = FileSystem::GetFileSystem(ctx_ref);
+		// A remote file goes through DuckDB's external file cache, as its own readers' files do: the cache is opt-in
+		// per open (VirtualFileSystem wraps the handle when the flags carry a CachingMode; the default is
+		// NO_CACHING), so without this every engineered-wood read refetched the bytes on every query.
+		// ALWAYS_CACHE so onelake:// is served too (the cache still takes a "local" scheme only under
+		// cache_local_files, which a OneLake catalog turns on); entries are validated per open as for DuckDB's own
+		// readers (validate_external_file_cache). Local paths keep the plain open below. The cached open cannot say
+		// "not found" (the wrapper dereferences the handle it opened), so any failure falls back to the plain open,
+		// which classifies it. FABRICATOR_HOST_FS_CACHE=0 turns it off.
+		static const bool host_fs_cache = [] {
+			auto v = std::getenv("FABRICATOR_HOST_FS_CACHE");
+			return !(v && std::strcmp(v, "0") == 0);
+		}();
+		if (host_fs_cache && std::strstr(path, "://")) {
+			try {
+				FileOpenFlags flags(FileOpenFlags::FILE_FLAGS_READ);
+				flags.SetCachingMode(CachingMode::ALWAYS_CACHE);
+				// onelake:// echoes a literal glob with no IO, carrying what the managed side knows about the
+				// file: its size and, for a Delta data file (immutable, size from the log), the declaration that
+				// the cache need not validate it. Without that each open fetched the file's properties (~40 ms
+				// on OneLake), as DuckDB's own reader would without the multi-file reader's OpenFileInfos.
+				OpenFileInfo info(path);
+				if (std::strncmp(path, "onelake://", 10) == 0) {
+					try {
+						auto globbed = fs.Glob(path);
+						if (globbed.size() == 1 && globbed[0].path == info.path && globbed[0].extended_info) {
+							info = globbed[0];
+						}
+					} catch (std::exception &) {
+						// plain open below
+					}
+				}
+				auto cached = fs.OpenFile(info, flags);
+				if (cached) {
+					*out_file = reinterpret_cast<FabricatorHandle>(cached.release()); // closed via HostFsClose
+					return FABRICATOR_OK;
+				}
+			} catch (std::exception &) {
+				// fall through: a missing file (or a real error) is reported by the plain open
+			}
+		}
 		// NULL_IF_NOT_EXISTS: a missing file comes back as null instead of an exception, which on Windows is not
 		// just cheaper. DuckDB's local file system asks the Restart Manager who holds the file on EVERY failed
 		// open (AdditionalLockInfo), also for "not found": 70-80 ms per missing file, and every Delta table

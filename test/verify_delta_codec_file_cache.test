@@ -1,0 +1,57 @@
+# name: test/verify_delta_codec_file_cache.test
+# description: the codec engine's data-file reads land in DuckDB's external file cache. The host file system opens
+#   a remote file with a CachingMode (DuckDB 2.0's cache is opt-in per open, default NO_CACHING); before that, every
+#   engineered-wood read refetched the bytes on every query. Mutant: FABRICATOR_HOST_FS_CACHE=0 leaves the cache
+#   empty and dies at the "cached after the read" row.
+# group: [fabricator]
+
+require fabricator
+
+require httpfs
+
+require parquet
+
+require-env FABRICATOR_S3_ENDPOINT
+
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = false;
+
+statement ok
+CREATE SECRET minio_s3 (TYPE s3, KEY_ID 'miniouser', SECRET 'miniosecret123',
+                        ENDPOINT '${FABRICATOR_S3_ENDPOINT}', URL_STYLE 'path', REGION 'us-east-1',
+                        USE_SSL true);
+
+statement ok
+ATTACH 's3://fabricator/codeccache' AS cc (TYPE fabricator, PROVIDER 'engineeredwooddelta', SECRET minio_s3,
+                                          READ_ONLY false);
+
+statement ok
+CREATE OR REPLACE TABLE cc.main.t AS SELECT i AS id, i % 7 AS g FROM range(100000) r(i);
+
+# control: the write did not put the data files into the cache, so the row below measures the READ
+query I
+SELECT count(*) FROM duckdb_external_file_cache()
+WHERE path LIKE 's3://fabricator/codeccache/%.parquet' AND path NOT LIKE '%_delta_log%';
+----
+0
+
+query II
+SELECT count(*), sum(id) FROM cc.main.t;
+----
+100000	4999950000
+
+# cached after the read
+query I
+SELECT count(*) > 0 FROM duckdb_external_file_cache()
+WHERE path LIKE 's3://fabricator/codeccache/%.parquet' AND path NOT LIKE '%_delta_log%' AND loaded;
+----
+true
+
+# a second read answers the same from the cache
+query II
+SELECT g, count(*) FROM cc.main.t WHERE g = 3 GROUP BY g;
+----
+3	14286
+
+statement ok
+DETACH cc;

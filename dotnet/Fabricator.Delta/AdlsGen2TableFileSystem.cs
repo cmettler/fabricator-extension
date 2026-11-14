@@ -41,8 +41,11 @@ namespace Fabricator.Bridge;
 /// DataLake APIs — the sync ones use <c>HttpClient.Send</c>, which hangs under the hostfxr-hosted CLR (the same
 /// gotcha documented across the Bridge's ADLS IO).</para>
 /// </summary>
-internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
+internal sealed class AdlsGen2TableFileSystem : ITableFileSystem, IReadConcurrencyHint
 {
+    /// <summary>An object store: see <see cref="RemoteReadConcurrency"/>.</summary>
+    public int? PreferredConcurrentReads => RemoteReadConcurrency.Hint;
+
     // Per-IO Debug lines, the log-side twin of OneLakeForwardFs's (Fabricator.OneLake.Fs): this filesystem
     // carries the Delta LOG traffic (listings, commit JSONs, checkpoint parquet), and a table open that costs
     // seconds was unattributable without the IO timeline — the 2026-08-16 fixture showed a ~15 s open WITH a
@@ -61,7 +64,15 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         _fs = credential.CreateFileSystemClient(host, fileSystem);
         _readFs = credential.CreateFileSystemClient(host, fileSystem, StorageReadOptions.Create());
         _rootUnderFs = pathUnderFs.TrimEnd('/');
+        _oneLakeFileSystem = host.Contains("onelake", StringComparison.OrdinalIgnoreCase) ? fileSystem : null;
     }
+
+    // OneLake only: the filesystem (workspace) name, for reading data files through onelake:// (see OpenReadAsync)
+    private readonly string? _oneLakeFileSystem;
+
+    /// <summary><c>FABRICATOR_ONELAKE_HOST_READS=0</c> keeps every OneLake read on the SDK (see OpenReadAsync).</summary>
+    internal static readonly bool HostDataReads =
+        Environment.GetEnvironmentVariable("FABRICATOR_ONELAKE_HOST_READS") != "0";
 
     /// <summary>
     /// <inheritdoc cref="ITableFileSystem.PathConstraints"/>
@@ -216,6 +227,27 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         {
             Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls open {Path}", path);
         }
+        // A OneLake DATA file (outside _delta_log) is read through DuckDB's file system, our onelake:// subsystem,
+        // so DuckDB's external file cache serves it from the second read on, as it does for the native reader. The
+        // log, listings and commits stay on the SDK. Falls back to the SDK when there is no host context on this
+        // flow or the host open fails.
+        if (_oneLakeFileSystem is not null && HostDataReads && AmbientOpener.Current is var opener && opener != 0)
+        {
+            var under = Resolve(path);
+            if (!under.Contains("/_delta_log/", StringComparison.Ordinal))
+            {
+                try
+                {
+                    return new DuckDbRandomAccessFile(opener, "onelake://" + _oneLakeFileSystem + "/" + under,
+                                                      bufferSmallFiles: true);
+                }
+                catch (Exception ex)
+                {
+                    Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                        IoLog, "adls open {Path}: host read failed, using the SDK: {Error}", path, ex.Message);
+                }
+            }
+        }
         var file = ReadFile(path);
         long length = (await file.GetPropertiesAsync(cancellationToken: cancellationToken).ConfigureAwait(false)).Value.ContentLength;
         return new OneLakeRandomAccessFile(file, length, buffered: length <= BufferedReadMax);
@@ -366,8 +398,11 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
 }
 
 /// <summary>Offset-addressed read handle over a OneLake file (Azure DataLake), using range GETs.</summary>
-internal sealed class OneLakeRandomAccessFile : IRandomAccessFile
+internal sealed class OneLakeRandomAccessFile : IRandomAccessFile, IReadConcurrencyHint
 {
+    /// <summary>An object store: see <see cref="RemoteReadConcurrency"/>.</summary>
+    public int? PreferredConcurrentReads => RemoteReadConcurrency.Hint;
+
     // Same per-IO Debug category as the owning filesystem: these ranged reads are how the CHECKPOINT
     // PARQUET is consumed (engineered-wood's parquet reader over this handle), and they were the ONE
     // uninstrumented method left when the 2026-08-16 fixture showed ~13 s between the checkpoint open and
@@ -452,6 +487,11 @@ internal sealed class OneLakeRandomAccessFile : IRandomAccessFile
     public async ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
         IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
     {
+        if (RemoteReadConcurrency.CoalesceRanges && !_buffered && ranges.Count > 1)
+        {
+            return await new EngineeredWood.IO.CoalescingFileReader(this)
+                .ReadRangesAsync(ranges, cancellationToken).ConfigureAwait(false);
+        }
         var result = new IMemoryOwner<byte>[ranges.Count];
         for (int i = 0; i < ranges.Count; i++)
         {

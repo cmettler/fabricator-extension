@@ -107,8 +107,11 @@ public static class AmbientS3Credential
 /// test rig's <c>enable_curl_server_cert_verification=false</c>; the AWS default endpoint keeps full
 /// certificate validation.
 /// </summary>
-internal sealed class S3CommitFileSystem : ITableFileSystem
+internal sealed class S3CommitFileSystem : ITableFileSystem, EngineeredWood.IO.IReadConcurrencyHint
 {
+    /// <summary>The reads go to the wrapped host filesystem, which reports for itself.</summary>
+    public int? PreferredConcurrentReads => (_inner as EngineeredWood.IO.IReadConcurrencyHint)?.PreferredConcurrentReads;
+
     // Per-IO Debug lines for the operations this class performs ITSELF, via the AWS SDK. ⚠ Deliberately only
     // those: everything from ListAsync down DELEGATES to _inner (DuckDbTableFileSystem), which logs to the
     // SAME `Fabricator.Host.Fs` category — instrumenting the delegating members here would double every line

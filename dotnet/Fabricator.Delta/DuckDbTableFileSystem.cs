@@ -25,10 +25,14 @@ namespace Fabricator.Bridge;
 /// operator's ClientContext) carries secret resolution and is valid for the duration of the synchronous call
 /// that drives the read (a table-function execution). Write operations are not supported.
 /// </summary>
-internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
+internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem, IReadConcurrencyHint
 {
     private readonly nint _capturedOpener;
     private readonly string _root; // normalized (forward slashes), no trailing slash
+
+    /// <summary>An object-store root reports how many requests it serves at once (<see cref="RemoteReadConcurrency"/>);
+    /// a local root reports nothing, so engineered-wood keeps its local defaults.</summary>
+    public int? PreferredConcurrentReads => _root.Contains("://") ? RemoteReadConcurrency.Hint : null;
 
     public DuckDbTableFileSystem(nint opener, string root)
     {
@@ -942,8 +946,12 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
 /// synchronous host calls wrapped in completed <see cref="ValueTask"/>s (no real async — the hostfxr CLR has
 /// no SynchronizationContext, so sync-over-async upstream cannot deadlock).
 /// </summary>
-internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
+internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile, IReadConcurrencyHint
 {
+    /// <summary>A remote file (the handles an object-store root opens, which are also the ones that buffer small files)
+    /// reports how many requests it serves at once; see <see cref="RemoteReadConcurrency"/>.</summary>
+    public int? PreferredConcurrentReads => _bufferSmallFiles ? RemoteReadConcurrency.Hint : null;
+
     // Same per-IO Debug category as the owning filesystem (Fabricator.Host.Fs). ⚠ THESE RANGED READS ARE THE
     // ONES THAT MATTER: on the ADLS twin the equivalent method was the LAST uninstrumented one, and it is
     // where the 2026-08-16 OneLake finding actually lived — a checkpoint parquet consumed as ~63 sequential
@@ -1065,6 +1073,13 @@ internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
         {
             Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
                 IoLog, "host read-ranges {Path} x{Count}", _path, ranges.Count);
+        }
+        if (RemoteReadConcurrency.CoalesceRanges && _bufferSmallFiles && ranges.Count > 1 && _buffer is null
+            && !Eligible())
+        {
+            // a remote file too large to buffer whole: merged ranges, fetched concurrently (one handle serves
+            // positional reads concurrently, see ReadAsync). Not disposed: it would dispose this file.
+            return new EngineeredWood.IO.CoalescingFileReader(this).ReadRangesAsync(ranges, cancellationToken);
         }
         var result = new IMemoryOwner<byte>[ranges.Count];
         for (int i = 0; i < ranges.Count; i++)

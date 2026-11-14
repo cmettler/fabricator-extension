@@ -953,12 +953,13 @@ internal static class DeltaReader
     /// the ClientContext lives for the whole table-function execution.
     /// </summary>
     public static IAsyncEnumerable<RecordBatch> Stream(
-        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
+        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamImpl(opener, fs, options, columns, filter, ct);
+        return StreamImpl(opener, fs, options, columns, filter, ct, startFrom);
     }
 
     // Returns the snapshot's mapped Delta schema when the table has column mapping AND nested (struct-carrying)
@@ -972,16 +973,25 @@ internal static class DeltaReader
            && ArrowColumnMappingRename.HasNestedFields(snap.Schema)
             ? snap.Schema : null;
 
+    // A scan opens from the snapshot an earlier read of this catalog stored (one listing when nothing is new)
+    // instead of a full open (two listings, _last_checkpoint, the log): ~0.5 s per table per query on OneLake.
+    internal static ValueTask<DeltaTable> OpenScanAsync(ITableFileSystem fs, DeltaTableOptions options,
+                                                         EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom, CancellationToken token)
+        => startFrom is null
+            ? DeltaTable.OpenAsync(fs, options, token)
+            : DeltaTable.OpenAsync(fs, startFrom, options, token);
+
     private static async IAsyncEnumerable<RecordBatch> StreamImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
-        Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
+        Predicate? filter, [EnumeratorCancellation] CancellationToken ct,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         // Cancel long-running reads (a big OneLake/S3 row-group) when the query is interrupted (Ctrl+C /
         // timeout): the scope polls DuckDB's interrupt flag and trips this token, which engineered-wood honors
         // between chunks. See docs/cancellation.md.
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
-        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
+        var table = await OpenScanAsync(fs, options, startFrom, token).ConfigureAwait(false);
         try
         {
             var nested = NestedMappedSchema(table.CurrentSnapshot);
@@ -1043,21 +1053,23 @@ internal static class DeltaReader
     /// engineered-wood's <c>_ew_row_address</c> by <see cref="RenameRowAddressToDuckDbRowId"/>) — used to
     /// surface the DuckDB rowid for UPDATE/DELETE.</summary>
     public static IAsyncEnumerable<RecordBatch> StreamWithRowIds(
-        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct)
+        nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, CancellationToken ct,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamWithRowIdsImpl(opener, fs, options, columns, filter, ct);
+        return StreamWithRowIdsImpl(opener, fs, options, columns, filter, ct, startFrom);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns,
-        Predicate? filter, [EnumeratorCancellation] CancellationToken ct)
+        Predicate? filter, [EnumeratorCancellation] CancellationToken ct,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
-        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
+        var table = await OpenScanAsync(fs, options, startFrom, token).ConfigureAwait(false);
         try
         {
             var nested = NestedMappedSchema(table.CurrentSnapshot);
@@ -1851,21 +1863,22 @@ internal static class DeltaReader
     /// snapshot is never written), so there is no rowid variant.</summary>
     public static IAsyncEnumerable<RecordBatch> StreamAt(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
-        CancellationToken ct)
+        CancellationToken ct, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamAtImpl(opener, fs, options, columns, filter, unit, value, ct);
+        return StreamAtImpl(opener, fs, options, columns, filter, unit, value, ct, startFrom);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamAtImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
-        string unit, string value, [EnumeratorCancellation] CancellationToken ct)
+        string unit, string value, [EnumeratorCancellation] CancellationToken ct,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
-        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
+        var table = await OpenScanAsync(fs, options, startFrom, token).ConfigureAwait(false);
         try
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, token).ConfigureAwait(false);
@@ -2161,21 +2174,22 @@ internal static class DeltaReader
     /// <see cref="StreamWithRowIds"/>; a timestamp is resolved to its version first.</summary>
     public static IAsyncEnumerable<RecordBatch> StreamWithRowIdsAt(
         nint opener, string path, IReadOnlyList<string>? columns, Predicate? filter, string unit, string value,
-        CancellationToken ct)
+        CancellationToken ct, EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom = null)
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
         var options = DeltaWriter.Options();
-        return StreamWithRowIdsAtImpl(opener, fs, options, columns, filter, unit, value, ct);
+        return StreamWithRowIdsAtImpl(opener, fs, options, columns, filter, unit, value, ct, startFrom);
     }
 
     private static async IAsyncEnumerable<RecordBatch> StreamWithRowIdsAtImpl(
         nint opener, ITableFileSystem fs, DeltaTableOptions options, IReadOnlyList<string>? columns, Predicate? filter,
-        string unit, string value, [EnumeratorCancellation] CancellationToken ct)
+        string unit, string value, [EnumeratorCancellation] CancellationToken ct,
+        EngineeredWood.DeltaLake.Snapshot.Snapshot? startFrom)
     {
         using var interrupt = new InterruptScope(opener, ct);
         var token = interrupt.Token;
-        var table = await DeltaTable.OpenAsync(fs, options, token).ConfigureAwait(false);
+        var table = await OpenScanAsync(fs, options, startFrom, token).ConfigureAwait(false);
         try
         {
             var snap = await ResolveSnapshotAsync(table, unit, value, token).ConfigureAwait(false);

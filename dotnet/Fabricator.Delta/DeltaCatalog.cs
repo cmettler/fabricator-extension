@@ -1658,9 +1658,9 @@ public sealed partial class DeltaCatalog : IProviderCatalog
             // `cache_local_files`: the native reader opens a OneLake table through our onelake:// filesystem,
             // and DuckDB 2.0's file cache only caches the remote prefixes it knows (upstream 8ff69049cd0), so
             // without this every read refetches every byte (TPC-H SF1 on OneLake: 81 s -> 39 s). The host sets
-            // the GLOBAL setting unless the user set it. Not for the codec engine, which reads through the
-            // Azure SDK and never touches DuckDB's cache.
-            if (_nativeRead && (FabricLakehouse.IsOneLake(_root)
+            // the GLOBAL setting unless the user set it. The codec engine reads its data files through onelake://
+            // too (AdlsGen2TableFileSystem.OpenReadAsync) unless FABRICATOR_ONELAKE_HOST_READS=0.
+            if ((_nativeRead || AdlsGen2TableFileSystem.HostDataReads) && (FabricLakehouse.IsOneLake(_root)
                                 || _root.StartsWith("onelake://", StringComparison.OrdinalIgnoreCase)))
             {
                 caps += ",\"cache_local_files\":true";
@@ -2775,12 +2775,33 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
         bool needRowId = wantRowId || hasDeletes;
         var outSchema = wantRowId ? SchemaWithRowId(projected) : projected;
+        // the scan opens from the snapshot this catalog stored (one listing, not a full log open)
+        var startFrom = SnapshotCacheEnabled ? StoredSnapshot(path) : null;
+        // OneLake data files read through onelake:// (AdlsGen2TableFileSystem): their sizes from the log let the
+        // host open them without a properties request and without cache validation (a Delta data file is
+        // immutable), as the native reader does (DeltaNativeReader seeds the same table).
+        if (startFrom is not null && AdlsGen2TableFileSystem.HostDataReads)
+        {
+            var readable = DeltaReader.ToReadableRoot(path);
+            if (readable.StartsWith("onelake://", StringComparison.Ordinal))
+            {
+                foreach (var add in startFrom.ActiveFiles.Values)
+                {
+                    if (add.Size > 0)
+                    {
+                        OneLakeForwardFs.SeedKnownSize(readable + "/" + EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path)
+                                                           .Replace('\\', '/').TrimStart('/'), add.Size);
+                    }
+                }
+            }
+        }
         System.Collections.Generic.IAsyncEnumerable<RecordBatch> stream;
         if (needRowId)
         {
             stream = pinnedReadValue is null
-                ? DeltaReader.StreamWithRowIds(opener, path, ewProjCols, filter, default)
-                : DeltaReader.StreamWithRowIdsAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default);
+                ? DeltaReader.StreamWithRowIds(opener, path, ewProjCols, filter, default, startFrom)
+                : DeltaReader.StreamWithRowIdsAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default,
+                                                 startFrom);
             if (hasDeletes)
             {
                 stream = DeltaTxnBuffer.ExcludeDeleted(
@@ -2790,8 +2811,8 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         else
         {
             stream = pinnedReadValue is null
-                ? DeltaReader.Stream(opener, path, ewProjCols, filter, default)
-                : DeltaReader.StreamAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default);
+                ? DeltaReader.Stream(opener, path, ewProjCols, filter, default, startFrom)
+                : DeltaReader.StreamAt(opener, path, ewProjCols, filter, "version", pinnedReadValue, default, startFrom);
         }
         if (reconcile)
         {

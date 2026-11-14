@@ -1721,6 +1721,45 @@ never taken (§1).
   no `file_row_number` filter. Not built; the Arrow transport per chunk would remain.
 - The remaining gap to the file scan is mostly that transport; closing it means the file scan inside `BEGIN`.
 
+## The codec engine's remote reads (2026-11-14)
+
+What the codec engine (`PROVIDER 'engineeredwooddelta'`, or `native_read false`) does on an object store, and why. Each
+piece came out of the EW #861 review measurements, where the codec engine's ordered read only became fast once all of
+them were in place.
+
+- **DuckDB's external file cache.** The host file system opens a remote file with `CachingMode::ALWAYS_CACHE`
+  (`fabricator_fs_spike.cpp`, `HostFsOpenRead`). DuckDB 2.0's cache is opt-in per open, so before this every
+  engineered-wood read refetched its bytes on every query. A failing cached open falls back to the plain one, which
+  classifies "not found". Off with `FABRICATOR_HOST_FS_CACHE=0`. Gate `verify_delta_codec_file_cache` (service tier;
+  the mutant dies at "cached after the read").
+- **OneLake data files through `onelake://`.** `AdlsGen2TableFileSystem.OpenReadAsync` reads a data file (outside
+  `_delta_log`) through DuckDB's file system, so the cache serves it. The log stays on the SDK. Off with
+  `FABRICATOR_ONELAKE_HOST_READS=0`. The catalog then declares `cache_local_files` for the codec engine too.
+- **Range coalescing.** A remote file too large to buffer whole reads its ranges through engineered-wood's
+  `CoalescingFileReader` (nearby ranges merged, fetched concurrently). Off with `FABRICATOR_COALESCE_RANGES=0`.
+- **Read-concurrency hint.** Remote files and file systems report `IReadConcurrencyHint` 4 (`RemoteReadConcurrency`),
+  so engineered-wood reads a filtered row group in two passes instead of treating the file as local.
+  `FABRICATOR_EW_READ_CONCURRENCY` sets the number; 0 reports nothing.
+- **Open from the stored snapshot.** The codec scan opens the table from the snapshot the catalog stored
+  (`StoredSnapshot`, one listing) instead of a full log open. On OneLake it also seeds each data file's size from the
+  log (`OneLakeForwardFs.SeedKnownSize`), so an open needs neither a properties request nor a cache validation.
+
+Measured on TPC-H SF10 (`pushdown_filters 'all'`, sum of 22 queries, best warm round, all results correct):
+
+| | local S3 (RustFS), cache | local S3, no cache | OneLake, cache |
+|---|---|---|---|
+| before | 35.4 s | | |
+| cache + coalescing + hint | 28.5 s | 39.6 s | 119 s |
+| + stored snapshot and size seeds | 27.8 s | | 46.0 s |
+
+On OneLake the stored snapshot is what matters: without it each scan replays the log and each data file costs a
+properties request (~40 ms per file).
+
+What comes next is in [docs/ew-late-decoding-join-filters.md](ew-late-decoding-join-filters.md) (join filters as row
+masks), followed by the read budget. The #861 measurements showed that a larger `MaxBufferedReadBytes` together with
+more concurrent reads brings the ordered read to the speed of reading by units (S3 27.4 → 23.5 s, OneLake
+49 → 38 s). A memory measurement per scan comes first.
+
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 
 CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
