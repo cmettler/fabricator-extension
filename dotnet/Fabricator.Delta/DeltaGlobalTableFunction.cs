@@ -1865,6 +1865,23 @@ internal static class DeltaWriter
         }
     }
 
+    /// <summary>Releases batches a write path owns. A dispose that fails (a buffer still pinned by an export the
+    /// consumer has not released, on Arrow 23) is left to the finalizer rather than turning a finished write into
+    /// an error.</summary>
+    internal static void DisposeAll(IEnumerable<RecordBatch> batches)
+    {
+        foreach (var b in batches)
+        {
+            try
+            {
+                b.Dispose();
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+    }
+
     private static async Task<(Schema Schema, List<RecordBatch> Batches, long Rows)> MaterializeAsync(
         IArrowArrayStream stream, CancellationToken ct)
     {
@@ -1874,15 +1891,25 @@ internal static class DeltaWriter
             var retained = new List<RecordBatch>();
             long retainedRows = 0;
             RecordBatch? batch;
-            while ((batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
+            try
             {
-                if (batch.Length == 0)
+                while ((batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false)) is not null)
                 {
-                    batch.Dispose(); // see the remark: an empty batch would become an empty parquet file
-                    continue;
+                    if (batch.Length == 0)
+                    {
+                        batch.Dispose(); // see the remark: an empty batch would become an empty parquet file
+                        continue;
+                    }
+                    retained.Add(batch);
+                    retainedRows += batch.Length;
                 }
-                retained.Add(batch);
-                retainedRows += batch.Length;
+            }
+            catch
+            {
+                // A faulted stream (the producing statement failed, or was cancelled) ends the write: what was
+                // collected so far is ours and nobody else will see it, so release it now rather than by finalizer.
+                DisposeAll(retained);
+                throw;
             }
             LivenessMark($"materialize retained {retained.Count} batch(es), {retainedRows} row(s)");
             return (schema, retained, retainedRows);

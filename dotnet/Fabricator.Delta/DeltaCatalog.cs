@@ -3689,14 +3689,22 @@ public sealed partial class DeltaCatalog : IProviderCatalog
         // Collect path: materialize the whole stream in C# (bounded by RAM), then write via engineered-wood's
         // codec OR DuckDB's per-file writer (native_write, non-streamable case: partitioned/merge/…).
         var (schema, batches, rows) = DeltaWriter.Materialize(data, default);
-        DeltaWriter.Write(opener, tablePath, schema, batches, mode, default,
-                          deletionVectors: flags.DeletionVectors,
-                          inCommitTimestamps: flags.InCommitTimestamps,
-                          changeDataFeed: flags.ChangeDataFeed,
-                          rowTracking: flags.RowTracking,
-                          spec: spec, nativeWrite: _nativeWrite,
-                          columnMapping: flags.ColumnMapping, serializable: _serializable,
-                          sortedBy: sortColumns);
+        try
+        {
+            DeltaWriter.Write(opener, tablePath, schema, batches, mode, default,
+                              deletionVectors: flags.DeletionVectors,
+                              inCommitTimestamps: flags.InCommitTimestamps,
+                              changeDataFeed: flags.ChangeDataFeed,
+                              rowTracking: flags.RowTracking,
+                              spec: spec, nativeWrite: _nativeWrite,
+                              columnMapping: flags.ColumnMapping, serializable: _serializable,
+                              sortedBy: sortColumns);
+        }
+        finally
+        {
+            // The collected batches are this statement's alone: written or failed, nothing reads them afterwards.
+            DeltaWriter.DisposeAll(batches);
+        }
         return rows;
     }
 

@@ -1390,12 +1390,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            RecordBatch? argsBatch = null;
-            if (args is not null)
-            {
-                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            }
+            var argsBatch = ReadArgsBatch(args);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             string sql = handle == 0
                 ? GlobalFunctions.GenerateTableSql(f, argsBatch)
@@ -1708,12 +1703,7 @@ public static unsafe class Bootstrap
             // `args` (nullable) is a 1-row stream of the call's arguments, read synchronously below. The values
             // are PARTIAL: `argConstant` is a mask, one char per argument, '1' = a folded constant whose value
             // is real, '0' = a runtime expression whose slot holds a NULL placeholder.
-            RecordBatch? argsBatch = null;
-            if (args is not null)
-            {
-                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            }
+            var argsBatch = ReadArgsBatch(args);
             var mask = Marshal.PtrToStringUTF8((nint)argConstant) ?? string.Empty;
             var constant = new bool[argsBatch?.ColumnCount ?? 0];
             for (int i = 0; i < constant.Length && i < mask.Length; i++)
@@ -1815,12 +1805,7 @@ public static unsafe class Bootstrap
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // `args` (nullable) is a 1-row stream of the constant call args — a custom table function's output
             // schema may depend on them. Discovered SQL functions ignore it.
-            RecordBatch? argsBatch = null;
-            if (args is not null)
-            {
-                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            }
+            var argsBatch = ReadArgsBatch(args);
             CArrowSchemaExporter.ExportSchema(catalog.GetFunctionOutputSchema(s, f, argsBatch), outSchema);
             return FabricatorStatus.Ok;
         }
@@ -1849,12 +1834,7 @@ public static unsafe class Bootstrap
             }
             var inSchema = CArrowSchemaImporter.ImportSchema(inputSchema); // takes ownership of the C schema
             // `args` (nullable) is a 1-row stream of the constant cost args (read synchronously below).
-            RecordBatch? argsBatch = null;
-            if (args is not null)
-            {
-                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            }
+            var argsBatch = ReadArgsBatch(args);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // handle == 0 => a connection-free GLOBAL in-out / collector: resolve from the global registry by
             // name (a collector is wrapped as an IInOutFunctionBinding). Else the catalog path.
@@ -1945,12 +1925,7 @@ public static unsafe class Bootstrap
             var inSchema = CArrowSchemaImporter.ImportSchema(inputSchema); // takes ownership of the C schema
             // `args` (nullable) carries the constant NAMED args only — a lateral function's positional
             // parameters ARE its per-row input columns and have no bind-time value (see abi.h).
-            RecordBatch? argsBatch = null;
-            if (args is not null)
-            {
-                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            }
+            var argsBatch = ReadArgsBatch(args);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             var binding = handle == 0
                 ? GlobalFunctions.ResolveLateral(f, argsBatch, inSchema)
@@ -2076,12 +2051,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.InvalidArgument;
             }
             // `args` (nullable) is a 1-row stream of the constant call args (read synchronously below).
-            RecordBatch? argsBatch = null;
-            if (args is not null)
-            {
-                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            }
+            var argsBatch = ReadArgsBatch(args);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // handle == 0 => a connection-free GLOBAL table function: resolve from the global registry by name.
             var bound = handle == 0
@@ -2100,6 +2070,23 @@ public static unsafe class Bootstrap
             SetError(err, ex);
             return FabricatorStatus.Error;
         }
+    }
+
+    /// <summary>
+    /// Reads the 1-row bind-argument batch of a bind call (null when <paramref name="args"/> is null) as a MANAGED
+    /// copy, and releases the imported stream and batch at once. A binding may keep its arguments for the life of
+    /// the binding (a plugin's too), so handing it the imported batch would hold DuckDB's memory until a finalizer
+    /// ran; the copy is one row and is collected like any object.
+    /// </summary>
+    private static RecordBatch? ReadArgsBatch(CArrowArrayStream* args)
+    {
+        if (args is null)
+        {
+            return null;
+        }
+        using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+        using var imported = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+        return imported is null ? null : BorrowedBatch.Copy(imported);
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -2552,12 +2539,7 @@ public static unsafe class Bootstrap
             // `args` (nullable) is a 1-row stream of the call's arguments; `argConstant` says which slots hold
             // a REAL value ('1') rather than a NULL placeholder for a runtime expression. Same pair, same
             // meaning and same partiality as scalarfn_bind's — see ScalarBindArgs.
-            RecordBatch? argsBatch = null;
-            if (args is not null)
-            {
-                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            }
+            var argsBatch = ReadArgsBatch(args);
             var mask = Marshal.PtrToStringUTF8((nint)argConstant) ?? string.Empty;
             var constant = new bool[argsBatch?.ColumnCount ?? 0];
             for (int i = 0; i < constant.Length && i < mask.Length; i++)

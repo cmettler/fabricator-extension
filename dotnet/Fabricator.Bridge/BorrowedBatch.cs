@@ -36,6 +36,45 @@ internal static class BorrowedBatch
 
     public static IArrowArray View(IArrowArray array) => ArrowArrayFactory.BuildArray(View(array.Data));
 
+    /// <summary>
+    /// A deep copy of <paramref name="batch"/> in MANAGED memory, for handing a small imported batch (the 1-row bind
+    /// arguments) to code that may keep it: the copy is collected like any object, so the imported original can be
+    /// released at once instead of holding DuckDB's memory until a finalizer runs.
+    /// </summary>
+    public static RecordBatch Copy(RecordBatch batch)
+    {
+        var columns = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < columns.Length; i++)
+        {
+            columns[i] = ArrowArrayFactory.BuildArray(Copy(batch.Column(i).Data));
+        }
+        return new RecordBatch(batch.Schema, columns, batch.Length);
+    }
+
+    private static ArrayData Copy(ArrayData data)
+    {
+        ArrowBuffer[]? buffers = null;
+        if (data.Buffers is { } source)
+        {
+            buffers = new ArrowBuffer[source.Length];
+            for (int i = 0; i < source.Length; i++)
+            {
+                buffers[i] = source[i].IsEmpty ? ArrowBuffer.Empty : new ArrowBuffer(source[i].Span.ToArray());
+            }
+        }
+        ArrayData[]? children = null;
+        if (data.Children is { } kids)
+        {
+            children = new ArrayData[kids.Length];
+            for (int i = 0; i < kids.Length; i++)
+            {
+                children[i] = Copy(kids[i]);
+            }
+        }
+        return new ArrayData(data.DataType, data.Length, data.NullCount, data.Offset, buffers, children,
+                             data.Dictionary is null ? null : Copy(data.Dictionary));
+    }
+
     private static ArrayData View(ArrayData data)
     {
         ArrowBuffer[]? buffers = null;

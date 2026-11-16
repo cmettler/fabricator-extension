@@ -24,13 +24,28 @@ internal static class ScalarBindingRunner
         RecordBatch? inBatch;
         while ((inBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
         {
-            if (inBatch.Length == 0)
+            IArrowArray result;
+            try
             {
-                continue;
+                if (inBatch.Length == 0)
+                {
+                    continue;
+                }
+                // The input chunk is DuckDB's memory and ours to release, but the result may BE one of its columns
+                // (an identity or pass-through function) or share its buffers. So the result is kept through a
+                // retained view, and only then are the input and the result as returned released: a buffer the
+                // result shares stays alive through the view's reference, everything else is freed now instead of
+                // by the finalizer. Disposing the same handle twice (result == an input column) is a no-op.
+                var resultArray = handle.Binding.Invoke(inBatch);
+                result = BorrowedBatch.View(resultArray);
+                resultArray.Dispose();
             }
-            var resultArray = handle.Binding.Invoke(inBatch);
-            resultSchema ??= new Schema(new[] { new Field("result", resultArray.Data.DataType, nullable: true) }, null);
-            batches.Add(new RecordBatch(resultSchema, new[] { resultArray }, resultArray.Length));
+            finally
+            {
+                inBatch.Dispose();
+            }
+            resultSchema ??= new Schema(new[] { new Field("result", result.Data.DataType, nullable: true) }, null);
+            batches.Add(new RecordBatch(resultSchema, new[] { result }, result.Length));
         }
         // No non-empty input => a correctly-typed zero-row stream. This is the ONLY place the declared field
         // is read on the execute path, which is what keeps a discovered SQL UDF's per-call-site cost at zero
