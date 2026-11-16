@@ -421,6 +421,20 @@ public static class ProviderRegistry
         var loaded = new HashSet<string>(
             host.Assemblies.Select(a => a.GetName().Name).Where(n => n != null)!,
             StringComparer.OrdinalIgnoreCase);
+        // ⚠ "ALREADY LOADED" IS NOT "THE HOST'S": a host dependency that loads LAZILY is not in host.Assemblies at
+        // scan time, so a plugin directory's copy of it became a candidate and was loaded into the default context
+        // first. MEASURED with Apache.Arrow.Scalars (first needed by a bulk load or a DELETE): a stale 23.0.0 copy
+        // under a plugin root's publish/ was loaded by the scan, and every later host use of Scalars 23.1.0 failed
+        // with "The requested assembly version conflicts with what is already loaded" — 9 service suites. With a
+        // host at the same version it was silently loaded from the plugin directory instead of the payload. So
+        // every assembly that ships beside the Bridge counts as shared too, loaded or not.
+        if (System.IO.Path.GetDirectoryName(typeof(ProviderRegistry).Assembly.Location) is { Length: > 0 } hostDir)
+        {
+            foreach (var hostDll in System.IO.Directory.EnumerateFiles(hostDir, "*.dll", System.IO.SearchOption.TopDirectoryOnly))
+            {
+                loaded.Add(System.IO.Path.GetFileNameWithoutExtension(hostDll));
+            }
+        }
         lock (Gate)
         {
             loaded.ExceptWith(PluginLoaded);
