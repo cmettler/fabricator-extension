@@ -516,3 +516,267 @@ refusal pinned. Since 2026-11-05 (-> 127) the UPDATE works inside a transaction:
 SQL-Server-keyed UPDATE refused, ROLLBACK undoing it, and OPENROWSET agreeing after COMMIT. Two mutants: a predicate DELETE that commits at once dies at the no-read-your-writes row; dropping
 the after-write refusal dies at its row. `verify_mssql_external_delete` (43 → 45) and `verify_mssql_s3_polybase`
 (267 → 268) assert a ROLLBACK where they pinned the old refusal.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-11-16)
+
+These were open-thread or reference records in CLAUDE.md. They are closed, so they moved here word for word in the 2026-11-16 cleanup; links inside them are written relative to the repo root, as they were in CLAUDE.md.
+
+### From CLAUDE.md §Next up — THE WRITE-OPTIONS REVISIT (2026-08-06/07)
+
+- **THE WRITE-OPTIONS REVISIT — AGREED, NOT STARTED (user, 2026-08-06). Where each parquet knob BELONGS, not
+  just whether it is plumbed.** Triggered by the measured gap below, but the user's ask is deliberately wider:
+  it is a surface question, so decide the surface before finishing the plumbing.
+  - **(1) PARTLY DONE 2026-08-07 — five more parquet options, on all three surfaces (`WITH` / `SET` /
+    ATTACH), same precedence.** Added `parquet_row_group_size_bytes` (→ native `ROW_GROUP_SIZE_BYTES`, EW
+    `RowGroupMaxBytes`), `parquet_version` V1/V2 (→ native `PARQUET_VERSION`, EW `DataPageVersion`), and
+    `parquet_dictionary_size_limit` (native only). Gate `verify_with_options` 96 → **113**.
+    - **⚠ `dictionary_size_limit` IS NOT EW's `DictionaryPageSizeLimit` — mapping them would have been
+      silently wrong.** DuckDB's is a cap on DISTINCT VALUES; EW's is BYTES. DuckDB's byte-valued knob is a
+      SEPARATE option (`string_dictionary_page_size_limit`). Hence native-only, with the reason in the error.
+    - **⚠ THE TWO FILE-ROTATING OPTIONS ARE REFUSED, and each path has its OWN measured reason.** Native +
+      NOT partitioned: DuckDB writes `<name>.parquet/data_0.parquet` while the Delta `add` records
+      `<name>.parquet` — **the commit SUCCEEDS and the data file is a directory (silent corruption)**. Native
+      + PARTITIONED: DuckDB refuses outright (*"Can't combine file rotation (e.g., ROW_GROUPS_PER_FILE) and
+      PARTITION_BY for COPY"*) — worth recording because **OUR side would have coped**: `RunCopyPartitioned`
+      already targets a directory and `ReadFileStats` already registers one `add` per `RETURN_STATS` row, so
+      when upstream lifts that limit only the refusal has to go. Codec: no equivalent.
+    - **⚠ `spec.PartitionColumns` IS NOT "this write is partitioned"** — it carries the STATEMENT's
+      `PARTITIONED BY`, so an INSERT into an existing partitioned table has it EMPTY. Gating on it refused a
+      valid write (measured). The table's partitioning is only known further down, in the writer.
+    - **⚠ `dataFileWriter == null` IS NOT "the codec engine" either** — a native CTAS writes through DuckDB's
+      COPY on a separate route and still opens EW with no writer, so that inference refused valid options on
+      the DEFAULT provider (measured). Read the catalog's `_nativeWrite`.
+    - ⚠ `ROW_GROUP_SIZE_BYTES` needs `SET preserve_insertion_order=false` (DuckDB binder). We deliberately do
+      NOT set that on our COPY connection — it would silently break `SORTED BY` writes; DuckDB's error surfaces.
+    - **⚠ BLOOM FILTERS ON THE NATIVE PATH NEED NOTHING — a note here previously said to build
+      `write_bloom_filter` + `bloom_filter_false_positive_ratio`, and that was WRONG (corrected 2026-08-07,
+      user-prompted).** DuckDB enables bloom filters by DEFAULT, we always pass `WRITE_BLOOM_FILTER true`, and
+      its writer picks the COLUMNS itself — per-column selection is not a DuckDB concept because the decision
+      is per column on cardinality: `parquet_extension.cpp:75` — *"After how many distinct values should we
+      abandon dictionary compression AND BLOOM FILTERS?"* — i.e. the cutoff IS `dictionary_size_limit`, the
+      knob added in this same pass. So `parquet_bloom_filter_columns` is codec-only by nature, not by a gap,
+      and the README says so. It is accepted-and-ignored on native rather than refused, which is a small
+      inconsistency with the "never silently ignore" rule elsewhere — harmless, because DuckDB blooms those
+      columns anyway; tighten it only if the rule is ever made absolute.
+    - **STILL OPEN from (1) — CLOSED 2026-08-07: `compression_level` and `bloom_filter_false_positive_ratio`
+      are BUILT, on all three surfaces, and BOTH are two-engine.** `parquet_compression_level` → native
+      `COMPRESSION_LEVEL`, EW **`CustomCompressionLevel`** (NOT `CompressionLevel`: DuckDB's is a NATIVE codec
+      level and so is that one, while EW's `CompressionLevel` is a coarse `BlockCompressionLevel` ENUM —
+      mapping to it would silently reinterpret the number as one of a handful of presets).
+      `parquet_bloom_filter_false_positive_ratio` → native `BLOOM_FILTER_FALSE_POSITIVE_RATIO`, EW
+      `BloomFilterFpp`. Both persist as `fabricator.parquet.*`.
+      - ⚠ The **DEFAULTS DIFFER and are deliberately NOT normalised** (DuckDB 0.01, EW 0.05), so an unset
+        option does NOT make the two engines write equivalent files — normalising would silently change the
+        codec engine's behaviour for a user who asked for nothing. Pinned so any doc claiming equivalence has
+        to reckon with it.
+      - **The gates read the FILE, never the option**, because parquet records the CODEC and not the level:
+        same data compressed at level 1 vs 19 (native 35808 → 28532 bytes; codec 25745 → 25332), and bloom
+        bytes at fpp 0.3 vs 1e-6 (**544 → 8224**). ⚠ The bloom cardinality is chosen so DuckDB actually WRITES
+        a filter — it abandons dictionary encoding AND bloom filters past `dictionary_size_limit` distinct
+        values, and a first attempt at 50 000 distinct values produced two filter-less files and a vacuously
+        equal comparison.
+      - Both ends of the fpp range are REFUSED rather than clamped: 0 asks for a filter with no false
+        positives (impossible) and 1 for one that matches everything (useless, and still costs bytes).
+    - **⚠ A SHIPPED BUG THIS PASS FOUND: `parquet_bloom_filter_columns` WAS A SILENT NO-OP ON THE DEFAULT
+      TABLE SHAPE (found 2026-08-07, REFUSED until 2026-10-24, when EW 65a69a6's translation let the refusal be
+      lifted — see the 2026-10-23 bump entry).** engineered-wood matches the list against the PARQUET
+      path (`HasBloomFilter(pathInSchema)`), and on a **column-mapped** table that path is the PHYSICAL name
+      (`col-e090d9ee…`), never the logical one. MEASURED: **0 of 10 column chunks got a filter with mapping
+      on, 10 of 10 with it off.** Column mapping is the DEFAULT, so the option did nothing for almost
+      everyone.
+      - **Nothing caught it because NO SUITE HAD EVER ASSERTED THAT A BLOOM FILTER WAS WRITTEN.** The option
+        was accepted, the statement succeeded, and `verify_with_options` checked only that. It was found by
+        adding the fpp gate — i.e. by writing a test that reads the FILE — which is the same lesson the rest
+        of this surface keeps producing: *a "the statement succeeded" test cannot distinguish a working write
+        option from one that never reached the writer.*
+      - **REFUSED rather than fixed, and the bound is real:** the physical names are assigned by the CREATE
+        itself and engineered-wood takes `ParquetWriteOptions` AT OPEN, so translating logical → physical
+        needs either a two-phase open or an EW-side resolution against the Delta schema. A loud error naming
+        the one-word workaround (`column_mapping='none'`) beats a knob that writes nothing. **The real fix is
+        an upstream-shaped ask and is the right thing to do later.**
+      - **⚠ Only the `WITH` layer refuses.** A `SET delta_write_options` bloom list spans every table in the
+        session (some mapped, some not) and a PERSISTED one is a declaration another engine may read —
+        failing either would punish writes that never asked for anything here. Consistent with the
+        ignore/refuse split above.
+      - Gate `verify_with_options` §9c, **mutation-tested** (dropping the guard makes the refusal assertion
+        fail), with the `column_mapping='none'` leg as the POSITIVE CONTROL — otherwise the refusal would pass
+        equally if bloom filters had simply stopped working everywhere.
+  - **(1-original) EVERY parquet option must be expressible in `CREATE TABLE … WITH (…)`, INCLUDING bloom-filter
+    columns for the EW codec.** Today `WITH (parquet_compression=…, parquet_row_group_size=…,
+    parquet_bloom_filter_columns=…)` is the DuckLake-parity set gated by `verify_with_options`; confirm each
+    reaches BOTH engines (⚠ the codec and native paths take different routes — see the void measurement below)
+    and add whatever is missing.
+  - **(2) Bloom-filter columns are NOT wanted as an ATTACH default (user, explicit).** They are a per-TABLE
+    property — which columns you probe — so a catalog-wide default is the wrong shape and should not be added
+    even though the spec can carry one.
+  - **⚠ THE SQL SERVER `unicode`/NVARCHAR WITH OPTION WAS SCOPED AND THEN NOT BUILT — because the behaviour
+    the user wanted ALREADY EXISTS (2026-08-07).** The ask was "same DuckDB code writes to prod SQL Server
+    (default collation, NVARCHAR) and to Fabric (VARCHAR only), and new SQL Server databases should default to
+    VARCHAR + UTF-8". `MapArrowToSqlType` already resolves exactly that, per connection, from the COLLATION:
+    `IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR`. All three targets land correctly with NO
+    setting. **Check whether an ask is already satisfied before designing an option for it** — a redundant knob
+    would have added a way to get it WRONG (forcing VARCHAR on a legacy collation is silently lossy).
+    - **BOTH legs are now gated (2026-08-07), and the reason the second one was not is that a claim here was
+      FALSE.** `verify_default_varchar_length` asserts `nvarchar/-1` on the docker box's default collation
+      AND `varchar/-1` on a UTF-8 one (8 → 44 assertions). ⚠ This entry used to read *"the UTF-8-collation ⇒
+      VARCHAR leg is NOT gated — the rig has no UTF-8-collation database"*, and recommended provisioning one.
+      **The rig has had one all along**: `BinCollTest` is `Latin1_General_100_BIN2_UTF8` (provisioned to
+      reproduce Fabric Warehouse's default collation, which is binary AND UTF-8) and `IsUtf8Collation` is a
+      plain `_UTF8` SUFFIX test, so it qualified from the start. The half a new-database user depends on was
+      one ATTACH away from covered, and the write-up said it was impossible. **Check the rig before recording
+      a gap as unclosable.**
+      - The section carries a POSITIVE CONTROL (`is_utf8_collation` really is true on that attach) — without
+        it the VARCHAR assertion would pass equally on a server that had merely lost NVARCHAR support, which
+        is a different bug — plus a non-ASCII ROUND TRIP, which is the assertion that JUSTIFIES the rule
+        rather than restating it, and the `mssql_ctas_text_type` escape in the OTHER direction (keeping
+        NVARCHAR on a UTF-8 database, which a migration needs).
+    - Escape hatches already exist: `mssql_default_varchar_length` (bounds whichever type is chosen) and
+      `mssql_ctas_text_type` (replaces the type outright). What is genuinely missing is only the PER-TABLE
+      form of these — the (3) item below.
+  - **(2b) THE PARQUET TUNING IS NOW PERSISTED AS TABLE PROPERTIES — BUILT + GATED 2026-08-07 (C#-only, no
+    ABI).** A `CREATE … WITH (parquet_compression='zstd') AS …` writes `fabricator.parquet.compression` into
+    the Delta table CONFIG, and every later write to that table reads it back: plain INSERT, merge-on-read
+    post-image, copy-on-write rewrite, and **OPTIMIZE's compaction output** — whichever catalog or session runs
+    them. New BCL-only format file `dotnet/Fabricator.Bridge/DeltaParquetProperties.cs` (`ParquetTuning`), keys
+    `fabricator.parquet.{compression,row_group_size,row_group_size_bytes,version,dictionary_size_limit,
+    row_groups_per_file,file_size_bytes,bloom_filter_columns}`.
+    - **The problem it fixes, measured before:** `CREATE TABLE t WITH (parquet_compression='zstd') AS …` wrote
+      ZSTD and a later plain `INSERT INTO t` wrote **SNAPPY**, so a table accumulated MIXED compression; on an
+      incrementally-built dbt model most bytes were snappy whatever it was configured for, and OPTIMIZE — which
+      rewrites the MAJORITY of a table's bytes — actively undid the setting it was configured for.
+    - **PRECEDENCE, as decided: ATTACH < `SET delta_write_options` < TABLE PROPERTY < statement `WITH`.** The
+      property outranks the session setting deliberately — a stray `SET` must not silently change a table's
+      storage format. Implemented as a fourth layer inside `ResolveWriteSpec`, which now takes a REQUIRED
+      `tablePath` (the structural obstacle this entry predicted): required rather than optional so the compiler
+      forces every present and future call site to answer "which table?" — the same omission on the rewrite
+      paths is what let OPTIMIZE undo its own configuration for months.
+    - **⚠ ONLY THE STATEMENT'S OWN `WITH` PERSISTS, never the resolved spec.** Persisting the resolved value
+      would turn a session `SET` into a permanent property of the table — exactly what the precedence rule
+      exists to prevent, and durably. The keys ride `CreateProperties`, whose only consumer is `CreateConfig`
+      at creation (EW's `OpenOrCreateAsync` returns early for an existing table and ignores `configuration`
+      entirely), so it is create-only BY CONSTRUCTION and a plain INSERT cannot rewrite it.
+    - **⚠ THE BUG THAT ONLY MEASUREMENT FOUND, and it would have silently broken `fabricator.sortedBy` too.**
+      The write spec is resolved BEFORE the write runs, so a CTAS asks for the config of a table that does not
+      exist yet. Caching that MISS made the CREATE's own declaration invisible to every later statement in the
+      session — the property landed in the table and the next plain INSERT still wrote SNAPPY. Fix: **a miss is
+      never cached.** The collateral damage is the instructive part: this pass UNIFIED `_sortedByCache` into one
+      `_tableConfigCache` (one open per table instead of two, one set of invalidation sites), and `sortedBy` had
+      never been read on a create path — so caching the miss would have made an ordered table quietly stop
+      ordering its appends. **Unifying two caches inherits the WORST staleness behaviour of either consumer.**
+    - **⚠ A `CREATE OR REPLACE` INHERITS the declaration and CANNOT CHANGE it — measured, and the intuitive
+      answer is the wrong one.** My first version treated a replace as "redefines the table, inherit nothing".
+      But a REPLACE does NOT re-create the Delta table: the log continues and the metaData commit COPIES the
+      configuration forward (measured — a replace with a different schema emits `CHANGE COLUMNS` and the
+      `fabricator.parquet.*` keys survive it). So inheriting nothing writes the replace's files at the engine
+      default INTO a zstd-declared table, and the next plain INSERT flips back — **mixed compression produced by
+      one statement**, the exact disease. Now it inherits. The corollary is a real limitation, pinned and in the
+      README: a REPLACE's `WITH` applies to that statement's write only, because create-time configuration is
+      applied at v0. That is NOT specific to these keys — it is equally true of every create flag
+      (`deletion_vectors` / `column_mapping` / `row_tracking` / `change_data_feed`) and of the `delta.*` WITH
+      properties beside them. `fabricator_delta_set_tblproperties` is what changes a declaration.
+    - **THE IGNORE/REFUSE SPLIT, as decided and now built.** A `WITH`/`SET` option is an ACTIVE REQUEST in THIS
+      statement ⇒ an engine that cannot honour it FAILS (`ValidateSpecForEngine`, unchanged). A persisted
+      property is a DECLARATION ABOUT THE TABLE, read later by a possibly DIFFERENT engine ⇒ apply what fits,
+      ignore the rest, `Fabricator.Delta` **Debug** line naming what was dropped (not a Warning — ignoring here
+      is correct rather than degraded, and the choice is invisible from SQL otherwise). The persisted layer
+      deliberately does NOT route through `ValidateSpecForEngine`. Verified both directions on ONE key and ONE
+      engine, which is what makes it a demonstration rather than two unrelated assertions:
+      `WITH (parquet_dictionary_size_limit=…)` on a codec catalog ERRORS, while the codec engine writes happily
+      into a table DECLARING it (that key ignored, the compression still honoured).
+    - **A MALFORMED persisted value THROWS, naming the key** — `set_tblproperties` writes arbitrary
+      `fabricator.*` keys so someone will hand-set garbage, and swallowing an UNPARSEABLE value is a different
+      case from ignoring a well-formed-but-unhonourable one. Recoverable from SQL (re-set the key), which is
+      what makes refusing acceptable rather than a trap.
+    - **⚠ PERSISTING `row_group_size_bytes` HAS A SESSION PREREQUISITE — found by writing the suite, and it is
+      the one key that changes character when persisted.** DuckDB's binder refuses `ROW_GROUP_SIZE_BYTES` while
+      preserving insertion order. As a per-statement option that is fine (the user sets the flag in the same
+      breath); persisted, it means **a plain INSERT naming nothing now fails** until the session sets
+      `preserve_insertion_order=false`. We deliberately do NOT set it on our COPY connection — it would silently
+      break `SORTED BY` writes — so DuckDB's error surfaces. The codec engine has no such constraint. Pinned
+      (§8g) so a future change cannot start swallowing it.
+    - **⚠ `dictionary_size_limit` is still NOT mappable to EW's `DictionaryPageSizeLimit`** — DuckDB's is a cap
+      on DISTINCT VALUES, EW's is BYTES — so it stays native-only in BOTH layers. The two file-ROTATING keys
+      persist but can be honoured on NO path today; persisting them is still right (the declaration outlives the
+      limitation, and when upstream lifts it they start being honoured with no migration).
+    - Gates: `verify_with_options` 113 → **171** (§8–§8g), pinned on the **NATIVE** engine because a codec-only
+      gate would pass while the shipped default path stayed broken; hermetic **67/67 — 6661**. Tier-0
+      `Fabricator.Bridge.Tests` 85 → **106** (the format round trip + every malformed case, offline — those are
+      reachable from SQL only through `set_tblproperties`, one service round trip each). **Mutation-tested with
+      two mutants, both killed at the same assertion** — the plain-INSERT one, which is the whole feature:
+      caching the miss, and never reading the persisted layer at all.
+  - **(3) Re-examine the `SET` parameters and MOVE what belongs per-table into `WITH`.** `delta_write_options`
+    is one JSON blob mixing genuinely session-scoped things (compression as a storage-cost policy) with
+    per-table ones (partitioning, `replace_where`, `schema_mode`). Decide each knob's home rather than
+    accepting the current split, and keep an escape for the per-statement case.
+  - **(3b) THE SQL SERVER PER-TABLE `WITH` FORMS — BUILT + GATED 2026-08-07 (C#-only, no ABI).**
+    `CREATE TABLE … WITH (table_type=…, varchar_length=…, text_type=…)`: the per-table forms of
+    `mssql_default_table_type`, `mssql_default_varchar_length` and `mssql_ctas_text_type`. The per-table value
+    OUTRANKS the session setting, same precedence rule as the Delta write tuning.
+    - **⚠ I FIRST WROTE THIS UP AS BLOCKED ON TWO OBSTACLES AND BOTH WERE OVERSTATED — the user challenged
+      the first one ("why does table_type collide? it depends on location") and was right, which is why the
+      correction is recorded rather than quietly fixed.**
+      - **"`table_type` COLLIDES" — IT DOES NOT.** It already meant `DELTA`/`PARQUET` for the external-table
+        CETAS analog, and I called adding `CLUSTERED COLUMNSTORE`/`HEAP` a collision needing a design
+        decision. The two vocabularies are DISJOINT, so a value determines its own branch; and `location`
+        corroborates it (an external `WITH` has always REQUIRED `location`, so a `WITH` without one is
+        currently an ERROR — the regular branch is purely additive and can shadow nothing). Sharing the key
+        is the BETTER option, because it keeps the per-table spelling equal to the setting it mirrors.
+      - **"IT NEEDS THREADING THROUGH THE WHOLE DDL CHAIN INTO A SHARED TYPE MAPPER" — it needed ONE optional
+        parameter.** `optionsJson` was ALREADY in scope at both create paths, `BuildCreateTable` has three
+        call sites, and `MapArrowToSqlType` takes two optional overrides that DEFAULT to the old
+        session-store reads — so the ALTER paths, which carry no `WITH`, are untouched by construction.
+      - The generalisable bit: **both objections came from reading a method SIGNATURE and inferring the
+        blast radius, instead of counting the call sites.** The same shortcut produced the "we never reach
+        `CommitOccAsync`" error already recorded in this file.
+    - **The branch rule, and the one asymmetry in it:** `location` present ⇒ external (so a missing/foreign
+      `table_type` errors AGAINST the external vocabulary); otherwise the value picks the branch. An ordinary
+      table needs no `table_type` at all — `WITH (varchar_length=200)` alone is valid — which is why
+      "`location` is present" ALSO forces the external branch rather than `table_type` alone. An unknown value
+      falls to the REGULAR branch, so a typo reads as "not a valid storage form" and offers both vocabularies
+      rather than being silently treated as external.
+    - `varchar_length` / `text_type` are REFUSED on an external table: its column types come from the storage
+      files, so accepting them would do nothing — the failure mode this whole surface exists to prevent.
+    - **⚠ THE GATE'S LOAD-BEARING ASSERTION IS THE OPT-OUT, NOT THE POSITIVE.** With the SESSION default set
+      to columnstore, `WITH (table_type='HEAP')` must win — a test that only checked "columnstore produces a
+      columnstore index" passes with the per-table value ignored entirely. It carries a POSITIVE CONTROL that
+      the session default really was in force. Gate `verify_with_options_mssql` 9 → **41**,
+      **mutation-tested** (dropping `with?.TableType ??` kills it at exactly the HEAP assertion).
+    - **⚠ One third of the original ask was already satisfied and was NOT built.** The `unicode`/NVARCHAR flag
+      is unnecessary: `MapArrowToSqlType` resolves the text type per connection from the COLLATION
+      (`IsUtf8Collation ? VARCHAR : HasNVarchar ? NVARCHAR : VARCHAR`), so prod SQL Server gets NVARCHAR, a
+      UTF-8 database gets VARCHAR and Fabric gets VARCHAR, with no setting. Now gated on BOTH legs — see the
+      `verify_default_varchar_length` note above. `text_type` remains the escape hatch in either direction.
+  - **(4) THE PLUMBING GAP IS FIXED (2026-08-07), and fixing it needed TWO changes where the write-up assumed
+    one.** `ResolveWriteSpec` lives on the `DeltaCatalog` INSTANCE while the rewrite paths sit in the STATIC
+    `DeltaReader`, so merge-on-read post-images, copy-on-write DELETE/UPDATE rewrites and **OPTIMIZE's
+    compaction output** were written at engineered-wood's defaults whatever the user configured. Now threaded:
+    `DeleteByRowIds` / `UpdateByRowIds` / `Optimize` take a `DeltaWriteSpec?` and the catalog passes
+    `ResolveWriteSpec(...)`; `ReadRowsByRowIds` takes the catalog's `native_read` (the streaming-audit item —
+    done together, as this entry predicted it should be).
+    - **⚠ THREADING THE SPEC INTO THE EW OPEN WAS NECESSARY AND NOT SUFFICIENT — measured, and the first
+      re-measurement still showed SNAPPY.** Under `native_write` (the `PROVIDER 'delta'` DEFAULT) the file is
+      written by **DuckDB's COPY** via `NativeParquetDataFileWriter`, so EW's `ParquetWriteOptions` never
+      apply; the spec also had to reach that writer's COPY options. It already accepted a `spec` — the three
+      `DeltaReader` sites simply constructed it without one. **Re-measuring after the "fix" is what caught
+      this**; the EW-only change would have shipped as done.
+    - MEASURED, native engine, `SET delta_write_options='{"compression":"zstd"}'`: before, CTAS **ZSTD** but
+      the UPDATE post-image **SNAPPY** and OPTIMIZE's compaction output **SNAPPY**; after, **zero SNAPPY
+      chunks anywhere**. Gate `verify_with_options` 82 → **96**, mutation-tested (dropping the spec from
+      `NativeParquetDataFileWriter` dies at exactly the post-image assertion). ⚠ The gate is pinned on the
+      **NATIVE** engine on purpose — a codec-only gate would have passed while the shipped default path was
+      still wrong.
+  - **⚠ THAT VOID MEASUREMENT IS NOW SETTLED (2026-08-07), AND ITS SUSPICION WAS WRONG — the "fourth gap" does
+    not exist.** It had read: *"`SET delta_write_options='{"compression":"zstd"}'` on `PROVIDER 'delta'` produced
+    SNAPPY data files … so the session setting may simply not reach the native COPY"*. **It does reach it.**
+    MEASURED per file: with that SET, a CTAS on `PROVIDER 'delta'` (native COPY) writes **ZSTD**, as does the
+    per-table `WITH (parquet_compression='zstd')` and as does the codec engine. `SET` and `WITH` ARE equivalent
+    on the statement's own write, so the surface question can be decided on merits rather than on plumbing.
+  - **⚠ THE REAL AXIS IS *WHICH WRITE*, NOT `SET`-vs-`WITH` — and it is now MEASURED ON THE NATIVE ENGINE, not
+    just reasoned or seen on the codec.** With the SET in force on `PROVIDER 'delta'`: CTAS/INSERT files
+    **ZSTD**, the merge-on-read UPDATE's post-image file **SNAPPY**, and **OPTIMIZE's compaction output
+    SNAPPY** (before: 6 ZSTD chunks and zero SNAPPY; after: the same 6 plus 4 SNAPPY, the compacted file). So
+    this file's prediction that *"OPTIMIZE is the one that stings — it rewrites the MAJORITY of a table's bytes,
+    so it actively undoes the setting it was configured for"* is CONFIRMED rather than inferred, and it is not a
+    codec-only defect. Cause is unchanged: `ResolveWriteSpec` lives on the `DeltaCatalog` INSTANCE while ~33
+    bare `DeltaWriter.Options()` opens sit in the STATIC `DeltaReader` and pass no spec.
+

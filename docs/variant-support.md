@@ -424,3 +424,46 @@ to this directory, so it still resolves from here.
       `paths` filters and a new branch with no new commits matches none of them. Use
       `gh workflow run Main.yml --ref <branch> -f run_all=true`. ⚠ The concurrency group is keyed on
       `github.ref`, so a push to a DIFFERENT branch cannot cancel an in-flight run on another.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-11-16)
+
+These were open-thread or reference records in CLAUDE.md. They are closed, so they moved here word for word in the 2026-11-16 cleanup; links inside them are written relative to the repo root, as they were in CLAUDE.md.
+
+### From CLAUDE.md §Next up — the variant transport removal (DuckDB 2.0)
+
+- **⚠⚠ THE VARIANT TRANSPORT WORKAROUND IS RETIRED BY DuckDB 2.0 — USER-DIRECTED 2026-10-21 (*"wir
+  brauchen nicht mehr unseren workaround. variant ist in duckdb arrow implementiert (unser pull request)"*).
+  CONFIRMED FROM THE 2.0 SOURCE, and it is NOT optional: on 2.0 the two registrations COLLIDE and the Delta
+  variant path is BROKEN until the workaround goes. NOT YET BUILT — scoped here so the next session does not
+  re-derive it.**
+  - **WHAT LANDED UPSTREAM:** `arrow_type_extension.cpp` registers **`arrow.parquet.variant`** with the
+    CANONICAL storage `struct<metadata: binary, value: binary>` (`ArrowVariant::StorageType`). That is
+    exactly the shape `ew.variant_transport` was invented to avoid — the leaf blob existed because a NESTED
+    internal type crashed DuckDB's `ArrowAppender::FinalizeChild`. Upstream also notes its conversions run
+    WITHOUT the binder, which removes a second fragility of ours (we bind `variant_bytes_to_variant` per
+    conversion).
+  - **⚠⚠ OUR C++ REGISTRATION IS ALREADY A NO-OP ON 2.0, WHICH IS WHAT MAKES THIS A BREAKAGE RATHER THAN A
+    TIDY-UP.** `RegisterFabricatorVariantExtension` guards on
+    `config.HasArrowExtension(LogicalType::VARIANT())` and DuckDB's own
+    `ArrowTypeExtensionSet::Initialize` runs at DB startup, i.e. BEFORE extension load — so the guard fires
+    and our transport is never registered. The C# side still MARKS fields `ew.variant_transport` and writes
+    leaf blobs, which nothing on the C++ side understands any more. MEASURED:
+    `verify_delta_catalog_variant` dies with **`INTERNAL Error: Vector::Reference used on vector of
+    different type (source VARIANT referenced STRUCT(metadata VARIANT, "value" VARIANT))`** — the
+    assertion-failure class this file records as able to invalidate the database.
+  - **THE SURFACE, ENUMERATED BY GREPPING THE CALLEE as this file's own rule demands — 38 call sites across
+    8 files**, which is already three times the "13 sites written from memory" that rule was paid for:
+    `DeltaReader` (13), `DeltaCatalog` (9), `DeltaGlobalTableFunction` (6), `VariantTransport` itself (5),
+    `NativeParquetDataFileWriter` (2), `NativeParquetDataFileReader` (1), `ExternalTableRouting` (1),
+    `SqlServer/SqlServerBackend` (1). Plus the C++ `fabricator_variant.cpp` registration and EW's
+    `DeltaTableOptions.VariantTransportBlob`.
+  - ⚠ **THE HAZARD IS UNCHANGED and it is why this gets its own gated step rather than riding the port:** a
+    transport-marked field reaching EW maps to Delta **`binary`**, and a `metaData` commit is NOT revisable
+    — so a CREATE/CTAS/ADD COLUMN would record the wrong type DURABLY. Three of the sites hand EW a SCHEMA;
+    those are the dangerous ones.
+  - ⚠ The marker name has LIED since engineered-wood stopped knowing about it (patch 867 -> 0); the removal
+    finally ends that rather than renaming it.
+  - ⚠ Deliberately deferred until the 2.0 port's other suites are green, so the variant change can be
+    measured against a working baseline instead of debugged together with the port.
+
+

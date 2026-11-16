@@ -1040,3 +1040,106 @@ eposluid`) AND THEN FOUND THE BETA
     would have proved nothing — it is equally true of a machine with no plugins.
   - **STILL NOT BUILT**: per-plugin ALC isolation, and archive signature/checksum verification (`Hashing`
     exists in `Fabricator.Installer.Core` and nothing consumes it).
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-11-16)
+
+These were open-thread or reference records in CLAUDE.md. They are closed, so they moved here word for word in the 2026-11-16 cleanup; links inside them are written relative to the repo root, as they were in CLAUDE.md.
+
+### From CLAUDE.md §Sibling repos — the plugin migration to the vendored package, the retired submodule reference, the plugin/host build boundary
+
+- **⚠⚠⚠ RETIRED 2026-10-24 — ALL FOUR PLUGINS NOW TAKE A VENDORED `PackageReference`, AND THE TWO BULLETS
+  BELOW ARE HISTORY.** The "day `Fabricator.Abstractions` is packed and published" arrived with v0.2.0: the
+  nuget job ships `Fabricator.Abstractions.0.2.0.nupkg` as a release asset. `fabricator-sustainalytics`,
+  `-quantax`, `-dlrest` and `-grist` each **vendor that exact asset** in `nuget/`, declare a local feed in
+  `nuget.config` pinned by `packageSourceMapping`, reference it with `ExcludeAssets="runtime"`, and drive both
+  the reference and the archive manifest's `abstractionsVersion` from ONE property,
+  `FabricatorAbstractionsVersion`. **Their `fabricator-extension` submodules are GONE.** Each repo's own
+  CLAUDE.md opens with a dated box saying so. NOT COMMITTED in any of the four — that is the user's call.
+  - **WHY VENDORED, not a feed:** there is no public feed, and a DRAFT release's assets are not downloadable
+    by an unauthenticated CI. Vendoring keeps a plugin build to *nothing but a .NET SDK*.
+  - **⚠⚠ IT WAS ALSO A HOST-LINE MOVE, which is easy to miss:** 0.2.x IS the DuckDB 2.0 contract, and all four
+    had been pinned to 1.5-era commits (ABI v87). A plugin binds to the contract the RUNNING bridge loaded, so
+    they run against `build/release-v2` now. The prediction that v87 → v92 changed the managed contract ONLY
+    through default interface methods HELD: **zero plugin source changes** across all four.
+  - **MEASURED, 1.5 host + submodule → 2.0 host + package, like-for-like (credential-gated `*_live` suites left
+    out of BOTH runs):** sustainalytics **65 = 65** (four suites), offline **237**; quantax **21 = 21**, offline
+    **206**, and its contract map reports the **same 6 hosted** function members on both contracts; dlrest
+    **26 = 26**, offline **201**, `bin/` the same three DLLs; grist **21/22 on BOTH, same line, same reason**
+    (pre-existing — see below), offline **535**, and its own `tools/verify.ps1 -SkipLive` green on everything
+    else including **the shipping path** (install → activate → register on the 2.0 host).
+  - **⚠ A STANDING FALSE ALARM WENT AWAY WITH IT.** Three plugins hardcoded `"abstractionsVersion": "1.0.0"`,
+    so every install printed *"built against Fabricator.Abstractions 1.0.0, this host has 0.2.0"*. MEASURED
+    with a CONTROL: the same archive with the old manifest prints that line; with the migrated one, nothing.
+    grist had already fixed it by reading the submodule's `VERSION` file — which would have gone SILENTLY
+    EMPTY with the submodule removed, so it was rewired to the property too.
+  - **⚠⚠ THREE DEFECTS SURFACED THAT WERE ALREADY THERE, none caused by the migration:** (1) quantax's
+    `tools/Show-CatalogContract.ps1` — the "check the compiler cannot do" — had been **DEAD since the
+    2026-09-02 `IBackend → IProvider` rename** (it looked for `IBackendCatalog`, got null, and threw), so its
+    "run after every repin" instruction had not been running; fixed. (2) grist's `tools/verify.ps1`
+    hardcoded the host in THREE places; one `$hostBuild` now. (3) **OPEN, NOT FIXED:**
+    `verify_grist_plugin.test:181` expects the workspace-target refusal but, with no Grist credentials, <!-- check-docs:ignore (a suite in fabricator-grist, not here) -->
+    gets *"grist: no credentials"* — `open_catalog` checks credentials BEFORE validating the target, so one
+    assertion in a nominally OFFLINE suite only passes with credentials present.
+  - **⚠ ONE MISTAKE OF MINE WORTH THE NOTE:** the csproj swap helper first replaced the reference's whole
+    `ItemGroup`, which was right where the reference stood alone and DESTROYED dlrest's, whose group also
+    holds its Api `ProjectReference` and four `ExcludeAssets` packages. The build failed loudly (49 errors);
+    it now replaces only the element. ⚠ dlrest also shows that `ExcludeAssets` on the contract keeps
+    Apache.Arrow out of `bin/` ONLY where the contract is Arrow's sole path — Arrow reaches dlrest through
+    its Api too, so its own Arrow exclusion stays load-bearing. **Check `bin/`, do not assume.**
+  - **⚠ TO MOVE THE PLUGINS TO A NEW CONTRACT:** download the release's `.nupkg` into each repo's `nuget/`,
+    delete the old one, bump `FabricatorAbstractionsVersion`, rebuild. Whether the contract MOVED is
+    `git diff --stat v<old>..v<new> -- dotnet/Fabricator.Abstractions/` in THIS repo.
+- **A `ProjectReference` to `Fabricator.Abstractions` inside a git submodule of THIS repo** (shallow,
+  `--depth 1`, 8.3 MB, pinned at `db59dc2`), `Private="false"`, overridable with `-p:FabricatorPath=`. Same
+  shape as our own `DuckDBExtensionKitPath`.
+- **⚠ THE PIN IS LOAD-BEARING FOR A REASON THAT IS OURS, NOT THEIRS: WE DO NOT VERSION THE CONTRACT.**
+  Every assembly here is `1.0.0.0` and `Fabricator.Abstractions` sets no `IsPackable`/`PackageId`, so it is
+  not on NuGet and there is **no version number that could express "built against contract X" — only a sha**.
+  A plugin binds to the RUNNING bridge's copy at load, so a mismatch makes its `IBackend` a different,
+  non-assignable type; visible since 2026-08-18 as a `rejected` row with a `TypeLoadException`, but still a
+  debugging session. ⇒ **the day `Fabricator.Abstractions` is packed and published, `PackageReference` becomes
+  the right answer and this whole paragraph retires.** An assembly `HintPath` and a bare sibling
+  `ProjectReference` both lose (no restore / no transitive Arrow version / no pin) — and we converted
+  engineered-wood AWAY from the sibling form for exactly that.
+- ⚠ A plugin targets **`net8.0` only**: it runs on whatever runtime the bridge was published for, and net8.0
+  loads on both SKUs while net10.0 fails on the framework-dependent one.
+- ⚠ **`Private="false"` on the contract reference is load-bearing**, and a copied `Apache.Arrow` at a
+  different major is the classic `rejected` plugin.
+- ⚠ **Its `IBackend.Name` must not collide with a first-party provider** — `BackendRegistry.Add` is an
+  OVERWRITE, so a collision silently replaces ours and reports as an ordinary `loaded` row (the unfixed gap
+  recorded under the plugin entry).
+- Verified end to end against the real extension rather than merely compiled: install ⇒ `activated=true`;
+  the plugin's GLOBAL function ABSENT in that session and present after a restart (the documented split);
+  `ATTACH` surfacing the plugin's own refusal (which only a real provider resolution produces).
+  ⚠ The run caught what reading could not — the version function reported `1.0.0` out of a directory named
+  `0.0.1`, because the assembly version was defaulting while `PluginVersion` drove the manifest and the
+  install path. **A plugin skeleton is not verified by compiling it.**
+
+**⚠⚠ THE PLUGIN/HOST BUILD BOUNDARY — user-raised 2026-09-08 after a plugin session rebuilt this whole
+extension unnecessarily ("i forgot how we setup a plugin project. the plugin should only compile the
+abstraction+common right?"). There are FOUR out-of-tree plugins now (`fabricator-sustainalytics`,
+`-quantax`, `-dlrest`, `-grist`), each carrying THIS repo as a shallow submodule.**
+- **A PLUGIN BUILD COMPILES `Fabricator.Abstractions` AND NOTHING ELSE OF OURS — MEASURED** on grist with
+  `dotnet build src/Fabricator.Grist -c Release --no-incremental -v:m`: three `->` lines
+  (`Fabricator.Abstractions`, and the plugin's own two projects), the only submodule one being
+  Abstractions. ⚠ **`Fabricator.Common` is referenced by NONE of the four** — it is available and equally
+  referenceable (the optional library half of the plugin-services split), so the answer to "abstractions +
+  common?" is *"Abstractions alone today; Common is a choice no plugin has taken"*.
+- **⚠⚠ A PLUGIN CANNOT BUILD A HOST OUT OF ITS SUBMODULE, and grist's CLAUDE.md told a session to try
+  — which is what caused the rebuild.** It said `make release` AND `make managed` there. MEASURED: the
+  nested submodules are EMPTY BY DESIGN (a plugin inits `--init fabricator-extension`, NOT `--recursive`,
+  precisely to skip engineered-wood's ~½ GB corpus), and `release` is not in our Makefile at all — it
+  comes from `extension-ci-tools/makefiles/duckdb_extension.Makefile`, so make dies at *"No rule to make
+  target"* and `make managed` dies on the same missing include. A session that hits that then goes looking
+  for a host and rebuilds the SIBLING checkout: ~500 targets. **Fixed in grist's CLAUDE.md** (§A repin does
+  not mean a host rebuild).
+- **⇒ THE RULE: the submodule is a CONTRACT SOURCE, not a host.** A repin needs the PLUGIN rebuilt (its
+  manifest's `abstractionsVersion` is read from the submodule's `VERSION`) and the host it RUNS against
+  checked — which is the sibling checkout, and if that is already at the pinned commit and built there is
+  nothing to do (measured: pin `afda880`, sibling HEAD `afda880`).
+- **⚠⚠ AND OUR `build/release` IS SHARED WITH EVERY PLUGIN SESSION**, which is the hazard worth carrying:
+  a re-configure there that does not re-supply the whole documented line breaks it for everyone — the same
+  day's `ENABLE_EXTENSION_AUTOLOADING=0` regression is exactly that shape, and a plugin session publishing
+  the managed payload can trip the `-Clean` deletion hazard too. Both pre-build checks are recorded under
+  the build-and-test traps.
+

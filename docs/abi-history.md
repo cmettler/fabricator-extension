@@ -4062,3 +4062,245 @@ to this directory, so it still resolves from here.
     JSON inside a string (`MSSQL connection validation failed: {"exception_type":"IO","exception_message":…}`)
     because `ThrowManagedError` throws a `duckdb::IOException` and `FabricatorAttach` re-wraps `ex.what()`.
     Every managed crossing that fails during load reads that way.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-11-16)
+
+These were open-thread or reference records in CLAUDE.md. They are closed, so they moved here word for word in the 2026-11-16 cleanup; links inside them are written relative to the repo root, as they were in CLAUDE.md.
+
+### From CLAUDE.md §C ABI contract — the "Previously" list v73–v99 and the rename notes
+
+- **Previously: ABI v99** (2026-10-30 — `execute_query_filtered`: a pushed query under DuckDB's table filters,
+  e.g. a hash join's runtime keys. [docs/abi-history.md](docs/abi-history.md) §v99.)
+- **Previously: ABI v98** (2026-10-29 — `execute_modify_returning`: DELETE / UPDATE … RETURNING from T-SQL
+  OUTPUT; MERGE … RETURNING through the action operators. [docs/abi-history.md](docs/abi-history.md) §v98.)
+- **Previously: ABI v97** (2026-10-26 — every catalog object takes a SCHEMA PATH: the nine per-function
+  entries, `catalog_functions`/`_macros`/`_views` lead with a `schema_path` list, providers return typed
+  `FunctionDeclaration`/`CatalogMacroDefinition`/`ViewDefinition`, dead `bulk_insert` removed. ⚠ A plugin member
+  still typed `string` compiles and silently stops implementing the interface (implicit `SchemaPath`). Two DuckDB 2.0
+  leaf-schema bugs worked around (nested view body, nested CTAS that drops its rows). [docs/abi-history.md](docs/abi-history.md) §v97.)
+- **Previously: ABI v96** (2026-10-25 — `remote_translate`: a pushed query as a Substrait plan, translated
+  by the provider; the Substrait producer is mandatory since 2026-10-25. [docs/abi-history.md](docs/abi-history.md) §v96 +
+  docs/duckdb-2.0-remote-execution.md §3.12.)
+- **Previously: ABI v95** (2026-10-24 — `table_partition_stats`: COUNT/MIN/MAX from metadata.
+  [docs/abi-history.md](docs/abi-history.md) §v95.)
+- **Previously: ABI v94** (2026-10-24 — `table_delete_where` RENAMED `table_dml_where`, its spec gaining
+  an optional `"set"` that makes it an UPDATE; `table_dml_info` gains `update_where`.
+  [docs/abi-history.md](docs/abi-history.md) §v94.)
+- **Previously: ABI v93** (2026-10-24 — `table_dml_info` + `table_delete_where` APPENDED to the
+  table session: predicate DELETE with an EXACT filter. [docs/abi-history.md](docs/abi-history.md) §v93.)
+- **Previously: ABI v92** (2026-10-23 — **the EIGHT write crossings take a SCHEMA PATH too**:
+  `create_table` / `drop_table` / `begin_bulk` / `execute_update` / `execute_delete` / `insert_returning`
+  / `create_schema` / `drop_schema` each swap one `const char *schema` for
+  `const char *const *schema_path, int32_t schema_path_len` (nested schemas, slice 2c of
+  [docs/nested-schemas.md](docs/nested-schemas.md)). For the two SCHEMA entries the path is the schema's
+  OWN, so `CREATE SCHEMA a.b` is `["a","b"]`. `bulk_insert` is NOT widened — no C++ caller since the
+  streaming bulk path. ⚠⚠ **`table_alter` needed NO WIRE CHANGE**: it rides the table session, already
+  opened with the full path; what was wrong was purely managed, the handler passing the definition's
+  LEAF. Fixed with `ITable.SchemaPath` + an `AlterTable` path overload. ⚠ Every managed widening is a DIM
+  taking the leaf, so no out-of-tree plugin breaks; `DeltaCatalog` INVERTS the direction (it implements
+  the path forms and derives the name forms), because the leaf-taking default is exactly wrong for a
+  provider that nests. ⚠⚠ **A DIM DEFAULT IS A SILENT FALLBACK and that is this slice's one real bug**:
+  `DeltaTableDefinition` carried a path and did not EXPOSE it, so ALTER alone kept resolving the wrong
+  directory and reported *"No Delta table found"* — a message that reads like a missing table. Full
+  record: [docs/abi-history.md](docs/abi-history.md) §v92.)
+- **Previously: ABI v91** (2026-10-23 — **`table_open` takes a SCHEMA PATH**:
+  `const char *const *schema_path, int32_t schema_path_len`, outermost first, replacing one
+  `const char *schema` (DuckDB 2.0 nested schemas, slice 2b of
+  [docs/nested-schemas.md](docs/nested-schemas.md)). The entry v90 deliberately left alone, because at
+  depth 1 a path IS a name. ⚠ No out-of-tree plugin breaks: `IProviderCatalog.GetTable(IReadOnlyList
+  <string>, string)` is a DIM taking the LEAF, so an un-migrated provider is byte-for-byte unaffected —
+  and an override is MANDATORY for one that declares `supports_nested_schemas`, since the default would
+  resolve `a.b.t` as `b.t`, a different table reported as success. ⚠⚠ **NESTING IS READ-ONLY**: the eight
+  flat write crossings (create_table / drop_table / begin_bulk / execute_update / execute_delete /
+  insert_returning / create_schema / drop_schema) plus `table_alter` still address a table by ONE schema
+  name, so the host REFUSES each by name rather than sending a leaf that lands elsewhere. ⚠ ALTER was
+  first EXEMPTED on a wrong argument (it rides the path-carrying table SESSION) — the managed handler
+  re-derives from the leaf; found by reading the CALLEE. Full record:
+  [docs/abi-history.md](docs/abi-history.md) §v91.)
+- **Earlier: ABI v90** (2026-10-23 — **the catalog wire carries a SCHEMA PATH**: `catalog_schemas`
+  and `catalog_tables` lead with a `LIST<VARCHAR>`, outermost element first (DuckDB 2.0 nested schemas,
+  slice 1 of [docs/nested-schemas.md](docs/nested-schemas.md)). BEHAVIOUR-NEUTRAL — every provider still
+  emits depth-1 paths. ⚠ `table_open` is UNCHANGED (at depth 1 a path is a name), and functions/macros/views
+  stay flat. ⚠ No out-of-tree plugin breaks: `GetSchemaPaths`/`GetTablePaths` are DIMs over
+  `SchemaPathAdapter`. ⚠⚠ It shipped a USE-AFTER-FREE first — 69 of 82 suites — by disposing a source batch
+  whose columns it had handed out by reference; the one-column/three-column asymmetry is what named it, and
+  a one-provider smoke test would have passed. Full record:
+  [docs/abi-history.md](docs/abi-history.md) §v90.)
+- **And: ABI v89** (2026-09-14 — **`agg_open` became the aggregate's BIND**: it carries the
+  call's constant arguments + the call context and returns the RESOLVED result field, so an aggregate's
+  return type is per CALL SITE. ⚠⚠ It was possible because `agg_open` is ALREADY called from DuckDB's
+  aggregate bind, and DuckDB passes `AggregateFunction` BY VALUE there and moves the mutated copy into the
+  bound expression. ⚠ update/combine/finalize still carry NO context, so a binding needing host access must
+  acquire it at BIND and keep it. Full record: [docs/abi-history.md](docs/abi-history.md) §v89.)
+- **Previously: ABI v88** (2026-09-06 — **`execute_query` / `execute_dml` take a nullable
+  `struct ArrowArrayStream *params`**, so `fabricator_query(cat, sql, params := …)` and
+  `fabricator_exec(cat, sql, …)` bind values instead of splicing them. ⚠⚠ The WIRE (one column named
+  `params`, the argument as written) and the CONTRACT (one column per parameter) are deliberately DIFFERENT
+  shapes — `ProviderParameters` normalises host-side, so the STRUCT/JSON branch lives in one language.
+  ⚠ The default DIM REFUSES a non-null bag rather than chaining, because chaining drops parameters silently.
+  Full record: [docs/abi-history.md](docs/abi-history.md) §v88 +
+  [docs/provider-query-parameters.md](docs/provider-query-parameters.md) §5.)
+- **Previously: ABI v85** (2026-09-04 — **`host_query` gains `batch_rows`: the CALLER picks how many
+  rows go into each exported Arrow batch.** 0 = the historical default of ONE DuckDB `DataChunk` (2048
+  rows), so every existing caller is byte-identical; a `publish` publication asks for 122880. ⚠⚠ **It can
+  NEVER be a better default and that is the whole design: a batch is also a FILE** — engineered-wood
+  writes one parquet file per input batch and this same service feeds WRITERS, so a row-group default made
+  `verify_delta_clustered_optimize` collapse 80000 rows into one file (147 passed at one chunk, 1 failed at
+  122880). Only the caller knows whether its batches are morsels or files. Full record:
+  [docs/abi-history.md](docs/abi-history.md) §v85.)
+- **Previously: ABI v84** (2026-09-03 — the PINNED host connection: `host_query` gains a
+  `connection` parameter and `host_connection_open`/`host_connection_close` appear beside it, so several
+  calls share ONE DuckDB Connection and therefore one TEMPORARY catalog. Read the entry under "Next up"
+  and [docs/abi-history.md](docs/abi-history.md) §v84 before touching it — the silent-short-read hazard
+  is the part that shapes the design.)
+- **Previously: ABI v81** (2026-08-24 — **`tablefn_execute` gained a `schema_may_change` out-param**, so a
+  provider table function that performs DDL can say so and the host rebuilds its metadata cache. A SIGNATURE
+  change on one existing entry, hence the bump; it mirrors `execute_dml`'s flag of the same name, which had
+  served `fabricator_exec` alone. ⚠⚠ TWO things to know before touching it, both recorded in
+  [docs/abi-history.md](docs/abi-history.md) §v81: **the flag is read when the call RETURNS, not when the
+  stream is drained**, so a function reporting through it must do its work in the EAGER part of `Execute()` —
+  an async-iterator body has not begun then, and the failure is SILENT (the DDL succeeds, only the rebuild is
+  lost; mutation-proven to kill the suite at the same assertion as never setting the flag). And **the host
+  must NOT act on it where it is set** — it is raised during a SCAN, where `RefreshCache` would retire the very
+  entry the running statement is scanning; `FabricatorTransactionManager::StartTransaction` consumes it
+  instead, which is provably outside any bind or scan because DuckDB resolves the `CatalogTransaction` before
+  `LookupSchema` takes `schema_lock_`. ⚠ Why it was needed at all, MEASURED: with no ATTACH object filter a
+  name missing from the discovered list is treated as GENUINELY ABSENT, so an object such a call created was
+  **unreachable** for the session — not merely un-enumerated, and with no by-name fallback. First and only
+  consumer: the `db.cdc.*` setup functions.)
+- **Previously: ABI v80** (2026-08-23 — **`execute_scalar` REPLACED by the `scalarfn_*` session**,
+  BREAKING, no aliases: `scalarfn_bind` / `scalarfn_execute` / `scalarfn_close`, so a scalar's return type is
+  resolved PER CALL SITE from the call's constant arguments instead of being fixed at registration, and a
+  provider has somewhere to park work done once per call site rather than once per chunk. `IScalarFunction
+  .Result` became `Field?` (declared ⇒ used for the catalog entry; absent ⇒ the bind must supply it) and
+  `Bind` is a DIM returning `StaticScalarBinding`, so a fixed-return function implements NOTHING new.
+  Gate: `verify_global_functions` 101 → **118** (hermetic — this line said 113 for a day; the measured count is 118, which is also what the commit message says), three mutants each killed at its own section.
+  ⚠ FOUR things only building it settled — read [docs/abi-history.md](docs/abi-history.md) §v80 before
+  touching it: (1) **a SCALAR bind must NOT establish the ambients, unlike every other bind in the tree** —
+  `FabricatorSetActiveTxn` also pushes the host-FS opener, which is right for a bind of a statement's OWN
+  source but fatal for a scalar, because a scalar binds wherever it is CALLED, including inside a nested host
+  query an OUTER operation is running while IT holds the ambient (OPTIMIZE's recluster exactly): measured
+  exit 127 / 139-SIGSEGV at `OPTIMIZE main.c1` with the call, 147 assertions without it. ⚠⚠ My first
+  "confirmation" of this was CONFOUNDED and is the more useful lesson — switching the result schema to a bare
+  `ArrowSchema` (right on its own merits, and it removes a second copy of the same hazard) moved the exit code
+  127 → 1 and I recorded it as the fix; that change came from the null-`Result` deref below having dropped
+  `hilbert_index` entirely, so the crash was merely UNREACHABLE. **When a fix changes a failure's SHAPE rather
+  than removing it, ask what else changed.** (2) the UNRESOLVED sentinel is read in BOTH directions, and a
+  binding answering "the declared type stands" is what keeps a discovered SQL UDF from paying an
+  `INFORMATION_SCHEMA` round trip per call site; (3) unlike `tablefn_bind` the argument values are PARTIAL —
+  a scalar's arguments need not be constant, so an `arg_constant` MASK says which slots are real and a `'0'`
+  placeholder is indistinguishable from an explicit NULL by value alone; (4) **`Field` → `Field?` produced
+  CS8602 at a site that silently dropped EVERY managed global function** (one throw inside
+  `list_global_functions` fails the whole crossing), surfacing three layers away as *"Scalar Function with
+  name hilbert_index does not exist"* — nullable warnings ARE the finding when a member becomes nullable, and
+  `dotnet build` shows none on an up-to-date project, so `--no-incremental` is required to see them. It also
+  fixed a PRE-EXISTING bug on the way: an untyped NULL in an `ANY`-declared parameter position
+  (`fluid_render('tpl', NULL)`) had never worked, because DuckDB exports an Arrow null array with
+  `null_count = 0` and Apache.Arrow refuses it; nothing covered it, since the suites' only NULL sat in a
+  VARCHAR position, which DuckDB casts.)
+- **Previously: ABI v79** (2026-08-22 — **the `lateral_*` session added after `table_close`**, additive:
+  five entries for ROW-MAPPED (correlated LATERAL) functions — `lateral_bind` / `_open` / `_call` / `_close` /
+  `_bind_close`. The shape a table-in-out cannot express: a lateral function's POSITIONAL parameters are real
+  value types and it declares no `{TABLE}` input, so DuckDB synthesises the input relation from the argument
+  EXPRESSIONS and `FROM t, f(t.a, t.b)` binds. ⚠ What makes it a separate session rather than the in-out
+  exchange under a new name: **PROVENANCE** (each output row must say which input row produced it, or the
+  correlated columns cannot be stamped and 1→N / 1→0 are inexpressible), SEVERAL SESSIONS AT ONCE (the batched
+  operator is parallel; the exchange permits one per binding behind a gate), and REQUEST/RESPONSE rather than
+  a stream (an empty result means "these inputs produced nothing", never end-of-stream). Full record:
+  [docs/abi-history.md](docs/abi-history.md) §v79 +
+  [docs/lateral_unnest_analysis.md](docs/lateral_unnest_analysis.md) §8.)
+- **Previously: ABI v78** (2026-08-20 — **`catalog_init` added beside `get_capabilities`**, additive:
+  the provider's ONE chance to initialise with a LIVE client context, called from `LoadCatalog` after the
+  ambients are established and BEFORE every discovery crossing. `IBackendCatalog.Initialize()` is a DIM
+  no-op, so no provider and no plugin is forced to implement it. ⚠ Its exceptions PROPAGATE — the call sits
+  above `DiscoverSchemas` and the only `catch` in `LoadCatalog` is scoped to the capability read below it —
+  so a failing init fails the ATTACH and creates no catalog (measured). Full record:
+  [docs/abi-history.md](docs/abi-history.md) §v78.)
+- **Earlier: ABI v77** (2026-08-19 — **`catalog_views` added beside `catalog_macros`**, additive:
+  three UTF-8 columns (schema, name, create_sql) carrying provider-declared CATALOG-BOUND VIEWS, each one a
+  complete `CREATE VIEW` statement the host parses and binds into the ATTACHed catalog's schema, resolving as
+  an ordinary relation `db.schema.v`. ⚠ Placed MID-STRUCT, so every later slot shifts — safe only because the
+  version moved with it (the v75 precedent). Why it exists beside the macro entry: DuckDB anchors a VIEW
+  body's search path to the view's OWN catalog+schema, so it is the only declaration form whose body can name
+  the provider's tables without knowing the ATTACH alias. Full record:
+  [docs/abi-history.md](docs/abi-history.md) §v77 +
+  [docs/macros-and-sqlgen-functions.md](docs/macros-and-sqlgen-functions.md) §5.)
+- **Previously: ABI v76** (2026-08-18 — **`http_request` APPENDED to `FabricatorHostServices`**, additive:
+  a managed HTTP request performed by DuckDB's own HTTP layer, so it inherits the `TYPE http` secret whose SCOPE
+  matches the URL plus `ca_cert_file` / `http_proxy*` / `http_timeout` / the retry knobs. The bump is needed even
+  though nothing moved — the managed side rejects a host-services block whose `abi_version` differs, which is what
+  makes a mismatched pair loud at boot. Full record: [docs/abi-history.md](docs/abi-history.md) §v76 +
+  [docs/http-transport.md](docs/http-transport.md).)
+- **Previously: ABI v75** (2026-08-18 — **`fabricator_delta_mfr_scan` + the `delta_list_files` vtable <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
+  slot DELETED**, breaking, no aliases; a MID-STRUCT removal, so a stale loadable/bridge pair is caught by
+  the version check rather than by calling the next entry through the wrong signature. Full record:
+  [docs/abi-history.md](docs/abi-history.md) §v75.)
+- **Previously: ABI v74** (2026-08-17 — **`alter_table` DELETED, `table_alter(table, alter_json,
+  column, err)` appended to the table session**, BREAKING, no aliases. The kind int + `arg1`/`arg2`/`flags`
+  — four carriers each meaning something different per kind — became ONE typed JSON doc naming its variant;
+  the `column` Arrow stream stayed BESIDE it as the TYPE CHANNEL (a VARIANT rides Arrow field metadata no
+  type name can carry). It is the v73 doc pattern with the direction REVERSED — the only ABI doc the HOST
+  writes, rendered by `FabricatorRenderAlterJson` with yyjson's MUTABLE api, parsed into `AlterTableSpec`
+  (Fabricator.Abstractions, BCL-only ⇒ tier-0 testable). Full record: [docs/abi-history.md](docs/abi-history.md)
+  §v74; the follow-on entry under "Next up" carries what the scoping did not anticipate.)
+- **Previously: ABI v73** (2026-08-15, two bumps in one unpushed series — **v72 = `get_metadata` +
+  `scan_table` + the `FabricatorMetadataKind` enum DELETED** (slice 4d of the catalog/table abstraction,
+  breaking, no aliases), **v73 = `table_info`/`table_stats` re-carried as JSON via OUR OWN vcpkg yyjson**
+  after the user pointed out the v72 justification for avoiding JSON was an overclaim. Catalog discovery is
+  FIVE dedicated typed entries (`catalog_schemas`/`catalog_tables`/`catalog_functions`/`catalog_macros`/
+  `catalog_server_info` — each keeping its old kind's column layout, minus the kind int and the
+  per-provider unknown-kind fallback shapes behind the `ReadStringTable` OOB hazard), and the per-table
+  kinds (2/3/4/5/12) live on the **`table_*` SESSION** mirroring `tablefn_*`: `table_open(schema, table,
+  at_unit, at_value)` → a handle the C++ ENTRY owns for its life (released in the destructor, graveyard
+  incl.), `table_schema` (zero-row stream, carries the NOT_FOUND absence contract — same place as the old
+  kind 2), `table_info` (rowid + virtual columns, ONE crossing —
+  `{"rowid":[...],"virtual":[{"name":..,"type":..}]}`), `table_stats` (row_count + NDV, ONE crossing —
+  `{"row_count":N,"ndv":{...}}`, absent = unknown, typed JSON numbers where kinds 4/5 crossed text; lazy at
+  first scan), `table_scan` (the old scan_table minus the name pair), `table_close`. ⚠ **The handle wraps
+  the stateless DEFINITION, never a binding** — every call re-binds against the ambient txn via the new
+  `IBackendCatalog.ResolveTransaction(txnId)` DIM (SqlServer TryGet — lazy creation preserved; Delta
+  GetOrCreate — the pin/open sharing), which is §6's lazy-bind default and what makes a graveyard-lived
+  handle trivially safe. Managed: `IBackendCatalog.GetMetadata`/`MetadataKind` DELETED, five list members
+  added, `GetTable` now required on every provider (DAX/DeltaRs/Stub gained thin `ITable` implementations);
+  `TableSession` (Bridge) writes the JSON with `Utf8JsonWriter` (proper escaping — identifiers are
+  user-controlled). **v73 also RETIRED `ReadCapabilityFlag`**: `get_capabilities` is now parsed with
+  yyjson instead of the string-find shortcut that was safe only by a producer-side bare-booleans argument.
+  ⚠ **yyjson is a NEW BUILD DEPENDENCY on every platform** — `vcpkg install yyjson:<triplet>` (one line in
+  the shared `.github/actions/build-extension` covers all three CI build tiers; quickstart + WSL docs
+  updated); deliberately OUR copy because DuckDB's vendored `duckdb_yyjson` is C++-namespaced and not
+  `DUCKDB_API`-exported, so a loadable cannot resolve it — which also means the two copies cannot collide.
+  Remaining deviations from the design's letter, in
+  [docs/catalog-table-abstraction.md](docs/catalog-table-abstraction.md) §5 item 4d: stats split OUT of
+  table_info (bundling would put stats queries on the enumeration path), and the zero-row-stream schema
+  carrier kept (PopulateReturnSchema is the proven import path incl. VARIANT). Entry materialization is
+  open+schema+info = 2 IO crossings (was 3: kinds 2, 3, 12), stats 1 (was 2). ⚠ Mid-struct slot REMOVAL
+  shifts every later field — deliberate, the v30/v31/v47 precedent; the version check makes a mismatched
+  pair loud at boot.)
+- **v71 (`get_capabilities` — the capability JSON, slice 3), v70 (METADATA KINDS 8-11/13-14 DELETED — the
+  `delta.*` function namespace, slice 2) and v69 (SCOPED SETTINGS): [docs/abi-history.md](docs/abi-history.md).**
+- **⚠ RENAME, 2026-08-14, NO BUMP: `table_bind`/`table_execute`/`table_close` → `tablefn_*`** (+ C++
+  `TableFnBind`/`TableFnExecute`/`TableFnClose`/`TableFnBindState`, C# `IBoundTable` →
+  `IBoundTableFunction` with `BindingBoundTableFunction`/`TvfBoundTableFunction`/`DaxEvalBoundTableFunction`,
+  and `IArrowTableFunctionBinding` → `ITableFunctionBinding`). The word ORDER was already right — session
+  entries are `<function kind>_verb` (`agg_*`, `inout_*`) and one-shot ones are `verb_noun` (`scan_table`,
+  `execute_scalar`) — but `table_` was the only session prefix whose noun is ALSO a first-class ABI noun,
+  so `table_execute` read as "execute a table" while `scan_table` is the entry that does that. **The
+  confusion is real, not stylistic: a CATALOG table scan goes through `scan_table` and has NO C# bind
+  object at all** (its bind state is the C++ `ArrowStreamBindData`), which is exactly why the
+  per-transaction caches exist. No bump because a rename changes no layout, ordinal or signature — the
+  vtable is positional, so mismatched loadable/bridge pairs keep working in BOTH directions. Old names +
+  the two mechanical hazards: [docs/abi-history.md](docs/abi-history.md) §RENAME. Gate: hermetic
+  **69/69 — 7127, IDENTICAL to the pre-rename counts** ⇒ behaviour-preserving.
+- **⚠ AND THE `IArrow*` UN-PREFIXING IS NOW FINISHED (same day, C#-only, BREAKING for plugin authors, no
+  aliases).** `IArrowCollectorBinding`/`IArrowInOutBinding`/`IArrowInOutIsolation`/`IArrowAggregateState` →
+  `ICollectorBinding`/`IInOutBinding`/`IInOutIsolation`/`IAggregateState`, plus the four stale FILE names
+  (`IArrowAggregateFunction.cs` etc. → `IAggregateFunction.cs`). It COMPLETED a convention half-applied
+  months ago — the function interfaces were already unprefixed — so **the only `IArrow*` names left in the
+  tree are Apache Arrow's own** (`IArrowArray`, `IArrowArrayBuilder`, `IArrowArrayStream`, `IArrowType`),
+  which is now a usable invariant: an `IArrow` prefix means the type is THEIRS. ⚠ **The README named three
+  interfaces that never existed** (`IArrowTableFunction`/`IArrowInOutFunction`/`IArrowAggregateFunction` are
+  FILE names) — corrected to the catalog interfaces `CustomFunctions.cs` documents. Historical design docs
+  still name `IArrowFunction`/`IArrowScalarFunction`/`IArrowTableInOutFunction` and are deliberately NOT
+  swept: those passages document the earlier renames themselves. Full record:
+  [docs/abi-history.md](docs/abi-history.md) §The `IArrow*` un-prefixing.
+

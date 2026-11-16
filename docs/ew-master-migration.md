@@ -4522,3 +4522,353 @@ to this directory, so it still resolves from here.
     PRE-ATTACHED and the DELETE made genuinely expensive (`id % 7 = 3` rewrites nearly every file).
     Re-creating the table did NOT help — the warmth that matters is the SPARK CLUSTER's, so each level needs
     its own run in the cold first slot.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-11-16)
+
+These were open-thread or reference records in CLAUDE.md. They are closed, so they moved here word for word in the 2026-11-16 cleanup; links inside them are written relative to the repo root, as they were in CLAUDE.md.
+
+### From CLAUDE.md §THE UPSTREAM STRATEGY + the 2026-10-25 fork detour
+
+### THE UPSTREAM STRATEGY — GOAL REACHED, and the whole offer list is SETTLED (moved verbatim to [docs/ew-master-migration.md](docs/ew-master-migration.md) Appendix 2, 2026-08-23)
+
+The user's goal was: run on ORIGINAL upstream engineered-wood, with our needs met by high-probability PRs;
+maintain our own only if impossible, and then make our amendments clear IN THE CODE. **It was reached in its
+strongest form** — see the box below: upstream, `branch = main`, ZERO patches. Every item that was once on
+the offer list LANDED (`ConflictChecker` isBlindAppend, vacuum below the root, `logRetentionDuration`,
+`checkpointInterval` and its second trigger, `LogCleanup`, and the `WriteAsync`/`isBlindAppend` fix as #137).
+What is worth keeping here rather than in the journal:
+
+- **⛔ NEVER OFFER THE VARIANT TRANSPORT.** It is OURS-BY-DESIGN and it has LEFT engineered-wood entirely
+  (patch 867 → 0). `Fabricator.Delta/VariantTransport.cs` owns canonical⇄blob at THREE read boundaries and
+  three write FUNNELS; ⚠ the marker string is still `ew.variant_transport` and **the name now LIES** — EW
+  knows nothing about it. Renaming is safe in principle but must move in LOCKSTEP with the C++
+  ArrowTypeExtension registration in `src/fabricator/fabricator_variant.cpp`. <!-- check-docs:ignore (DELETED 2026-10-22 with the variant transport; naming it IS the point) -->
+  - **⚠ THE WORST FAILURE MODE IN THAT SURFACE, restated because it is durable and silent:** a
+    transport-marked field reaching EW maps to Delta **`binary`**, and a `metaData` commit is not revisable —
+    so a CREATE/CTAS/ADD COLUMN would record the wrong type DURABLY, surfacing far away as an insert that
+    cannot convert VARIANT to BLOB. **ENUMERATE THE SITES BY GREPPING THE CALLEE, never by listing call
+    sites from memory**: a 13-site enumeration written from memory missed four, and three of those hand EW a
+    SCHEMA, i.e. exactly this class.
+  - ⚠ **A GREEN INTERMEDIATE CANNOT PROVE COMPLETENESS** while the EW patch is still there to cover a missed
+    site — it only separates "my conversions are right" from "the deletion broke something".
+- **WHAT MAKES AN OFFER LAND, from the ones that did:** it needs nothing of ours, it is self-contained, and
+  it is what the spec already says should happen. Two of the three 2026-08-08 offers were things WE NEEDED,
+  which is what made them offerable rather than favours to ask.
+- **THE CHEAPEST WAY TO RETIRE A PATCH IS TO STOP NEEDING IT.** Two offers were retired NEVER SENT because
+  an architectural slice dissolved them (`RowUpdateMode`, solved by removal; the
+  `WriteChangeDataFilesForAsync` overload, dissolved by the transaction hoist). **Re-derive the offer list
+  after each architectural slice** — an offer that exists to work around our OWN architecture is the first
+  candidate. And do not spend credibility on a request we do not need.
+- **⚠ A NEGATIVE RESULT NEEDS A CONTROL THAT WOULD HAVE PRODUCED A POSITIVE** — the `LogCleanup` lesson, and
+  the sharpest methodology point in the whole strategy. Two of my three arguments that EW ignored
+  `delta.logRetentionDuration` were INADEQUATE: a backwards grep for `Cleanup*` (a cleanup under an
+  unguessed name would not appear — the very search pattern this file records as having produced a wrong
+  conclusion once already), and observing a table go 148 → 151 files across OPTIMIZE + VACUUM (which does not
+  DISCRIMINATE, because Delta's default retention is 30 DAYS and every file in the rig was minutes old, so a
+  correct implementation would have done nothing either). Only forcing the horizon to ONE SECOND separated
+  the hypotheses: 28 commit JSONs vs 27, nothing reclaimed where ~20 files should have been.
+- **⚠ IT EXPOSED A SHIPPED FAKE, which is the part worth carrying:** `DuckDbTableFileSystem` reported a
+  HARDCODED `DateTimeOffset.UnixEpoch` as every file's modification time. Nothing read it, so nothing
+  noticed — and the first thing to read it deletes BY AGE, under which every commit looks 56 years old and a
+  30-day retention collects one written a second ago. Fixed on both sides, **plus a guard that declines the
+  whole pass when any file cannot be dated**: unknown must stay unknown rather than default to a date.
+- **⚠ `netstandard2.0` HAS NO `DateTimeOffset.UnixEpoch`** — this assembly still targets it for the net472
+  leg, and only the all-TFM run catches it. Spell the epoch out.
+- **MARK THE AMENDMENTS** (`// [FABRICATOR-PATCH: OFFER-READY | OFFERED #n | OURS-BY-DESIGN]` + why + what
+  retires it). The convention is what made the eventual audit cheap and it stays in force for anything new.
+
+### ✅ BACK ON UPSTREAM (2026-10-25, commit `3277084`): Microsoft published System.IO.Pipelines / System.Text.Encodings.Web 9.0.22, the NU1605 resolved itself, and `.gitmodules` points at clast-project/engineered-wood `main` again at `987a0ce`. The fork branch `fabricator-patches-v4` stays on the fork, unused. The paragraph below is the record of the detour.
+### (HISTORY) TEMPORARILY ON THE FORK AGAIN (2026-10-25, user-approved): `.gitmodules` → cmettler/engineered-wood `fabricator-patches-v4` = the pin `987a0ce` + ONE commit (`771e39d`, System.Threading.Tasks.Extensions 4.6.0 → 4.6.3 in the two Delta projects), because every fresh restore failed with NU1605 (System.Text.Json `9.*` → 9.0.22, whose System.IO.Pipelines / System.Text.Encodings.Web 9.0.22 are missing on nuget.org). Cut off the PIN, not upstream/main, so no unswept bump rides along. NEXT: CI green on all tiers, THEN offer it upstream (user: CI first), then back to clast-project/main. The box below is the state this returns to.
+
+### From CLAUDE.md §WE NOW RUN ON ORIGINAL UPSTREAM — the per-bump records (2026-08-12 … 2026-10-23)
+
+- **⚠⚠ THE 2026-10-23 EW BUMP — `e515a2b → 987a0ce`, SIXTY-NINE commits, still ZERO patches (a
+  fast-forward). NOT housekeeping: it FIXES a silent-correctness bug in files OUR OWN codec writer
+  produced, and it BROKE sixteen hermetic suites on arrival. Full record:
+  [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE 2026-10-23 BUMP — read it before the
+  next bump, because the METHOD it establishes is worth more than the findings.**
+  - **⚠⚠⚠ FILES WE HAVE ALREADY WRITTEN CAN HAVE INVERTED DECIMAL STATISTICS, and the fix does not
+    repair them.** Until EW `#398` the writer ordered chunk min/max by PHYSICAL type, so a chunk holding
+    decimals of BOTH SIGNS (FLBA, i.e. precision > 18) recorded a minimum ABOVE its maximum; same for
+    uints straddling 2^31/2^63. The values are fine, the statistics are not. **MEASURED with
+    `git merge-base --is-ancestor`, not read off a changelog: the fix `edabc29` is 2026-09-26 and our
+    previous pin `e515a2b` is 2026-09-18** ⇒ every file the codec writer produced up to and including
+    the `v0.1.0-duckdb2.0.0` artifact can carry them.
+    - **EW's own reader is SAFE** (`StatisticsEvaluator` reads a min-above-max row group); **every other
+      reader is not**, and upstream measured DataFusion 54 *"silently returning none of their rows"*.
+      ⇒ **our DEFAULT read path is exposed** — `PROVIDER 'delta'` reads via DuckDB's `read_parquet`,
+      which prunes on statistics, as do Spark and SQL Server PolyBase.
+    - **BOUNDED TO THE CODEC ENGINE**: default-path data files are written by DuckDB's COPY under
+      `native_write`, so EW's writer never runs on them; checkpoints are EW-written everywhere but the
+      Delta action schema has no decimal/uint column.
+    - ⚠ **`created_by` CANNOT IDENTIFY AN AFFECTED FILE** (released builds say just `EngineeredWood` on
+      both sides of the fix), so the discriminator is provenance + schema. The remedy is REWRITING the
+      table (`OPTIMIZE` does it) — a judgement call about real tables, not something a bump performs.
+  - **⚠⚠ WHAT BROKE: `DeltaTableOptions.ParquetReadOptions.Filter` IS REFUSED NOW** — it would apply to
+    every read of a data file, compaction and DML rewrites included, so a rewrite would silently drop the
+    rows it excludes. Sixteen suites, ONE cause. The predicate rides `DeltaReadOptions.Filter` on the READ
+    now (where it prunes files AND row groups), which every call site already passed it to.
+    ⚠ **The trap in the fix: `FilterUseBloomFilters` defaults to FALSE and lived on the had-a-filter
+    branch** — deleting that branch would have retired bloom refinement with no message. Set
+    unconditionally now; it is the policy knob, not the predicate.
+  - **⚠⚠ A FAILURE THAT STOPPED BEING LOUD: post-commit maintenance.** A version checksum, an interval
+    checkpoint and log cleanup run AFTER the commit is durable, so EW stopped throwing on them and reports
+    through `OnPostCommitMaintenanceFailure` instead — and **an unsubscribed callback reports nothing**.
+    Now subscribed in `DeltaWriter.Options()` as a WARNING. Why it matters here: log cleanup deletes only
+    what a checkpoint covers, so a table whose checkpoint keeps failing reclaims nothing and replays its
+    whole log on every open — the ~10 ms/dead-commit, ~85 ms/active-file S3 pathology this file already
+    measured, diagnosed as "Delta is slow". ⚠ SYNCHRONOUS by contract (an async lambda is `async void` and
+    would end the process); NOT gated, because forcing a checkpoint failure needs the FS to fail on cue.
+  - **⚠⚠ ISOLATION: `delta.isolationLevel` IS HONOURED NOW, and the "never weaker" rule exposed us.** EW
+    never read the property, so a declared-`Serializable` table committed at `WriteSerializable`. ⚠ Our
+    OWN layer was already right (`EffectiveSerializable` drives the row-level DV retry), so the accurate
+    claim is narrow — for a table that DECLARES Serializable, our conflict CHECKING diverged from Spark
+    under concurrency; a table declaring nothing is unaffected, since EW kept `absent = WriteSerializable`.
+    - **A caller may now ask for a STRONGER level, never a WEAKER one** (`ArgumentException`, raised
+      BEFORE the contention check so it cannot read as intermittent). We passed an explicit
+      `WriteSerializable` at two `StartTransaction` sites, staking every write on OUR parser agreeing with
+      EW's. ⇒ we pass **`null`** now and let EW read the property; asking for Serializable stays safe by
+      construction, which keeps the ATTACH `isolation_level 'serializable'` working.
+    - ⚠ The Serializable row-level check also got STRICTER (`EnsureNoDataChangeInResolvedLineage` throws
+      and follows a file's lineage through `dataChange=false` rewrites). The two changes COMPOSE: such a
+      table now both gets Serializable and gets the stricter check ⇒ more conflicts, absorbed by our OCC
+      retry loops. Availability, not correctness.
+    - ⚠ The `concurrentAppend`/`OpaquePredicate` passage in `delta-concurrency.md` does NOT reach us: it
+      is about `DeltaTable.DeleteAsync(predicate)`/`UpdateAsync` and their delegate overloads, and we call
+      NEITHER — our only `DeleteAsync` sites are filesystem deletes. Our DML composes the file-level
+      staging APIs, whose read-set rule (*"exactly the files it rewrites"*) is unchanged.
+    - ⚠ **ALL OF IT IS REASONED, NOT MEASURED — no suite can produce a concurrent commit.**
+  - **⚠⚠ THE SWEEP THAT WORKS, because subject-reading demonstrably does not.** Classify a change by HOW
+    IT WOULD FAIL: the compiler catches signature changes, the tiers catch behaviour on paths we exercise,
+    and **nothing catches the rest** — a new OPT-IN hook, a flipped DEFAULT, a refusal on an untested path.
+    ⇒ (1) **diff the PUBLIC SURFACE of the option records we construct** (`DeltaTableOptions`,
+    `DeltaReadOptions`, `ParquetReadOptions`, `ParquetWriteOptions`) and read each new member's DEFAULT —
+    mechanical and exhaustive where subject-reading is neither; (2) read the changed `*.md`, especially
+    `doc/known-issues.md`, which is where EW keeps what is BROKEN; (3) SKIP the tests as a sweep.
+    ⚠ The maintenance hook was IN the first subject grep's output and got skimmed past; the USER found it
+    by reading `doc/delta-concurrency.md`, and the inverted-statistics entry came only from `known-issues`.
+  - Gates: compile **zero**; EW `DeltaLake.Tests` **608/608, 0 skipped × 3 TFMs**; `DeltaLake.Table.Tests`
+    **1345 passed / 124 skipped / 0 failed × 3 TFMs** (all skips under `Tests.Interop.*`, counted);
+    hermetic **82/82 — 10082** and service **60/60 — 3586**, both IDENTICAL to the previous pin, with
+    `verify_mssql_s3_polybase` at its full **263**.
+  - ⚠ `WritePageIndex` now defaults TRUE (write side, checkpoints included) — covered for real by the
+    polybase gate. `DataPageRowCountLimit` defaults to 20,000 rows and its gate passes **VACUOUSLY**: it
+    only splits a row group above that size, and the interop tables are far smaller.
+  - ✅ **`65a69a6` RETIRED A REFUSAL OF OURS — LIFTED 2026-10-24**: per-column parquet write options now
+    translate logical → physical names, so `parquet_bloom_filter_columns` works on a column-mapped table.
+    Gate `verify_with_options` §9c (234 -> 246) reads the FILES: filter on every `id` chunk and on no other
+    column's, through a CTAS, a later INSERT and an UPDATE rewrite (`id`'s physical leaf found by its max).
+- **⚠⚠ THE 2026-09-18 EW BUMP — `bab9a89 → e515a2b`, EIGHTY-THREE commits, still ZERO patches (a
+  fast-forward; HEAD is exactly `upstream/main`'s tip, so the pin is fetchable by any clone). Mostly
+  PARQUET, which is the area this file records as our silent-corruption history — but the exposure check
+  says almost none of it reaches us.**
+  - **WHAT WE ACTUALLY REFERENCE, established by grep rather than assumed: exactly ONE EW project,
+    `EngineeredWood.DeltaLake.Table`.** We set NO `ByteArrayEncoding` and declare none of the new feature
+    flags (`EWPARQUET0004` extended-precision timestamps, `EWPARQUET0005` PFOR), and we reference neither
+    `EngineeredWood.Vortex` (34 files, a whole new area) nor Lance. ⇒ **`24d94d5` — the BREAKING
+    "move FSST off encoding 11, which PFOR now claims" — is INERT for us**, and the standing rule that
+    keeps it inert is unchanged: do NOT enable FSST/ALP/PFOR, they are unratified and contest encoding
+    slots (the contention has now moved from slot 10 to slot 11).
+  - **A FIX WE INHERIT AND SHOULD KNOW WE INHERIT: `5ae1421` — bit-packed values wider than 26 bits were
+    SILENTLY TRUNCATED.** Fifth entry in the silent-corruption ledger, and this time on the fixing side.
+    Also `1ec2b81` (float columns default to PLAIN, so every reader can decode), `42236b1` (a V1 data page
+    honours the encoding options), `1ab4a7c` (ALP vectors bounded at the next offset, not the page end).
+  - Gates: compile cost **ZERO** (the managed publish, which is what actually compiles EW, 0 errors);
+    EW `DeltaLake.Tests` **593/593, ZERO skipped, × 3 TFMs** (was 575 — the suite GREW); EW
+    `DeltaLake.Table.Tests` **853 passed / 114 skipped / 0 failed × 3 TFMs** (was 841/113 — grew too);
+    hermetic **79/79 — 9672**, IDENTICAL to the previous pin, which is the behaviour-neutrality claim.
+  - **THE FOREIGN-READER GATE PASSED, which is the half a smoke test cannot give you: service
+    **59/59 — 3483**, also IDENTICAL to the previous pin, with `verify_mssql_s3_polybase` at its full
+    **263**.** That suite is SQL Server reading, through a real EXTERNAL TABLE, parquet this EW wrote — and
+    checkpoint content is exactly where our SQL Server interop has broken before (the 0-byte snappy chunk).
+  - ⚠ STILL NOT COVERED, and neither CI tier can be it: a LIVE Fabric leg (OneLake write + read back by
+    Fabric's own SQL endpoint, incl. through a checkpoint this EW wrote). The 2026-08-25 bump treated that
+    as the gate neither tier can be; this bump has not had it.
+- **⚠⚠ THE 2026-08-25 EW BUMP — `3a31d9e → bab9a89`, THIRTY-NINE commits, still ZERO patches (a
+  fast-forward). The user's framing was "most parquet fixes and a few delta"; the DELTA FIVE are the ones
+  that change our behaviour, because between them they add a FILE TO EVERY COMMIT, a new conflict class and
+  a protocol declaration.** Full record: [docs/ew-master-migration.md](docs/ew-master-migration.md)
+  §THE 2026-08-25 BUMP. `git ls-tree HEAD engineered-wood` remains the authority for the pin, not this prose.
+  - **⚠⚠ WE NOW WRITE A `_delta_log/<version>.crc` BESIDE EVERY COMMIT** (`f54b269`,
+    `DeltaTableOptions.WriteVersionChecksums` defaulting to **true**). MEASURED on a fresh table:
+    twelve commits, twelve `.crc`, v0 included — and on the NATIVE provider too, so it is not codec-only.
+    **Nothing of ours trips over it, checked rather than hoped**
+    — our object-store discovery globs `*/_delta_log/*.json`, the local fast path tests
+    `Directory.Exists(_delta_log)`, VACUUM's hidden-name rule excludes `_delta_log` because it begins `_`,
+    and **`LogCleanup` already reclaimed `.crc` files before this bump** (it learned to during the retention
+    work, while its own comment still said "nothing here writes one"), so they do not grow without bound.
+    ⚠ The COST is one extra create-if-absent request PER COMMIT — ~180 ms on OneLake — on the WRITE path
+    only. Left ON deliberately: the spec says SHOULD, delta-spark and kernel both do it, and being the odd
+    writer on a shared table is the exact condition it exists to end.
+  - **⚠⚠ AND IT EXPOSED A COERCION IN OUR OWN CHECKPOINTS — the FOURTH entry in the silent-corruption
+    ledger.** `CheckpointWriter` wrote `m.Name ?? ""`, `m.Description ?? ""`, `m.CreatedTime ?? 0`,
+    `t.LastUpdated ?? 0`, so **one table read back differently depending on whether the reader used the log
+    or the checkpoint** — and nothing could see it, because nothing compared the two. A checksum IS that
+    comparison, and delta-spark's `computedState` fails the WHOLE READ on a mismatch
+    (`DELTA_STATE_RECOVER_ERROR`, which names nothing that is wrong; upstream saw a **600 s hang**).
+    **OUR EXPOSURE IS REAL AND TRANSITIONAL, and reading the file is what BOUNDED it to two of the four
+    fields:** a `.crc` we write carries `"metadata"` with **no `name` and no `description` key** (we never
+    set either) while `createdTime` IS present — so those two are the disagreeing pair against a PRE-bump
+    checkpoint that coerced them to `""`. Fixed upstream, so the
+    window closes at each table's next checkpoint — default interval 10.
+  - **⚠⚠ `ARROW:schema` IS NOW IN EVERY EW-WRITTEN FILE, CHECKPOINTS INCLUDED** (`56ad9d7`,
+    `ParquetWriteOptions.WriteArrowSchema` default **true**) — MEASURED present in both a data file and the
+    `.checkpoint.parquet`. ⚠ It is a FIXED PER-FILE cost — **480 bytes in a 949-byte two-column data
+    file, half of it, and 4568 bytes on the checkpoint** — so noise on a large file and material on a small
+    one, and EW writes ONE FILE PER INPUT BATCH, which makes single-row INSERTs the shape that pays it.
+    DuckDB's own parquet reader reads both unchanged. ⚠ **Checkpoints are written by EW ON EVERY ENGINE,
+    `native_write` included**, so
+    this is not scoped to the codec provider — and checkpoint content is where our SQL Server interop has
+    broken before (the 0-byte snappy chunk). `verify_mssql_s3_polybase` is the gate, which is why this bump
+    is not believable on the hermetic tier alone.
+  - **`95aa633` — OPTIMIZE, the metadata-only schema changes, `SetClusteringColumnsAsync` and the two
+    domain-metadata writers now REBASE instead of making one attempt.** A single concurrent append used to
+    fail an ALTER TABLE or throw away an OPTIMIZE that had already rewritten its whole candidate set.
+    **We call two of the five** (`SET SORTED BY`, OPTIMIZE) and neither call site is a retry loop, so
+    nothing of ours double-retries — the win is that our `ConcurrentModification` translation fires far less
+    often. ⚠ Its new `ConflictType.DomainMetadataChanged` carries a ROW-TRACKING EXEMPTION that is
+    LOAD-BEARING FOR US: our default table has row tracking on — measured on BOTH the codec and the native
+    provider, whose v0 protocols are identical — and every commit adding files
+    advances `delta.rowTracking`, so without it two ordinary concurrent INSERTs would conflict on a domain
+    neither writer named.
+  - **`7376d96`'s stated cost does NOT reach us** — our default create already declares `domainMetadata` in
+    `writerFeatures` at v0 (measured), so there is no first-domain protocol upgrade to race; and our one
+    `StageActions` call stages only `protocol` and `metaData`, never a domain.
+  - **⚠ `a684678` — PRUNING ACTED ON LOSSY COMPARISONS, so a row group holding a match could be SKIPPED**
+    with no error anywhere (upstream measured it on 2^53+1). **It reaches us** — `DeltaFilePruner` calls
+    `StatisticsEvaluator.Evaluate` — though narrowly, since DuckDB normally casts a literal to the column's
+    type at bind. A fix we inherit, not a risk we take on.
+  - **THE EIGHT ALP COMMITS AND THE FOUR CLOUD-BACKEND COMMITS DO NOT REACH US, each established by one
+    grep**: we set no `ByteArrayEncoding` at all, and `Fabricator.Delta` references
+    `EngineeredWood.DeltaLake.Table` and nothing else (our S3/ADLS filesystems are our own). ⚠ **Still do
+    not enable ALP or FSST** — both are unratified proposals contesting encoding slot 10, so either makes
+    our parquet unreadable by Spark/DuckDB/PyArrow.
+  - **⚠⚠ EW Table.Tests went `922/922` → `841 passed / 113 SKIPPED / 0 failed × {net10.0, net8.0, net472}`,
+    AND THAT IS AN HONESTY FIX RATHER THAN A REGRESSION.** `8fc2d66`/`aa90d86` reclassify tiers that cannot
+    run here from Passed to Skipped; the suite GREW (922 → 954 total). **Verified rather than assumed,
+    because "81 fewer passing on a bump" is exactly the shape a real regression takes**: all 113 skips are
+    under `…Tests.Interop.*` (the pyspark/delta-rs tier), counted. ⚠ The corollary is uncomfortable — **the
+    previous bump's "922/922" was partly a VACUOUS PASS.**
+  - **⚠⚠ LIVE FABRIC VALIDATION, and it is the gate NEITHER CI TIER CAN BE** — no tier writes to OneLake or
+    is read by a foreign engine, which is exactly what this bump changes. dbt `lakehouse` target: a single
+    200k CTAS **PASS** (5.86 s) and `load_a…d` at `--threads 4` **PASS=4/4** (13.1 s, a re-run so it also
+    took the table-swap RENAME path); `.crc` confirmed landing on the remote root; **Fabric's OWN SQL
+    analytics endpoint read all four tables — 800,000 rows, `sum(doubled)` = 39,999,800,000, the exact
+    closed-form answer**; and, the leg that matters, **a table driven past the checkpoint interval ON
+    OneLake and read back by Fabric THROUGH a checkpoint the new EW wrote — 59 rows / 30810, exact.** That
+    shape is the one that broke last time checkpoint content changed under us (the 0-byte snappy chunk
+    failed every SQL Server read that crossed a checkpoint).
+    - **⚠⚠ THE FIRST READING WAS WRONG IN A WAY THAT LOOKS EXACTLY LIKE CORRUPTION — 55 rows / 18720
+      against a truth of 59 / 30810 — and it was the Lakehouse SQL endpoint's ASYNCHRONOUS METADATA SYNC**,
+      i.e. a stale-but-CONSISTENT snapshot at v5 that **converged to the exact truth after 45 s**. Reported
+      at first reading it is a false data-integrity alarm; waved through as "probably lag" it is an unearned
+      pass. **Poll to convergence and say which reading you took.**
+  - **⚠ THE FABRIC WAREHOUSE dbt TARGET FAILED HERE, PRE-EXISTING rather than this bump — and chasing it
+    is what found and FIXED the discovery defect (see the top-level entry under "Next up").** `dbt run
+    --target fabric` died before any model with *"table_schema failed: 15871: 'managed_delta_table_forks'
+    is not supported"*; dbt introspects before it builds. Split by hand: ATTACH succeeded,
+    `fabricator_query` answered (52 rows from `sys.tables`), a TARGETED `w.dbo.load_a` returned **200,000**,
+    and only `duckdb_tables()` — full ENUMERATION — failed. Three independent grounds that it was not the
+    bump: this file had carried the identical error string since **2026-08-09** (two EW pins earlier); it
+    fails in `table_schema` on a **SqlServer** catalog over TDS, where nothing EW does can change the T-SQL
+    we send; and the service tier enumerates box SQL Server in dozens of suites and came back
+    **54/54 — 2992** — same code, same call, different server. ⇒ **the cause was OURS all along**, and the
+    target is now PASS=4/4.
+  - Gates: compile cost **ZERO** (0 errors, 8 pre-existing unrelated warnings); EW Table.Tests as above;
+    EW DeltaLake.Tests (the log/conflict/checksum layer, where the five delta commits land) **575/575, ZERO
+    skipped, × 3 TFMs**; a codec smoke (5000 rows, UPDATE + DELETE) correct; hermetic **74/74 — 8003** and
+    service
+    **54/54 — 2992**, both IDENTICAL to the previous pin, which is the behaviour-neutrality claim.
+- **THE 2026-08-20 EW BUMP — `2c51cd7 → 3a31d9e`, twelve commits, all parquet, zero patches. Full record
+  moved to [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE 2026-08-20 BUMP (2026-08-25);
+  what is worth carrying here is the standing rules it was paid for.**
+  - **⚠⚠ TWO of its twelve were SILENT WRITE CORRUPTIONS.** `69ed857` — a nullable column auto-split across
+    row groups took its validity UNSHIFTED, so values SHIFTED on disk; **our data files were safe (one
+    parquet file per ≤122880-row batch, never reaching the 1M `RowGroupMaxRows` default) and our CHECKPOINTS
+    were not**, because `CheckpointWriter` builds ONE batch for the whole snapshot and its columns are
+    heavily nullable by construction. `cbd0d0f` — a float/double dictionary keyed on VALUE not BITS, so a
+    column holding both `+0.0` and `-0.0` lost the sign of whichever came second.
+  - ⇒ **THE STANDING RULE: EW's parquet writer is where our silent-corruption history lives — treat a
+    parquet release note as a data-integrity question, not a dependency bump.** Four entries now, and the
+    2026-08-25 checkpoint coercion is the fourth.
+  - ⚠ **Do NOT enable FSST or ALP** (unratified, both claim encoding slot 10) — the rule the 2026-08-25
+    bump's eight ALP commits inherit.
+  - ⚠ **EW `Parquet.Tests` reports 119 FAILURES and every one is the uninitialised `parquet-testing` corpus**
+    (`DirectoryNotFoundException`), which we deliberately do not init (~½ GB); 818 pass. Verified by reading
+    the failure reason, because "119 failed" on a parquet bump is exactly the shape a real regression takes.
+  - ⚠ If `ParquetWriteOptions.WriteStatistics` (added there) is ever surfaced, it inherits the
+    `parquet_bloom_filter_columns` bug: EW matches per-column maps against the PARQUET path, which on a
+    column-mapped table — the DEFAULT — is the PHYSICAL name, so a logical-name list silently matches nothing.
+- **The 2026-08-13 follow-on (`9d204d7 → 2c51cd7`) is TWO commits, zero compile cost, and one of them
+  changes our concurrency behaviour**: **#146** gives `ExamineConcurrentAdds` Delta's third term (see the
+  CLOSED divergence note further down — it is the one this file recorded and never chased), and **#147**
+  ships XML documentation.
+  - ⚠ **#147 puts 1.1 MB of `EngineeredWood.*.xml` into the managed payload** — six files with no runtime
+    purpose, which ride into the single-file distribution artifact. With the 768 KB of `.pdb` already there
+    that is ~1.6% of a 118 MB self-contained payload, so it is FLAGGED rather than fixed:
+    `<AllowedReferenceRelatedFileExtensions>none</AllowedReferenceRelatedFileExtensions>` would drop both,
+    but a packaging change does not belong in a dependency bump.
+- **What retired the last patch:** our `WriteAsync`/`isBlindAppend` fix landed as **#137**. Verified by
+  CONTENT at six surface points in `upstream/main`'s `DeltaTable.cs`, not by PR state.
+- **Upstream then extended it TWICE, and #143 fixes a corruption OUR patch made reachable**:
+  `rebaseSafe: isBlindAppend != false`, so a declared-false append is no longer rebased onto a newer
+  version and re-committed verbatim. #144 teaches the *inference* to read a `cdc` action as positive
+  evidence of a read (matters when we READ another engine's log, not when we write).
+- **⚠ THE BUMP EXPOSED A DEFECT OF OURS, and the compile cost was ZERO — 14 commits, 0 errors, no new
+  warnings, which is exactly the state in which a bump looks finished.** Both OCC retry loops
+  (`DeltaCatalog.FlushDeferredFilesAsync`, `DeltaGlobalTableFunction.WriteAsync`) caught EVERY
+  `DeltaConflictException` and REPLAYED the same already-written data files — so #143's new
+  `RebaseUnsafe`/`Replan` ("rebuild, do not replay") was swallowed and the corruption reopened one layer
+  up. Fixed with `when (… && isBlindAppend != false)` on both. **Pre-existing, not caused by the bump**
+  (EW used to rebase silently); what the bump added is the signal. **REASONED, NOT MEASURED** — no suite
+  can produce a concurrent commit.
+- **⚠ TO OFFER A PATCH AGAIN**: `git -C engineered-wood remote add fork <cmettler url>`, cut a FRESH
+  `fabricator-patches-v<n>` off `upstream/main`, push it to the fork, and point `.gitmodules` url+branch
+  at the fork while the set is non-empty. A pin nobody can fetch breaks every clone, and release tags pin
+  EW shas forever. The v1/v2/v3 lineages are DEAD — never merge into one.
+- **⚠ A CONSTRAINED DELTA TABLE IS NOW *INSERT-ONLY* — MEASURED 2026-08-12, and my first two write-ups of
+  this were both wrong.** #136/#138/#139/#140 make EW evaluate CHECK constraints and invariants and compute
+  generated columns, where it used to REFUSE every write to such a table. I first recorded *"nothing changes
+  for us"* (the `constraintsEnforcedByCaller` opt-in defaults to false), then *"a capability gain worth
+  revisiting"*. The truth is narrower than the second and much larger than the first, and only running it
+  showed that. Gate: `verify_delta_tblproperties` §8 (102 → **132**).
+
+  | statement | on a table declaring `delta.constraints.*` |
+  |---|---|
+  | `INSERT` | **works**, and a violating row is refused BY EVALUATION (*"CHECK constraint … is violated by a row being written"*) |
+  | `UPDATE` | **REFUSED**, even when the post-image would satisfy the constraint |
+  | `DELETE` | **REFUSED**, though a delete has no post-image to check at all |
+  | `CREATE OR REPLACE` | works — and **copies the declaration forward** |
+
+  - **The mechanism is `SupportsExternalDataFileCommit`, which STOPPED LYING** (#140 found it reported
+    `true` for a constrained table while the commit refused — sending a caller off to write files it could
+    not commit). We read it in FIVE places, all fallback gates; the false now steers an INSERT off the
+    streaming external-commit path onto EW's `WriteAsync`, where rows exist to be checked. Our UPDATE/DELETE
+    are COMPOSED from file-level staging APIs (`StageDataFilesAsync`/`CommitDataFilesAsync`) which are handed
+    finished files, so EW refuses them — the honest answer and the safe direction.
+  - **⚠ THE `created_by` PROBE DOES NOT DISCRIMINATE, and I ran it and nearly believed it.** Under
+    `native_write` BOTH paths hand the file writing to DuckDB's COPY, so a constrained and an unconstrained
+    table both report `DuckDB`. The discriminator is the Debug log: `delta stream-write … deferred` (external
+    commit) vs `delta write … mode=Append` (`WriteAsync`). **The file WRITER is not the COMMIT PATH.**
+  - **⚠ AND IT WAS A ONE-WAY DOOR — FOUND AND CLOSED (2026-08-12).** `set_tblproperties` commits through
+    `CommitDataFilesAsync` with an **EMPTY file list**, and EW applies the refusal to the CALL rather than to
+    the rows — so a constrained table rejected EVERY property edit, **including the one that removes the
+    constraint**. Escape was DROP + re-create (a REPLACE copies it forward). Fixed by passing
+    `constraintsEnforcedByCaller: true` on the two metadata-only commits (`SET TBLPROPERTIES`, `SET/RESET
+    SORTED BY`), where the claim is **VACUOUSLY TRUE** — zero rows are written, so nothing can violate
+    anything. ⚠ Legitimate ONLY while the file list is empty; on a call that writes files it would be a claim
+    we cannot support, and a wrong one poisons the table for every later reader. Mutation-tested: reverting
+    it dies at exactly the unset, after 124 assertions pass. The violating-INSERT assertion EARLIER in the
+    section is its positive control — the property is declared through the very call that now asserts
+    enforcement, so a leak into the row-writing paths would show up there.
+  - **⚠ TWO UPSTREAM OBSERVATIONS worth offering**, both from the same root (the refusal keys on the CALL,
+    not on whether rows exist): a commit writing **zero data files** cannot violate a row constraint, and a
+    **DELETE** produces no post-image either. Neither can poison a table. The UPDATE refusal is right in
+    general — but our composed path HOLDS the post-image batches before writing files, so a public way to
+    evaluate a table's constraints against batches (EW has `DeltaConstraintEnforcer`, `internal`) would let us
+    assert honestly instead of being refused.
+  - We never CREATE such a table (`CHECK` on CREATE is unsupported); the case this serves is a
+    **Spark-authored** table, and the gate declares the constraint the way Delta itself stores it — a
+    `delta.constraints.<name>` property.
+
+
