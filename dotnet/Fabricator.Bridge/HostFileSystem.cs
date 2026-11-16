@@ -439,7 +439,7 @@ internal static unsafe class HostFs
             {
                 paramStream = CArrowArrayStream.Create();
                 // a 1-row stream the host reads + binds positionally (consumed + released by the host).
-                CArrowArrayStreamExporter.ExportArrayStream(
+                OwnedStreamExport.Export(
                     new InMemoryArrayStream(parameters.Schema, new[] { parameters }), paramStream);
             }
 
@@ -453,7 +453,7 @@ internal static unsafe class HostFs
                 {
                     namePtrs[i] = (byte*)Marshal.StringToCoTaskMemUTF8(inputs![i].Name);
                     var s = CArrowArrayStream.Create();
-                    CArrowArrayStreamExporter.ExportArrayStream(inputs[i].Stream, s); // host consumes + releases it
+                    OwnedStreamExport.Export(inputs[i].Stream, s); // host consumes + releases it
                     streamPtrs[i] = s;
                 }
                 hi.Count = n;
@@ -554,7 +554,7 @@ internal static unsafe class HostFs
         bool handedOver = false;
         try
         {
-            CArrowArrayStreamExporter.ExportArrayStream(new BorrowedKeysStream(schema, batch), stream);
+            OwnedStreamExport.Export(new BorrowedKeysStream(schema, batch), stream);
             fixed (byte* p = match)
             {
                 byte* err = null;

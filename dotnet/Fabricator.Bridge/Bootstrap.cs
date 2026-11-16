@@ -333,7 +333,7 @@ public static unsafe class Bootstrap
             IArrowArrayStream stream = new DescribedArrowStream(
                 () => { Restore(); return catalog.DescribeQuery(query, bag); },
                 () => { Restore(); return catalog.ExecuteQuery(query, bag); });
-            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            OwnedStreamExport.Export(stream, outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -365,7 +365,7 @@ public static unsafe class Bootstrap
             var bag = ReadParameterBag(parameters);
             var stream = catalog.ExecuteQuery(query, bag, spec, values);
             values = null; // the provider owns it now
-            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            OwnedStreamExport.Export(stream, outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -498,7 +498,7 @@ public static unsafe class Bootstrap
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             BridgeLog.LogDebug("abi {What}", what);
-            CArrowArrayStreamExporter.ExportArrayStream(member(catalog), outStream);
+            OwnedStreamExport.Export(member(catalog), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -627,7 +627,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            CArrowArrayStreamExporter.ExportArrayStream(session.SchemaStream(), outStream);
+            OwnedStreamExport.Export(session.SchemaStream(), outStream);
             return FabricatorStatus.Ok;
         }
         catch (ObjectNotFoundException ex)
@@ -803,7 +803,7 @@ public static unsafe class Bootstrap
             var (json, parts) = session.FilePlan(at);
             if (parts is not null)
             {
-                CArrowArrayStreamExporter.ExportArrayStream(parts, outParts); // a declined plan leaves it unset
+                OwnedStreamExport.Export(parts, outParts); // a declined plan leaves it unset
             }
             *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(json); // host frees via free_error
             return FabricatorStatus.Ok;
@@ -855,7 +855,7 @@ public static unsafe class Bootstrap
             *got = unit is null ? 0 : 1;
             if (unit is not null)
             {
-                CArrowArrayStreamExporter.ExportArrayStream(unit, outStream);
+                OwnedStreamExport.Export(unit, outStream);
             }
             return FabricatorStatus.Ok;
         }
@@ -882,7 +882,7 @@ public static unsafe class Bootstrap
             var columns = request.RootElement.GetProperty("columns").EnumerateArray()
                 .Select(c => c.ValueKind == System.Text.Json.JsonValueKind.Null ? null : c.GetString())
                 .ToList();
-            CArrowArrayStreamExporter.ExportArrayStream(session.PartScan(part, columns), outStream);
+            OwnedStreamExport.Export(session.PartScan(part, columns), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -928,7 +928,7 @@ public static unsafe class Bootstrap
                 ? null
                 : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
 
-            CArrowArrayStreamExporter.ExportArrayStream(session.Scan(spec, values), outStream);
+            OwnedStreamExport.Export(session.Scan(spec, values), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1108,7 +1108,7 @@ public static unsafe class Bootstrap
 
             var rows = CArrowArrayStreamImporter.ImportArrayStream(input);
             IArrowArrayStream returned = catalog.InsertReturning(path, tableName, rows);
-            CArrowArrayStreamExporter.ExportArrayStream(returned, outStream);
+            OwnedStreamExport.Export(returned, outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1139,7 +1139,7 @@ public static unsafe class Bootstrap
             IArrowArrayStream returned = setCount < 0
                 ? catalog.ExecuteDeleteReturning(path, tableName, rows)
                 : catalog.ExecuteUpdateReturning(path, tableName, setCount, rows);
-            CArrowArrayStreamExporter.ExportArrayStream(returned, outStream);
+            OwnedStreamExport.Export(returned, outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1435,7 +1435,7 @@ public static unsafe class Bootstrap
             var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
             var stream = Host.OpenSource(n)
                          ?? throw new InvalidOperationException($"fabricator: no named source registered as '{n}'");
-            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            OwnedStreamExport.Export(stream, outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1764,7 +1764,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.InvalidArgument;
             }
             var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-            CArrowArrayStreamExporter.ExportArrayStream(ScalarBindingRunner.Execute(bound, argStream), outStream);
+            OwnedStreamExport.Export(ScalarBindingRunner.Execute(bound, argStream), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1843,7 +1843,7 @@ public static unsafe class Bootstrap
                 : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
                     .InOutBind(FunctionSchemaPath(schemaPath, schemaPathLen), f, argsBatch, inSchema);
             // Export the binding's full output schema as a zero-row stream so the host can read return types.
-            CArrowArrayStreamExporter.ExportArrayStream(
+            OwnedStreamExport.Export(
                 new InMemoryArrayStream(binding.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
             *outBinding = Handles.Alloc(binding);
             return FabricatorStatus.Ok;
@@ -1883,7 +1883,7 @@ public static unsafe class Bootstrap
                     cols[i] = projected[i];
                 }
             }
-            CArrowArrayStreamExporter.ExportArrayStream(new InOutExchangeStream(b, inputStream, cols), output);
+            OwnedStreamExport.Export(new InOutExchangeStream(b, inputStream, cols), output);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1934,7 +1934,7 @@ public static unsafe class Bootstrap
             var bound = new LateralBindingHandle(binding, f, inSchema);
             // The host binds its RETURN TYPES from this: the function's own columns, WITHOUT the provenance
             // column (which is transport, not a result column).
-            CArrowArrayStreamExporter.ExportArrayStream(
+            OwnedStreamExport.Export(
                 new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
             *outBinding = Handles.Alloc(bound);
             return FabricatorStatus.Ok;
@@ -1998,7 +1998,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.InvalidArgument;
             }
             var rows = CArrowArrayImporter.ImportRecordBatch(input, s.InputSchema); // takes ownership
-            CArrowArrayStreamExporter.ExportArrayStream(s.Call(rows), outStream);
+            OwnedStreamExport.Export(s.Call(rows), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -2059,7 +2059,7 @@ public static unsafe class Bootstrap
                 : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
                     .TableFnBind(FunctionSchemaPath(schemaPath, schemaPathLen), f, argsBatch);
             // Export the binding's output schema as a zero-row stream so the host can read return types.
-            CArrowArrayStreamExporter.ExportArrayStream(
+            OwnedStreamExport.Export(
                 new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
             *supportsPushdown = bound.MapResultByName ? 1 : 0;
             *outBinding = Handles.Alloc(bound);
@@ -2133,7 +2133,7 @@ public static unsafe class Bootstrap
             }
             try
             {
-                CArrowArrayStreamExporter.ExportArrayStream(rows, outStream);
+                OwnedStreamExport.Export(rows, outStream);
             }
             catch
             {
@@ -2230,7 +2230,7 @@ public static unsafe class Bootstrap
             {
                 provider.Build(), name.Build(), type.Build(), def.Build(), desc.Build(), min.Build(),
             }, rows);
-            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            OwnedStreamExport.Export(new InMemoryArrayStream(schema, new[] { batch }), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -2374,7 +2374,7 @@ public static unsafe class Bootstrap
             {
                 name.Build(), kind.Build(), stringOrder.Build(), body.Build(), paramCount.Build(), returnType.Build(),
             }, rows);
-            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            OwnedStreamExport.Export(new InMemoryArrayStream(schema, new[] { batch }), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -2436,7 +2436,7 @@ public static unsafe class Bootstrap
             {
                 provider.Build(), secretType.Build(), name.Build(), type.Build(), redact.Build(),
             }, rows);
-            CArrowArrayStreamExporter.ExportArrayStream(new InMemoryArrayStream(schema, new[] { batch }), outStream);
+            OwnedStreamExport.Export(new InMemoryArrayStream(schema, new[] { batch }), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -2632,7 +2632,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.InvalidArgument;
             }
             var rb = CArrowArrayImporter.ImportRecordBatch(ids, AggIdsSchema); // takes ownership
-            CArrowArrayStreamExporter.ExportArrayStream(s.Finalize(rb), outStream);
+            OwnedStreamExport.Export(s.Finalize(rb), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -2701,7 +2701,7 @@ public static unsafe class Bootstrap
             }
             var states = CArrowArrayImporter.ImportRecordBatch(groupStates, AggStateSchema); // takes ownership
             var rows = CArrowArrayImporter.ImportRecordBatch(batch, s.UpdateSchema);          // takes ownership
-            CArrowArrayStreamExporter.ExportArrayStream(s.UpdateSpill(states, rows), outStream);
+            OwnedStreamExport.Export(s.UpdateSpill(states, rows), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -2728,7 +2728,7 @@ public static unsafe class Bootstrap
             }
             var target = CArrowArrayImporter.ImportRecordBatch(targetStates, AggStateSchema);       // takes ownership
             var batch = CArrowArrayImporter.ImportRecordBatch(combineBatch, AggCombineBatchSchema); // takes ownership
-            CArrowArrayStreamExporter.ExportArrayStream(s.CombineSpill(target, batch), outStream);
+            OwnedStreamExport.Export(s.CombineSpill(target, batch), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -2753,7 +2753,7 @@ public static unsafe class Bootstrap
                 return FabricatorStatus.InvalidArgument;
             }
             var batch = CArrowArrayImporter.ImportRecordBatch(states, AggStateSchema); // takes ownership
-            CArrowArrayStreamExporter.ExportArrayStream(s.FinalizeSpill(batch), outStream);
+            OwnedStreamExport.Export(s.FinalizeSpill(batch), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
