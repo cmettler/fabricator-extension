@@ -180,6 +180,10 @@ public static class SchemaPathAdapter
                     values.Append(names.GetString(i));
                 }
                 var columns = new List<IArrowArray>(batch.ColumnCount) { builder.Build() };
+                // Column 0 is REPLACED, not passed on: its strings were copied into the path list, so nothing
+                // points at it any more and it is ours to release. Left to the finalizer it was harmless; under a
+                // caller-owned allocator (no finalizer) it leaked one names column per catalog_tables call.
+                names.Dispose();
                 for (int i = 1; i < batch.ColumnCount; i++)
                 {
                     columns.Add(batch.Column(i));
