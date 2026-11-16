@@ -238,7 +238,9 @@ internal sealed class HostQueryService : IHostQuery
         {
             var next = _pending;
             _pending = null;
-            return new ValueTask<RecordBatch?>(next);
+            // A retained view, because the exporter disposes what it is given (arrow-dotnet #483) and the same
+            // registered batch is handed out again on the next scan. See BorrowedBatch.
+            return new ValueTask<RecordBatch?>(next is null ? null : BorrowedBatch.View(next));
         }
 
         // Drops the reference only. The batch belongs to whoever registered it.

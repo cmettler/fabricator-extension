@@ -600,7 +600,9 @@ internal static unsafe class HostFs
         {
             var next = _pending;
             _pending = null;
-            return new System.Threading.Tasks.ValueTask<RecordBatch?>(next);
+            // A retained view, because the exporter disposes what it is given (arrow-dotnet #483) and these keys
+            // are engineered-wood's, read again once the lookup returns. See BorrowedBatch.
+            return new System.Threading.Tasks.ValueTask<RecordBatch?>(next is null ? null : BorrowedBatch.View(next));
         }
 
         public void Dispose() => _pending = null;
