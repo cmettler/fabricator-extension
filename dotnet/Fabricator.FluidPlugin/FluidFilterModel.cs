@@ -71,6 +71,7 @@ internal static class FluidFilterModel
             // The copy is ours outright and outlives the call, which is what lets the SQL variable below be
             // rendered by DuckDB from the TYPED constants rather than by a second renderer of ours.
             values = batch is null ? null : Copy(batch);
+            batch?.Dispose(); // the copy is what we keep; the import goes back to DuckDB now
         }
         if (tree is null || values is null)
         {

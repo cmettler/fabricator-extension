@@ -396,7 +396,10 @@ public static class ExternalTableRouting
         {
             using (filterValues)
             {
-                where.Constants = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                // A managed copy, so the imported batch goes back to DuckDB at once rather than at a finalizer;
+                // the constants are re-read later (the scan and the predicate delete both need them).
+                using var imported = filterValues.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                where.Constants = imported is null ? null : BorrowedBatch.Copy(imported);
             }
         }
         var values = new List<object?>();

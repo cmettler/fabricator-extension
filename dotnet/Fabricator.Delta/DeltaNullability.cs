@@ -273,7 +273,15 @@ internal static class DeltaNullability
             var batch = await _inner.ReadNextRecordBatchAsync(cancellationToken).ConfigureAwait(false);
             if (batch is not null)
             {
-                ValidateBatch(batch, _schema, _table);
+                try
+                {
+                    ValidateBatch(batch, _schema, _table);
+                }
+                catch
+                {
+                    batch.Dispose(); // a rejected batch is never handed on, so nobody else would release it
+                    throw;
+                }
             }
             return batch;
         }

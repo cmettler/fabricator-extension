@@ -131,19 +131,22 @@ internal static class FilterConstants
                 {
                     return System.Array.Empty<object?>();
                 }
-                var values = new object?[batch.ColumnCount];
-                for (int i = 0; i < batch.ColumnCount; i++)
+                using (batch) // ReadScalar copies each value, so the imported batch can go back to DuckDB now
                 {
-                    try
+                    var values = new object?[batch.ColumnCount];
+                    for (int i = 0; i < batch.ColumnCount; i++)
                     {
-                        values[i] = ArrowValueReader.ReadScalar(batch.Column(i), 0);
+                        try
+                        {
+                            values[i] = ArrowValueReader.ReadScalar(batch.Column(i), 0);
+                        }
+                        catch (System.NotSupportedException)
+                        {
+                            values[i] = null; // unmappable Arrow type → that predicate node won't push (DuckDB re-applies)
+                        }
                     }
-                    catch (System.NotSupportedException)
-                    {
-                        values[i] = null; // unmappable Arrow type → that predicate node won't push (DuckDB re-applies)
-                    }
+                    return values;
                 }
-                return values;
             }
     }
 }
@@ -2031,12 +2034,15 @@ public sealed class DeltaWriteCollectorFunction : ICollectorFunction
             {
                 await foreach (var b in allInput.WithCancellation(ct).ConfigureAwait(false))
                 {
-                    if (b.Length == 0)
+                    using (b) // copied into the IPC stream; the collector owns each input chunk (as the others do)
                     {
-                        continue;
+                        if (b.Length == 0)
+                        {
+                            continue;
+                        }
+                        await w.WriteRecordBatchAsync(b, ct).ConfigureAwait(false);
+                        rows += b.Length;
                     }
-                    await w.WriteRecordBatchAsync(b, ct).ConfigureAwait(false);
-                    rows += b.Length;
                 }
                 await w.WriteEndAsync(ct).ConfigureAwait(false);
             }

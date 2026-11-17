@@ -424,13 +424,16 @@ public sealed class DeltaRsCatalog : IProviderCatalog
             {
                 return System.Array.Empty<object?>();
             }
-            var values = new object?[batch.ColumnCount];
-            for (int i = 0; i < batch.ColumnCount; i++)
+            using (batch) // ReadScalar copies each value, so the imported batch can go back to DuckDB now
             {
-                try { values[i] = ArrowValueReader.ReadScalar(batch.Column(i), 0); }
-                catch (System.NotSupportedException) { values[i] = null; }
+                var values = new object?[batch.ColumnCount];
+                for (int i = 0; i < batch.ColumnCount; i++)
+                {
+                    try { values[i] = ArrowValueReader.ReadScalar(batch.Column(i), 0); }
+                    catch (System.NotSupportedException) { values[i] = null; }
+                }
+                return values;
             }
-            return values;
         }
     }
 

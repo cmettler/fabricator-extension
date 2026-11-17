@@ -253,6 +253,8 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
             var staging = DuckSql.QuoteIdent(StagingTable);
             await foreach (var batch in input.WithCancellation(ct).ConfigureAwait(false))
             {
+                // The collector owns each input chunk; RegisterRows only BORROWS it for the staging INSERT.
+                using var owned = batch;
                 if (batch.Length == 0)
                 {
                     continue;
