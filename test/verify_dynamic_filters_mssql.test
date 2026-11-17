@@ -142,8 +142,10 @@ CREATE TABLE keys AS SELECT * FROM (VALUES ('r1', 1), ('R1 ', 2), ('R2', 3), ('n
 statement ok
 CREATE TABLE keysn AS SELECT * FROM (VALUES ('r1', 1), (NULL, 2), ('R2', 3), ('nope', 4)) t(region, w);
 
+# 50 ms early: dm_exec_query_stats.last_execution_time is a DATETIME (1/300 s), so a statement starting within ~2 ms
+# of SYSDATETIME() rounds to BEFORE it and is missed (CI 2026-11-17: 0 <> 2).
 statement ok
-SET VARIABLE df_t0 = (SELECT t FROM fabricator_query('rp', 'SELECT SYSDATETIME() AS t'));
+SET VARIABLE df_t0 = (SELECT t FROM fabricator_query('rp', 'SELECT DATEADD(millisecond, -50, SYSDATETIME()) AS t'));
 
 statement ok
 CALL enable_logging(['Fabricator.Sql', 'Fabricator.Remote'], storage := 'memory', level := 'debug');

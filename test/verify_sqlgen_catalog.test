@@ -121,8 +121,10 @@ SET fabricator_subtree_pushdown = false;
 
 # only the statements of THIS run: the plan cache keeps earlier runs' texts (until 2026-10-30 the WHERE carried the
 # predicate twice, `[yr] = @p0 AND [yr] = @p1`)
+# 50 ms early: dm_exec_query_stats.last_execution_time is a DATETIME (1/300 s), so a statement starting within ~2 ms
+# of SYSDATETIME() rounds to BEFORE it and is missed (CI 2026-11-17: 0 <> 2).
 statement ok
-SET VARIABLE sg_t0 = (SELECT t FROM fabricator_query('db', 'SELECT SYSDATETIME() AS t'));
+SET VARIABLE sg_t0 = (SELECT t FROM fabricator_query('db', 'SELECT DATEADD(millisecond, -50, SYSDATETIME()) AS t'));
 
 query I
 SELECT count(*) FROM db.dbo.cf_union_by_pattern('sg_sales_%') WHERE yr = 2024 AND nm <> 'zz';
