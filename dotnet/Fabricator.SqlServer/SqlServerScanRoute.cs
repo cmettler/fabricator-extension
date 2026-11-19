@@ -174,6 +174,7 @@ public sealed partial class SqlServerCatalog
                 if (state.Connection is not null && !snapshotRead &&
                     (state.MarsEnabled || readYourWrites || materialize))
                 {
+                    state.ThrowIfEndedByServer();
                     string why = state.MarsEnabled ? "pin (MARS)"
                         : readYourWrites ? "pin (metadata ryw, drains immediately)"
                                          : "pin (drained scan)";

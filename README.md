@@ -817,6 +817,15 @@ dropped is also left out of their listings. After `COMMIT` everyone sees the new
 old names are back. This is what lets parallel `BEGIN … COMMIT` blocks swap tables, as dbt does at
 `--threads > 1`. Until 2026-11-03 such runs could hang forever. Details: [transactions.md](docs/transactions.md) §8.
 
+**Parallel transactions can each `ALTER` their own table**, as dbt does for incremental models with
+`on_schema_change` at `--threads > 1`. Until 2026-11-19 they deadlocked inside SQL Server, and the transaction
+SQL Server picked as the victim went on outside any transaction, failing with `207: Invalid column name …`.
+If SQL Server ever ends a transaction on its own (a deadlock victim, an error that aborts the transaction, a raw
+`ROLLBACK` sent through `fabricator_exec`), every later statement in it, and its `COMMIT`, now fails with
+*"SQL Server ended this transaction on its own and rolled back its work …"*. Run `ROLLBACK` and start the
+transaction again. Before, those statements ran in autocommit and a later `ROLLBACK` did not undo them.
+Details: [transactions.md](docs/transactions.md) §8.1.
+
 ## INSERT / UPDATE / DELETE
 
 ```sql

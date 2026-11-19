@@ -1503,6 +1503,59 @@ swap runs in 2–3 s.
 ⚠ The pending record is in memory, per ATTACH. Another PROCESS's uncommitted DDL is not covered by it, and
 there the cycle cannot form: the other side never waits in this client.
 
+### 8.1 Parallel ALTER — a deadlock inside SQL Server, and a transaction that went on without one (2026-11-19)
+
+dbt-duckdb incremental models with `on_schema_change` at `--threads 4` (elt-airflow's grist_mirror, 36 MERGE
+models): as soon as several models altered their tables at once, most failed with `207: Invalid column name
+'hd'`, `Binder Error: Referenced update column hd not found in table!` or *"… is BIGINT on the provider but
+VARCHAR in the catalog"*; `--threads 1` was green. Reproduced without dbt (`test/repro/parallel_alter_mssql.py`,
+from the handoff): `BEGIN; ALTER TABLE t ADD COLUMN hd; UPDATE t SET hd = …; COMMIT`, each thread on its OWN
+table, failed 4 rounds of 5 at 2 threads.
+
+**The cause is a real SQL Server deadlock, not the shared catalog cache** (the handoff's first hypothesis).
+The `system_health` deadlock graph: both transactions hold X on their own key in `sys.sysrowsets` (the ALTER),
+and each waits for S on the other's, inside
+`SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID(…)`. That is the row-count estimate
+(`RowCountSql`), which the binding of the UPDATE fetches on the transaction's pinned connection. `sys.partitions`
+is answered by SCANNING `sysrowsets`, which is clustered on `rowsetid`, so a filter on `object_id` still reads,
+and locks, every other table's row. The same read from an autocommit connection waits for any open ALTER
+(the handoff's `block` mode, LCK_M_S for 309 s).
+
+Two things turned the deadlock into the reported errors:
+
+1. **The failure was swallowed.** Statistics are best-effort (`FabricatorTableEntry::GetScanFunction` catches
+   everything and leaves the estimate unknown), so the victim's 1205 vanished. But SQL Server had already
+   rolled the victim's transaction back, ALTER included.
+2. **SqlClient does not refuse a dead transaction.** After a server-side rollback the `SqlTransaction` is
+   "zombied" (`Connection` reads null), and a `SqlCommand` handed one drops it and runs in AUTOCOMMIT. So the
+   victim's UPDATE ran without a transaction against a table that no longer had the column (207). MEASURED with
+   a deterministic stand-in: `BEGIN; UPDATE …; fabricator_exec('ROLLBACK TRANSACTION'); UPDATE …; DELETE …;
+   ROLLBACK` left the second UPDATE and the DELETE committed. (`SqlBulkCopy` refuses a zombied transaction, so
+   INSERT/CTAS already failed loudly.)
+
+Fixes, both managed-only:
+
+- `RowCountSql` and `ColumnNdvSql` read their catalog views `WITH (NOLOCK)` (box only; the warehouse paths are
+  separate and refuse the hint). They are estimates for the optimizer; a dirty read is harmless, a lock is not.
+  Same reasoning as the comment/DEFAULT read-back in §8 item 1.
+- `SqlServerTransaction.EndedByServer` (the zombie check) is tested before the pinned connection is handed out
+  (`BeginWrite`, both branches incl. the `fabricator_exec` join, and the pinned scan route), and at COMMIT. A
+  statement or COMMIT in such a transaction fails with *"SQL Server ended this transaction on its own and
+  rolled back its work …"*; ROLLBACK is quiet. Parked external Delta writes are rolled back with it.
+
+After the fix: `add 2 5`, `add 4 10`, `type 4 10`, `dbt 4 10` and `block` all pass. Gate:
+`test/verify_parallel_alter_mssql.test` (service). §1 holds an ALTER open on one connection and asserts the
+row-count estimate of another table on a second connection with `mssql_command_timeout = 5` (without NOLOCK it
+times out, the estimate is missing, and the suite fails instead of hanging). §2 is the server-ended transaction
+(UPDATE, `fabricator_exec` and COMMIT refused, nothing left on the server). §3 is the race, 4 workers × 5 rounds
+of add + dbt's `alter_column_type`. Mutants: NOLOCK removed from the row count dies at §1, and at §3 alone 2 of
+2 runs (already with the new message instead of 207); the zombie check disabled dies at §2.
+
+⚠ Other catalog reads in a transaction still run without NOLOCK (`RowIdSql` on `sys.indexes`, the external-table
+probe, cached per table and usually issued before the table's own ALTER). Neither was part of any measured
+deadlock, and whether their plans scan is not measured; with the zombie check in place a
+future deadlock there fails with the clear message rather than continuing in autocommit.
+
 ## Key invariants & safety nets
 
 - **DuckDB owns commit/rollback.** The extension relays the decision; it never self-commits. The one place

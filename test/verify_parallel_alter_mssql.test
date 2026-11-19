@@ -1,0 +1,196 @@
+# name: test/verify_parallel_alter_mssql.test
+# description: ALTER TABLE in parallel DuckDB transactions on SQL Server (dbt-duckdb incremental models with
+#              on_schema_change at --threads > 1, 2026-11-19). The row-count estimate read sys.partitions inside
+#              the user's transaction WITHOUT NOLOCK; that view scans sys.sysrowsets, so two transactions that
+#              each altered their OWN table deadlocked on each other's sysrowsets row. SQL Server rolled the
+#              victim back, the failure was swallowed as "no statistics", and the victim's next statement ran
+#              in AUTOCOMMIT against a table without the new column (207, or a binder error). §1 is the lock
+#              itself, §2 what happens after SQL Server ends a transaction on its own, §3 the race.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('db', 'IF SCHEMA_ID(''fab_paralter'') IS NULL EXEC(''CREATE SCHEMA fab_paralter'');
+  DECLARE @s nvarchar(max) = N''''; SELECT @s += N''DROP TABLE fab_paralter.'' + QUOTENAME(name) + N'';''
+  FROM sys.tables WHERE schema_id = SCHEMA_ID(''fab_paralter''); EXEC(@s)');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# ── §1 another transaction's open ALTER does not hold up this one's row-count estimate ─────────────────
+# con1 keeps an ALTER on ta open; con2 then binds tb (never bound before, so its statistics are fetched now).
+# Without NOLOCK the sys.partitions scan waits on ta's sysrowsets row until con1 ends: with no timeout that
+# is a hang, here the 5 s timeout fails the read and the estimate is missing from the plan.
+
+statement ok
+CREATE TABLE db.fab_paralter.ta AS SELECT range AS id, 'v' || range AS a FROM range(10);
+
+statement ok
+CREATE TABLE db.fab_paralter.tb AS SELECT range AS id, 'v' || range AS a FROM range(10);
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE UNIQUE CLUSTERED INDEX ux ON fab_paralter.tb (id)');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+ALTER TABLE db.fab_paralter.ta ADD COLUMN c VARCHAR;
+
+statement ok con2
+SET mssql_command_timeout = 5;
+
+query II con2
+EXPLAIN SELECT * FROM db.fab_paralter.tb;
+----
+physical_plan	<REGEX>:.*~10 rows.*
+
+statement ok con2
+UPDATE db.fab_paralter.tb SET a = 'x' WHERE id = 3;
+
+statement ok con2
+RESET mssql_command_timeout;
+
+statement ok con1
+ROLLBACK;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a = 'x') FROM db.fab_paralter.tb;
+----
+10	1
+
+# ── §2 a transaction SQL Server ended on its own is refused, not continued in autocommit ─────────────────
+# A deadlock victim cannot be produced on demand; a raw ROLLBACK through fabricator_exec leaves the provider
+# transaction in the same state. Before, the statements after it ran on the pinned connection WITHOUT a
+# transaction (SqlClient drops a zombied SqlTransaction from a command) and survived the user's ROLLBACK.
+
+statement ok
+CREATE TABLE db.fab_paralter.z AS SELECT range AS id, 0 AS v FROM range(3);
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE UNIQUE CLUSTERED INDEX ux ON fab_paralter.z (id)');
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE db.fab_paralter.z SET v = 1 WHERE id = 0;
+
+statement ok
+SELECT fabricator_exec('db', 'ROLLBACK TRANSACTION');
+
+statement error
+UPDATE db.fab_paralter.z SET v = 2 WHERE id = 1;
+----
+SQL Server ended this transaction on its own
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM db.fab_paralter.z WHERE id = 2;
+
+statement ok
+SELECT fabricator_exec('db', 'ROLLBACK TRANSACTION');
+
+statement error
+SELECT fabricator_exec('db', 'UPDATE fab_paralter.z SET v = 3');
+----
+SQL Server ended this transaction on its own
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE db.fab_paralter.z SET v = 4 WHERE id = 0;
+
+statement ok
+SELECT fabricator_exec('db', 'ROLLBACK TRANSACTION');
+
+statement error
+COMMIT;
+----
+SQL Server ended this transaction on its own
+
+# nothing of the three transactions is on the server
+query II
+SELECT id, v FROM db.fab_paralter.z ORDER BY id;
+----
+0	0
+1	0
+2	0
+
+# ── §3 four transactions each altering their own table, five rounds ─────────────────────────────────────
+# add: dbt's on_schema_change add + a write to the new column. type: dbt's alter_column_type
+# (add tmp column, copy, drop, rename). Each round starts from a fresh table.
+
+concurrentloop w 0 4
+
+loop r 0 5
+
+statement ok
+CREATE TABLE db.fab_paralter.a{w}_{r} AS SELECT range AS id, 'v' || range AS a, range * 10 AS n FROM range(100);
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE UNIQUE CLUSTERED INDEX ux ON fab_paralter.a{w}_{r} (id)');
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE db.fab_paralter.a{w}_{r} ADD COLUMN hd VARCHAR;
+
+statement ok
+UPDATE db.fab_paralter.a{w}_{r} SET hd = md5(a);
+
+statement ok
+ALTER TABLE db.fab_paralter.a{w}_{r} ADD COLUMN n__dbt_alter VARCHAR;
+
+statement ok
+UPDATE db.fab_paralter.a{w}_{r} SET n__dbt_alter = n;
+
+statement ok
+ALTER TABLE db.fab_paralter.a{w}_{r} DROP COLUMN n;
+
+statement ok
+ALTER TABLE db.fab_paralter.a{w}_{r} RENAME COLUMN n__dbt_alter TO n;
+
+statement ok
+COMMIT;
+
+endloop
+
+endloop
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# every table has the new columns, in order, and every row the written values
+query II
+SELECT count(*), count(DISTINCT cols) FROM (
+  SELECT table_name, string_agg(column_name, ',' ORDER BY column_index) AS cols FROM duckdb_columns()
+  WHERE database_name = 'db' AND schema_name = 'fab_paralter' AND table_name LIKE 'a%' GROUP BY table_name)
+WHERE cols = 'id,a,hd,n';
+----
+20	1
+
+query I
+SELECT fabricator_exec('db', 'DECLARE @s nvarchar(max) = N''''; SELECT @s += CASE WHEN @s = N'''' THEN N'''' ELSE
+  N'' UNION ALL '' END + N''SELECT id, a, hd, n FROM fab_paralter.'' + QUOTENAME(name) FROM sys.tables
+  WHERE schema_id = SCHEMA_ID(''fab_paralter'') AND name LIKE ''a%'';
+  EXEC(N''IF (SELECT COUNT(*) FROM ('' + @s + N'') x WHERE hd = LOWER(CONVERT(varchar(32), HASHBYTES(''''MD5'''', CAST(a AS varchar(max))), 2))
+  AND n = CAST(id * 10 AS varchar(32))) <> 2000 THROW 50000, ''''wrong rows'''', 1'')');
+----
+0

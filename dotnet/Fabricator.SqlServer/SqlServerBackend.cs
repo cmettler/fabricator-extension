@@ -1185,6 +1185,39 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
         public SqlTransaction? Transaction;
 
         /// <summary>
+        /// True once SQL Server has ended the provider transaction ON ITS OWN and rolled its work back — a
+        /// deadlock victim, an error that aborts the transaction (XACT_ABORT, some severities), a raw ROLLBACK
+        /// through <c>fabricator_exec</c>. SqlClient then "zombies" the <see cref="SqlTransaction"/>
+        /// (<c>Connection</c> reads null).
+        /// </summary>
+        /// <remarks>
+        /// ⚠⚠ WHY IT MUST BE CHECKED BEFORE EVERY USE OF THE PINNED CONNECTION: a <c>SqlCommand</c> handed a
+        /// zombied transaction does NOT fail — SqlClient drops the transaction and runs the command in AUTOCOMMIT.
+        /// MEASURED 2026-11-19: <c>BEGIN; UPDATE …; fabricator_exec('ROLLBACK TRANSACTION'); UPDATE …; DELETE …;
+        /// ROLLBACK</c> left the second UPDATE and the DELETE COMMITTED, i.e. the user's ROLLBACK undid nothing.
+        /// The parallel dbt ALTER failure was the same thing with a deadlock as the cause: every statement after
+        /// it ran outside any transaction. (SqlBulkCopy already refuses a zombied transaction; plain commands
+        /// do not.)
+        /// </remarks>
+        public bool EndedByServer => Transaction is { Connection: null };
+
+        public const string EndedByServerMessage =
+            "SQL Server ended this transaction on its own and rolled back its work (for example as a deadlock " +
+            "victim, or after an error that aborts a transaction); no further statement can run in it. " +
+            "ROLLBACK and run the transaction again.";
+
+        /// <summary>Refuses to hand out a connection whose transaction SQL Server has already rolled back (see
+        /// <see cref="EndedByServer"/>). Call under the lock on this instance, before returning
+        /// <see cref="Connection"/>.</summary>
+        public void ThrowIfEndedByServer()
+        {
+            if (EndedByServer)
+            {
+                throw new InvalidOperationException(EndedByServerMessage);
+            }
+        }
+
+        /// <summary>
         /// The MARS mode <see cref="Connection"/> was opened with. Meaningless while Connection is null.
         /// </summary>
         /// <remarks>
@@ -1238,7 +1271,16 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
             {
                 if (Transaction is not null)
                 {
-                    if (commit)
+                    if (EndedByServer)
+                    {
+                        // Already rolled back by the server: nothing to roll back, and a COMMIT must not
+                        // look like it succeeded (SqlClient's own error here names no cause).
+                        if (commit)
+                        {
+                            throw new InvalidOperationException(EndedByServerMessage);
+                        }
+                    }
+                    else if (commit)
                     {
                         Transaction.Commit();
                     }
@@ -1319,6 +1361,13 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
         {
             return;
         }
+        if (commit && txn.EndedByServer)
+        {
+            // Nothing of it survived on SQL Server, so nothing else may commit either (the parked external
+            // Delta writes, the DuckLake mirror check).
+            txn.Dispose();
+            throw new InvalidOperationException(SqlServerTransaction.EndedByServerMessage);
+        }
         var external = txn.External;
         txn.External = null;
         if (external is not null)
@@ -1385,6 +1434,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
                 {
                     if (existing.Connection is not null)
                     {
+                        existing.ThrowIfEndedByServer();
                         RefreshPinnedSessionContext(existing);
                         return (existing.Connection, existing.Transaction, false);
                     }
@@ -1399,6 +1449,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
             var state = EnsureTxnConnection(txnId);
             lock (state)
             {
+                state.ThrowIfEndedByServer();
                 RefreshPinnedSessionContext(state);
                 return (state.Connection!, state.Transaction, false);
             }
@@ -4154,7 +4205,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
     // columns that are a leading stat key appear (others => no row => unknown). Used
     // ONLY for selectivity estimation, so stale/approximate is safe (never drives
     // pruning); min/max and null counts are deliberately not exposed (docs/duckdb-2.0-
-    // remote-execution.md §4.19).
+    // remote-execution.md §4.19). Box only (a warehouse refuses NOLOCK and never gets here);
+    // read WITH (NOLOCK) for the reason given at RowCountSql.
     private static string ColumnNdvSql(string schema, string table)
     {
         string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
@@ -4162,14 +4214,14 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
             "SELECT c.name AS column_name, CAST(b.ndv AS VARCHAR(32)) AS ndv FROM (" +
             "SELECT sc.column_id, h.ndv, ROW_NUMBER() OVER (PARTITION BY sc.column_id " +
             "ORDER BY p.rows_sampled DESC, p.last_updated DESC) AS rn " +
-            "FROM sys.stats s " +
-            "JOIN sys.stats_columns sc ON sc.object_id = s.object_id AND sc.stats_id = s.stats_id AND sc.stats_column_id = 1 " +
+            "FROM sys.stats s WITH (NOLOCK) " +
+            "JOIN sys.stats_columns sc WITH (NOLOCK) ON sc.object_id = s.object_id AND sc.stats_id = s.stats_id AND sc.stats_column_id = 1 " +
             "CROSS APPLY (SELECT COUNT_BIG(*) - MAX(CASE WHEN hist.range_high_key IS NULL THEN 1 ELSE 0 END) " +
             "             + SUM(hist.distinct_range_rows) AS ndv " +
             "             FROM sys.dm_db_stats_histogram(s.object_id, s.stats_id) hist) h " +
             "CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) p " +
             "WHERE s.object_id = OBJECT_ID(" + objectLiteral + ")) b " +
-            "JOIN sys.columns c ON c.object_id = OBJECT_ID(" + objectLiteral + ") AND c.column_id = b.column_id " +
+            "JOIN sys.columns c WITH (NOLOCK) ON c.object_id = OBJECT_ID(" + objectLiteral + ") AND c.column_id = b.column_id " +
             "WHERE b.rn = 1 AND b.ndv > 0";
     }
 
@@ -4181,6 +4233,15 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
     // the other). An object without partitions — a view — yields NULL, i.e. unknown:
     // a 0 told DuckDB a view over a million rows was EMPTY (est=0), which made it the
     // build side of a hash join.
+    //
+    // ⚠ WITH (NOLOCK), and that is what keeps parallel DDL transactions alive (2026-11-19). This runs inside the
+    // user's transaction, on its pinned connection, and sys.partitions is answered by SCANNING sys.sysrowsets
+    // (clustered on rowsetid, not object_id) — so it takes a shared lock on every other table's row, including
+    // the row another transaction's uncommitted ALTER holds X on. Two transactions each altering their OWN table
+    // and then binding it therefore DEADLOCKED (graph: both waiting S on the other's sysrowsets key), SQL Server
+    // rolled the victim back, and the failure was swallowed as "statistics unavailable": the victim's next
+    // statement ran WITHOUT a transaction against a table that no longer had the new column (207). A row count
+    // is an estimate; reading it dirty is harmless, a lock is not. Box only — the warehouse path is separate.
     /// <summary>The row count on a warehouse engine, where sys.partitions answers NULL and the partition-stats DMV does
     /// not exist: COUNT_BIG(*), which Fabric answers from its metadata — MEASURED 0.09 s warm (up to 0.9 s on the first
     /// call) for 180 and for 6 001 215 rows alike. Only for a user TABLE: a view's count would run the view. Written so it
@@ -4199,7 +4260,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog, ISchemaByName
     {
         string objectLiteral = "N'" + (schema + "." + table).Replace("'", "''") + "'";
         return "SELECT CAST(SUM(p.rows) AS VARCHAR(32)) AS n " +
-               "FROM sys.partitions p " +
+               "FROM sys.partitions p WITH (NOLOCK) " +
                "WHERE p.object_id = OBJECT_ID(" + objectLiteral + ") AND p.index_id IN (0, 1)";
     }
 
