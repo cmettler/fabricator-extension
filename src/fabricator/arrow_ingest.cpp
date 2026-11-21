@@ -1446,6 +1446,21 @@ static unique_ptr<Expression> BloomAsExpression(const BoundFunctionExpression &f
 	return make_uniq<BoundFunctionExpression>(BoundScalarFunction(JoinFilterFunction()), std::move(args), nullptr);
 }
 
+//! A join filter on an `IS NOT DISTINCT FROM` join must let NULL keys through: NULL matches NULL there. DuckDB says so
+//! with `filters_null_values == false` on the filter's data, and its own evaluation keeps NULLs (fabricator_join_filter
+//! does too). The range and key list we render beside or instead of the call do not, so they get `col IS NULL OR`.
+//! ⚠ DuckDB 2.0.0 built no runtime filter for such a join at all; 2.0.1 does, and without this the rows with a NULL key
+//! vanished from the join (verify_remote_select_mssql: a window FILTER rewritten into a self-join on the partition).
+static unique_ptr<Expression> KeepNullJoinKeys(unique_ptr<Expression> filter, const Expression &column,
+                                               bool filters_null_values) {
+	if (filters_null_values || !filter) {
+		return filter;
+	}
+	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null->GetChildrenMutable().push_back(column.Copy());
+	return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(is_null), std::move(filter));
+}
+
 static unique_ptr<Expression> PrefixRangeAsExpression(const BoundFunctionExpression &f, const Expression &column) {
 	if (!g_expand_prefix_ranges || !f.BindInfo()) {
 		return nullptr;
@@ -1473,9 +1488,11 @@ static unique_ptr<Expression> PrefixRangeAsExpression(const BoundFunctionExpress
 			auto le = BoundComparisonExpression::Create(ExpressionType::COMPARE_LESSTHANOREQUALTO, column.Copy(),
 			                                            make_uniq<BoundConstantExpression>(Value::Numeric(data.key_type, hi)));
 			auto range = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(ge), std::move(le));
-			return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(range), std::move(call));
+			return KeepNullJoinKeys(
+			    make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(range), std::move(call)),
+			    column, data.filters_null_values);
 		}
-		return call;
+		return KeepNullJoinKeys(std::move(call), column, data.filters_null_values);
 	}
 	// Outside the SQL channel's registry: the keys themselves, or their range.
 	vector<Value> keys;
@@ -1491,16 +1508,30 @@ static unique_ptr<Expression> PrefixRangeAsExpression(const BoundFunctionExpress
 		                                            make_uniq<BoundConstantExpression>(Value::Numeric(data.key_type, lo)));
 		auto le = BoundComparisonExpression::Create(ExpressionType::COMPARE_LESSTHANOREQUALTO, column.Copy(),
 		                                            make_uniq<BoundConstantExpression>(Value::Numeric(data.key_type, hi)));
-		return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(ge), std::move(le));
+		return KeepNullJoinKeys(
+		    make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(ge), std::move(le)), column,
+		    data.filters_null_values);
 	}
 	auto in = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN, LogicalType::BOOLEAN);
 	in->GetChildrenMutable().push_back(column.Copy());
 	for (auto &k : keys) {
 		in->GetChildrenMutable().push_back(make_uniq<BoundConstantExpression>(k));
 	}
-	return std::move(in);
+	return KeepNullJoinKeys(std::move(in), column, data.filters_null_values);
 }
 
+
+//! The JSON form of KeepNullJoinKeys: appends `node`, or `{"op":"or","children":[{"op":"is_null",<col>},node]}` when the
+//! join filter must let NULL keys through.
+static void LiveJsonKeepNullKeys(const string &node, const vector<string> &path, bool filters_null_values, string &out) {
+	if (filters_null_values) {
+		out += node;
+		return;
+	}
+	out += "{\"op\":\"or\",\"children\":[{\"op\":\"is_null\",";
+	LiveJsonColumnRef(path, out);
+	out += "}," + node + "]}";
+}
 
 //! Serialize one EXPRESSION_FILTER expression node into a FilterNode JSON object. Same contract as
 //! LiveFilterNode: false = not convertible, which is skip-safe for the pruning consumer.
@@ -1536,16 +1567,19 @@ static bool LiveExprNode(const Expression &e, vector<string> &path, const Logica
 				entry.filters_null_values = data.filters_null_values;
 				LiveJsonLookup(RegisterJoinFilter(entry, nullptr), path, lookup);
 			}
+			string node;
 			if (!ReadPrefixRangeKeys(data, keys, lo, hi)) {
-				path.resize(base);
 				if (lookup.empty()) {
+					path.resize(base);
 					return false;
 				}
-				out += lookup;
+				node += lookup;
+				LiveJsonKeepNullKeys(node, path, data.filters_null_values, out);
+				path.resize(base);
 				return true;
 			}
 			if (!lookup.empty()) {
-				out += "{\"op\":\"and\",\"children\":[" + lookup + ",";
+				node += "{\"op\":\"and\",\"children\":[" + lookup + ",";
 			}
 			if (!keys.empty() && static_cast<uint64_t>(keys.size()) == static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1) {
 				keys.clear(); // every value of the range: the range says as much, and costs no list
@@ -1554,27 +1588,28 @@ static bool LiveExprNode(const Expression &e, vector<string> &path, const Logica
 				const idx_t lo_idx = constants.size();
 				constants.push_back(Value::Numeric(type, lo));
 				constants.push_back(Value::Numeric(type, hi));
-				out += "{\"op\":\"and\",\"children\":[{\"op\":\"compare\",\"cmp\":\">=\",";
-				LiveJsonColumnRef(path, out);
-				out += ",\"val\":" + to_string(lo_idx) + "},{\"op\":\"compare\",\"cmp\":\"<=\",";
-				LiveJsonColumnRef(path, out);
-				out += ",\"val\":" + to_string(lo_idx + 1) + "}]}";
+				node += "{\"op\":\"and\",\"children\":[{\"op\":\"compare\",\"cmp\":\">=\",";
+				LiveJsonColumnRef(path, node);
+				node += ",\"val\":" + to_string(lo_idx) + "},{\"op\":\"compare\",\"cmp\":\"<=\",";
+				LiveJsonColumnRef(path, node);
+				node += ",\"val\":" + to_string(lo_idx + 1) + "}]}";
 			} else {
-				out += "{\"op\":\"in\",";
-				LiveJsonColumnRef(path, out);
-				out += ",\"vals\":[";
+				node += "{\"op\":\"in\",";
+				LiveJsonColumnRef(path, node);
+				node += ",\"vals\":[";
 				for (idx_t i = 0; i < keys.size(); i++) {
 					if (i) {
-						out += ',';
+						node += ',';
 					}
-					out += to_string(constants.size());
+					node += to_string(constants.size());
 					constants.push_back(std::move(keys[i]));
 				}
-				out += "]}";
+				node += "]}";
 			}
 			if (!lookup.empty()) {
-				out += "]}";
+				node += "]}";
 			}
+			LiveJsonKeepNullKeys(node, path, data.filters_null_values, out);
 			path.resize(base);
 			return true;
 		}

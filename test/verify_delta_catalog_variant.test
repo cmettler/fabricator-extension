@@ -438,17 +438,17 @@ SELECT id, v::VARCHAR, v IS NULL FROM nshredcodec.main.shrednative ORDER BY id;
 4	{'a': 40, 'b': z, 'extra': [1, 2]}	false
 5	{'a': 50, 'b': w}	false
 
-# ⚠ A DuckDB 2.0 defect, pinned so it announces its own fix: SHREDDING lowercases the column name and then misses
-# a column whose name has upper-case letters, so on an OPTED-OUT table under column_mapping 'none' such a column is
-# STILL SHREDDED, which the protocol forbids there. (Under column mapping the physical name is col-<guid>,
-# lower-case; on a shredding table shredding is allowed anyway.) When this row fails with false, DuckDB fixed it.
+# A VARIANT column whose name has upper-case letters on an OPTED-OUT table under column_mapping 'none' stays
+# UNSHREDDED, as the protocol requires there. DuckDB 2.0.0 got this wrong (SHREDDING lower-cased the name and then
+# missed the column, so it was shredded anyway; docs/duckdb-upstream-issues.md §16); this row read `true` until
+# the v2.0.1 pin, where it failed as designed. (Under column mapping the physical name is col-<guid>, lower-case.)
 statement ok
 CREATE TABLE nshredoff.main.uppername AS SELECT i AS id, {'a': i}::VARIANT AS "Payload" FROM range(100) r(i);
 
 query I
 SELECT count(*) > 0 FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/varnativeshredoff/uppername/*.parquet') WHERE name = 'typed_value';
 ----
-true
+false
 
 # The control for the opted-out zeros: DuckDB shreds the same data when nothing asks it not to.
 statement ok

@@ -161,28 +161,25 @@ SELECT count(*) FROM codec.main.b_ident;
 ----
 2000
 
-# ==== 6. ⚠ A SESSION `RESET` LATCHES "UNSET" — IT DOES NOT FALL BACK TO THE GLOBAL VALUE ====
+# ==== 6. A SESSION `RESET` FALLS BACK TO THE GLOBAL VALUE (DuckDB v2.0.1 and later) ====
 #
-# The intuitive expectation is GZIP (the global set in §3) and it is WRONG. `RESET` at session scope stores
-# the option's DEFAULT — NULL here — as this connection's own value, which SHADOWS the global one. So the
-# resetting connection writes at the ENGINE default, and a later `SET GLOBAL` will not reach it either.
-#
-# ⚠ This is DuckDB's behaviour, not ours, and it was VERIFIED rather than assumed: after `RESET`,
-# `current_setting('delta_write_options')` reports NULL, and it STILL reports NULL after a subsequent
-# `SET GLOBAL … = gzip` in the same connection. `PhysicalReset::ResetExtensionVariable` does exactly this
-# (`client_config.user_settings.SetUserSetting(idx, default_value)`), so matching it keeps our resolution and
-# `current_setting`'s answer in agreement — which is the property that matters, since a user diagnosing a
-# write will read the setting back with `current_setting`.
+# con_b holds its own zstd from §4 and the global is gzip (§3). `RESET` at session scope REMOVES con_b's own
+# value, so con_b writes at the global gzip again. DuckDB does exactly this since v2.0.1
+# (`PhysicalReset::ResetExtensionVariable` → `user_settings.ClearSetting`). Up to v2.0.0 it stored the DEFAULT
+# in the session instead, which shadowed the global, and this section pinned that; it failed on the 2.0.1 pin,
+# and a probe showed our write still at the engine default while `current_setting` already reported gzip. What
+# matters is that the two AGREE, since a user diagnosing a write reads the setting back with `current_setting`.
 
 statement ok con_b
 RESET delta_write_options;
 
-# The corroborating control, in DuckDB's own vocabulary: the value con_b will resolve is NULL, not the global.
+# DuckDB's own view: con_b now resolves the global value.
 query I con_b
-SELECT current_setting('delta_write_options') IS NULL;
+SELECT current_setting('delta_write_options');
 ----
-true
+{"compression":"gzip"}
 
+# …and our write agrees with it (neither con_b's former zstd nor the engine default SNAPPY).
 statement ok con_b
 CREATE OR REPLACE TABLE lake.main.b_reset AS SELECT i FROM range(2000) t(i);
 
@@ -190,10 +187,9 @@ query I con_b
 SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/b_reset/*.parquet')
 WHERE compression <> '';
 ----
-SNAPPY
+GZIP
 
-# …while a connection that never reset still sees the global — so §6 pins the latch, not a global that
-# stopped working.
+# A connection that never reset sees the same global.
 statement ok con_c
 CREATE OR REPLACE TABLE lake.main.c_still AS SELECT i FROM range(2000) t(i);
 

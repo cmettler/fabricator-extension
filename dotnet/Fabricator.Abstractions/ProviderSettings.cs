@@ -75,12 +75,22 @@ public sealed class ProviderSettingsStore
     /// </summary>
     /// <remarks>⚠ <paramref name="session"/> 0 means "no session" and falls back to the GLOBAL slot — which is
     /// the correct behaviour for registration defaults and for a <c>SET GLOBAL</c>, and the reason the caller
-    /// must be explicit about scope rather than letting a missing key silently become global.</remarks>
+    /// must be explicit about scope rather than letting a missing key silently become global.
+    /// A null <paramref name="value"/> for a session REMOVES that session's value, so the global one applies
+    /// again — what DuckDB does on a session <c>RESET</c> since v2.0.1.</remarks>
     public void SetForSession(long session, string provider, string name, string? value)
     {
         if (session == 0)
         {
             Set(provider, name, value);
+            return;
+        }
+        if (value is null)
+        {
+            if (_bySession.TryGetValue(session, out var forSession) && forSession.TryGetValue(provider, out var bucket))
+            {
+                bucket.TryRemove(name, out _);
+            }
             return;
         }
         _bySession

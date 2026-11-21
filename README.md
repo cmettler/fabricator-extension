@@ -4293,10 +4293,10 @@ and `RESET` / `RESET GLOBAL` to undo the respective layer. A session value outra
 > happens to run on that connection. If you want a setting to apply to one model only, `RESET` it in a
 > post-hook.
 
-> ⚠ `RESET` does **not** fall back to the global value — it sets *this connection* back to the setting's own
-> default, so a later `SET GLOBAL` will not reach a connection that has reset. (This is DuckDB's behaviour
-> for extension settings, not ours; `SELECT current_setting('<name>')` reports what the connection will
-> actually use.)
+> `RESET` removes *this connection's* own value, so the global value (`SET GLOBAL`, else the default) applies
+> again. This is DuckDB's behaviour for extension settings since v2.0.1; up to v2.0.0 a `RESET` set the
+> connection to the setting's default and a later `SET GLOBAL` did not reach it. `SELECT
+> current_setting('<name>')` reports what the connection will actually use.
 >
 Every `mssql_*` setting is read when it is **used**, so a `SET` applies from the next statement — including
 `mssql_mars`, which is resolved each time a connection is opened. The exception is a connection already in

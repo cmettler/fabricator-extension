@@ -56,8 +56,8 @@ env:
   # appends `-dev<commit count>` unless DUCKDB_EXPLICIT_VERSION is set — which is exactly what this value
   # becomes, via the action's `override-git-describe`. A tagged checkout alone yields `v2.0.0-dev64553`,
   # which a stock wheel rejects. (On 1.5 the tag was enough; that note in CLAUDE.md is 1.5-only now.)
-  DUCKDB_VERSION: v2.0.0
-  DUCKDB_WHEEL: 2.0.0
+  DUCKDB_VERSION: v2.0.1
+  DUCKDB_WHEEL: 2.0.1
 
 defaults:
   run:

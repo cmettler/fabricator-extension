@@ -765,6 +765,8 @@ it twice.
 
 ## 8. `ROW_GROUP_SIZE` is SILENTLY IGNORED below ~8192 when the COPY's source supplies batch indexes — a 2.0 regression
 
+**Re-measured on v2.0.1 (2026-11-21): STILL PRESENT** — the repro below still gives 10 row groups.
+
 **DuckDB 2.0 (`v2.0-cyanoptera`); 1.5.6 does the right thing.** A `COPY … TO … (FORMAT parquet,
 ROW_GROUP_SIZE n)` whose source hands the copy BATCH INDEXES — i.e. the plan is `PhysicalBatchCopyToFile`,
 which `read_parquet`, a table scan and `duckdb_arrow_scan` all produce — writes **one row group per source
@@ -974,6 +976,8 @@ input crosses whole. The real fix, ours or upstream's, is a factory that narrows
 
 ## 11. An id-keyed `schema` map SILENTLY NULLs every column after the first one without a field id — 2.0
 
+**Re-measured on v2.0.1 (2026-11-21): STILL PRESENT** — the repro below still reads `a = NULL`. (§1, the FieldId Map INTERNAL error, is a different defect and was fixed in 2.0.0.)
+
 **Status: reproduced on our 2.0 build 2026-10-24 with the control beside it, mechanism read from the source.
 NOT filed. Ready to file — it is a wrong answer with no error.**
 
@@ -1007,6 +1011,8 @@ make an id-keyed read return NULLs with no message.
 
 ## 12. A VIEW in a nested schema binds its body against the LEAF schema — a wrong answer, 2.0
 
+**FIXED UPSTREAM in v2.0.1 — do not file.** Re-measured 2026-11-21: the unqualified view now answers `NESTED` (v2.0.0 control: `TOP`).
+
 Found 2026-10-26 while nesting our declared views (ABI v97). Ready to file; native control below.
 
 ```sql
@@ -1030,6 +1036,8 @@ SELECT * FROM sales.eu.v2;   -- NESTED
   materialization (depth ≥ 2 only). Gate `verify_delta_nested_schemas` §12, mutant killed at :446.
 
 ## 13. A CTAS into a nested schema creates an EMPTY table when the leaf names an existing one — silent data loss, 2.0
+
+**FIXED UPSTREAM in v2.0.1 — do not file.** Re-measured 2026-11-21: the CTAS keeps its row (count 1; v2.0.0 control: 0).
 
 Found the same day, by the probe for §12. Ready to file; native control below.
 
@@ -1055,6 +1063,8 @@ SELECT count(*) FROM a.eu.other;              -- 1
 
 ## 14. The remote pushdown optimizer checks a bare table name in `main`, not in the search path's schema — 2.0
 
+**Re-read on v2.0.1 (2026-11-21): STILL PRESENT** — `RemotePushdownOptimizer::LookupEntry` still qualifies an empty schema path with `DEFAULT_SCHEMA`.
+
 Found 2026-10-31 (docs/duckdb-2.0-remote-execution.md §4.22). NOT filed. A missed pushdown, never a wrong answer.
 
 - `RemotePushdownOptimizer::Rewrite(BaseTableRef)`, case 2 (no catalog in the name): after deciding the single
@@ -1068,6 +1078,8 @@ Found 2026-10-31 (docs/duckdb-2.0-remote-execution.md §4.22). NOT filed. A miss
   pushed. The fix is to look it up in `GetSchemasForCatalog(remote_catalog)` from the search path.
 
 ## 15. A correlated `NOT EXISTS` gets no join filter — a missed filter, never a wrong answer, 2.0 and main
+
+**Re-read on v2.0.1 (2026-11-21): STILL PRESENT** — `JoinTypeIsSupported` still excludes ANTI/RIGHT_ANTI (the FIXME is unchanged), and `PushdownMarkJoin` still simplifies null-safe conditions for SEMI only. ⚠ v2.0.1 DOES now build runtime filters for `IS NOT DISTINCT FROM` joins (2.0.0 built none, `NullValuesAreEqual`), with `filters_null_values = false` so NULL keys pass — that changed what our scans receive (see the 2026-11-21 note in `arrow_ingest.cpp`, `KeepNullJoinKeys`).
 
 Found 2026-11-01 through TPC-H q21 with `lineitem` on SQL Server (docs/tpc-benchmarks.md). NOT filed; a PR is the
 user's to write. The `NOT EXISTS (… l3.l_orderkey = l1.l_orderkey …)` scan of `lineitem` (6M rows) received no
@@ -1106,7 +1118,11 @@ filter is built from `conditions[0]`'s key only, so that is a larger change.
 
 ## 16. `SHREDDING` misses a VARIANT column whose name has upper-case letters — silent, 2.0
 
-**Ready to file, not filed** (draft with repro: the session scratchpad `shredcase/issue.md`; the user posts).
+**FIXED UPSTREAM in DuckDB v2.0.1 — do not file.** Found by the v2.0.1 pin (2026-11-21): the `uppername` row in
+`verify_delta_catalog_variant` failed as designed (no `typed_value` any more) and now pins the fixed behaviour.
+The record below is how it looked on v2.0.0.
+
+**Was: ready to file, not filed** (draft with repro: the session scratchpad `shredcase/issue.md`; the user posts).
 Reproduced on the STOCK `duckdb==2.0.0` wheel: `SHREDDING {'v': 'VARIANT'}` writes `v` unshredded, while a
 column `"Payload"` stays shredded whether the option names it `Payload` or `payload`; no error either way.
 
@@ -1124,6 +1140,8 @@ case, so only `column_mapping 'none'` with a mixed-case variant column is affect
 `verify_delta_catalog_variant` (the `uppername` row fails the day upstream fixes it).
 
 ## 17. A struct path into a member one file lacks raises an INTERNAL error under `union_by_name` — 2.0.0, invalidates the database
+
+**FIXED UPSTREAM in v2.0.1 — do not file.** Re-measured 2026-11-21 against the v2.0.0 shell as control: projection, filter and join through the missing member all answer correctly (`[NULL, 7]`, `[2]`, `[2]`), where v2.0.0 raised the INTERNAL errors below. Our file scan lifted its restriction for files mapped by name (`FileScanSupportsPushdownExtract`, 2026-11-21); columns the files store under another name or by field id (column mapping, the default) keep it because of §18.
 
 Found 2026-11-10 through the file scan (`src/fabricator/fabricator_file_scan.cpp`), reproduced on the official
 `duckdb` 2.0.0 Python wheel without any extension:
@@ -1157,6 +1175,29 @@ substitutes a NULL of the member's type where the extract expects the field's. A
 query. Ours: the file scan declares `supports_pushdown_extract` only for a struct column without a struct member
 (`FileScanSupportsPushdownExtract`; `verify_delta_file_scan` §13, and `verify_delta_catalog_nested_alter:222` fails
 with it declared for every struct). Not filed; expected to be fixed in a DuckDB 2.0 patch release.
+
+## 18. An OR over two struct paths into a member a file lacks raises an INTERNAL error when the files store the column under another name — v2.0.1, NOT YET ATTRIBUTED
+
+Found 2026-11-21 while lifting our file scan's §17 restriction on the v2.0.1 pin. **Only seen through our file scan,
+not reproduced on plain `read_parquet` — so it may as well be ours; NOT ready to file.** A Delta table with column
+mapping `'name'` (the files store each column and member under a physical name `col-<uuid>`, which our plan passes
+as the column's identifier, `ApplyStoredNames`), a struct that gained a struct member (`ALTER TABLE … ADD COLUMN
+s.deep STRUCT(q INT)`), one file before and one after:
+
+| query (struct-field pushdown on) | mapping `'name'` (stored names) | mapping `'none'` (the table's names) |
+|---|---|---|
+| `WHERE s.deep IS NULL OR s.deep.q IS NULL` | INTERNAL `Attempted to access index 2 within vector of size 1`, invalidates the database | correct (1) |
+| `WHERE s.deep.q IS NULL` | correct | correct |
+| `WHERE s.deep IS NULL` | correct | correct |
+| projection `s.deep.q` | correct | correct |
+
+Plain `read_parquet(…, union_by_name := true)` with the table's names answers all four correctly on v2.0.1. Our file
+scan therefore declares `supports_pushdown_extract` for every struct column whose files use the table's names, and
+keeps the §17 restriction (no struct member) for a column stored under another name or by field id
+(`FileScanSupportsPushdownExtract`). Since column mapping is the Delta default, most tables keep the restriction.
+Gates: `verify_delta_catalog_nested_alter` (the `w` table) fails with the restriction removed;
+`verify_delta_file_scan` §13 pins both sides. Next step: a plain repro over a name-keyed `schema` map, to tell an
+upstream defect from ours.
 
 ## Not a bug, but pinned here because it wasted time three times
 

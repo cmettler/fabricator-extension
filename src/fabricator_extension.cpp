@@ -40,7 +40,6 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
-#include <array>
 #include <cstring>
 #include <utility>
 
@@ -98,26 +97,12 @@ static void FabricatorVersionFunction(DataChunk &args, ExpressionState &state, V
 // -----------------------------------------------------------------------------
 // Provider-declared settings (see docs/settings-architecture.md). Each provider declares its settings in C#
 // (IProvider.Settings); we register them here as DuckDB extension options and push value changes back into
-// the managed ProviderSettingsStore. DuckDB's set-callback carries no setting name, so we bind one callback
-// per slot (a compile-time trampoline array). The provider-agnostic core thus knows no setting names.
+// the managed ProviderSettingsStore. Each option carries a FabricatorSettingInfo naming its provider and
+// setting, so the provider-agnostic core knows no setting names.
 // -----------------------------------------------------------------------------
 
-// Max settings registrable across all providers (trampoline array size; generous).
-static constexpr size_t FABRICATOR_MAX_SETTINGS = 128;
-
-struct SettingSlot {
-	string provider;
-	string name;
-	bool has_min = false;
-	int64_t min_value = 0;
-};
-static SettingSlot g_setting_slots[FABRICATOR_MAX_SETTINGS];
-static size_t g_setting_count = 0;
-
 // The scope our options are REGISTERED with (AddExtensionOption's `default_scope`), and therefore the scope
-// an unqualified `SET fabricator_x = …` resolves to. It is DuckDB's own default for extension options; it is
-// named here because the trampoline below has to resolve SetScope::AUTOMATIC the same way DuckDB does, and
-// the two must not drift.
+// an unqualified `SET fabricator_x = …` resolves to. It is DuckDB's own default for extension options.
 static constexpr SetScope FABRICATOR_SETTING_DEFAULT_SCOPE = SetScope::SESSION;
 
 // The lifetime hook for a session's settings. The SESSION KEY is a ClientContext ADDRESS, so leaving entries
@@ -148,72 +133,61 @@ private:
 // DuckDB's own or another extension's.
 static constexpr const char *FABRICATOR_SESSION_STATE_KEY = "fabricator_session_settings";
 
-// One set-callback per slot: validates an optional minimum (parity with the former RequireAtLeastOne), then
-// best-effort pushes the new value to the managed store. DuckDB has already cast `value` to the option type.
+// Called by DuckDB on every SET and RESET of one provider setting, with the scope already resolved to SESSION
+// or GLOBAL and the value already cast to the option type. Validates an optional minimum, then best-effort
+// pushes the value to the managed store.
 //
 // ⚠ THE SCOPE IS LOAD-BEARING AND WAS DISCARDED UNTIL ABI v69, WHICH WAS A DATA BUG RATHER THAN A MISSING
 // FEATURE. MEASURED: `SET mssql_mars='false'` in DuckDB connection A made a same-catalog CTAS in connection
 // B — which set nothing — return 10 rows instead of 15, the control (same script, no SET) returning 15. So a
 // setting applied in one connection changed the DATA another connection saw. DuckDB stores the value
 // per-connection on ITS side already (default_scope = SESSION, `client_config.user_settings`); only this push
-// was process-wide. The practical consequence: configuring ONE dbt model via a pre-hook could not work — the
-// value leaked to models running concurrently on other threads.
+// was process-wide.
 //
-// ⚠ SET AND RESET HAND US THE SCOPE DIFFERENTLY, and only one of them can be AUTOMATIC.
-// `PhysicalSet::SetExtensionVariable` calls us with the RAW scope and resolves AUTOMATIC afterwards, while
-// `PhysicalReset::ResetExtensionVariable` resolves it BEFORE calling us. So we must resolve AUTOMATIC
-// ourselves, and must resolve it to the same thing DuckDB will.
-template <size_t I>
-static void SettingTrampoline(ClientContext &context, SetScope scope, Value &value) {
-	const SettingSlot &slot = g_setting_slots[I];
-	if (slot.has_min && !value.IsNull() && value.GetValue<int64_t>() < slot.min_value) {
-		throw InvalidInputException("fabricator: %s must be >= %lld", slot.name, (long long)slot.min_value);
+// ⚠ A RESET AT SESSION SCOPE REMOVES the connection's own value, so the GLOBAL one applies again. That is what
+// DuckDB does since v2.0.1 (`PhysicalReset::ResetExtensionVariable` → `user_settings.ClearSetting`); up to
+// v2.0.0 it stored the DEFAULT in the session instead, which shadowed a `SET GLOBAL`, and we copied that. A
+// plain set-callback cannot tell a RESET from a SET, which is why this is an ExtensionOptionInfo: OnSet gets
+// `is_reset`. Matching DuckDB keeps our resolution and `current_setting` in agreement (verify_setting_scope §6).
+// The store treats a null SESSION value as "no session value", so a session `SET x = NULL` also falls back to
+// the global value, where DuckDB would report NULL — an edge case nobody has needed.
+class FabricatorSettingInfo : public ExtensionOptionInfo {
+public:
+	FabricatorSettingInfo(string provider_p, string name_p, bool has_min_p, int64_t min_value_p)
+	    : provider(std::move(provider_p)), name(std::move(name_p)), has_min(has_min_p), min_value(min_value_p) {
 	}
-	if (scope == SetScope::AUTOMATIC) {
-		scope = FABRICATOR_SETTING_DEFAULT_SCOPE;
-	}
-	// GLOBAL writes the process-wide layer (key 0); anything else is this connection's own.
-	// ⚠ A RESET at session scope pushes the option's DEFAULT into the session layer rather than deleting the
-	// session entry — which shadows a `SET GLOBAL` value instead of falling back to it. That looks wrong and
-	// is exactly what DuckDB does one line later (`client_config.user_settings.SetUserSetting(idx, default)`),
-	// so matching it keeps our view and DuckDB's `duckdb_settings()` view of the same setting in agreement.
-	int64_t session = scope == SetScope::GLOBAL ? 0 : fabricator::SessionKeyFor(&context);
-	if (session != 0 && context.registered_state) {
-		// Arm the cleanup BEFORE the write, so a session entry can never exist without the state that
-		// reclaims it. GetOrCreate is keyed and locked, so repeated SETs on one connection register exactly
-		// one — the cost is per connection, not per setting.
-		context.registered_state->GetOrCreate<FabricatorSessionSettingsState>(FABRICATOR_SESSION_STATE_KEY,
-		                                                                      session);
-	}
-	try {
-		if (value.IsNull()) {
-			fabricator::SetSetting(slot.provider, slot.name, nullptr, session);
-		} else {
-			string rendered = value.ToString();
-			fabricator::SetSetting(slot.provider, slot.name, rendered.c_str(), session);
+
+	void OnSet(ClientContext &context, SetScope scope, Value &value, bool is_reset) const override {
+		if (!is_reset && has_min && !value.IsNull() && value.GetValue<int64_t>() < min_value) {
+			throw InvalidInputException("fabricator: %s must be >= %lld", name, (long long)min_value);
 		}
-	} catch (...) {
-		// Best-effort: a managed-store hiccup must not fail the user's SET.
+		// GLOBAL writes the process-wide layer (key 0); anything else is this connection's own.
+		int64_t session = scope == SetScope::GLOBAL ? 0 : fabricator::SessionKeyFor(&context);
+		if (session != 0 && !is_reset && context.registered_state) {
+			// Arm the cleanup BEFORE the write, so a session entry can never exist without the state that
+			// reclaims it. GetOrCreate is keyed and locked, so repeated SETs on one connection register exactly
+			// one — the cost is per connection, not per setting.
+			context.registered_state->GetOrCreate<FabricatorSessionSettingsState>(FABRICATOR_SESSION_STATE_KEY,
+			                                                                      session);
+		}
+		try {
+			if (value.IsNull() || (is_reset && session != 0)) {
+				fabricator::SetSetting(provider, name, nullptr, session);
+			} else {
+				string rendered = value.ToString();
+				fabricator::SetSetting(provider, name, rendered.c_str(), session);
+			}
+		} catch (...) {
+			// Best-effort: a managed-store hiccup must not fail the user's SET.
+		}
 	}
-}
 
-// Hand-rolled compile-time index sequence: the build is -std=c++11 (std::make_index_sequence is C++14;
-// MSVC's STL provides it even in C++11 mode, but a strict libstdc++ -std=c++11 build does not).
-template <size_t...>
-struct IndexSeq {};
-template <size_t N, size_t... Is>
-struct BuildIndexSeq : BuildIndexSeq<N - 1, N - 1, Is...> {};
-template <size_t... Is>
-struct BuildIndexSeq<0, Is...> {
-	using type = IndexSeq<Is...>;
+private:
+	string provider;
+	string name;
+	bool has_min;
+	int64_t min_value;
 };
-
-template <size_t... I>
-static std::array<set_option_callback_t, sizeof...(I)> MakeSettingTrampolines(IndexSeq<I...>) {
-	return {{&SettingTrampoline<I>...}};
-}
-static const std::array<set_option_callback_t, FABRICATOR_MAX_SETTINGS> g_setting_trampolines =
-    MakeSettingTrampolines(BuildIndexSeq<FABRICATOR_MAX_SETTINGS>::type {});
 
 // Registers every provider's declared settings (queried from the managed bridge) as DuckDB extension
 // options. Best-effort: if the bridge can't boot at load (e.g. the managed dir is missing), registration is
@@ -228,7 +202,7 @@ static void RegisterProviderSettings(ExtensionLoader &loader) {
 		// Columns: provider, name, type, default, description, min (empty string => null/none).
 		auto rows = ReadStringTable(stream, 6);
 		size_t n = rows[0].size();
-		for (size_t i = 0; i < n && g_setting_count < FABRICATOR_MAX_SETTINGS; i++) {
+		for (size_t i = 0; i < n; i++) {
 			const string &provider = rows[0][i];
 			const string &name = rows[1][i];
 			const string &type = rows[2][i];
@@ -250,16 +224,10 @@ static void RegisterProviderSettings(ExtensionLoader &loader) {
 				}
 			}
 
-			size_t slot = g_setting_count++;
-			g_setting_slots[slot].provider = provider;
-			g_setting_slots[slot].name = name;
-			g_setting_slots[slot].has_min = !min.empty();
-			g_setting_slots[slot].min_value = min.empty() ? 0 : std::stoll(min);
-
-			// The scope is passed EXPLICITLY although it is also DuckDB's default for extension options, so
-			// that it and the trampoline's AUTOMATIC resolution read from one constant and cannot drift.
-			config.AddExtensionOption(Identifier(name), desc, lt, default_value, g_setting_trampolines[slot],
-			                          FABRICATOR_SETTING_DEFAULT_SCOPE);
+			ExtensionOption option(desc, lt, nullptr, default_value, FABRICATOR_SETTING_DEFAULT_SCOPE, false, false);
+			option.info = make_shared_ptr<FabricatorSettingInfo>(provider, name, !min.empty(),
+			                                                     min.empty() ? 0 : std::stoll(min));
+			config.AddExtensionOption(Identifier(name), std::move(option));
 
 			// Seed the managed store with the default so reads see it before any SET. Session 0: a
 			// registration default belongs to every connection, not to whichever one happened to load the

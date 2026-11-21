@@ -191,18 +191,22 @@ session-scoped `SET` (lazily, so a connection that never sets anything costs not
 `ClientContextState` is held for the context's whole life, so its **destructor** is the connection-close
 signal — there is no explicit close callback to hook. It calls `clear_session_settings`.
 
-**⚠ `RESET` at session scope LATCHES "unset" — it does not fall back to the global value.** MEASURED with
-DuckDB's own vocabulary: after `RESET delta_write_options`, `current_setting('delta_write_options')` reports
-NULL, and it *still* reports NULL after a subsequent `SET GLOBAL … = gzip` in the same connection. That is
-DuckDB's behaviour (`PhysicalReset::ResetExtensionVariable` stores the option's DEFAULT as the connection's
-own value), so we match it deliberately — which keeps our resolution and `current_setting`'s answer in
-agreement, the property that matters when a user diagnoses a write by reading the setting back.
-
-**⚠ `SET` and `RESET` hand the callback the scope DIFFERENTLY.** `PhysicalSet::SetExtensionVariable` calls
-it with the RAW scope and resolves `AUTOMATIC` *afterwards*; `PhysicalReset::ResetExtensionVariable`
-resolves it *before* calling. So the trampoline must resolve `AUTOMATIC` itself, and to the same value
-DuckDB will — hence `FABRICATOR_SETTING_DEFAULT_SCOPE`, passed explicitly to `AddExtensionOption` as well
-so the two readings come from one constant.
+**`RESET` at session scope FALLS BACK to the global value (since DuckDB v2.0.1).** DuckDB's
+`PhysicalReset::ResetExtensionVariable` now clears the connection's own value (`user_settings.ClearSetting`),
+so `current_setting` reports the global value after a session `RESET`. We match it, which keeps our
+resolution and `current_setting`'s answer in agreement — the property that matters when a user diagnoses a
+write by reading the setting back. Each option carries a `FabricatorSettingInfo` (DuckDB's
+`ExtensionOptionInfo`), whose `OnSet` gets the resolved scope and an `is_reset` flag; a session reset pushes a
+null value, and the managed store treats a null SESSION value as "remove it".
+- ⚠ Up to v2.0.0 DuckDB stored the option's DEFAULT as the connection's own value instead ("RESET latches
+  unset", `current_setting` NULL even after a later `SET GLOBAL`), and we copied that through a plain
+  set-callback. The v2.0.1 pin turned that copy into a disagreement — measured: `current_setting` gzip, our
+  Delta write SNAPPY — which is what `verify_setting_scope` §6 caught.
+- A plain set-callback cannot tell RESET from SET, and SET handed it the RAW scope (AUTOMATIC unresolved)
+  while RESET resolved it first; `OnSet` receives the scope resolved in both cases, which retired the
+  per-slot trampoline array and its own AUTOMATIC resolution.
+- Edge case: a session `SET x = NULL` also falls back to the global value in our store, where DuckDB reports
+  NULL.
 
 **Gates.** `test/verify_setting_scope.test` (**30**, hermetic) pins it with `delta_write_options`
 compression as the observable — the setting's effect is written into the parquet files, so it is read back
@@ -395,12 +399,11 @@ to this directory, so it still resolves from here.
     connection the allocator places at the same address — a silent wrong answer under connection churn.
     A `ClientContextState` registered at the first session-scoped SET has its **destructor** as the
     connection-close signal (there is no explicit close hook); it calls the new `clear_session_settings`.
-  - **⚠ `RESET` at session scope LATCHES "unset" rather than falling back to the global** — VERIFIED in
-    DuckDB's own vocabulary (`current_setting` reports NULL after RESET, and still NULL after a later
-    `SET GLOBAL` in that connection). We match `PhysicalReset` deliberately so our resolution and
-    `current_setting` agree. And **SET vs RESET hand the callback the scope differently** (SET passes RAW,
-    resolving AUTOMATIC afterwards; RESET resolves first), so the trampoline resolves AUTOMATIC itself from
-    the same constant it registers with.
+  - **⚠ `RESET` at session scope LATCHED "unset" rather than falling back to the global** — DuckDB's
+    behaviour up to v2.0.0, which we matched. Since the v2.0.1 pin a session RESET falls back to the global,
+    in DuckDB and in our store (see the section above). And **SET vs RESET handed the callback the scope
+    differently** (SET passed RAW, RESET resolved first), so the trampoline resolved AUTOMATIC itself; the
+    `ExtensionOptionInfo` that replaced it gets the resolved scope.
   - Gate `test/verify_setting_scope.test` (**30**, hermetic), **mutation-tested**: restoring the pre-v69
     behaviour kills it at exactly the §1 assertion with the leak's own symptom (ZSTD where SNAPPY is
     expected). ⚠ Its POSITIVE CONTROL is load-bearing — without it "con_b wrote SNAPPY" would pass equally if

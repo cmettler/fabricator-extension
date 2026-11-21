@@ -88,17 +88,22 @@ public class ProviderSettingsScopeTests
         Assert.Equal("viazero", s.GetString(P, "k"));
     }
 
-    /// <summary>A session value of null is an explicit UNSET for that session — it must not fall back to the
-    /// global value, or a per-session RESET would silently restore whatever the global happened to be.</summary>
+    /// <summary>A null session value REMOVES that session's value, so the global applies again: a session
+    /// RESET does this in DuckDB since v2.0.1, and our resolution must agree with <c>current_setting</c>.
+    /// Other sessions keep their own values.</summary>
     [Fact]
-    public void A_null_session_value_shadows_the_global_as_unset()
+    public void A_null_session_value_removes_it_and_the_global_applies_again()
     {
         var s = New();
         s.Set(P, "k", "global");
+        s.SetForSession(1, P, "k", "mine");
+        s.SetForSession(2, P, "k", "theirs");
         s.SetForSession(1, P, "k", null);
 
         ProviderSettingsStore.CurrentSession = 1;
-        Assert.Null(s.GetString(P, "k"));
+        Assert.Equal("global", s.GetString(P, "k"));
+        ProviderSettingsStore.CurrentSession = 2;
+        Assert.Equal("theirs", s.GetString(P, "k"));
     }
 
     [Fact]

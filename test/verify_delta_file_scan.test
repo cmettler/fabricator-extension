@@ -519,10 +519,12 @@ statement ok
 DETACH l12;
 
 # ============================================================================
-# 13. STRUCT FIELD PUSHDOWN, ONLY WHERE DuckDB 2.0.0 READS IT RIGHT. `s.a` is a scan column, so a join filter on it
-#     reaches the parquet reader. DuckDB 2.0.0 raises an INTERNAL error for a path THROUGH a member some file lacks
-#     that is itself a struct (docs/duckdb-upstream-issues.md §17), so a struct column with a struct member keeps the
-#     whole column. Join filters are read off the profile: the probe scan's rows.
+# 13. STRUCT FIELD PUSHDOWN. `s.a` is a scan column, so a join filter on it reaches the parquet reader. A struct with a
+#     struct member (`t.y`) is pushed too when the files store it under the table's own names (column_mapping 'none'),
+#     since DuckDB v2.0.1; up to 2.0.0 a path THROUGH a member some file lacks that is itself a struct raised an
+#     INTERNAL error (docs/duckdb-upstream-issues.md §17; the `e` table below is that case). Under column mapping (this
+#     catalog's default) such a column is still read whole: §18. Join filters are read off the profile: the probe
+#     scan's rows.
 # ============================================================================
 statement ok
 SET fabricator_file_scan = true;
@@ -572,13 +574,41 @@ FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_FIL
 ----
 2	true
 
-# `t` has a struct member: no pushdown, the whole column, every row
+# `t` has a struct member and this table uses column mapping: no pushdown, the whole column, every row (§18)
 query I
 SELECT max(CAST(r AS BIGINT))
 FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_FILE_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
       FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/fs13_t.json'));
 ----
 400000
+
+# the same table without column mapping: `t.y` is pushed and the probe scan hands over only the matching rows
+statement ok
+ATTACH '{FABRICATOR_DELTA_WRITE_DIR}/fs13n' AS l13n (TYPE fabricator, PROVIDER 'delta', READ_ONLY false, column_mapping 'none');
+
+statement ok
+CREATE TABLE l13n.main.big AS SELECT * FROM l13.main.big;
+
+statement ok
+SET enable_profiling = 'json';
+
+statement ok
+SET profiling_output = '{FABRICATOR_DELTA_WRITE_DIR}/fs13_tn.json';
+
+query II
+SELECT count(*), sum(b.g) FROM l13n.main.big b JOIN l13.main.dim d ON b.t.y = d.k;
+----
+2000	6002
+
+statement ok
+SET enable_profiling = 'no_output';
+
+query II
+SELECT count(*), max(CAST(r AS BIGINT)) < 10000
+FROM (SELECT unnest(regexp_extract_all(content, '(?s)"Function": "FABRICATOR_FILE_SCAN".*?"intermediate_rows": (\d+)', 1)) AS r
+      FROM read_text('{FABRICATOR_DELTA_WRITE_DIR}/fs13_tn.json'));
+----
+2	true
 
 # a struct that gained a struct member: the old file lacks it, and projection, WHERE and join all read it right
 statement ok

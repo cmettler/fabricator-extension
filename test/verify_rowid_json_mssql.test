@@ -210,7 +210,10 @@ FROM duckdb_logs WHERE type = 'Fabricator.Sql';
 ----
 1	1
 
-# a row id matched twice comes back ONCE, with its final values — as DuckDB answers
+# a row id matched twice comes back ONCE from SQL Server, with its final values: the UPDATE … OUTPUT updates each row
+# once. ⚠ DuckDB's own table answers once PER MATCH since v2.0.1 (#28701 restored the 1.x behaviour; 2.0.0 also
+# answered once, and this pair agreed until the v2.0.1 pin). The rows are right either way (§2); only the RETURNING
+# count differs for a multi-match UPDATE … FROM. DuckDB announces another change for 2.1.
 query I
 WITH r AS (UPDATE db.dbo.rj_k SET v = s.v FROM src s WHERE rj_k.i = s.i RETURNING rj_k.i) SELECT count(*) FROM r;
 ----
@@ -219,7 +222,7 @@ WITH r AS (UPDATE db.dbo.rj_k SET v = s.v FROM src s WHERE rj_k.i = s.i RETURNIN
 query I
 WITH r AS (UPDATE lk SET v = s.v FROM src s WHERE lk.i = s.i RETURNING lk.i) SELECT count(*) FROM r;
 ----
-15
+30
 
 # ═══ §7  A table with a trigger: OUTPUT INTO a table variable, read in the same batch ═══════════════════════
 

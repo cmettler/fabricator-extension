@@ -53,11 +53,12 @@ SELECT id, region FROM flatlk.sales.orders;
 ----
 1	eu
 
-# `eu` is a folder under sales/, and WITHOUT nesting it is not a schema at all.
+# `eu` is a folder under sales/, and WITHOUT nesting it is not a schema at all. Since v2.0.1 DuckDB's binder says so
+# itself (up to v2.0.0 the path fell through to a "does not exist").
 statement error
 SELECT * FROM flatlk.sales.eu.deep;
 ----
-does not exist
+does not support nested schemas
 
 # The capability is OFF, so a dotted schema argument stays a LITERAL name rather than a path.
 statement error
@@ -183,13 +184,20 @@ SELECT count(*) FROM duckdb_schemas() WHERE database_name='lk' AND schema_name='
 ----
 0
 
-# ⚠ COMMENT ON is the ONE statement that still cannot reach a nested table, and the layer that stops it is
-#    DuckDB's PARSER, not us: it caps the statement at three qualifications. Pinned as the parser's error
-#    rather than ours — the day upstream lifts the cap, this row fails and sends the reader here.
-statement error
+# COMMENT ON reaches a nested table since DuckDB v2.0.1. Up to v2.0.0 DuckDB's PARSER capped the statement at
+# three qualifications and this row pinned that error; it failed as designed on the v2.0.1 pin. The comments
+# are read back here and again after the re-attach in §8, so they are stored, not only accepted.
+statement ok
 COMMENT ON TABLE lk.sales.eu.deep IS 'hi';
+
+statement ok
+COMMENT ON COLUMN lk.sales.eu.deep.v IS 'the answer';
+
+query TT
+SELECT (SELECT comment FROM duckdb_tables() WHERE database_name='lk' AND schema_name='eu' AND table_name='deep'),
+       (SELECT comment FROM duckdb_columns() WHERE database_name='lk' AND table_name='deep' AND column_name='v');
 ----
-Too many qualifications found
+hi	the answer
 
 # ── §6 THE DEPTH-1 CONTROL. Everything above must still work one level up — without this, a build that
 #    had broken writing altogether would look identical.
@@ -252,6 +260,12 @@ query I
 SELECT v FROM lk2.sales.eu.deep;
 ----
 42
+
+query TT
+SELECT (SELECT comment FROM duckdb_tables() WHERE database_name='lk2' AND schema_name='eu' AND table_name='deep'),
+       (SELECT comment FROM duckdb_columns() WHERE database_name='lk2' AND table_name='deep' AND column_name='v');
+----
+hi	the answer
 
 query I
 SELECT count(*) FROM lk2.sales.orders;
@@ -329,7 +343,7 @@ SELECT id, region FROM v1.sales.orders ORDER BY id;
 statement error
 SELECT * FROM v1.sales.eu.deep;
 ----
-does not exist
+does not support nested schemas
 
 statement ok
 DETACH v1;

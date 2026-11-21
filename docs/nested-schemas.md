@@ -1,8 +1,8 @@
 # Nested schemas (DuckDB 2.0) — the plan, and what is built
 
 **Status (2026-10-23): SLICES 0, 1, 2a, 2b AND 2c BUILT — a Delta root attached with `nested_schemas
-true` resolves `cat.a.b.t` to any depth, for READS AND WRITES. ABI v92. The only statement that still
-cannot name a nested table is `COMMENT ON`, and the layer that stops it is DuckDB's own parser. Slice 3
+true` resolves `cat.a.b.t` to any depth, for READS AND WRITES. ABI v92. Since DuckDB v2.0.1 that includes
+`COMMENT ON` (until v2.0.0 DuckDB's parser capped it at three qualifications). Slice 3
 (DAX per-model `system`) NOT started.**
 
 > ⚠ **THE OPTION WAS RENAMED 2026-10-24: `nested_schemas true` IS NOW `schemas 'nested'`.** `schemas` and
@@ -223,8 +223,9 @@ BY NAME instead. Reads nest; writes say so.
   the managed side then calls `AlterTable(spec, definition.SchemaName, TableName)` and re-derives the
   storage path from the leaf, exactly like the flat crossings. **Found by reading the callee**, which is
   the rule this repo already records, after the SCAN was caught doing the same thing.
-- ⚠ `COMMENT ON` never reaches the refusal anyway: DuckDB's PARSER caps it at three qualifications. The
-  gate pins the parser's error, not ours — asserting ours would misname the layer that stops it.
+- ⚠ Up to DuckDB v2.0.0 `COMMENT ON` never reached the refusal anyway: DuckDB's PARSER capped it at three
+  qualifications, and the gate pinned the parser's error. v2.0.1 lifted the cap; `COMMENT ON TABLE`/`COLUMN`
+  on a nested table now works and persists (gate §5 and the re-attach in §8).
 
 #### ⚠⚠ FOUR DEFECTS, AND THREE OF THEM WERE SILENT OR MISLEADING
 
@@ -331,9 +332,8 @@ interface's leaf-taking default is exactly the wrong way round.
 
 #### What is left
 
-`COMMENT ON` still cannot name a nested table: DuckDB's PARSER caps that statement at three
-qualifications, so it never reaches us. The gate pins the PARSER's error rather than ours, and fails the
-day upstream lifts the cap.
+Nothing for Delta. `COMMENT ON` on a nested table works since DuckDB v2.0.1, which lifted the parser's cap of
+three qualifications; the gate pinned that cap until the v2.0.1 pin and now asserts the stored comments.
 
 ### ✅ Slice 2d — everything else nests: functions, macros, views (BUILT 2026-10-26, ABI v92 -> v97)
 
