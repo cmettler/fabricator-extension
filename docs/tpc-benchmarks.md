@@ -235,3 +235,63 @@ no `native_read`) has no file scan and is unchanged.
 metadata), `bench.py <engine> [rounds]` (one engine per process, results to `results/<engine>.json`) and `compare.py`
 (sums and the correctness check). The Python side is a uv venv there (polars, deltalake, pysail, pyspark-client,
 pyiceberg[sql-sqlite], s3fs, duckdb 2.0.0); the DuckDB engines use `build/release-v2/duckdb.exe`.
+
+## fabricator 0.2.9 on DuckDB 2.0.1: TPC-H and TPC-DS SF10, native and codec, S3 and OneLake (2026-11-22)
+
+`build/release-v2` at `6f06cf4` (DuckDB v2.0.1, engineered-wood `feda5cdd`), one process per engine and suite, default
+settings. Native = `PROVIDER 'delta'` (the file scan), codec = `PROVIDER 'engineeredwooddelta'`. S3 = RustFS in the docker
+rig (TPC-H: `s3://fabricator/tpch10/CH0010`; TPC-DS: `s3://fabricator/tpcds10/DS0010`); OneLake = `LH_bench` in workspace
+`Test` (schemas `CH0010` and the new `DS0010`). TPC-DS SF10 was generated with DuckDB's `dsdgen` (3.9 GB parquet in
+`D:/tpcds10_local/DS0010`) and written as Delta through the provider. Every query of every round matches a reference
+(DuckDB over the local parquet). Harness: `scratchpad/rustfs-bench/bench.py` with `BENCH_SUITE=tpcds`, driver
+`run_lakehouse_022.sh`, logs `logs/lakehouse_022/`.
+
+Seconds, sum over all queries (TPC-H 22, TPC-DS 99):
+
+| suite / store | native cold | native best warm | codec cold | codec best warm |
+|---|---|---|---|---|
+| TPC-H, S3 | 13.6 | 10.4 | 22.9 | 19.4 |
+| TPC-H, OneLake | 70.5 | 18.6 | 96.6 | 34.9 |
+| TPC-DS, S3 | 35.1 | 28.2 | 67.8 | 60.7 |
+| TPC-DS, OneLake | 155.3 | 48.2 | 220.8 | 97.8 |
+
+- Against 2026-11-10 (TPC-H on RustFS): native 13.1 -> 10.4 s, codec 36.0 -> 19.4 s. The codec gain is the EW bump
+  (`feda5cdd`, Parquet read performance); against 2026-11-12 the codec on OneLake went from 279-392 s per TPC-H round to
+  97 s cold / 35 s warm.
+- Native is about 2x faster than codec everywhere. Largest TPC-DS gaps: q72 (0.6 vs 2.9 s S3), q28, q9 (wide scans of
+  store_sales), q64.
+- OneLake cold rounds are dominated by first touches (TPC-H q1 15.6 s; TPC-DS q4 11.7 s, q26 11.6 s); warm OneLake is
+  1.7-1.8x the S3 time for native.
+- ⚠ On this box `DefaultAzureCredential` now fails hard in its managed-identity probe ("unreachable network
+  169.254.169.254"), and the `onelake://` file path does not forward the azure secret's PROVIDER, so `CHAIN 'cli'` is
+  ignored there (fixed afterwards in `ef7b029`). The runs set `AZURE_TOKEN_CREDENTIALS=AzureCliCredential`. Not caused by DuckDB 2.0.1's secret-scope
+  change (`MatchScore`: authority-only scopes get an implicit trailing slash).
+
+**codec read budget (same day, same data):** `FABRICATOR_EW_READ_CONCURRENCY=16` with `FABRICATOR_EW_BUFFERED_READ_BYTES`
+512 MiB or 1 GiB, against the defaults (4 reads, 256 MiB). Both variables reach the catalog's codec reads (the factory is
+`DeltaWriter.Options`). Seconds, sum over all queries, cold / best warm; peak working set:
+
+| suite / store | default (4, 256 MiB) | 16 reads, 512 MiB | 16 reads, 1 GiB |
+|---|---|---|---|
+| TPC-H, S3 | 22.9 / 19.4, 7.8 GB | 25.7 / 20.6, 9.5 GB | 25.3 / 20.8, 8.5 GB |
+| TPC-H, OneLake | 96.6 / 34.9, 7.6 GB | 105.0 / 37.1, 11.0 GB | 112.4 / 36.3, 12.3 GB |
+| TPC-DS, S3 | 67.8 / 60.7, 8.0 GB | 71.5 / 62.5, 8.9 GB | 71.7 / 64.9, 8.2 GB |
+| TPC-DS, OneLake | 220.8 / 97.8, 8.1 GB | 184.3 / 99.2, 8.8 GB | 186.2 / 102.2, 9.0 GB |
+
+More reads and a larger budget do not pay: warm rounds are 3-7 % slower, only the cold TPC-DS round on OneLake gains
+(-17 %), and memory rises by up to 4.7 GB. 512 MiB and 1 GiB behave the same, so the budget is not the limit. One run
+per variant; OneLake cold rounds vary between runs.
+
+**The codec engine already reads through DuckDB's external file cache** (since `debe42c`, 2026-11-14: `HostFsOpenRead`
+opens remote files with `ALWAYS_CACHE`, OneLake data files go through `onelake://`, and the catalog turns on
+`cache_local_files` with 2 MB blocks). Checked on the same build, TPC-H SF10 Q1 on OneLake, one process, first run then
+second run:
+
+| engine | first run | second run | CPU (user) second run | cached after the first run |
+|---|---|---|---|---|
+| native (`delta`) | 6.8 s | 0.61 s | 2.9 s | 155 MB, 9 files |
+| codec (`engineeredwooddelta`) | 12.7 s | 1.10 s | 7.8 s | 315 MB, 9 files |
+
+So the warm gap between the engines is decoding CPU (about 2.7x), not IO, and turning the cache on by hand changes
+nothing. The cold gap is partly the bytes: the codec engine fetches about twice as much (coalesced ranges take the gaps
+between columns along, `MaxGapBytes` 1 MiB).
