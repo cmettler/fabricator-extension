@@ -94,6 +94,16 @@ std::string ResolveCredJson(const std::string &path, optional_ptr<FileOpener> op
 			first = false;
 			json += "\"" + EscapeJson(field.first.GetIdentifierName()) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
 		}
+		// The secret's PROVIDER is not in its secret_map (same as fabricator_secret.cpp AppendSecretProvider): without
+		// it the managed resolver never sees `credential_chain`, so a `CHAIN 'cli'` was ignored on onelake:// paths and
+		// DefaultAzureCredential ran instead.
+		const auto provider = kv.GetProvider().GetIdentifierName();
+		if (!provider.empty() && kv.secret_map.find("provider") == kv.secret_map.end()) {
+			if (!first) {
+				json += ",";
+			}
+			json += "\"provider\":\"" + EscapeJson(provider) + "\"";
+		}
 		json += "}";
 		return json;
 	} catch (...) {
