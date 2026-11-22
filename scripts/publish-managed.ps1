@@ -7,7 +7,7 @@
 .DESCRIPTION
     Two deployment modes:
       SelfContained (default) — runtime + assemblies (~250 MB); runs on machines
-        with NO .NET installed. net10.0.
+        with NO .NET installed. net10.0 (or -Framework net11.0).
       Framework — assemblies only (~tens of MB); the native clr_host resolves a
         PROVIDED .NET install at load (FABRICATOR_DOTNET_ROOT > DOTNET_ROOT >
         global). Targets net8.0 with rollForward=LatestMajor, so ONE payload
@@ -29,7 +29,7 @@
     "SelfContained" (default) or "Framework" (framework-dependent).
 
 .PARAMETER Framework
-    Target framework of the publish. Defaults: net10.0 for SelfContained,
+    Target framework of the publish (net8.0, net10.0 or net11.0). Defaults: net10.0 for SelfContained,
     net8.0 for Framework (lowest supported runtime; rolls forward).
 #>
 [CmdletBinding()]

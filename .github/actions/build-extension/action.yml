@@ -37,11 +37,13 @@ runs:
   steps:
     - uses: actions/setup-dotnet@v4
       with:
-        # 10 builds and runs the bridge; 8 is the deployment floor it also targets and supplies the
-        # runtime a framework-dependent publish resolves at load.
+        # 11 builds every TFM (engineered-wood's Core targets net11.0 too); 10 runs the self-contained
+        # bridge; 8 is the deployment floor it also targets and supplies the runtime a
+        # framework-dependent publish resolves at load.
         dotnet-version: |
           8.0.x
           10.0.x
+          11.0.x
 
     # The Linux and Windows runner images ship ninja and vcpkg; the macOS image is less predictable,
     # so bootstrap whatever is missing rather than discovering it as a failed run. All three checks

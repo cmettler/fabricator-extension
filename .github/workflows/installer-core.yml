@@ -76,12 +76,12 @@ jobs:
     # Both operating systems on purpose: three tests take a Windows-only path (the upgrade-in-use
     # rename-aside promote, and path-separator normalisation), and the resolver's Windows behaviour
     # differs from POSIX. Both target frameworks on purpose too: net8.0 is the deployment floor (the
-    # runtime preinstalled in Fabric notebooks), net10.0 the default.
+    # runtime preinstalled in Fabric notebooks), net10.0 the default, net11.0 the newest.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        tfm: [net8.0, net10.0]
+        tfm: [net8.0, net10.0, net11.0]
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.os }} / ${{ matrix.tfm }}
 
@@ -96,11 +96,12 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          # SDK 10 builds both TFMs; the 8.0 SDK is what supplies the .NET 8 runtime needed to
-          # actually EXECUTE the net8.0 test run.
+          # The newest SDK builds every TFM; the 8.0 and 10.0 SDKs supply the runtimes needed to
+          # actually EXECUTE the net8.0 and net10.0 test runs.
           dotnet-version: |
             8.0.x
             10.0.x
+            11.0.x
 
       - name: Test
         run: |
@@ -141,12 +142,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        tfm: [net8.0, net10.0]
+        tfm: [net8.0, net10.0, net11.0]
     runs-on: ${{ matrix.os }}
     # Both OSes on purpose. The format code under test normalises PATH SEPARATORS (Fabric's own docs
     # spell the value-set folder with a backslash) and asserts on CRLF in stored JSON; pinning that
     # behaviour on one platform only is how an accidental Path.DirectorySeparatorChar or
-    # Environment.NewLine dependency would hide. Both TFMs because net8.0 is the deployment floor.
+    # Environment.NewLine dependency would hide. Every TFM because net8.0 is the deployment floor.
     name: bridge / ${{ matrix.os }} / ${{ matrix.tfm }}
 
     steps:
@@ -163,6 +164,7 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
+            11.0.x
 
       - name: Test
         run: |

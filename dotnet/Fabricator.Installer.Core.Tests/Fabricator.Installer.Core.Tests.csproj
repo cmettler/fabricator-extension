@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>Fabricator.Installer.Tests</RootNamespace>
     <IsPackable>false</IsPackable>
-    <!-- Runs on both TFMs (inherited): net8.0 is the deployment floor, net10.0 the default. -->
+    <!-- Runs on every TFM (inherited): net8.0 is the deployment floor, net10.0 the default, net11.0 the newest. -->
   </PropertyGroup>
 
   <ItemGroup>

@@ -178,7 +178,7 @@ jobs:
   # NuGet: the two assemblies a PLUGIN references, packed ONCE.
   #
   # ⚠ ONCE, not per matrix leg, and that is the whole reason this is its own job: the packages are pure IL
-  # (lib/net10.0 + lib/net8.0) and platform-independent, so packing them inside `pack` would produce four
+  # (lib/net11.0 + lib/net10.0 + lib/net8.0) and platform-independent, so packing them inside `pack` would produce four
   # identical artifacts whose upload names would collide — and the one that won would be decided by which
   # leg finished last.
   #
@@ -199,10 +199,11 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          # SDK 10 builds both TFMs; the 8.0 SDK is what supplies the net8.0 targeting pack.
+          # SDK 11 builds every TFM; the 8.0 SDK is what supplies the net8.0 targeting pack.
           dotnet-version: |
             8.0.x
             10.0.x
+            11.0.x
 
       # pwsh is preinstalled on ubuntu-latest. The script is the one place that names WHICH projects are
       # packable — `dotnet pack` on a project whose IsPackable is false succeeds and emits nothing, so it

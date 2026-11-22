@@ -14,7 +14,7 @@
 
     <!--
       ⚠ ONE TFM AND A FIXED OUTPUT PATH, both to keep the fixture at a path the runner and CI can name
-      without interpolating a TFM or a RID. Directory.Build.props cross-targets net10.0;net8.0 and sets a
+      without interpolating a TFM or a RID. Directory.Build.props cross-targets net11.0;net10.0;net8.0 and sets a
       RID, which would put this at bin/Release/<tfm>/<rid>/ and force every consumer to know both. net8.0
       because a plugin loads into the bridge's context and net8.0 runs on either SKU.
     -->

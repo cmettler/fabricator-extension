@@ -6,7 +6,7 @@
 
   <PropertyGroup>
     <!-- Single-TFM: AOT publishes one native library. TargetFrameworks must be CLEARED, not just
-         overridden, or the repo-wide net10.0;net8.0 makes this a cross-targeting project and
+         overridden, or the repo-wide net11.0;net10.0;net8.0 makes this a cross-targeting project and
          `dotnet publish` refuses without -f. -->
     <TargetFrameworks></TargetFrameworks>
     <TargetFramework>net10.0</TargetFramework>

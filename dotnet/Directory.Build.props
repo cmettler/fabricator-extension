@@ -2,8 +2,9 @@
   <PropertyGroup>
     <!-- net8.0 = the LOWEST supported runtime (the Fabric-notebook preinstalled .NET 8); the
          framework-dependent publish targets it with rollForward=LatestMajor so ONE payload runs on
-         .NET 8 AND 10+. net10.0 stays the self-contained default. EW already multi-targets net8.0. -->
-    <TargetFrameworks>net10.0;net8.0</TargetFrameworks>
+         .NET 8 AND 10+. net10.0 (LTS) stays the self-contained default; net11.0 is built too, for a
+         payload published with -Framework net11.0 (EW Core targets it for the .NET 11 codecs). -->
+    <TargetFrameworks>net11.0;net10.0;net8.0</TargetFrameworks>
 
     <!-- ONE version for the whole repo, read from ./VERSION. It used to be two literals (CMakeLists.txt's
          FABRICATOR_EXTENSION_VERSION and extension_config.cmake's EXTENSION_VERSION) and CLAUDE.md records
