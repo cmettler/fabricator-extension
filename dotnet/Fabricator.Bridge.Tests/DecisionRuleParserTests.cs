@@ -101,6 +101,25 @@ public class DecisionRuleParserTests
     public void Function_argument_comma_is_not_a_list()
         => Assert.Equal("coalesce(col, 'x') = 'y'", DecisionRuleParser.ParseCondition("coalesce(?, 'x') = 'y'", "col"));
 
+    // ⚠⚠ A QUOTED ITEM KEEPS ITS COMMA. The list check skipped quotes but the item split did not, so this
+    // rendered `IN ('''a', 'b''', 'c')` — valid SQL that matches nothing. Both now use one splitter.
+    [Theory]
+    [InlineData("'a, b', c", "region", "region IN ('a, b', 'c')")]
+    [InlineData("in ['a, b', 'c']", "region", "region IN ['a, b', 'c']")]
+    [InlineData("in ('a, b', 'O''Land')", "region", "region IN ('a, b', 'O''Land')")]
+    public void List_items_keep_quoted_commas(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    [Fact]
+    public void Quoted_comma_list_on_tsql()
+        => Assert.Equal("region IN ('a, b', 'c')",
+            DecisionRuleParser.ParseCondition("in ['a, b', 'c']", "region", DmnDialect.TSql));
+
+    // ⚠ …and an item that is a function call keeps its argument commas.
+    [Fact]
+    public void List_items_keep_function_argument_commas()
+        => Assert.Equal("col IN (coalesce(x, 1), 2)", DecisionRuleParser.ParseCondition("in (coalesce(@x, 1), 2)", "col"));
+
     // ── output / value expressions ───────────────────────────────────────────────────────────────────
     [Theory]
     [InlineData("approve", "'approve'")]

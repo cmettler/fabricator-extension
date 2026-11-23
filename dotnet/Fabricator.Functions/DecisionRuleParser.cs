@@ -666,34 +666,56 @@ public static class DecisionRuleParser
         return sb.ToString();
     }
 
-    private static bool HasTopLevelComma(string s)
+    private static bool HasTopLevelComma(string s) => SplitTopLevel(s).Count > 1;
+
+    private static List<string> ParseListItems(string raw, DmnDialect dialect, string refPrefix)
     {
-        bool inQuote = false;
-        int depth = 0;
-        foreach (var ch in s)
+        var items = new List<string>();
+        foreach (var item in SplitTopLevel(raw))
         {
+            items.Add(ParseValue(item.Trim(), dialect, refPrefix, 0));
+        }
+        return items;
+    }
+
+    /// <summary>
+    /// Splits a list cell at its TOP-LEVEL commas — never inside a quoted string or a bracket pair.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ ONE SPLITTER FOR BOTH QUESTIONS — "is this a list?" (<see cref="HasTopLevelComma"/>) and "what are
+    /// its items?" (<see cref="ParseListItems"/>). They used to disagree: the check skipped quotes and
+    /// parentheses, the split was a plain <c>Split(',')</c>, so <c>'a, b', c</c> was recognised as a two-item
+    /// list and then cut into three broken literals — <c>IN ('''a', 'b''', 'c')</c>, which is VALID SQL that
+    /// matches nothing. A doubled quote (<c>'O''Land'</c>) toggles twice, so it needs no special case.
+    /// Pinned by <c>DecisionRuleParserTests.List_items_keep_quoted_commas</c> and
+    /// <c>List_items_keep_function_argument_commas</c>.
+    /// </remarks>
+    private static List<string> SplitTopLevel(string s)
+    {
+        var parts = new List<string>();
+        var start = 0;
+        var inQuote = false;
+        var depth = 0;
+        for (var i = 0; i < s.Length; i++)
+        {
+            var ch = s[i];
             if (ch == '\'')
             {
                 inQuote = !inQuote;
             }
             else if (!inQuote)
             {
-                if (ch == '(') depth++;
-                else if (ch == ')') depth--;
-                else if (ch == ',' && depth == 0) return true;
+                if (ch is '(' or '[') depth++;
+                else if (ch is ')' or ']') depth--;
+                else if (ch == ',' && depth == 0)
+                {
+                    parts.Add(s[start..i]);
+                    start = i + 1;
+                }
             }
         }
-        return false;
-    }
-
-    private static List<string> ParseListItems(string raw, DmnDialect dialect, string refPrefix)
-    {
-        var items = new List<string>();
-        foreach (var item in raw.Split(','))
-        {
-            items.Add(ParseValue(item.Trim(), dialect, refPrefix, 0));
-        }
-        return items;
+        parts.Add(s[start..]);
+        return parts;
     }
 
     /// <summary>
