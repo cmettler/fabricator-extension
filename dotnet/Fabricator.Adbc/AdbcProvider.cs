@@ -229,7 +229,7 @@ internal sealed class AdbcCatalog : IProviderCatalog
     // among them, and re-applies them, so the driver may return more rows than they select.
     public string CapabilitiesJson =>
         "{\"remote_select\":true,\"superset_filter_pushdown\":true"
-        + (_duckDbServer ? ",\"substrait_native_functions\":true,\"lossless_arrow_boundary\":true" : "") + (_defaultSchema is null ? "" : ",\"default_schema\":" +
+        + (_duckDbServer ? ",\"substrait_native_functions\":true,\"lossless_arrow_boundary\":true,\"dml_returning\":true" : "") + (_defaultSchema is null ? "" : ",\"default_schema\":" +
             System.Text.Json.JsonSerializer.Serialize(_defaultSchema)) + "}";
 
     // ── discovery ────────────────────────────────────────────────────────────────────────────────────────────
@@ -765,10 +765,10 @@ internal sealed class AdbcCatalog : IProviderCatalog
                             IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns, string? optionsJson)
     {
         RequireDuckDb("CREATE TABLE");
-        if (!string.IsNullOrEmpty(defaults) || partitionColumns is { Count: > 0 } || sortColumns is { Count: > 0 }
-            || identityColumns is { Count: > 0 } || !string.IsNullOrEmpty(optionsJson))
-            throw new NotSupportedException("adbc: CREATE TABLE with DEFAULT, PARTITIONED BY, SORTED BY, an identity or WITH options is not supported");
-        ExecuteDdl(DuckDbDdl.CreateTable(schemaName, tableName, columns, ifNotExists, replace: false, primaryKey, uniques));
+        if (partitionColumns is { Count: > 0 } || sortColumns is { Count: > 0 } || identityColumns is { Count: > 0 }
+            || !string.IsNullOrEmpty(optionsJson))
+            throw new NotSupportedException("adbc: CREATE TABLE with PARTITIONED BY, SORTED BY, an identity or WITH options is not supported");
+        ExecuteDdl(DuckDbDdl.CreateTable(schemaName, tableName, columns, ifNotExists, replace: false, primaryKey, uniques, defaults));
     }
 
     public void DropTable(string schemaName, string tableName, bool ifExists)
@@ -994,10 +994,99 @@ internal sealed class AdbcCatalog : IProviderCatalog
         }
     }
 
-    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => throw ReadOnly("DELETE");
+    // ── the key path: a DELETE / UPDATE the host could not push, by the rows' keys (the table's PRIMARY KEY / UNIQUE) ──
+
+    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) =>
+        KeyDml(schemaName, tableName, keys, setColumnCount: -1, returning: false, (c, sql) =>
+        {
+            using var statement = c.CreateStatement();
+            statement.SqlQuery = sql;
+            return statement.ExecuteUpdate().AffectedRows;
+        });
 
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data) =>
-        throw ReadOnly("UPDATE");
+        KeyDml(schemaName, tableName, data, setColumnCount, returning: false, (c, sql) =>
+        {
+            using var statement = c.CreateStatement();
+            statement.SqlQuery = sql;
+            return statement.ExecuteUpdate().AffectedRows;
+        });
+
+    public IArrowArrayStream ExecuteDeleteReturning(IReadOnlyList<string> schemaPath, string tableName, IArrowArrayStream keys) =>
+        KeyDml(Leaf(schemaPath), tableName, keys, setColumnCount: -1, returning: true, Returned);
+
+    public IArrowArrayStream ExecuteUpdateReturning(IReadOnlyList<string> schemaPath, string tableName, int setColumnCount,
+                                                    IArrowArrayStream data) =>
+        KeyDml(Leaf(schemaPath), tableName, data, setColumnCount, returning: true, Returned);
+
+    private static string Leaf(IReadOnlyList<string> path) => path.Count == 0 ? string.Empty : path[path.Count - 1];
+
+    private static IArrowArrayStream Returned(AdbcConnection connection, string sql)
+    {
+        using var statement = connection.CreateStatement();
+        statement.SqlQuery = sql;
+        return Drained(statement.ExecuteQuery().Stream!);
+    }
+
+    /// <summary>
+    /// A key-path DELETE (<paramref name="setColumnCount"/> &lt; 0: the rows are keys) or UPDATE (the first
+    /// <paramref name="setColumnCount"/> columns are the new values, named by the columns they set, the rest the keys):
+    /// the rows go to a temporary table of the session under positional names (a key column may also be set), and ONE
+    /// statement changes the target's rows whose keys are there — in the DuckDB transaction.
+    /// </summary>
+    private T KeyDml<T>(string schemaName, string tableName, IArrowArrayStream rows, int setColumnCount, bool returning,
+                        Func<AdbcConnection, string, T> run)
+    {
+        if (!_duckDbServer)
+        {
+            rows.Dispose();
+            throw ReadOnly(setColumnCount < 0 ? "DELETE" : "UPDATE");
+        }
+        var names = rows.Schema.FieldsList.Select(f => f.Name).ToList();
+        var positional = new RenamedStream(rows, Enumerable.Range(0, names.Count).Select(i => "_" + i).ToList());
+        string target = DuckDbDdl.Table(schemaName, tableName);
+        int firstKey = setColumnCount < 0 ? 0 : setColumnCount;
+        T Statement(AdbcConnection connection) => ThroughTemporary(connection, positional, (temp, _) =>
+        {
+            string match = string.Join(" AND ", Enumerable.Range(firstKey, names.Count - firstKey)
+                .Select(i => "T." + DuckDbDdl.Quote(names[i]) + " IS NOT DISTINCT FROM S._" + i));
+            string sql = setColumnCount < 0
+                ? "DELETE FROM " + target + " AS T WHERE EXISTS (SELECT 1 FROM " + temp + " AS S WHERE " + match + ")"
+                : "UPDATE " + target + " AS T SET " + string.Join(", ", Enumerable.Range(0, setColumnCount)
+                      .Select(i => DuckDbDdl.Quote(names[i]) + " = S._" + i)) + " FROM " + temp + " AS S WHERE " + match;
+            return run(connection, returning ? sql + " RETURNING T.*" : sql);
+        });
+        var txn = WriteTransaction();
+        if (txn is null)
+        {
+            using var own = Connect();
+            return Statement(own);
+        }
+        lock (txn.Gate)
+            return Statement(txn.Connection!);
+    }
+
+    /// <summary>A stream whose columns are renamed by position.</summary>
+    private sealed class RenamedStream : IArrowArrayStream
+    {
+        private readonly IArrowArrayStream _inner;
+
+        public RenamedStream(IArrowArrayStream inner, IReadOnlyList<string> names)
+        {
+            _inner = inner;
+            Schema = Renamed(inner.Schema, names);
+        }
+
+        public Schema Schema { get; }
+
+        public async ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
+        {
+            var batch = await _inner.ReadNextRecordBatchAsync(cancellationToken).ConfigureAwait(false);
+            return batch is null ? null : new RecordBatch(Schema, Enumerable.Range(0, batch.ColumnCount).Select(batch.Column), batch.Length);
+        }
+
+        public void Dispose() => _inner.Dispose();
+    }
 
     public void Dispose()
     {

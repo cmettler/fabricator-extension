@@ -29,12 +29,20 @@ internal static class DuckDbDdl
     /// CREATE TABLE. <paramref name="primaryKey"/>: comma-separated column indexes; <paramref name="uniques"/>: such
     /// groups separated by ';' (the host's encoding).
     /// </summary>
+    /// <param name="defaults">Literal defaults: "&lt;column index&gt; &lt;base64 of the value's text, or - for NULL&gt;" pairs.</param>
     public static string CreateTable(string schema, string table, Schema columns, bool ifNotExists, bool replace,
-                                     string? primaryKey, string? uniques)
+                                     string? primaryKey, string? uniques, string? defaults = null)
     {
+        var defaultOf = new Dictionary<int, string?>();
+        var tokens = (defaults ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        for (int t = 0; t + 1 < tokens.Length; t += 2)
+            defaultOf[int.Parse(tokens[t], CultureInfo.InvariantCulture)] =
+                tokens[t + 1] == "-" ? null : Encoding.UTF8.GetString(Convert.FromBase64String(tokens[t + 1]));
         var sql = new StringBuilder(replace ? "CREATE OR REPLACE TABLE " : ifNotExists ? "CREATE TABLE IF NOT EXISTS " : "CREATE TABLE ");
         sql.Append(Table(schema, table)).Append(" (");
-        sql.Append(string.Join(", ", columns.FieldsList.Select(f => Quote(f.Name) + " " + TypeName(f) + (f.IsNullable ? "" : " NOT NULL"))));
+        sql.Append(string.Join(", ", columns.FieldsList.Select((f, i) => Quote(f.Name) + " " + TypeName(f)
+            + (defaultOf.TryGetValue(i, out var value) ? " DEFAULT " + TypedLiteral(value, f) : "")
+            + (f.IsNullable ? "" : " NOT NULL"))));
         if (!string.IsNullOrEmpty(primaryKey))
             sql.Append(", PRIMARY KEY (").Append(ColumnList(columns, primaryKey)).Append(')');
         foreach (var group in (uniques ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
