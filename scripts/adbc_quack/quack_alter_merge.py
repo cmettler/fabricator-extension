@@ -150,7 +150,7 @@ def run(port):
         ok = False
         print("BAD insert returning  error:", str(e).splitlines()[0][:220])
     bad += not ok
-    print(f"\n{len(ALTERS) + len(MERGES) + 1} cases, {bad} not ok")
+    print(f"\n{len(ALTERS) + len(MERGES) + len(KEYLESS) + len(RETURNING) + len(KEYLESS_RETURNING) + 2} cases, {bad} not ok")
 
 
 qe.run = run
