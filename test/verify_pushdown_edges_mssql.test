@@ -1408,5 +1408,13 @@ SELECT DISTINCT ON (g) g, id FROM rp.dbo.ed_t ORDER BY g, id
 3	5
 NULL	7
 
+# interval mixed
+query TT rowsort
+SELECT g, max(ts + INTERVAL '1 month 2 days') FROM rp.dbo.ed_t WHERE year(ts) BETWEEN 1000 AND 9000 GROUP BY g
+----
+1	2024-03-31 23:59:59.999999
+2	1970-02-03 00:00:00
+3	2024-04-17 12:30:45.5
+
 statement ok
 SELECT fabricator_exec('rp', 'DROP TABLE dbo.ed_t; DROP TABLE dbo.ed_u;', refresh_cache := true);

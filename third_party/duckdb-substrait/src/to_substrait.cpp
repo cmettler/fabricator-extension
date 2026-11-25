@@ -287,6 +287,11 @@ void DuckDBToSubstrait::TransformInterval(const Value &dval, substrait::Expressi
 	// unfortunately. This implementation opts to set the largest interval value.
 	auto &sval = *sexpr.mutable_literal();
 	auto months = dval.GetValue<interval_t>().months;
+	// [FABRICATOR-PATCH: OFFER-READY] "set the largest value" dropped the days and the time of a mixed interval:
+	// ts + INTERVAL '1 month 2 days' was sent as ts + 1 month. Decline such a constant instead.
+	if (months != 0 && (dval.GetValue<interval_t>().days != 0 || dval.GetValue<interval_t>().micros != 0)) {
+		throw NotImplementedException("to_substrait: an interval with months and days or time is not supported");
+	}
 	if (months != 0) {
 		auto interval_year = make_uniq<substrait::Expression_Literal_IntervalYearToMonth>();
 		interval_year->set_months(months);

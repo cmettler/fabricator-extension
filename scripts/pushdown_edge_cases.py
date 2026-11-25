@@ -194,6 +194,7 @@ CASES = [
     # Q found through the adbc provider's DuckDB dialect (2026-11-25): both were wrong answers on this path too
     ("cast unsigned", "SELECT sum(CAST(i AS UTINYINT)) FROM {t} WHERE i BETWEEN -10 AND 10"),
     ("distinct on", "SELECT DISTINCT ON (g) g, id FROM {t} ORDER BY g, id"),
+    ("interval mixed", "SELECT g, max(ts + INTERVAL '1 month 2 days') FROM {t} WHERE year(ts) BETWEEN 1000 AND 9000 GROUP BY g"),
 ]
 
 
