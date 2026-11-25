@@ -18,6 +18,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
     <ProjectReference Include="..\Fabricator.Common\Fabricator.Common.csproj" />
+    <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
     <PackageReference Include="Apache.Arrow.Adbc" Version="1.0.0" />
   </ItemGroup>
 

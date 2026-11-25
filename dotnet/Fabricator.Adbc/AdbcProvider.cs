@@ -39,7 +39,10 @@ internal sealed class AdbcCatalog : IProviderCatalog
     // Plans the host pushed, by the handle the host runs them through (TranslateRemotePlan -> ExecuteQuery).
     private readonly ConcurrentDictionary<string, PushedPlan> _plans = new(StringComparer.Ordinal);
 
-    private sealed record PushedPlan(byte[] Plan, Schema Schema);
+    private sealed record PushedPlan(byte[] Plan, Schema Schema, bool Writes = false);
+
+    // The driver connection of each DuckDB transaction that wrote (AdbcTransaction).
+    private readonly TransactionManager<AdbcTransaction> _txns = new(id => new AdbcTransaction(id));
 
     private const string PlanPrefix = "adbc-substrait-plan:";
 
@@ -425,6 +428,15 @@ internal sealed class AdbcCatalog : IProviderCatalog
                                            SubstraitFunctions functions, IReadOnlyList<string> names,
                                            IReadOnlyList<int>? select = null)
     {
+        if (Pinned() is { } txn)
+        {
+            lock (txn.Gate)
+            {
+                var pinned = txn.Connection!.CreateStatement();
+                SetPlan(pinned, ChoosePlan(pinned, build, conjuncts, functions));
+                return Drained(new OwningStream(pinned.ExecuteQuery().Stream!, names, pinned, null, select));
+            }
+        }
         var connection = Connect();
         AdbcStatement? statement = null;
         try
@@ -507,6 +519,41 @@ internal sealed class AdbcCatalog : IProviderCatalog
             return values.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
     }
 
+    /// <summary>Whether the plan's root relation is a write (Plan.relations → PlanRel.root → RelRoot.input → Rel.write).</summary>
+    internal static bool IsWritePlan(byte[] plan)
+    {
+        var reader = new ProtoReader(plan);
+        while (reader.Next(out int field, out int wire, out _))
+        {
+            if (field != 3 || wire != 2) // Plan.relations
+            {
+                reader.Skip(wire);
+                continue;
+            }
+            var relation = reader.Message();
+            while (relation.Next(out int rf, out int rw, out _))
+            {
+                if (rf != 2 || rw != 2) // PlanRel.root
+                {
+                    relation.Skip(rw);
+                    continue;
+                }
+                var root = relation.Message();
+                while (root.Next(out int of, out int ow, out _))
+                {
+                    if (of != 1 || ow != 2) // RelRoot.input
+                    {
+                        root.Skip(ow);
+                        continue;
+                    }
+                    var rel = root.Message();
+                    return rel.Next(out int kind, out _, out _) && kind == 19; // Rel.write
+                }
+            }
+        }
+        return false;
+    }
+
     /// <summary>The index of a column by name: exact first, then ignoring case (DuckDB names are case-insensitive).</summary>
     internal static int? IndexOf(IReadOnlyList<string> names, string name)
     {
@@ -531,13 +578,15 @@ internal sealed class AdbcCatalog : IProviderCatalog
         if (!_duckDbServer && hints.Contains("fabricator.single_join_any_row"))
             return RemoteQuery.Declined("adbc: a scalar subquery may take any of several rows here, which the driver "
                                         + "would refuse instead");
+        bool writes = IsWritePlan(substraitPlan);
         Schema schema;
         try
         {
             using var connection = Connect();
             using var statement = connection.CreateStatement();
             CheckPlan(statement, substraitPlan); // a driver that cannot run the plan refuses here, before anything executes
-            schema = statement.ExecuteSchema();
+            // a write has no result to describe: it answers its affected-row count
+            schema = writes ? new Schema(System.Array.Empty<Field>(), null) : statement.ExecuteSchema();
         }
         catch (Exception ex) when (IsRefusal(ex))
         {
@@ -545,6 +594,11 @@ internal sealed class AdbcCatalog : IProviderCatalog
             return RemoteQuery.Declined("adbc driver: " + ex.Message);
         }
         string handle = PlanPrefix + Guid.NewGuid().ToString("N");
+        if (writes)
+        {
+            _plans[handle] = new PushedPlan(substraitPlan, schema, Writes: true);
+            return new RemoteQuery(handle, 1, System.Array.Empty<bool>()) { ChangesRows = true };
+        }
         var renamed = Renamed(schema, Enumerable.Range(0, schema.FieldsList.Count).Select(i => "c" + i).ToList());
         _plans[handle] = new PushedPlan(substraitPlan, renamed);
         return new RemoteQuery(handle, schema.FieldsList.Count, System.Array.Empty<bool>());
@@ -616,6 +670,24 @@ internal sealed class AdbcCatalog : IProviderCatalog
 
     public long ExecuteNonQuery(string sql)
     {
+        if (_plans.TryGetValue(sql, out var pushed) && pushed.Writes)
+        {
+            // a pushed write: on the transaction's connection, committed with the DuckDB transaction
+            var txn = WriteTransaction();
+            if (txn is not null)
+            {
+                lock (txn.Gate)
+                {
+                    using var pinned = txn.Connection!.CreateStatement();
+                    SetPlan(pinned, pushed.Plan);
+                    return pinned.ExecuteUpdate().AffectedRows;
+                }
+            }
+            using var own = Connect();
+            using var write = own.CreateStatement();
+            SetPlan(write, pushed.Plan);
+            return write.ExecuteUpdate().AffectedRows;
+        }
         using var connection = Connect();
         using var statement = connection.CreateStatement();
         statement.SqlQuery = sql;
@@ -646,14 +718,62 @@ internal sealed class AdbcCatalog : IProviderCatalog
 
     public void BeginTransaction(bool isExplicit)
     {
+        if (isExplicit && AmbientTransaction.Current != 0)
+            _txns.GetOrCreate(AmbientTransaction.Current).IsExplicit = true;
     }
 
-    public void CommitTransaction()
+    public void CommitTransaction() => EndTransaction(commit: true);
+
+    public void RollbackTransaction() => EndTransaction(commit: false);
+
+    private void EndTransaction(bool commit)
     {
+        // removed before completed: nothing resolves a transaction that is being completed
+        using var txn = _txns.Remove(AmbientTransaction.Current);
+        txn?.Complete(commit);
     }
 
-    public void RollbackTransaction()
+    /// <summary>This transaction's pinned connection once it wrote; null otherwise (a read then takes its own).</summary>
+    private AdbcTransaction? Pinned() =>
+        AmbientTransaction.Current is var id and not 0 && _txns.TryGet(id) is { Connection: not null } txn ? txn : null;
+
+    /// <summary>The transaction a write runs in, its connection opened (autocommit off) by the first write.</summary>
+    private AdbcTransaction? WriteTransaction()
     {
+        long id = AmbientTransaction.Current;
+        if (id == 0)
+            return null;
+        var txn = _txns.GetOrCreate(id);
+        lock (txn.Gate)
+        {
+            if (txn.Connection is null)
+            {
+                var connection = Connect();
+                try
+                {
+                    connection.AutoCommit = false;
+                }
+                catch
+                {
+                    connection.Dispose();
+                    throw;
+                }
+                txn.Connection = connection;
+            }
+        }
+        return txn;
+    }
+
+    /// <summary>A result read whole, so the pinned connection is free for the next statement.</summary>
+    private static IArrowArrayStream Drained(IArrowArrayStream stream)
+    {
+        using (stream)
+        {
+            var batches = new List<RecordBatch>();
+            while (stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+                batches.Add(batch);
+            return new InMemoryArrayStream(stream.Schema, batches);
+        }
     }
 
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows) =>
@@ -681,12 +801,13 @@ internal sealed class AdbcCatalog : IProviderCatalog
     {
         private readonly IArrowArrayStream _inner;
         private readonly AdbcStatement _statement;
-        private readonly AdbcConnection _connection;
+        private readonly AdbcConnection? _connection;
 
         private readonly IReadOnlyList<int> _select;
 
+        /// <param name="connection">The connection to close with the stream; null for a pinned one.</param>
         public OwningStream(IArrowArrayStream inner, IReadOnlyList<string> names, AdbcStatement statement,
-                            AdbcConnection connection, IReadOnlyList<int>? select = null)
+                            AdbcConnection? connection, IReadOnlyList<int>? select = null)
         {
             _inner = inner;
             _statement = statement;
@@ -711,7 +832,7 @@ internal sealed class AdbcCatalog : IProviderCatalog
         {
             _inner.Dispose();
             _statement.Dispose();
-            _connection.Dispose();
+            _connection?.Dispose();
         }
     }
 }
