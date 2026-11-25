@@ -62,6 +62,9 @@ internal sealed class AdbcCatalog : IProviderCatalog
     /// </summary>
     internal bool ConsistentReads { get; }
 
+    /// <summary>DuckDB's own row id, the virtual row identity of a DuckDB server table with no key.</summary>
+    internal const string RowId = "rowid";
+
     /// <summary>The driver reads a scan's columns by name (a DuckDB server).</summary>
     internal bool ReadsByName => _duckDbServer;
 
@@ -478,11 +481,12 @@ internal sealed class AdbcCatalog : IProviderCatalog
     /// only widens the result, which the host filters again. <paramref name="select"/> picks result columns by
     /// position (after the rename); null keeps them all.
     /// </summary>
+    /// <param name="pin">Run in the transaction's own connection, opening it if this is its first use.</param>
     internal IArrowArrayStream RunFiltered(Func<ProtoWriter?, byte[]> build, IReadOnlyList<ProtoWriter> conjuncts,
                                            SubstraitFunctions functions, IReadOnlyList<string> names,
-                                           IReadOnlyList<int>? select = null)
+                                           IReadOnlyList<int>? select = null, bool pin = false)
     {
-        if (Pinned() is { } txn)
+        if ((pin ? WriteTransaction() : Pinned()) is { } txn)
         {
             lock (txn.Gate)
             {
@@ -1170,7 +1174,20 @@ internal sealed class AdbcTableBinding : ITableBinding
     }
 
     public Schema Schema { get; }
-    public IReadOnlyList<string> RowIdColumns() => _catalog.KeyColumns(_table.SchemaName, _table.TableName);
+    /// <summary>
+    /// The table's PRIMARY KEY / UNIQUE; for a DuckDB server table with neither, DuckDB's own <c>rowid</c> as a
+    /// VIRTUAL row identity (BIGINT, read by the scan — <see cref="Scan"/> pins it to the transaction, so the rows it
+    /// names are the rows the DELETE / UPDATE then changes). Not when the table has a column of that name.
+    /// </summary>
+    public IReadOnlyList<string> RowIdColumns()
+    {
+        var keys = _catalog.KeyColumns(_table.SchemaName, _table.TableName);
+        if (keys.Count > 0 || !_catalog.ReadsByName)
+            return keys;
+        return Schema.FieldsList.Any(f => string.Equals(f.Name, AdbcCatalog.RowId, StringComparison.OrdinalIgnoreCase))
+            ? keys
+            : new[] { AdbcCatalog.RowId };
+    }
     public IReadOnlyList<VirtualColumn> VirtualColumns() => System.Array.Empty<VirtualColumn>();
     public long? ApproximateRowCount() => _catalog.RowCount(_table.SchemaName, _table.TableName);
     public IReadOnlyList<NdvEntry> ColumnNdv() => System.Array.Empty<NdvEntry>();
@@ -1186,18 +1203,27 @@ internal sealed class AdbcTableBinding : ITableBinding
             // the bind's describe: the schema is known (GetTableSchema) — running the scan would read the table
             return new InMemoryArrayStream(Schema, System.Array.Empty<RecordBatch>());
         }
+        // DuckDB's rowid (the virtual row identity, RowIdColumns): an extra BIGINT column of the read
+        bool rowId = _catalog.ReadsByName && spec?.Columns is { } wanted
+            && wanted.Any(c => string.Equals(c, AdbcCatalog.RowId, StringComparison.OrdinalIgnoreCase))
+            && !Schema.FieldsList.Any(f => string.Equals(f.Name, AdbcCatalog.RowId, StringComparison.OrdinalIgnoreCase));
+        var schema = rowId
+            ? new Schema(Schema.FieldsList.Append(new Field(AdbcCatalog.RowId, Int64Type.Default, nullable: false)), Schema.Metadata)
+            : Schema;
         var projection = spec?.Columns is { Count: > 0 } columns
-            ? columns.Select(c => Schema.GetFieldIndex(c)).ToList()
+            ? columns.Select(c => AdbcCatalog.IndexOf(schema.FieldsList.Select(f => f.Name).ToList(), c)
+                ?? throw new InvalidOperationException($"adbc: the table has no column '{c}'")).ToList()
             : Enumerable.Range(0, Schema.FieldsList.Count).ToList();
-        var columnNames = Schema.FieldsList.Select(f => f.Name).ToList();
+        var columnNames = schema.FieldsList.Select(f => f.Name).ToList();
         var functions = new SubstraitFunctions();
         var conjuncts = spec?.Filter is { } filter
             ? SubstraitFilter.Conjuncts(filter, name => AdbcCatalog.IndexOf(columnNames, name), values, functions, _catalog.MaxInList)
             : new List<ProtoWriter>();
         var path = new[] { _table.SchemaName, _table.TableName };
-        return _catalog.RunFiltered(condition => SubstraitReadPlan.Build(path, Schema, projection, condition, functions,
+        // a read of the rowid is for a DELETE / UPDATE by it: in the transaction, so the rowids stay the rows they name
+        return _catalog.RunFiltered(condition => SubstraitReadPlan.Build(path, schema, projection, condition, functions,
                                                                           _catalog.ReadsByName),
-            conjuncts, functions, projection.Select(i => Schema.FieldsList[i].Name).ToList());
+            conjuncts, functions, projection.Select(i => schema.FieldsList[i].Name).ToList(), pin: rowId);
     }
 
     public void Dispose()

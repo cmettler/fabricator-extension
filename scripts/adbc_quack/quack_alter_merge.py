@@ -39,6 +39,18 @@ MERGES = [
     ("merge update joined", ["UPDATE {s}am_m SET v = s.v FROM {s}am_src s WHERE am_m.id = s.id AND NOT s.del"]),
     ("merge update key", ["UPDATE {s}am_m SET id = id + 10 WHERE id = 4"]),
 ]
+# on am_t, which has no key: the provider's row identity is then DuckDB's own rowid
+KEYLESS = [
+    ("rowid update joined", ["UPDATE {s}am_t SET v = s.v FROM {s}am_src s WHERE am_t.id = s.id AND NOT s.del"]),
+    ("rowid merge", ["MERGE INTO {s}am_t t USING {s}am_src s ON t.id = s.id "
+                     "WHEN MATCHED AND s.del THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v "
+                     "WHEN NOT MATCHED THEN INSERT (id, k, v) VALUES (s.id, s.k, s.v)"]),
+    ("rowid in txn", ["BEGIN", "DELETE FROM {s}am_t WHERE id = 1", "UPDATE {s}am_t SET k = s.k FROM {s}am_src s WHERE am_t.id = s.id", "COMMIT"]),
+]
+KEYLESS_RETURNING = [
+    ("rowid delete returning", "DELETE FROM {s}am_t WHERE v > 15 RETURNING *"),
+    ("rowid update returning", "UPDATE {s}am_t SET v = coalesce(v, 0) + 1 WHERE id < 4 RETURNING *"),
+]
 RETURNING = [
     ("delete returning", "DELETE FROM {s}am_m WHERE v > 15 RETURNING *"),
     ("update returning", "UPDATE {s}am_m SET v = coalesce(v, 0) + 1 WHERE id < 4 RETURNING *"),
@@ -77,7 +89,7 @@ def run(port):
         rows = sorted(map(repr, con.execute(f"SELECT * FROM {local}{name}").fetchall()))
         return cols, rows
 
-    for name, statements in ALTERS + MERGES:
+    for name, statements in ALTERS + MERGES + KEYLESS:
         setup()
         con.execute("CALL truncate_duckdb_logs()")
         err = None
@@ -104,12 +116,13 @@ def run(port):
         if err is None and got != want:
             print(f"   server {got}\n   local  {want}")
 
-    for name, st in RETURNING:
+    for name, st in RETURNING + KEYLESS_RETURNING:
         setup()
         try:
             got = sorted(map(repr, con.execute(st.format(s=remote)).fetchall()))
             want = sorted(map(repr, con.execute(st.format(s=local)).fetchall()))
-            ok = got == want and server_table("am_m") == local_table("am_m")
+            table = "am_t" if name.startswith("rowid") else "am_m"
+            ok = got == want and server_table(table) == local_table(table)
             print(f"{'ok ' if ok else 'BAD'} {name}" + ("" if ok else f" {got} / {want}"))
         except Exception as e:  # noqa: BLE001
             ok = False
