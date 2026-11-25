@@ -23,11 +23,14 @@ internal sealed class DuckDbSessionSettings
         "ieee_floating_point_ops", "error_on_division_by_zero",
     };
 
-    /// <summary>One query that reads them (and the version) as (name, value) rows; an absent setting has no row.</summary>
+    /// <summary>
+    /// One query that reads them and the version as ONE row, a column each (NULL for a setting this session does not
+    /// have — Calendar without ICU). current_setting, not duckdb_settings(): that scans every setting, ~7.6 ms
+    /// against ~1.2 ms, paid before every plan with expressions.
+    /// </summary>
     public static readonly string Query =
-        "SELECT name, CAST(value AS VARCHAR) AS value FROM duckdb_settings() WHERE lower(name) IN ("
-        + string.Join(", ", Compared.Select(n => "'" + n.ToLowerInvariant() + "'"))
-        + ") UNION ALL SELECT '#version', library_version FROM pragma_version()";
+        "SELECT " + string.Join(", ", Compared.Select(n => "try(CAST(current_setting('" + n + "') AS VARCHAR))"))
+        + ", library_version FROM pragma_version()";
 
     public static readonly DuckDbSessionSettings Default = new(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
@@ -51,10 +54,15 @@ internal sealed class DuckDbSessionSettings
         {
             using (batch)
             {
-                var names = (Apache.Arrow.StringArray)batch.Column(0);
-                var vals = (Apache.Arrow.StringArray)batch.Column(1);
-                for (int i = 0; i < batch.Length; i++)
-                    values[names.GetString(i)] = vals.GetString(i) ?? "";
+                if (batch.Length == 0)
+                    continue;
+                for (int c = 0; c < Compared.Length; c++)
+                {
+                    var column = (Apache.Arrow.StringArray)batch.Column(c);
+                    if (!column.IsNull(0))
+                        values[Compared[c]] = column.GetString(0) ?? "";
+                }
+                values["#version"] = ((Apache.Arrow.StringArray)batch.Column(Compared.Length)).GetString(0) ?? "";
             }
         }
         return new DuckDbSessionSettings(values);

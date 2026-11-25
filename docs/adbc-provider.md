@@ -217,6 +217,22 @@ wrong; fixed on `v2.0-cyanoptera` in `third_party/duckdb-substrait/src/to_substr
 - an interval constant with months AND days or a time: upstream kept only the months ("set the largest interval
   value"), so `ts + INTERVAL '1 month 2 days'` was pushed as `ts + 1 month`.
 
+### Inversion pass (2026-11-25, `scripts/adbc_quack/quack_inversion.py`, `quack_scale.py`)
+
+What the differential runs could not see, measured:
+
+| candidate | result |
+|---|---|
+| ORDER BY lost through projection, join, set operation, window, nested limit, an unselected sort key (the other runs compare sorted rows) | kept in all 12 shapes |
+| a volatile function written twice by the emitter's inlining (`random()`, `gen_random_uuid()`) | not pushed at all (the host keeps them local) |
+| nested types read losslessly (`BOOLEAN[]`, STRUCT with UUID / HUGEINT, MAP, `TIMETZ[]`, `BIT[]`) | exact |
+| **ENUM columns** | **two defects, both fixed.** (1) HOST: six sites read an Arrow column's type with `GetDuckType()`, whose default leaves out the dictionary, so a dictionary-encoded column was typed as its INDEX type (UTINYINT) and read as indexes — any provider or plugin returning dictionary arrays had this; DuckDB's own scan asks `GetDuckType(true)`. (2) DRIVER: the catalog sees an ENUM as VARCHAR (Arrow has no enum), but a pushed ORDER BY / min / max / top-n followed the ENUM's declared order — the driver now reads a column the plan declares a string as `CAST(… AS VARCHAR)` (DuckDB drops the cast on a VARCHAR) |
+| two transactions updating one row | the second fails ("Conflict on update!"), no update lost |
+| a large scan in a transaction after a write (drained) | +45 MB beyond the autocommit run for a 120k-row result: linear in the result, worth knowing for large reads inside a writing transaction |
+| bulk through a temporary table | 1M rows: CTAS 0.5 s, INSERT into an existing table 0.3 s — no cost |
+| per-query cost | **a point query took 55 ms where the driver alone takes 2.8 ms**: both settings reads used `duckdb_settings()` (~7.6 ms, every setting) and the driver translated each plan twice. Now `current_setting` and one translation per plan: **22.6 ms**. What remains is the bind's metadata round trips (schema, key, row count) and the host-session read through `IHostQuery` |
+| a non-fabricator Substrait producer | not measurable here: the driver takes a function with no URN as a DuckDB function and the standard names by their DuckDB meaning — fine for DuckDB's own `to_substrait`, an assumption for any other producer |
+
 ## The mssql-adbc side (branch `fabricator-tsql`, draft PR clast-project/mssql-adbc#32)
 
 Our T-SQL emitter started as a copy of mssql-adbc's at `677676c`; upstream has not changed those files since.
