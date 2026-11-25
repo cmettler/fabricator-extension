@@ -326,3 +326,21 @@ Pushed whole (all remote, `EXPLAIN` shows only `Fabricator Query`), same build d
   mixed placement costs is moving the remote side's rows to the join: facts-remote 7.9 s, slowest q21 1.4 s, q8 1.3 s,
   q5 1.1 s (box: q21 5.3 s, q8 1.3 s, q5 1.0 s).
 - TPC-DS all remote: the slowest are the not-whole ones, q16 2.4 s, q94 2.4 s, q10 1.8 s (local ~0.02 s each).
+
+**The slow TPC-DS queries, analysed (same day).** q16, q94 and q10 took 1.6–2.4 s over quack (local ~0.02 s), and
+nearly all of it was PLANNING (`EXPLAIN` as slow as the run; `optimizer.extension` 1.59 of 1.83 s for q10). Two causes:
+
+1. Every pushdown attempt binds a copy of the query, and the adbc provider read each bound table's schema from the
+   server (`GetTableSchema`): q16 bound tables 644 times, 2.4 s. Fixed `6d2ffcb` — schema and key are read once per
+   opened table. q16 2.37 → 0.21 s, q94 2.37 → 0.20 s, q10 1.59 → 0.22 s.
+2. q16 / q94 were refused by every consumer (quack: "Field 5 of 5", SQL Server: "Field reference 5 is out of range"):
+   the producer's projection after a MARK join listed the right side's columns, so with two right columns it named a
+   field past the join's output. Fixed `830dc43` (to_substrait, offer-ready): pushed whole now on both targets.
+
+After both, all remote: TPC-DS SF 0.01 23.6 → 7.8 s, TPC-H SF 1 2.6 → 1.8 s, TPC-H SF 0.01 1.8 → 0.9 s; pushed whole
+TPC-DS quack 92, box 85 of 99. 1430 runs on quack and box, 0 wrong. On box q16 / q94 pushed whole are as fast as before
+(best of 3: 0.10 vs 0.11 s, 0.09 vs 0.18 s); single runs there include SQL Server compiling a new statement (q64 2.5 s
+once, 0.07 s after).
+
+Still open: the pass before the optimizers fails to bind these correlated queries ("Failed to bind column reference
+"" [60.0]", every target) and leaves them to the pass after; q10 and q18 still run as scans only.
