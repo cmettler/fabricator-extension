@@ -22,6 +22,7 @@ breaks the build rather than an unmaintained branch.
 |---|---|---|
 | `max_in_list` | 1000 | longest IN list a filter sends as a list; longer goes as a range (integers, temporals) or not at all |
 | `consistent_reads` | false | the user's promise that one statement reads the same rows alike twice (RCSI / snapshot, or no concurrent writers); without it a plan carrying `fabricator.repeated_reads` is declined |
+| `dialect` | `substrait` | `duckdb`: the driver takes DuckDB SQL, not Substrait (quack-net's driver for a DuckDB quack server). The provider writes every plan as DuckDB SQL itself (`DuckDbSubstrait.cs`) and refuses there; see "quack" below |
 
 Drivers tried (both forks, branches pushed; mssql-adbc PRs since 2026-11-06, see below):
 
@@ -148,6 +149,53 @@ What the Kusto driver needed, all on the fork branch: ADBC 1.0 (the 0.22 exporte
 importer, "Undefined error"), `Prepare` / `ExecuteSchema`, source-generated JSON for the request (reflection is off
 under NativeAOT), a stream that knows its schema before the first batch, quoted column names from `cslschema`
 (`['1mbin']`), and `notruncation` (Kusto cuts a result at 500 000 rows and puts the error inside the rows).
+
+## quack (a DuckDB server): the DuckDB dialect, measured 2026-11-25 (branch `exp/adbc-duckdb-dialect`)
+
+quack-net's ADBC driver (`quack_adbc`, branch `duckdb-2.0.1`) talks DuckDB's quack protocol: SQL text only, no
+Substrait (`VendorSubstrait` false, no `Prepare`). With `dialect 'duckdb'` the provider translates each plan itself,
+like the SqlServer provider does with its T-SQL emitter:
+
+```sql
+ATTACH 'driver=…/quack_adbc.dll;uri="quack://127.0.0.1:9494/?token=…&tls=false"' AS q
+    (TYPE fabricator, PROVIDER 'adbc', dialect 'duckdb');
+```
+
+- **The emitter** (`dotnet/Fabricator.Adbc/DuckDbSubstrait.cs`) reuses the dialect-neutral decoder and model of the
+  T-SQL emitter (linked from `Fabricator.SqlServer/Substrait/`, not copied) and writes nested SELECTs. Since the
+  target is DuckDB, nearly all of the T-SQL emitter's compensations fall away (strings, collation, rounding, null
+  order, division); what is left is to undo the producer's renames (`modulus` → `%`, `std_dev` → `stddev`,
+  `round_calendar` → `date_trunc`, `extract` → `year()` …) and write each relation. Scans, pushed filters, a join's
+  runtime keys and whole pushed queries all go through it. Refusals: `any_value` (it stands for DuckDB's `first`
+  AND `any_value`, which differ on NULL), a repeated grouping set, table functions, catalog functions, volatile
+  functions, writes.
+- **Server settings**: a division by zero and a float outside its domain follow session settings, which the plan
+  carries as function options from the HOST's session. The provider reads the server's
+  `ieee_floating_point_ops` / `error_on_division_by_zero` at ATTACH and refuses a plan whose options differ. (DuckDB
+  2.0.1's default is `error_on_division_by_zero = true`.)
+- **The two plan hints need nothing**: one DuckDB statement reads one snapshot (`repeated_reads`), and the any-row
+  single join is written with `LIMIT 1` (one column) or refused.
+- **New host capability `substrait_native_functions`** (declared only with `dialect 'duckdb'`): the producer runs
+  non-strict for that catalog, so a DuckDB function with no Substrait declaration (`stddev_samp`, `median`,
+  `arg_max`, `grouping`, `dayname`, `regexp_matches` …) is declared by its DuckDB name with no extension URN, and the
+  emitter writes it as is. For every other provider the producer stays strict.
+
+**Measured** (`scratchpad` harness: a DuckDB 2.0.1 CLI serving quack with the edge-case tables in DuckDB types,
+compared with the same rows in the local DuckDB): the 139 SQL Server edge cases plus 17 DuckDB-only ones
+(unsigned / HUGEINT columns, `list`, QUALIFY, DISTINCT ON, median, arg_max, intervals …): **156 cases, 0 wrong,
+69 pushed as whole queries** (the rest run as scans with their filters; local: aggregates with ORDER BY and RANGE
+offset frames, both refused by the producer for every dialect).
+
+**Two producer defects it found, on the SqlServer path too** (control: v0.2.11 with `remote_pushdown true`, both
+wrong; fixed in `third_party/duckdb-substrait/src/to_substrait.cpp` as refusals, gated in
+`verify_pushdown_edges_mssql` cases `cast unsigned` / `distinct on`):
+- `CAST(x AS UTINYINT)` (any unsigned target, and HUGEINT): Substrait declares the target as the wider signed type, so
+  the range check went missing — `CAST(-7 AS UTINYINT)` fails in DuckDB and returned -7 when pushed.
+- `DISTINCT ON (g)`: written as a grouping by EVERY column, so every distinct row came back instead of one per `g`.
+  Refused now unless its targets are every column (`SELECT DISTINCT ON (k) k`, a plain DISTINCT, still goes —
+  `verify_remote_select_mssql` pins that; the first version of the fix refused it too and that suite caught it).
+
+SQL Server edge cases with the fix: 141 cases, identical to before except those two (now local, correct).
 
 ## The mssql-adbc side (branch `fabricator-tsql`, draft PR clast-project/mssql-adbc#32)
 

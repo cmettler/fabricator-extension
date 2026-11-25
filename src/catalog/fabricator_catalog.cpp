@@ -259,6 +259,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		null_order_expressible_ = caps.null_order_expressible;
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
+		substrait_native_functions_ = caps.substrait_native_functions;
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
 		parallel_table_open_ = caps.parallel_table_open;
 		dml_returning_ = caps.dml_returning;
@@ -277,6 +278,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		null_order_expressible_ = false;
 		supports_nested_schemas_ = false;
 		remote_select_ = false;
+		substrait_native_functions_ = false;
 		bind_schema_cacheable_ = false;
 		parallel_table_open_ = false;
 		dml_returning_ = false;

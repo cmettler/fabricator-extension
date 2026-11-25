@@ -74,6 +74,14 @@ internal sealed class AdbcCatalog : IProviderCatalog
                     : throw new ArgumentException($"adbc: max_in_list must be a positive integer, not '{text}'");
             }
             if (attach.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                && attach.RootElement.TryGetProperty("dialect", out var dialect))
+            {
+                string text = dialect.ValueKind == System.Text.Json.JsonValueKind.String ? dialect.GetString()! : dialect.GetRawText();
+                _duckDbDialect = text.Equals("duckdb", StringComparison.OrdinalIgnoreCase) ? true
+                    : text.Equals("substrait", StringComparison.OrdinalIgnoreCase) || text.Length == 0 ? false
+                    : throw new ArgumentException($"adbc: dialect must be 'substrait' or 'duckdb', not '{text}'");
+            }
+            if (attach.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
                 && attach.RootElement.TryGetProperty("consistent_reads", out var consistent))
             {
                 string text = consistent.ValueKind == System.Text.Json.JsonValueKind.String
@@ -105,7 +113,48 @@ internal sealed class AdbcCatalog : IProviderCatalog
         using var connection = Connect();
         _catalogName = Option(connection, "adbc.connection.catalog");
         _defaultSchema = Option(connection, "adbc.connection.db_schema");
+        if (_duckDbDialect)
+            _duckDbSettings = ReadDuckDbSettings(connection);
     }
+
+    // ATTACH option `dialect 'duckdb'`: the driver takes DuckDB SQL, not Substrait (quack); every plan is written as
+    // DuckDB SQL here (DuckDbSubstrait), refusals happen here, before anything reaches the server.
+    private readonly bool _duckDbDialect;
+    private readonly DuckDbSettings _duckDbSettings = DuckDbSettings.Default;
+
+    /// <summary>The server's settings that decide a division by zero and a float outside its domain.</summary>
+    private static DuckDbSettings ReadDuckDbSettings(AdbcConnection connection)
+    {
+        using var statement = connection.CreateStatement();
+        statement.SqlQuery = "SELECT CAST(current_setting('ieee_floating_point_ops') AS VARCHAR), "
+                             + "CAST(current_setting('error_on_division_by_zero') AS VARCHAR)";
+        using var stream = statement.ExecuteQuery().Stream!;
+        using var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
+            ?? throw new InvalidOperationException("adbc: the server returned no settings");
+        static bool Flag(IArrowArray column) =>
+            string.Equals(((StringArray)column).GetString(0), "true", StringComparison.OrdinalIgnoreCase);
+        return new DuckDbSettings(Flag(batch.Column(0)), Flag(batch.Column(1)));
+    }
+
+    /// <summary>Puts a plan on a statement: as Substrait, or written as DuckDB SQL (throws when it cannot be).</summary>
+    private void SetPlan(AdbcStatement statement, byte[] plan)
+    {
+        if (_duckDbDialect)
+            statement.SqlQuery = DuckDbSubstrait.ToSql(plan, _duckDbSettings);
+        else
+            statement.SubstraitPlan = plan;
+    }
+
+    /// <summary>Whether the plan translates: the driver's Prepare, or the DuckDB dialect here.</summary>
+    private void CheckPlan(AdbcStatement statement, byte[] plan)
+    {
+        SetPlan(statement, plan);
+        if (!_duckDbDialect)
+            statement.Prepare();
+    }
+
+    private static bool IsRefusal(Exception ex) =>
+        ex is AdbcException or NotImplementedException or NotSupportedException or Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException;
 
     private AdbcConnection Connect()
     {
@@ -128,7 +177,8 @@ internal sealed class AdbcCatalog : IProviderCatalog
     // superset_filter_pushdown: the host hands a scan (and a pushed query) its filters, a hash join's runtime keys
     // among them, and re-applies them, so the driver may return more rows than they select.
     public string CapabilitiesJson =>
-        "{\"remote_select\":true,\"superset_filter_pushdown\":true" + (_defaultSchema is null ? "" : ",\"default_schema\":" +
+        "{\"remote_select\":true,\"superset_filter_pushdown\":true"
+        + (_duckDbDialect ? ",\"substrait_native_functions\":true" : "") + (_defaultSchema is null ? "" : ",\"default_schema\":" +
             System.Text.Json.JsonSerializer.Serialize(_defaultSchema)) + "}";
 
     // ── discovery ────────────────────────────────────────────────────────────────────────────────────────────
@@ -351,7 +401,7 @@ internal sealed class AdbcCatalog : IProviderCatalog
         try
         {
             statement = connection.CreateStatement();
-            statement.SubstraitPlan = ChoosePlan(statement, build, conjuncts, functions);
+            SetPlan(statement, ChoosePlan(statement, build, conjuncts, functions));
             var result = statement.ExecuteQuery();
             return new OwningStream(result.Stream!, names, statement, connection, select);
         }
@@ -363,8 +413,8 @@ internal sealed class AdbcCatalog : IProviderCatalog
         }
     }
 
-    private static byte[] ChoosePlan(AdbcStatement statement, Func<ProtoWriter?, byte[]> build,
-                                     IReadOnlyList<ProtoWriter> conjuncts, SubstraitFunctions functions)
+    private byte[] ChoosePlan(AdbcStatement statement, Func<ProtoWriter?, byte[]> build,
+                              IReadOnlyList<ProtoWriter> conjuncts, SubstraitFunctions functions)
     {
         if (conjuncts.Count == 0)
             return build(null);
@@ -373,11 +423,10 @@ internal sealed class AdbcCatalog : IProviderCatalog
         {
             try
             {
-                statement.SubstraitPlan = plan;
-                statement.Prepare();
+                CheckPlan(statement, plan);
                 return true;
             }
-            catch (Exception ex) when (ex is AdbcException or NotImplementedException or NotSupportedException)
+            catch (Exception ex) when (IsRefusal(ex))
             {
                 Debug("the driver refused a filter: " + ex.Message);
                 return false;
@@ -444,11 +493,13 @@ internal sealed class AdbcCatalog : IProviderCatalog
     public RemoteQuery? TranslateRemotePlan(byte[] substraitPlan)
     {
         // hints the plan needs honoured and a driver does not read: DuckDB computes such a query itself
+        // the DuckDB dialect honours both hints itself: one DuckDB statement reads one snapshot, and the emitter
+        // writes the any-row single join
         var hints = SubstraitPlanFilter.Optimizations(substraitPlan);
-        if (hints.Contains("fabricator.repeated_reads") && !ConsistentReads)
+        if (!_duckDbDialect && hints.Contains("fabricator.repeated_reads") && !ConsistentReads)
             return RemoteQuery.Declined("adbc: the query reads the same rows more than once, and the driver cannot "
                                         + "promise one statement reads them alike (ATTACH option consistent_reads)");
-        if (hints.Contains("fabricator.single_join_any_row"))
+        if (!_duckDbDialect && hints.Contains("fabricator.single_join_any_row"))
             return RemoteQuery.Declined("adbc: a scalar subquery may take any of several rows here, which the driver "
                                         + "would refuse instead");
         Schema schema;
@@ -456,12 +507,12 @@ internal sealed class AdbcCatalog : IProviderCatalog
         {
             using var connection = Connect();
             using var statement = connection.CreateStatement();
-            statement.SubstraitPlan = substraitPlan;
-            statement.Prepare(); // a driver that cannot run the plan refuses here, before anything executes
+            CheckPlan(statement, substraitPlan); // a driver that cannot run the plan refuses here, before anything executes
             schema = statement.ExecuteSchema();
         }
-        catch (Exception ex) when (ex is AdbcException or NotImplementedException or NotSupportedException)
+        catch (Exception ex) when (IsRefusal(ex))
         {
+            Debug("declined: " + ex.Message);
             return RemoteQuery.Declined("adbc driver: " + ex.Message);
         }
         string handle = PlanPrefix + Guid.NewGuid().ToString("N");

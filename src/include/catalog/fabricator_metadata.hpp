@@ -100,6 +100,10 @@ struct FabricatorCapabilities {
 	//! The provider runs a whole SELECT pushed by DuckDB's remote optimizer (src/catalog/fabricator_remote_select.cpp).
 	//! Opt-in: SQL Server reports it only with the `remote_pushdown` ATTACH option.
 	bool remote_select = false;
+	//! The provider translates a DuckDB function that has no Substrait declaration by its DuckDB name (the target
+	//! speaks DuckDB: the adbc provider's `dialect 'duckdb'`), so the producer runs non-strict and declares such a
+	//! function by that name instead of refusing the plan. Never for a provider whose dialect is not DuckDB's.
+	bool substrait_native_functions = false;
 
 	//! The schema an unqualified name resolves to (FabricatorCatalog::GetDefaultSchema). Empty = the provider
 	//! names none and DuckDB's `main` stands (Delta, DAX). SQL Server reports the login's SCHEMA_NAME().

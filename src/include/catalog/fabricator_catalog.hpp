@@ -111,6 +111,11 @@ public:
 	bool ParallelTableOpen() const {
 		return parallel_table_open_;
 	}
+	//! Whether the provider translates DuckDB's own functions by name (capability `substrait_native_functions`):
+	//! the Substrait producer then runs non-strict for this catalog.
+	bool SubstraitNativeFunctions() const {
+		return substrait_native_functions_;
+	}
 
 	//! DuckDB 2.0 nested schemas: whether a dotted schema string may denote a PATH (`a.b` = schema `b`
 	//! inside schema `a`) rather than a literal schema named "a.b". Provider-declared through the
@@ -279,6 +284,8 @@ private:
 	string pushdown_boundary_;
 	//! The provider runs a pushed SELECT (capability `remote_select`); see Supports().
 	bool remote_select_ = false;
+	//! Capability `substrait_native_functions`; see SubstraitNativeFunctions().
+	bool substrait_native_functions_ = false;
 	mutex remote_plans_lock_;
 	unordered_map<string, string> remote_plans_;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true

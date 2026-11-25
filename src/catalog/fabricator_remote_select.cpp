@@ -621,7 +621,7 @@ bool BindToSubstrait(ClientContext &context, FabricatorCatalog &catalog, const Q
 		for (idx_t i = 0; i < bound.types.size(); i++) {
 			root_names.push_back("c" + std::to_string(i));
 		}
-		DuckDBToSubstrait to_substrait(context, *plan, true, root_names);
+		DuckDBToSubstrait to_substrait(context, *plan, !catalog.SubstraitNativeFunctions(), root_names);
 		plan_bytes = to_substrait.SerializeToString();
 		DumpPlan(plan_bytes);
 		types = bound.types;
@@ -2207,7 +2207,7 @@ SubtreeOutcome ReplaceSubtree(SubtreePushdown &state, unique_ptr<LogicalOperator
 		for (idx_t i = 0; i < types.size(); i++) {
 			root_names.push_back("c" + std::to_string(i));
 		}
-		DuckDBToSubstrait to_substrait(state.context, *copy, true, root_names);
+		DuckDBToSubstrait to_substrait(state.context, *copy, !catalog.SubstraitNativeFunctions(), root_names);
 		if (repeated_reads) {
 			// DuckDB read the CTE once; the server reads it once per copy, so within one statement the copies may see
 			// different rows unless the server reads consistently — the provider decides (`fabricator.repeated_reads`)

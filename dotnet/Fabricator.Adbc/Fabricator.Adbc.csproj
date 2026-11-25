@@ -21,4 +21,14 @@
     <PackageReference Include="Apache.Arrow.Adbc" Version="1.0.0" />
   </ItemGroup>
 
+  <!-- The dialect-neutral half of the Substrait translation (decoder + model), shared with the SqlServer provider's
+       copy; the DuckDB dialect (DuckDbSubstrait.cs) writes SQL from it. -->
+  <ItemGroup>
+    <Compile Include="..\Fabricator.SqlServer\Substrait\ProtoReader.cs" Link="Substrait\ProtoReader.cs" />
+    <Compile Include="..\Fabricator.SqlServer\Substrait\SubstraitFields.cs" Link="Substrait\SubstraitFields.cs" />
+    <Compile Include="..\Fabricator.SqlServer\Substrait\SubstraitModel.cs" Link="Substrait\SubstraitModel.cs" />
+    <Compile Include="..\Fabricator.SqlServer\Substrait\SubstraitPlanDecoder.cs" Link="Substrait\SubstraitPlanDecoder.cs" />
+    <Compile Include="..\Fabricator.SqlServer\Substrait\SubstraitTranslationException.cs" Link="Substrait\SubstraitTranslationException.cs" />
+  </ItemGroup>
+
 </Project>
