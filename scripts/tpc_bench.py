@@ -14,14 +14,20 @@ Targets:
                    dax_secret.sql)
   lakehouse-sql    the same Delta tables read through the lakehouse's SQL analytics endpoint, remote_pushdown on; the
                    load waits until the endpoint's asynchronous metadata sync shows every table with its full count
+  quack            a DuckDB 2.0.1 server serving quack (started here, its database kept in <data dir>/quack_tpc.duckdb),
+                   attached with PROVIDER 'adbc' through quack-net's driver (QUACK_ADBC_DRIVER); the CLI is
+                   QUACK_DUCKDB_CLI, the loadable FABRICATOR_TPC_LOADABLE — this branch's build, not release-v2
 ⚠ The Fabric targets read credentials from gitignored files and never print them. They consume Fabric capacity.
 """
 import argparse
+import atexit
 import json
 import math
 import os
 import random
 import re
+import socket
+import subprocess
 import threading
 import time
 
@@ -30,7 +36,8 @@ os.environ.setdefault("FABRICATOR_MANAGED_DIR",
                       os.path.join(REPO, "build", "release-v2", "extension", "fabricator", "fabricator"))
 import duckdb  # noqa: E402
 
-LOADABLE = os.path.join(REPO, "build", "release-v2", "extension", "fabricator", "fabricator.duckdb_extension")
+LOADABLE = os.environ.get("FABRICATOR_TPC_LOADABLE",
+                          os.path.join(REPO, "build", "release-v2", "extension", "fabricator", "fabricator.duckdb_extension"))
 BOX = "Server=localhost,1433;Database=TestDB;User Id=sa;Password=Arrow_Net_123!;TrustServerCertificate=true;Encrypt=true"
 ONELAKE_TABLES = "abfss://Test@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables"
 DATA_DIR = os.environ.get("FABRICATOR_TPC_DIR", os.path.join(REPO, "build", "tpc"))
@@ -54,6 +61,61 @@ def rschema(bench, sf):
     return f"{bench}_sf{str(sf).replace('.', '_')}"
 
 
+QUACK_TOKEN = "tpc-token"
+REMOTE = {}  # remote schema -> how the attached catalog names it (the adbc provider may qualify it with the database)
+
+
+def start_quack():
+    """A DuckDB CLI serving quack on a free port, its database a file that outlives the run (load once)."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    os.makedirs(DATA_DIR, exist_ok=True)
+    init = os.path.join(DATA_DIR, "quack_init.sql")
+    with open(init, "w", encoding="utf-8") as f:
+        f.write("INSTALL quack; LOAD quack;\n"
+                f"SELECT * FROM quack_serve('quack:127.0.0.1:{port}', token => '{QUACK_TOKEN}', disable_ssl => true);\n")
+    log = open(os.path.join(DATA_DIR, "quack_server.log"), "w", encoding="utf-8")
+    cli = os.environ.get("QUACK_DUCKDB_CLI", os.path.join(REPO, "build", "release-v2", "duckdb.exe"))
+    server = subprocess.Popen([cli, "-no-agent", "quack_tpc.duckdb", "-init", init], cwd=DATA_DIR,
+                              stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True)
+
+    def stop():
+        server.stdin.close()
+        try:
+            server.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            server.kill()
+        log.close()
+    atexit.register(stop)
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            return port
+        except OSError:
+            if time.monotonic() > deadline or server.poll() is not None:
+                raise RuntimeError("quack server did not start, see quack_server.log")
+            time.sleep(0.3)
+
+
+def remote_name(con, target, rs):
+    """`<catalog>.<schema>` of the remote schema as the attached catalog names it."""
+    if rs not in REMOTE:
+        cat = remote_catalog(target)
+        if target != "quack":
+            REMOTE[rs] = f"{cat}.{rs}"
+        else:
+            con.execute("SELECT fabricator_refresh_cache('rp')")
+            hits = [r[0] for r in con.execute(
+                "SELECT schema_name FROM information_schema.schemata WHERE catalog_name = 'rp'").fetchall()
+                    if r[0] == rs or r[0].endswith("." + rs)]
+            if len(hits) != 1:
+                raise RuntimeError(f"remote schema {rs}: {hits}")
+            REMOTE[rs] = f'{cat}."{hits[0]}"' if "." in hits[0] else f"{cat}.{hits[0]}"
+    return REMOTE[rs]
+
+
 def connect(bench, sf, target):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{LOADABLE}'")
@@ -64,6 +126,10 @@ def connect(bench, sf, target):
         con.execute(f"ATTACH '{BOX}' AS rp (TYPE fabricator, remote_pushdown 'true')")
     elif target == "warehouse":
         con.execute(f"ATTACH '{warehouse_dsn()}' AS rp (TYPE fabricator, remote_pushdown 'true')")
+    elif target == "quack":
+        port = start_quack()
+        uri = f"quack://127.0.0.1:{port}/?token={QUACK_TOKEN}&tls=false"
+        con.execute(f"ATTACH 'driver={os.environ['QUACK_ADBC_DRIVER']};uri=\"{uri}\"' AS rp (TYPE fabricator, PROVIDER 'adbc')")
     else:
         con.execute(open(os.path.join(REPO, "dax_secret.sql"), encoding="utf-8").read())
         # name mapping: the SQL analytics endpoint skips id-mapped tables without a word
@@ -108,12 +174,16 @@ def load(con, bench, sf, target):
         # baseline); a no-op on the warehouse, whose tables are columnstore anyway
         con.execute("SET mssql_default_table_type = 'clustered columnstore'")
         writer = "rp"
+    elif target == "quack":
+        con.execute(f"SELECT fabricator_exec('rp', 'CREATE SCHEMA IF NOT EXISTS {rs}', refresh_cache := true)")
+        writer = "rp"
     else:
         con.execute(f"CREATE SCHEMA IF NOT EXISTS lw.{rs}")
         writer = "lw"
     for t in names:
         t0 = time.perf_counter()
-        con.execute(f"CREATE OR REPLACE TABLE {writer}.{rs}.{t} AS SELECT * FROM l.{bench}.{t}")
+        dest = remote_name(con, target, rs) if target == "quack" else f"{writer}.{rs}"
+        con.execute(f"CREATE OR REPLACE TABLE {dest}.{t} AS SELECT * FROM l.{bench}.{t}")
         print(f"  loaded {t} in {time.perf_counter() - t0:.1f} s", flush=True)
     if target == "lakehouse-sql":
         wait_for_endpoint(con, bench, rs, names)
@@ -165,9 +235,9 @@ def use_placement(con, bench, names, remote, sf, target):
     con.execute("USE memory.main")
     con.execute("DROP SCHEMA IF EXISTS memory.mix CASCADE")
     con.execute("CREATE SCHEMA memory.mix")
-    cat = remote_catalog(target)
+    prefix = remote_name(con, target, rschema(bench, sf)) if remote else None
     for t in names:
-        src = f"{cat}.{rschema(bench, sf)}.{t}" if t in remote else f"l.{bench}.{t}"
+        src = f"{prefix}.{t}" if t in remote else f"l.{bench}.{t}"
         con.execute(f"CREATE VIEW memory.mix.{t} AS SELECT * FROM {src}")
     con.execute("USE memory.mix")
 
@@ -216,7 +286,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("bench", choices=["tpch", "tpcds"])
     ap.add_argument("sf")
-    ap.add_argument("--target", default="box", choices=["box", "warehouse", "lakehouse-delta", "lakehouse-sql"])
+    ap.add_argument("--target", default="box", choices=["box", "warehouse", "lakehouse-delta", "lakehouse-sql", "quack"])
     ap.add_argument("--load", action="store_true")
     ap.add_argument("--queries")
     ap.add_argument("--combos", default="remote,facts-remote,dims-remote,random1,random2")

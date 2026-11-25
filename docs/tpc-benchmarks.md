@@ -295,3 +295,34 @@ second run:
 So the warm gap between the engines is decoding CPU (about 2.7x), not IO, and turning the cache on by hand changes
 nothing. The cold gap is partly the bytes: the codec engine fetches about twice as much (coalesced ranges take the gaps
 between columns along, `MaxGapBytes` 1 MiB).
+
+## quack (a DuckDB 2.0.1 server through the adbc provider), 2026-11-25 (branch `exp/adbc-duckdb-dialect`)
+
+`scripts/tpc_bench.py --target quack` starts a DuckDB CLI serving quack on the same machine (its database kept in
+`<data dir>/quack_tpc.duckdb`) and attaches it with `PROVIDER 'adbc'` through quack-net's driver (`QUACK_ADBC_DRIVER`);
+the loadable is this branch's build (`FABRICATOR_TPC_LOADABLE`), not release-v2. Same queries, placements and seed as
+the SQL Server runs above.
+
+Correct in every run: TPC-H SF 0.01 110 of 110, TPC-DS SF 0.01 495 of 495, TPC-H SF 1 110 of 110.
+
+| seconds summed over all queries | local | all remote | facts remote | dims remote | random 1 | random 2 |
+|---|---|---|---|---|---|---|
+| quack, TPC-H SF 0.01 | 0.2 | 1.8 | 1.2 | 0.8 | 1.2 | 1.4 |
+| box, TPC-H SF 0.01 (above) | 0.2 | 3.9 | 1.5 | 0.4 | 1.2 | 6.2 |
+| quack, TPC-H SF 1 | 1.0 | 2.6 | 7.9 | 2.2 | 7.5 | 7.6 |
+| box, TPC-H SF 1, columnstore + key lists (above) | 1.0 | 11.8 | 25.3 | 4.4 | 25.0 | 24.7 |
+| quack, TPC-DS SF 0.01 | 2.0 | 23.6 | 6.1 | 9.8 | 10.4 | 15.2 |
+
+Pushed whole (all remote, `EXPLAIN` shows only `Fabricator Query`), same build day, `scratchpad/tpc_pushcount.py`:
+
+| | whole | partly | scans only |
+|---|---|---|---|
+| quack, TPC-H | 21 of 22 | 0 | 1 (q22) |
+| box, TPC-H | 20 of 22 | 0 | 2 (q16, q22) |
+| quack, TPC-DS | 90 of 99 | 7 | 2 (q10, q18) |
+| box, TPC-DS | 83 of 99 | 14 | 2 (q34, q73) |
+
+- The server is a DuckDB on the same box, so "all remote" is close to local: TPC-H SF 1 2.6 s vs 1.0 s. What a
+  mixed placement costs is moving the remote side's rows to the join: facts-remote 7.9 s, slowest q21 1.4 s, q8 1.3 s,
+  q5 1.1 s (box: q21 5.3 s, q8 1.3 s, q5 1.0 s).
+- TPC-DS all remote: the slowest are the not-whole ones, q16 2.4 s, q94 2.4 s, q10 1.8 s (local ~0.02 s each).
