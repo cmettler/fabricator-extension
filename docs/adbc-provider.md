@@ -41,7 +41,7 @@ Drivers tried (both forks, branches pushed; mssql-adbc PRs since 2026-11-06, see
 | statistics | the table's row count from ADBC `GetStatistics` (approximate). Without it DuckDB takes a remote table for one row, builds the join's hash table over it, and no join key reaches the driver |
 | remote pushdown | `remote_translate` hands over the host's Substrait plan: the provider sets it on a statement, calls `Prepare()` (a driver refuses there, before anything runs) and `ExecuteSchema()`, keeps the plan under an opaque handle and returns the handle as the query. `ExecuteQuery(handle)` runs the plan. Result columns are renamed to `c0…` by position; no ORDER BY keys are declared, so the driver's row order is kept |
 | connections | one ADBC connection per statement (a driver connection is not thread-safe) |
-| writes | a pushed write (the host's WriteRel: `INSERT … SELECT`, `DELETE`, `UPDATE` within the catalog) runs on a driver connection pinned per DuckDB transaction (`AdbcTransaction`: opened with autocommit off by the first write, committed / rolled back with the transaction); reads after it use that connection, one statement at a time and drained, so the transaction sees its own writes. Bulk (`INSERT … VALUES`, COPY, CTAS from local rows), the rowid path, DDL and MERGE are still refused |
+| writes | a pushed write (the host's WriteRel: `INSERT … SELECT`, `DELETE`, `UPDATE` within the catalog) runs on a driver connection pinned per DuckDB transaction (`AdbcTransaction`: opened with autocommit off by the first write, committed / rolled back with the transaction); reads after it use that connection, one statement at a time and drained, so the transaction sees its own writes. For a DuckDB server also DDL (CREATE / DROP TABLE and SCHEMA, CREATE TABLE with NOT NULL / PRIMARY KEY / UNIQUE; `DuckDbDdl`) and bulk loads (`INSERT … VALUES`, COPY, CTAS from local rows: ADBC ingest), in the transaction; host capability `lossless_arrow_boundary` makes those cross in DuckDB's lossless Arrow forms, and the connections read in them (`quack.arrow_lossless_conversion`), so no column changes its type. Still refused: the rowid path, MERGE, RETURNING, ALTER TABLE, DEFAULT / identity / WITH |
 
 Nothing on the C++ side changed: the ABI v96 contract already lets a provider return any query text for a plan,
 and ABI v99 hands a pushed query its table filters.
@@ -105,7 +105,7 @@ server. Everything in that hand-over is missing on the ADBC path:
 | 5 | server features assumed | IGNORE NULLS, DATETRUNC, LTRIM/RTRIM with characters (SQL Server 2022) and OPENJSON (compatibility level 130) are taken as present; an older server fails when the query runs, not at Prepare |
 | 6 | columns the emitter must not compare (`sql_variant` and similar) are unknown | the driver may translate a plan the SqlServer provider declines |
 | 7 | a TVF per row (`FROM t, a.dbo.tvf(t.a)`) | not a Substrait path at all — it is the lateral session (ABI v79), which this provider does not implement |
-| 8 | writes | only what the host pushes as one WriteRel and the driver translates (quack: `INSERT … SELECT`, `DELETE`, `UPDATE`); bulk loads, the rowid path, MERGE, RETURNING and DDL are refused |
+| 8 | writes | only what the host pushes as one WriteRel and the driver translates (quack: `INSERT … SELECT`, `DELETE`, `UPDATE`), and for a DuckDB server DDL and bulk loads; the rowid path, MERGE, RETURNING and ALTER TABLE are refused |
 | 9 | long IN lists | sent as a list up to `max_in_list` (default 1000), else as a range or not at all; a driver that writes a list as literals fails on a large one only when it runs |
 | 10 | per-statement cost outside the server | a scan with 28 572 keys took 2.8 s where the SqlServer provider took 1.5 s (see above); not investigated |
 
@@ -188,6 +188,14 @@ queries** (the rest run as scans with their filters; local: aggregates with ORDE
 refused by the producer for every dialect). Control: with `SET TimeZone` differing from the server's, a pushed query
 is declined with that reason and the scan answers correctly. quack-net's own tests: real plans of this producer as
 fixtures (`SubstraitTests`, a mutant in the emitter's `=` is caught).
+
+**Writes, measured the same way.** DML (`DELETE` incl. `USING` and an `IN` subquery, `UPDATE`, `INSERT … SELECT`, a
+committed transaction): 8 cases, each equal to the same statements on a local copy, all pushed; read-your-writes
+inside a transaction, then ROLLBACK. DDL and bulk: a table of 16 types (HUGEINT, UHUGEINT, UUID, TIMETZ, BIT, a list,
+a struct, TIMESTAMP_NS, INTERVAL …) created with exactly those types and its PRIMARY KEY, filled by `INSERT … VALUES`
+and by CTAS from a local table with exactly the same values; CREATE + INSERT + read + ROLLBACK / COMMIT in a
+transaction; schemas and DROP. Before the lossless boundary the same table read back HUGEINT as DECIMAL(38,0) — the
+INSERT then failed at bind (`Could not cast … to DECIMAL(38,0)`).
 
 **Three producer defects it found, on the SqlServer path too** (control: v0.2.11, remote pushdown on by default, all
 wrong; fixed on `v2.0-cyanoptera` in `third_party/duckdb-substrait/src/to_substrait.cpp` as refusals, gated in
