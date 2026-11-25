@@ -10,6 +10,8 @@ Each script starts its own server (a DuckDB CLI on a free port) and needs a Pyth
 | `quack_dml.py` | DELETE / UPDATE / INSERT … SELECT, a transaction, read-your-writes + ROLLBACK |
 | `quack_ddl.py` | CREATE TABLE with 16 types, INSERT VALUES, CTAS, DDL in a transaction, schemas, DROP |
 | `quack_alter_merge.py` | ALTER TABLE, MERGE, the key path, RETURNING, CREATE TABLE defaults |
+| `quack_txn.py` | transactions: one server snapshot per explicit transaction (and the `transaction_snapshot false` control), read-your-writes, CREATE TABLE after a write, buffering only on overlap (with a positive control), a write conflict, concurrent readers |
+| `quack_overlap.py` | statements that read and write the same session (non-pushed INSERT … SELECT, CTAS, UPDATE … FROM, UNION ALL of local and remote in a transaction): finish, right rows; `PROBE_REPEAT=n` |
 | `capture_plans.py` | captures the host's Substrait plan of one query (quack-net's test fixtures) |
 
 ```bash

@@ -62,6 +62,14 @@ internal sealed class AdbcCatalog : IProviderCatalog
     /// </summary>
     internal bool ConsistentReads { get; }
 
+    /// <summary>
+    /// On a DuckDB server, an explicit transaction reads through its own connection from its first read on, so all of
+    /// it sees one server snapshot — as a transaction does in DuckDB itself (ATTACH option <c>transaction_snapshot</c>,
+    /// default true). False: each read before the transaction's first write takes its own connection and sees what is
+    /// committed when it starts.
+    /// </summary>
+    internal bool TransactionSnapshot { get; } = true;
+
     /// <summary>DuckDB's own row id, the virtual row identity of a DuckDB server table with no key.</summary>
     internal const string RowId = "rowid";
 
@@ -81,6 +89,15 @@ internal sealed class AdbcCatalog : IProviderCatalog
                     System.Globalization.CultureInfo.InvariantCulture, out int n) && n > 0
                     ? n
                     : throw new ArgumentException($"adbc: max_in_list must be a positive integer, not '{text}'");
+            }
+            if (attach.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                && attach.RootElement.TryGetProperty("transaction_snapshot", out var snapshot))
+            {
+                string text = snapshot.ValueKind == System.Text.Json.JsonValueKind.String
+                    ? snapshot.GetString()! : snapshot.GetRawText();
+                TransactionSnapshot = text.Equals("true", StringComparison.OrdinalIgnoreCase) ? true
+                    : text.Equals("false", StringComparison.OrdinalIgnoreCase) ? false
+                    : throw new ArgumentException($"adbc: transaction_snapshot must be true or false, not '{text}'");
             }
             if (attach.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
                 && attach.RootElement.TryGetProperty("consistent_reads", out var consistent))
@@ -343,10 +360,14 @@ internal sealed class AdbcCatalog : IProviderCatalog
     {
         try
         {
-            if (Pinned() is { } txn)
+            if (ReadTransaction() is { } txn)
             {
-                lock (txn.Gate)
-                    return txn.Connection!.GetTableSchema(_catalogName, schemaName, tableName);
+                using var session = txn.Use();
+                // ⚠ in a DuckDB transaction a failed statement aborts the transaction, so a lookup of a table that is
+                // not there (CREATE TABLE asks first) must not fail on the server: ask with a query that cannot
+                if (_duckDbServer && !Exists(session.Connection, schemaName, tableName))
+                    throw new ObjectNotFoundException("table", schemaName + "." + tableName);
+                return session.Connection.GetTableSchema(_catalogName, schemaName, tableName);
             }
             using var connection = Connect();
             return connection.GetTableSchema(_catalogName, schemaName, tableName);
@@ -357,6 +378,30 @@ internal sealed class AdbcCatalog : IProviderCatalog
             // names are case-insensitive, Kusto's are not) — absence, not a failure
             throw new ObjectNotFoundException("table", schemaName + "." + tableName, ex);
         }
+    }
+
+    /// <summary>Whether a DuckDB server has the table or view, asked with a query that does not fail either way
+    /// (names compared as DuckDB does, case-insensitively).</summary>
+    private bool Exists(AdbcConnection connection, string schemaName, string tableName)
+    {
+        static string Literal(string v) => "'" + v.Replace("'", "''") + "'";
+        string where = "lower(name) = lower(" + Literal(tableName) + ")"
+                       + (string.IsNullOrEmpty(schemaName) ? "" : " AND lower(schema_name) = lower(" + Literal(schemaName) + ")")
+                       + (string.IsNullOrEmpty(_catalogName) ? "" : " AND database_name = " + Literal(_catalogName!));
+        using var statement = connection.CreateStatement();
+        statement.SqlQuery = "SELECT count(*) FROM (SELECT database_name, schema_name, table_name AS name FROM duckdb_tables() "
+                             + "UNION ALL SELECT database_name, schema_name, view_name FROM duckdb_views()) WHERE " + where;
+        using var stream = statement.ExecuteQuery().Stream!;
+        long n = 0;
+        while (stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+        {
+            using (batch)
+            {
+                if (batch.Length > 0)
+                    n += batch.Column(0) is Int64Array longs ? longs.GetValue(0) ?? 0 : 1;
+            }
+        }
+        return n > 0;
     }
 
     private const short RowCountStatistic = 6; // ADBC_STATISTIC_ROW_COUNT_KEY
@@ -486,14 +531,25 @@ internal sealed class AdbcCatalog : IProviderCatalog
                                            SubstraitFunctions functions, IReadOnlyList<string> names,
                                            IReadOnlyList<int>? select = null, bool pin = false)
     {
-        if ((pin ? WriteTransaction() : Pinned()) is { } txn)
+        if ((pin ? WriteTransaction() : ReadTransaction()) is { } txn)
         {
-            lock (txn.Gate)
+            // streams until something else needs the connection, then reads the rest into memory (PinnedStream)
+            using var session = txn.Use();
+            var pinned = session.Connection.CreateStatement();
+            OwningStream owned;
+            try
             {
-                var pinned = txn.Connection!.CreateStatement();
                 SetPlan(pinned, ChoosePlan(pinned, build, conjuncts, functions));
-                return Drained(new OwningStream(pinned.ExecuteQuery().Stream!, names, pinned, null, select));
+                owned = new OwningStream(pinned.ExecuteQuery().Stream!, names, pinned, null, select);
             }
+            catch
+            {
+                pinned.Dispose();
+                throw;
+            }
+            var stream = new PinnedStream(txn, owned, Debug);
+            txn.SetActive(stream);
+            return stream;
         }
         var connection = Connect();
         AdbcStatement? statement = null;
@@ -734,9 +790,9 @@ internal sealed class AdbcCatalog : IProviderCatalog
             var txn = WriteTransaction();
             if (txn is not null)
             {
-                lock (txn.Gate)
+                using (var session = txn.Use())
                 {
-                    using var pinned = txn.Connection!.CreateStatement();
+                    using var pinned = session.Connection.CreateStatement();
                     SetPlan(pinned, pushed.Plan);
                     return pinned.ExecuteUpdate().AffectedRows;
                 }
@@ -823,12 +879,10 @@ internal sealed class AdbcCatalog : IProviderCatalog
             statement.ExecuteUpdate();
             return;
         }
-        lock (txn.Gate)
-        {
-            using var statement = txn.Connection!.CreateStatement();
-            statement.SqlQuery = sql;
-            statement.ExecuteUpdate();
-        }
+        using var session = txn.Use();
+        using var ddl = session.Connection.CreateStatement();
+        ddl.SqlQuery = sql;
+        ddl.ExecuteUpdate();
     }
 
     public void BeginTransaction(bool isExplicit)
@@ -848,9 +902,24 @@ internal sealed class AdbcCatalog : IProviderCatalog
         txn?.Complete(commit);
     }
 
-    /// <summary>This transaction's pinned connection once it wrote; null otherwise (a read then takes its own).</summary>
+    /// <summary>This transaction's pinned connection once it has one; null otherwise.</summary>
     private AdbcTransaction? Pinned() =>
         AmbientTransaction.Current is var id and not 0 && _txns.TryGet(id) is { Connection: not null } txn ? txn : null;
+
+    /// <summary>
+    /// The transaction a read runs in: the one with a pinned connection, or — on a DuckDB server with
+    /// <see cref="TransactionSnapshot"/> — an explicit one, pinned now (its first read starts its server snapshot).
+    /// Null: the read opens its own connection (autocommit, or nothing pinned yet).
+    /// </summary>
+    private AdbcTransaction? ReadTransaction()
+    {
+        if (Pinned() is { } txn)
+            return txn;
+        if (_duckDbServer && TransactionSnapshot && AmbientTransaction.Current is var id and not 0
+            && _txns.TryGet(id) is { IsExplicit: true })
+            return WriteTransaction(id);
+        return null;
+    }
 
     /// <summary>The transaction a write runs in, its connection opened (autocommit off) by the first write.</summary>
     private AdbcTransaction? WriteTransaction() => WriteTransaction(AmbientTransaction.Current);
@@ -861,23 +930,20 @@ internal sealed class AdbcCatalog : IProviderCatalog
         if (id == 0)
             return null;
         var txn = _txns.GetOrCreate(id);
-        lock (txn.Gate)
+        txn.Pin(() =>
         {
-            if (txn.Connection is null)
+            var connection = Connect();
+            try
             {
-                var connection = Connect();
-                try
-                {
-                    connection.AutoCommit = false;
-                }
-                catch
-                {
-                    connection.Dispose();
-                    throw;
-                }
-                txn.Connection = connection;
+                connection.AutoCommit = false;
             }
-        }
+            catch
+            {
+                connection.Dispose();
+                throw;
+            }
+            return connection;
+        });
         return txn;
     }
 
@@ -896,23 +962,17 @@ internal sealed class AdbcCatalog : IProviderCatalog
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows)
     {
         RequireDuckDb("INSERT … RETURNING");
-        var txn = WriteTransaction();
-        if (txn is null)
-        {
-            using var own = Connect();
-            return InsertReturning(own, schemaName, tableName, rows);
-        }
-        lock (txn.Gate)
-            return InsertReturning(txn.Connection!, schemaName, tableName, rows);
+        using var session = WriteSession(AmbientTransaction.Current);
+        return InsertReturning(session, schemaName, tableName, rows);
     }
 
     /// <summary>
     /// The rows go to a temporary table of the session (ADBC ingest), and from there into the target with
     /// <c>INSERT … RETURNING *</c>, read whole; the temporary table is dropped after.
     /// </summary>
-    private static IArrowArrayStream InsertReturning(AdbcConnection connection, string schemaName, string tableName,
+    private static IArrowArrayStream InsertReturning(Session session, string schemaName, string tableName,
                                                      IArrowArrayStream rows) =>
-        ThroughTemporary(connection, rows, (temp, columns) =>
+        ThroughTemporary(session, rows, (connection, temp, columns) =>
         {
             using var insert = connection.CreateStatement();
             insert.SqlQuery = "INSERT INTO " + DuckDbDdl.Table(schemaName, tableName) + " (" + columns + ") SELECT "
@@ -931,31 +991,18 @@ internal sealed class AdbcCatalog : IProviderCatalog
             || partitionOverwrite || !string.IsNullOrEmpty(optionsJson))
             throw new NotSupportedException("adbc: a load with partitions, sorting, a schema mode or WITH options is not supported");
         // the rows arrive in DuckDB's lossless Arrow forms; the driver's ingest maps them back to the same types
-        var txn = WriteTransaction(txnId);
-        if (txn is null)
-        {
-            using var own = Connect();
-            return Load(own, schemaName, tableName, data, createTable, replace);
-        }
-        lock (txn.Gate)
-            return Load(txn.Connection!, schemaName, tableName, data, createTable, replace);
+        using var session = WriteSession(txnId);
+        return Load(session, schemaName, tableName, data, createTable, replace);
     }
 
-    private static long Load(AdbcConnection connection, string schemaName, string tableName, IArrowArrayStream data,
+    private static long Load(Session session, string schemaName, string tableName, IArrowArrayStream data,
                              bool createTable, bool replace)
     {
-        if (createTable)
-        {
-            using var create = connection.CreateStatement();
-            create.SqlQuery = DuckDbDdl.CreateTable(schemaName, tableName, data.Schema, ifNotExists: false, replace,
-                                                    primaryKey: null, uniques: null);
-            create.ExecuteUpdate();
-        }
-        else
+        if (!createTable)
         {
             // the rows may name only some of the target's columns (the rest take their defaults), which an ingest
             // into the table cannot express: they go to a temporary table first, then INSERT … SELECT by name
-            return ThroughTemporary(connection, data, (temp, columns) =>
+            return ThroughTemporary(session, data, (connection, temp, columns) =>
             {
                 using var insert = connection.CreateStatement();
                 insert.SqlQuery = "INSERT INTO " + DuckDbDdl.Table(schemaName, tableName) + " (" + columns + ") SELECT "
@@ -963,38 +1010,165 @@ internal sealed class AdbcCatalog : IProviderCatalog
                 return insert.ExecuteUpdate().AffectedRows;
             });
         }
-        using var ingest = connection.CreateStatement();
-        ingest.SetOption("adbc.ingest.target_table", tableName);
-        if (!string.IsNullOrEmpty(schemaName))
-            ingest.SetOption("adbc.ingest.target_db_schema", schemaName);
-        ingest.SetOption("adbc.ingest.mode", "adbc.ingest.mode.append");
-        ingest.BindStream(data);
-        return ingest.ExecuteUpdate().AffectedRows;
+        using (data)
+        {
+            session.Run(connection =>
+            {
+                using var create = connection.CreateStatement();
+                create.SqlQuery = DuckDbDdl.CreateTable(schemaName, tableName, data.Schema, ifNotExists: false, replace,
+                                                        primaryKey: null, uniques: null);
+                return create.ExecuteUpdate().AffectedRows;
+            });
+            return IngestChunks(session, data, (ingest, _) =>
+            {
+                ingest.SetOption("adbc.ingest.target_table", tableName);
+                if (!string.IsNullOrEmpty(schemaName))
+                    ingest.SetOption("adbc.ingest.target_db_schema", schemaName);
+                ingest.SetOption("adbc.ingest.mode", "adbc.ingest.mode.append");
+            });
+        }
+    }
+
+    /// <summary>
+    /// A statement's connection: the transaction's pinned one, entered per use (<see cref="AdbcTransaction.Use"/>), or
+    /// — outside any transaction — one of its own.
+    /// </summary>
+    private sealed class Session : IDisposable
+    {
+        private readonly AdbcTransaction? _txn;
+        private readonly AdbcConnection? _own;
+
+        public Session(AdbcTransaction? txn, AdbcConnection? own)
+        {
+            _txn = txn;
+            _own = own;
+        }
+
+        public T Run<T>(Func<AdbcConnection, T> work)
+        {
+            if (_txn is null)
+                return work(_own!);
+            using var lease = _txn.Use();
+            return work(lease.Connection);
+        }
+
+        public void Dispose() => _own?.Dispose();
+    }
+
+    /// <summary>The session a write runs in (<paramref name="id"/>: its DuckDB transaction).</summary>
+    private Session WriteSession(long id) =>
+        WriteTransaction(id) is { } txn ? new Session(txn, null) : new Session(null, Connect());
+
+    /// <summary>How much of a load is held in memory at most before it is sent (one ingest per chunk).</summary>
+    private const long ChunkBytes = 16L << 20;
+
+    /// <summary>
+    /// Sends <paramref name="rows"/> to the target <paramref name="target"/> sets on each ingest (the second argument:
+    /// this is the first chunk), in chunks of about <see cref="ChunkBytes"/>. ⚠ Each chunk is read from the host
+    /// OUTSIDE the session and the session is held only to send it: the rows may come from a scan of this same
+    /// connection that the host opens only later, and holding the connection while waiting for them would wait for
+    /// ever. The first ingest runs even for no rows (it may create the table). Returns the rows sent.
+    /// </summary>
+    private static long IngestChunks(Session session, IArrowArrayStream rows, Action<AdbcStatement, bool> target)
+    {
+        long total = 0;
+        bool first = true;
+        while (true)
+        {
+            var chunk = new List<RecordBatch>();
+            long bytes = 0;
+            bool end = false;
+            try
+            {
+                while (bytes < ChunkBytes)
+                {
+                    var batch = rows.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+                    if (batch is null)
+                    {
+                        end = true;
+                        break;
+                    }
+                    if (batch.Length == 0)
+                    {
+                        batch.Dispose();
+                        continue;
+                    }
+                    chunk.Add(batch);
+                    bytes += Bytes(batch);
+                    total += batch.Length;
+                }
+                if (chunk.Count > 0 || first)
+                {
+                    bool isFirst = first;
+                    session.Run(connection =>
+                    {
+                        using var ingest = connection.CreateStatement();
+                        target(ingest, isFirst);
+                        ingest.BindStream(new InMemoryArrayStream(rows.Schema, chunk.ToList()));
+                        return ingest.ExecuteUpdate().AffectedRows;
+                    });
+                    first = false;
+                }
+            }
+            finally
+            {
+                foreach (var batch in chunk)
+                    batch.Dispose();
+            }
+            if (end)
+                return total;
+        }
+    }
+
+    private static long Bytes(RecordBatch batch)
+    {
+        long n = 0;
+        foreach (var array in batch.Arrays)
+            n += Bytes(array.Data);
+        return n;
+    }
+
+    private static long Bytes(ArrayData data)
+    {
+        long n = 0;
+        foreach (var buffer in data.Buffers)
+            n += buffer.Length;
+        if (data.Children is { } children)
+            foreach (var child in children)
+                n += Bytes(child);
+        if (data.Dictionary is { } dictionary)
+            n += Bytes(dictionary);
+        return n;
     }
 
     /// <summary>Ingests the rows into a temporary table of the session, runs <paramref name="use"/> with its name and
     /// the quoted column list, and drops it.</summary>
-    private static T ThroughTemporary<T>(AdbcConnection connection, IArrowArrayStream rows, Func<string, string, T> use)
+    private static T ThroughTemporary<T>(Session session, IArrowArrayStream rows,
+                                         Func<AdbcConnection, string, string, T> use)
     {
         string name = "__fabricator_rows_" + Guid.NewGuid().ToString("N");
         string columns = string.Join(", ", rows.Schema.FieldsList.Select(f => DuckDbDdl.Quote(f.Name)));
-        using (var ingest = connection.CreateStatement())
-        {
-            ingest.SetOption("adbc.ingest.target_table", name);
-            ingest.SetOption("adbc.ingest.temporary", "true");
-            ingest.SetOption("adbc.ingest.mode", "adbc.ingest.mode.create");
-            ingest.BindStream(rows);
-            ingest.ExecuteUpdate();
-        }
         try
         {
-            return use("temp." + DuckDbDdl.Quote(name), columns);
+            using (rows)
+            {
+                IngestChunks(session, rows, (ingest, first) =>
+                {
+                    ingest.SetOption("adbc.ingest.target_table", name);
+                    ingest.SetOption("adbc.ingest.temporary", "true");
+                    ingest.SetOption("adbc.ingest.mode", first ? "adbc.ingest.mode.create" : "adbc.ingest.mode.append");
+                });
+            }
+            return session.Run(connection => use(connection, "temp." + DuckDbDdl.Quote(name), columns));
         }
         finally
         {
-            using var drop = connection.CreateStatement();
-            drop.SqlQuery = "DROP TABLE IF EXISTS temp." + DuckDbDdl.Quote(name);
-            drop.ExecuteUpdate();
+            session.Run(connection =>
+            {
+                using var drop = connection.CreateStatement();
+                drop.SqlQuery = "DROP TABLE IF EXISTS temp." + DuckDbDdl.Quote(name);
+                return drop.ExecuteUpdate().AffectedRows;
+            });
         }
     }
 
@@ -1050,7 +1224,8 @@ internal sealed class AdbcCatalog : IProviderCatalog
         var positional = new RenamedStream(rows, Enumerable.Range(0, names.Count).Select(i => "_" + i).ToList());
         string target = DuckDbDdl.Table(schemaName, tableName);
         int firstKey = setColumnCount < 0 ? 0 : setColumnCount;
-        T Statement(AdbcConnection connection) => ThroughTemporary(connection, positional, (temp, _) =>
+        using var session = WriteSession(AmbientTransaction.Current);
+        return ThroughTemporary(session, positional, (connection, temp, _) =>
         {
             string match = string.Join(" AND ", Enumerable.Range(firstKey, names.Count - firstKey)
                 .Select(i => "T." + DuckDbDdl.Quote(names[i]) + " IS NOT DISTINCT FROM S._" + i));
@@ -1060,14 +1235,6 @@ internal sealed class AdbcCatalog : IProviderCatalog
                       .Select(i => DuckDbDdl.Quote(names[i]) + " = S._" + i)) + " FROM " + temp + " AS S WHERE " + match;
             return run(connection, returning ? sql + " RETURNING T.*" : sql);
         });
-        var txn = WriteTransaction();
-        if (txn is null)
-        {
-            using var own = Connect();
-            return Statement(own);
-        }
-        lock (txn.Gate)
-            return Statement(txn.Connection!);
     }
 
     /// <summary>A stream whose columns are renamed by position.</summary>

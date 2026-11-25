@@ -21,6 +21,7 @@ breaks the build rather than an unmaintained branch.
 | ATTACH option | default | meaning |
 |---|---|---|
 | `max_in_list` | 1000 | longest IN list a filter sends as a list; longer goes as a range (integers, temporals) or not at all |
+| `transaction_snapshot` | true | DuckDB server: an explicit transaction reads one server snapshot from its first read (its connection is pinned then); false: each read before the first write takes its own connection ("Transactions on a quack server") |
 | `consistent_reads` | false | the user's promise that one statement reads the same rows alike twice (RCSI / snapshot, or no concurrent writers); without it a plan carrying `fabricator.repeated_reads` is declined |
 
 Drivers tried (both forks, branches pushed; mssql-adbc PRs since 2026-11-06, see below):
@@ -41,7 +42,7 @@ Drivers tried (both forks, branches pushed; mssql-adbc PRs since 2026-11-06, see
 | statistics | the table's row count from ADBC `GetStatistics` (approximate). Without it DuckDB takes a remote table for one row, builds the join's hash table over it, and no join key reaches the driver |
 | remote pushdown | `remote_translate` hands over the host's Substrait plan: the provider sets it on a statement, calls `Prepare()` (a driver refuses there, before anything runs) and `ExecuteSchema()`, keeps the plan under an opaque handle and returns the handle as the query. `ExecuteQuery(handle)` runs the plan. Result columns are renamed to `c0…` by position; no ORDER BY keys are declared, so the driver's row order is kept |
 | connections | one ADBC connection per statement (a driver connection is not thread-safe) |
-| writes | a pushed write (the host's WriteRel: `INSERT … SELECT`, `DELETE`, `UPDATE` within the catalog) runs on a driver connection pinned per DuckDB transaction (`AdbcTransaction`: opened with autocommit off by the first write, committed / rolled back with the transaction); reads after it use that connection, one statement at a time and drained, so the transaction sees its own writes. For a DuckDB server also DDL (CREATE / DROP TABLE and SCHEMA, CREATE TABLE with NOT NULL / PRIMARY KEY / UNIQUE; `DuckDbDdl`) and bulk loads (`INSERT … VALUES`, COPY, CTAS from local rows: ADBC ingest), in the transaction; host capability `lossless_arrow_boundary` makes those cross in DuckDB's lossless Arrow forms, and the connections read in them (`quack.arrow_lossless_conversion`), so no column changes its type. ALTER TABLE (rename, add / drop / retype a column, NOT NULL, defaults, struct fields, comments), INSERT … RETURNING and an INSERT naming some of the columns go through a temporary table of the session; the table's PRIMARY KEY / UNIQUE is its row identity, so the host pushes MERGE (the driver writes `MERGE INTO`). A DELETE / UPDATE the host cannot push (an UPDATE joined with another table, any RETURNING) takes the key path: the keys (and new values) go to a temporary table, then ONE `DELETE … WHERE EXISTS` / `UPDATE … FROM` (`RETURNING T.*`), capability `dml_returning`. CREATE TABLE takes literal DEFAULTs. The row identity is the table's PRIMARY KEY / UNIQUE, else DuckDB's own `rowid` as a VIRTUAL row id (BIGINT): a scan that reads it runs on the transaction's pinned connection, so the rowids it hands the key path name the rows the DELETE / UPDATE / MERGE then changes. Still refused: an identity or WITH options on CREATE TABLE |
+| writes | a pushed write (the host's WriteRel: `INSERT … SELECT`, `DELETE`, `UPDATE` within the catalog) runs on a driver connection pinned per DuckDB transaction (`AdbcTransaction`: opened with autocommit off by the first write — on a DuckDB server by the first read of an explicit transaction, see "Transactions" below — committed / rolled back with the transaction); reads after it use that connection, so the transaction sees its own writes. For a DuckDB server also DDL (CREATE / DROP TABLE and SCHEMA, CREATE TABLE with NOT NULL / PRIMARY KEY / UNIQUE; `DuckDbDdl`) and bulk loads (`INSERT … VALUES`, COPY, CTAS from local rows: ADBC ingest), in the transaction; host capability `lossless_arrow_boundary` makes those cross in DuckDB's lossless Arrow forms, and the connections read in them (`quack.arrow_lossless_conversion`), so no column changes its type. ALTER TABLE (rename, add / drop / retype a column, NOT NULL, defaults, struct fields, comments), INSERT … RETURNING and an INSERT naming some of the columns go through a temporary table of the session; the table's PRIMARY KEY / UNIQUE is its row identity, so the host pushes MERGE (the driver writes `MERGE INTO`). A DELETE / UPDATE the host cannot push (an UPDATE joined with another table, any RETURNING) takes the key path: the keys (and new values) go to a temporary table, then ONE `DELETE … WHERE EXISTS` / `UPDATE … FROM` (`RETURNING T.*`), capability `dml_returning`. CREATE TABLE takes literal DEFAULTs. The row identity is the table's PRIMARY KEY / UNIQUE, else DuckDB's own `rowid` as a VIRTUAL row id (BIGINT): a scan that reads it runs on the transaction's pinned connection, so the rowids it hands the key path name the rows the DELETE / UPDATE / MERGE then changes. Still refused: an identity or WITH options on CREATE TABLE |
 
 Nothing on the C++ side changed: the ABI v96 contract already lets a provider return any query text for a plan,
 and ABI v99 hands a pushed query its table filters.
@@ -228,10 +229,51 @@ What the differential runs could not see, measured:
 | nested types read losslessly (`BOOLEAN[]`, STRUCT with UUID / HUGEINT, MAP, `TIMETZ[]`, `BIT[]`) | exact |
 | **ENUM columns** | **two defects, both fixed.** (1) HOST: six sites read an Arrow column's type with `GetDuckType()`, whose default leaves out the dictionary, so a dictionary-encoded column was typed as its INDEX type (UTINYINT) and read as indexes — any provider or plugin returning dictionary arrays had this; DuckDB's own scan asks `GetDuckType(true)`. (2) DRIVER: the catalog sees an ENUM as VARCHAR (Arrow has no enum), but a pushed ORDER BY / min / max / top-n followed the ENUM's declared order — the driver now reads a column the plan declares a string as `CAST(… AS VARCHAR)` (DuckDB drops the cast on a VARCHAR) |
 | two transactions updating one row | the second fails ("Conflict on update!"), no update lost |
-| a large scan in a transaction after a write (drained) | +45 MB beyond the autocommit run for a 120k-row result: linear in the result, worth knowing for large reads inside a writing transaction |
+| a large scan in a transaction after a write (drained) | +45 MB beyond the autocommit run for a 120k-row result: linear in the result. **Superseded** — a pinned scan now streams and buffers only on overlap ("Transactions" below) |
 | bulk through a temporary table | 1M rows: CTAS 0.5 s, INSERT into an existing table 0.3 s — no cost |
 | per-query cost | **a point query took 55 ms where the driver alone takes 2.8 ms**: both settings reads used `duckdb_settings()` (~7.6 ms, every setting) and the driver translated each plan twice. Now `current_setting` and one translation per plan: **22.6 ms**. What remains is the bind's metadata round trips (schema, key, row count) and the host-session read through `IHostQuery` |
 | a non-fabricator Substrait producer | not measurable here: the driver takes a function with no URN as a DuckDB function and the standard names by their DuckDB meaning — fine for DuckDB's own `to_substrait`, an assumption for any other producer |
+
+### Transactions on a quack server (2026-11-25)
+
+A quack session runs one statement at a time, so everything a DuckDB transaction does on its pinned connection
+takes turns (`AdbcTransaction.Use`). What a transaction sees, by default:
+
+| | before the first write | after it |
+|---|---|---|
+| autocommit statement | each scan its own connection: what is committed when it starts | — |
+| explicit transaction, `transaction_snapshot` true (default) | **one server snapshot from the first read** (the connection is pinned then) | the same snapshot plus its own writes |
+| explicit transaction, `transaction_snapshot false` | each scan its own connection (per-scan, like RCSI but per scan, not per statement) | one snapshot from the first write |
+
+The default is what DuckDB does locally (a transaction reads one snapshot, taken at its first access to the
+database), i.e. SQL Server `SNAPSHOT`, not RCSI. A write conflicting with a commit after the snapshot fails
+(`Conflict on update!`), as in DuckDB. `fabricator_query` / `fabricator_exec` still take their own connection.
+
+**Buffering only on overlap.** A scan on the pinned connection STREAMS (`PinnedStream`); only when something else
+needs the connection while it is open does it read the rest of its result into memory (debug log `pinned scan
+buffered: N batches, M rows`). Statements one after the other buffer nothing; a non-pushed join of two remote
+tables did not buffer either (DuckDB finishes the build side before the probe side starts). What does buffer: a
+load into the server while a scan of the same connection feeds it (an `INSERT … SELECT` that is not pushed whole) —
+the rest of the scan, once the load's first chunk is sent.
+
+**Loads never hold the connection while waiting for their input.** Before this, a load held the connection for its
+whole ingest; if its input came from a scan of the same connection that DuckDB opened only later, both waited for
+ever — MEASURED: `BEGIN; INSERT …; INSERT INTO rp.t SELECT … FROM local UNION ALL SELECT … FROM rp.s` hung (the
+other orders passed by luck of the scan opening first). Loads (bulk, the temporary tables of INSERT naming some
+columns, RETURNING and the key path) now read their input in chunks of 16 MB outside the connection and hold it
+only to send each chunk (`IngestChunks`).
+
+**A failed statement aborts a DuckDB transaction**, so nothing may fail on the pinned connection that we would
+swallow. Pinning at the first read exposed one that was already there after a first write: CREATE TABLE asks the
+catalog whether the table exists, and `GetTableSchema` of a missing table failed on the server — "Current
+transaction is aborted" at the CREATE. On a pinned connection the lookup now asks `duckdb_tables()` /
+`duckdb_views()` first, a query that cannot fail (`quack_ddl.py` caught it; `quack_txn.py` pins it after a write).
+
+Measured (`scripts/adbc_quack/quack_overlap.py`, `quack_txn.py`): the UNION ALL case and 6 other
+read-and-write shapes 3x each, no hang, right rows; one snapshot across a concurrent commit and the control with
+the option off; read-your-writes + ROLLBACK; a 2M-row scan in a read transaction and a non-pushed join of two remote
+tables buffer nothing; the positive control (a load fed by a scan of the same connection) buffers 702,464 rows,
+right result; a conflicting update after the snapshot fails; 4 concurrent read transactions.
 
 ## The mssql-adbc side (branch `fabricator-tsql`, draft PR clast-project/mssql-adbc#32)
 
