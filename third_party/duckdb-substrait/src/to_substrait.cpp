@@ -1673,6 +1673,9 @@ substrait::Rel *DuckDBToSubstrait::TransformComparisonJoin(LogicalOperator &dop)
 			left_col_count = child_join.right_projection_map.size();
 		} else if (child_join.join_type == JoinType::SEMI || child_join.join_type == JoinType::ANTI) {
 			left_col_count = child_join.left_projection_map.size();
+		} else if (child_join.join_type == JoinType::MARK) {
+			// [FABRICATOR-PATCH: UPSTREAM #318] a mark join outputs its left side and one marker (below)
+			left_col_count = child_join.left_projection_map.size() + 1;
 		} else {
 			left_col_count = child_join.left_projection_map.size() + child_join.right_projection_map.size();
 		}
@@ -1806,8 +1809,16 @@ substrait::Rel *DuckDBToSubstrait::TransformComparisonJoin(LogicalOperator &dop)
 	for (auto idx : projection_map) {
 		CreateFieldRef(projection->add_expressions(), idx);
 	}
-	if (djoin.join_type != JoinType::SEMI && djoin.join_type != JoinType::RIGHT_SEMI &&
-	    djoin.join_type != JoinType::ANTI && djoin.join_type != JoinType::RIGHT_ANTI) {
+	if (djoin.join_type == JoinType::MARK) {
+		// [FABRICATOR-PATCH: UPSTREAM #318] a MARK join outputs the left columns and ONE marker (Substrait LEFT_MARK,
+		// DuckDB's own types alike), never the right side's columns: listing those named a field past the join's
+		// output as soon as the right side had two columns (TPC-DS q16 / q94: every consumer refused the plan). With
+		// one right column the reference happened to be the marker.
+		// The identical fix is in upstream PR #318 (open on 2026-11-25), not in main: it retires with the re-vendor.
+		child_column_count += 1;
+		CreateFieldRef(projection->add_expressions(), left_col_count);
+	} else if (djoin.join_type != JoinType::SEMI && djoin.join_type != JoinType::RIGHT_SEMI &&
+	           djoin.join_type != JoinType::ANTI && djoin.join_type != JoinType::RIGHT_ANTI) {
 		child_column_count += GetColumnCount(*dop.children[right_child_idx]);
 		for (auto right_idx : djoin.right_projection_map) {
 			CreateFieldRef(projection->add_expressions(), right_idx + left_col_count);

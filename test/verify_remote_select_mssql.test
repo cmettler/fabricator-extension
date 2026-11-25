@@ -2752,3 +2752,59 @@ CALL disable_logging();
 
 statement ok
 SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_in;', refresh_cache := true);
+
+# ═══ §25  A MARK join with two right columns (TPC-DS q16 / q94) ═════════════════════════════════════════════════════
+# A correlated EXISTS on two columns (one of them `<>`) stays a MARK join after the optimizers. The producer's projection
+# after it used to list the right side's columns, so with two of them it named a field past the join's output and the
+# whole statement was refused ("Field reference 4 is out of range"): it ran as scans, correct but not pushed. The
+# results are pinned too, so a plan that does go out must also answer right (checked against the local run when written).
+
+statement ok
+SELECT fabricator_exec('db', 'IF OBJECT_ID(''dbo.rs_mk_a'') IS NOT NULL DROP TABLE dbo.rs_mk_a; IF OBJECT_ID(''dbo.rs_mk_b'') IS NOT NULL DROP TABLE dbo.rs_mk_b; CREATE TABLE dbo.rs_mk_a (o INT, w INT, v INT); INSERT INTO dbo.rs_mk_a VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30), (3, 1, 40), (3, 1, 50), (4, NULL, 60); CREATE TABLE dbo.rs_mk_b (o INT); INSERT INTO dbo.rs_mk_b VALUES (2), (NULL);', refresh_cache := true);
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+query II
+EXPLAIN SELECT a1.o, a1.v FROM rp.dbo.rs_mk_a a1 WHERE EXISTS (SELECT * FROM rp.dbo.rs_mk_a a2 WHERE a1.o = a2.o AND a1.w <> a2.w);
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query II
+EXPLAIN SELECT count(DISTINCT a1.o), sum(a1.v) FROM rp.dbo.rs_mk_a a1 WHERE EXISTS (SELECT * FROM rp.dbo.rs_mk_a a2 WHERE a1.o = a2.o AND a1.w <> a2.w) AND NOT EXISTS (SELECT * FROM rp.dbo.rs_mk_b b WHERE a1.o = b.o);
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query II
+EXPLAIN SELECT a1.o, a1.v FROM rp.dbo.rs_mk_a a1 WHERE EXISTS (SELECT * FROM rp.dbo.rs_mk_a a2 WHERE a1.o = a2.o AND a1.w <> a2.w) OR a1.v > 55;
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query II rowsort
+SELECT a1.o, a1.v FROM rp.dbo.rs_mk_a a1 WHERE EXISTS (SELECT * FROM rp.dbo.rs_mk_a a2 WHERE a1.o = a2.o AND a1.w <> a2.w);
+----
+1	10
+1	20
+
+query II
+SELECT count(DISTINCT a1.o), sum(a1.v) FROM rp.dbo.rs_mk_a a1 WHERE EXISTS (SELECT * FROM rp.dbo.rs_mk_a a2 WHERE a1.o = a2.o AND a1.w <> a2.w) AND NOT EXISTS (SELECT * FROM rp.dbo.rs_mk_b b WHERE a1.o = b.o);
+----
+1	30
+
+query II rowsort
+SELECT a1.o, a1.v FROM rp.dbo.rs_mk_a a1 WHERE EXISTS (SELECT * FROM rp.dbo.rs_mk_a a2 WHERE a1.o = a2.o AND a1.w <> a2.w) OR a1.v > 55;
+----
+1	10
+1	20
+4	60
+
+# the oracle: the same three on the attach that never pushes
+query II rowsort
+SELECT a1.o, a1.v FROM db.dbo.rs_mk_a a1 WHERE EXISTS (SELECT * FROM db.dbo.rs_mk_a a2 WHERE a1.o = a2.o AND a1.w <> a2.w) OR a1.v > 55;
+----
+1	10
+1	20
+4	60
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_mk_a; DROP TABLE dbo.rs_mk_b;', refresh_cache := true);
