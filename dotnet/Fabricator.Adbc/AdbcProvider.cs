@@ -1306,9 +1306,17 @@ internal sealed class AdbcCatalog : IProviderCatalog
     }
 }
 
+/// <remarks>
+/// The table's schema and key are read once, at its first bind, and kept: the host binds a table for every plan it
+/// tries to push (TPC-DS q16: 175 binds of one table while planning one query), and each read is a server round trip.
+/// They live as long as this object, which is as long as the host's catalog entry — a DDL, a refresh or a rollback
+/// makes the host open the table anew, with nothing kept.
+/// </remarks>
 internal sealed class AdbcTable : ITable
 {
     private readonly AdbcCatalog _catalog;
+    private Schema? _schema;
+    private IReadOnlyList<string>? _keyColumns;
 
     public AdbcTable(AdbcCatalog catalog, string schemaName, string tableName)
     {
@@ -1320,11 +1328,14 @@ internal sealed class AdbcTable : ITable
     public string SchemaName { get; }
     public string TableName { get; }
 
+    /// <summary>The table's PRIMARY KEY / first UNIQUE (<see cref="AdbcCatalog.KeyColumns"/>), read once.</summary>
+    internal IReadOnlyList<string> KeyColumns() => _keyColumns ??= _catalog.KeyColumns(SchemaName, TableName);
+
     public ITableBinding Bind(ITransaction? transaction, TableAt? at = null)
     {
         if (at is not null)
             throw new NotSupportedException("adbc: AT (time travel) is not supported");
-        return new AdbcTableBinding(_catalog, this, _catalog.TableSchema(SchemaName, TableName));
+        return new AdbcTableBinding(_catalog, this, _schema ??= _catalog.TableSchema(SchemaName, TableName));
     }
 }
 
@@ -1348,7 +1359,7 @@ internal sealed class AdbcTableBinding : ITableBinding
     /// </summary>
     public IReadOnlyList<string> RowIdColumns()
     {
-        var keys = _catalog.KeyColumns(_table.SchemaName, _table.TableName);
+        var keys = _table.KeyColumns();
         if (keys.Count > 0 || !_catalog.ReadsByName)
             return keys;
         return Schema.FieldsList.Any(f => string.Equals(f.Name, AdbcCatalog.RowId, StringComparison.OrdinalIgnoreCase))
