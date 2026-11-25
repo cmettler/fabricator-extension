@@ -191,6 +191,9 @@ CASES = [
     ("some", "SELECT id FROM {t} t WHERE t.i <> SOME (SELECT i FROM {u} u WHERE u.i IS NOT NULL)"),
     ("all", "SELECT id FROM {t} t WHERE t.i > ALL (SELECT i FROM {u} u WHERE u.i IS NOT NULL)"),
     ("nested corr", "SELECT id FROM {t} t WHERE t.i < (SELECT sum(u.i) FROM {u} u WHERE u.id <= t.id AND u.i > (SELECT count(*) FROM {u} w WHERE w.id < u.id))"),
+    # Q found through the adbc provider's DuckDB dialect (2026-11-25): both were wrong answers on this path too
+    ("cast unsigned", "SELECT sum(CAST(i AS UTINYINT)) FROM {t} WHERE i BETWEEN -10 AND 10"),
+    ("distinct on", "SELECT DISTINCT ON (g) g, id FROM {t} ORDER BY g, id"),
 ]
 
 

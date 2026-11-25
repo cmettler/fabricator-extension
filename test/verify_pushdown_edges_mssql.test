@@ -1393,5 +1393,20 @@ SELECT id FROM rp.dbo.ed_t t WHERE t.i < (SELECT sum(u.i) FROM rp.dbo.ed_u u WHE
 6
 7
 
+# cast unsigned
+statement error
+SELECT sum(CAST(i AS UTINYINT)) FROM rp.dbo.ed_t WHERE i BETWEEN -10 AND 10
+----
+<REGEX>:.*
+
+# distinct on
+query TT rowsort
+SELECT DISTINCT ON (g) g, id FROM rp.dbo.ed_t ORDER BY g, id
+----
+1	1
+2	3
+3	5
+NULL	7
+
 statement ok
 SELECT fabricator_exec('rp', 'DROP TABLE dbo.ed_t; DROP TABLE dbo.ed_u;', refresh_cache := true);

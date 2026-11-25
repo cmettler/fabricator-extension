@@ -50,6 +50,8 @@ A `SELECT` that is not pushed is therefore not "pulled whole": its scans still c
 | `sqrt`, `ln`, `log10`, `log2`, `asin`, `acos` (with DuckDB's default `ieee_floating_point_ops`) | outside their domain DuckDB returns NaN / -inf, SQL Server raises an error | the function in DuckDB, the part below it pushed; with `SET ieee_floating_point_ops = false` they are pushed |
 | `power` with an exponent that is not a constant integer ≥ 0 | a negative base with a fractional exponent is NaN in DuckDB, an error on the server | DuckDB |
 | `cbrt`, `trunc`, one-argument `round`, `atan2`, `gcd` / `lcm`, `factorial`, `<<` / `>>` / `~` | no translation | DuckDB |
+| a cast to an unsigned integer type or `HUGEINT` | Substrait has no such type, so the cast would lose its range check (`CAST(-7 AS UTINYINT)` returned -7 until 0.2.12) | DuckDB |
+| `DISTINCT ON` over some of the columns | it was sent as a plain DISTINCT and returned every distinct row (until 0.2.12); `DISTINCT ON` all columns is a DISTINCT and is pushed | DuckDB |
 | `INSERT … VALUES` | the bulk copy is already the fast path (I2) | bulk copy |
 | `UPDATE … FROM` | a row matched twice would take whichever match SQL Server picks (U2) | key path |
 | `DELETE` / `UPDATE` / `MERGE` with `RETURNING` | not built as one statement | key path, rows from T-SQL `OUTPUT` (see [RETURNING](#returning)) |

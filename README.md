@@ -319,11 +319,12 @@ the default schema stays local — a DuckDB limit). Pushed:
 - joins of the catalog's tables (`INNER`, `LEFT`, `RIGHT`, `FULL`, and `IN` / `EXISTS` subqueries), `UNION ALL`,
   `EXCEPT ALL`, `INTERSECT ALL`;
 - aggregates (`count`, `sum`, `avg`, `min`/`max` — strings too — `bool_and`/`bool_or`, …), `GROUP BY`, `HAVING`,
-  `DISTINCT`, `ORDER BY` with `LIMIT` / `OFFSET`;
+  `DISTINCT` (`DISTINCT ON` only over every selected column), `ORDER BY` with `LIMIT` / `OFFSET`;
 - window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`/`lead`,
   `first_value`/`last_value`, aggregates over a window, `ROWS` frames with constant offsets and `RANGE` up to the
   current row; `IGNORE NULLS` with an offset of 1 and no default (SQL Server 2022+);
-- arithmetic, `CASE`, `COALESCE`, `NULLIF`, casts (a float cast to an integer rounds half to even, as in DuckDB),
+- arithmetic, `CASE`, `COALESCE`, `NULLIF`, casts (a float cast to an integer rounds half to even, as in DuckDB;
+  a cast to an unsigned type or `HUGEINT` stays local),
   date parts (`year`, `month`, `day`, `hour`, … via `extract` / `date_part`), `date_trunc` to year / quarter /
   month / week (ISO, Monday) / day / hour / minute / second (SQL Server 2022+), `date_diff` from year down to
   microsecond, `last_day`, `make_date` (a year past 9999 is an error on the server, an answer in DuckDB);

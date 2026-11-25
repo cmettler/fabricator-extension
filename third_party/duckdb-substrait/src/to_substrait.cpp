@@ -423,6 +423,19 @@ void DuckDBToSubstrait::TransformCastExpression(Expression &dexpr, substrait::Ex
 	if (BoundCastExpression::IsTryCast(dcast)) {
 		throw NotImplementedException("to_substrait: TRY_CAST is not supported");
 	}
+	// [FABRICATOR-PATCH: OFFER-READY] a cast checks the range of its target, and Substrait declares these targets as a
+	// WIDER type (no unsigned integers; HUGEINT as decimal(38,0)): CAST(-7 AS UTINYINT) fails in DuckDB and would
+	// return -7 as an i16. Decline them.
+	switch (dcast.GetReturnType().id()) {
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::HUGEINT:
+		throw NotImplementedException("to_substrait: a cast to %s is not supported", dcast.GetReturnType().ToString());
+	default:
+		break;
+	}
 	auto scast = sexpr.mutable_cast();
 	TransformExpr(*BoundCastExpression::ChildMutable(dcast), *scast->mutable_input(), col_offset);
 	*scast->mutable_type() = DuckToSubstraitType(dcast.GetReturnType());
@@ -2920,6 +2933,21 @@ substrait::Rel *DuckDBToSubstrait::CreateSetOperation(LogicalOperator &child_op,
 substrait::Rel *DuckDBToSubstrait::TransformDistinct(LogicalOperator &dop) {
 	D_ASSERT(dop.children.size() == 1);
 	auto &child_op = dop.children[0];
+	// [FABRICATOR-PATCH: OFFER-READY] DISTINCT ON keeps one row per value of its targets (the first by its ORDER BY);
+	// written below as a grouping by EVERY column it would keep every distinct row instead. When its targets are
+	// every column it IS a plain DISTINCT.
+	auto &distinct = dop.Cast<LogicalDistinct>();
+	if (distinct.distinct_type != DistinctType::DISTINCT) {
+		set<idx_t> targets;
+		for (auto &target : distinct.distinct_targets) {
+			if (target->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+				targets.insert(target->Cast<BoundReferenceExpression>().Index());
+			}
+		}
+		if (targets.size() != child_op->GetColumnBindings().size()) {
+			throw NotImplementedException("to_substrait: DISTINCT ON a subset of the columns is not supported");
+		}
+	}
 
 	// Check if this is a DISTINCT used with set operations (EXCEPT/INTERSECT)
 	// or a standalone DISTINCT operation
