@@ -3111,7 +3111,7 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
 		auto &child = *schema_root.arrow_schema.children[i];
 		names.push_back(Identifier(child.name ? string(child.name) : "column" + to_string(i)));
-		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType(true));
 	}
 	bind_data->output_width = return_types.size();
 	return std::move(bind_data);
@@ -3511,7 +3511,7 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
 		auto &child = *schema_root.arrow_schema.children[i];
 		names.push_back(Identifier(child.name ? string(child.name) : "column" + to_string(i)));
-		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType(true));
 	}
 	bind_data->output_width = return_types.size();
 	return std::move(bind_data);

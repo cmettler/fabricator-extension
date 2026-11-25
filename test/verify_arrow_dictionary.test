@@ -1,0 +1,36 @@
+# name: test/verify_arrow_dictionary.test
+# description: A dictionary-encoded Arrow column (an ENUM, in DuckDB's Arrow export) reaching the host must be read
+#              as its VALUE type with its values. Six sites asked DuckDB for a column's type with GetDuckType(),
+#              whose default leaves out the dictionary: the column was typed as its INDEX type (UTINYINT) and read
+#              as indexes — fabricator_host_query returned 0 for an ENUM 'b' (2026-11-25, found through the adbc
+#              provider against a DuckDB server, which returns ENUMs as dictionaries). DuckDB's own Arrow scan asks
+#              GetDuckType(true). An ENUM arrives as VARCHAR: Arrow has no enum type.
+# group: [fabricator]
+
+require fabricator
+
+query TT
+SELECT typeof(e), e FROM fabricator_host_query('SELECT CAST(''b'' AS ENUM(''a'',''b'')) AS e');
+----
+VARCHAR	b
+
+# several values and a NULL, ordered as strings
+query T
+SELECT e FROM fabricator_host_query('SELECT * FROM (VALUES (CAST(''b'' AS ENUM(''a'',''b'',''c''))), (NULL), (''c''), (''a'')) v(e)') ORDER BY e NULLS LAST;
+----
+a
+b
+c
+NULL
+
+# inside a list and a struct
+query TTTT
+SELECT typeof(l), l, typeof(s), s FROM fabricator_host_query('SELECT [CAST(''b'' AS ENUM(''a'',''b'')), NULL] AS l, {''x'': CAST(''a'' AS ENUM(''a'',''b''))} AS s');
+----
+VARCHAR[]	[b, NULL]	STRUCT(x VARCHAR)	{'x': a}
+
+# across several batches
+query II
+SELECT count(*), count(*) FILTER (WHERE e = '2') FROM fabricator_host_query('SELECT CAST(CAST(range % 3 AS VARCHAR) AS ENUM(''0'',''1'',''2'')) AS e FROM range(5000)') t(e);
+----
+5000	1666

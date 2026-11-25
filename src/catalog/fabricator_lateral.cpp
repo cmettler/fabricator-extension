@@ -550,7 +550,7 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
 		auto &child = *schema_root.arrow_schema.children[i];
 		names.push_back(Identifier(child.name ? string(child.name) : "column" + to_string(i)));
-		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType(true));
 	}
 	if (return_types.empty()) {
 		throw BinderException("Fabricator: lateral function \"%s\" declared no output columns", info.func);

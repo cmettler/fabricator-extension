@@ -411,7 +411,7 @@ static void ReadSchemaColumns(ClientContext &context, ArrowSchema &arrow_schema,
 	for (int64_t i = 0; i < arrow_schema.n_children; i++) {
 		auto &child = *arrow_schema.children[i];
 		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
-		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType(true));
 		if (column_nullable) {
 			column_nullable->push_back((child.flags & ARROW_FLAG_NULLABLE) != 0);
 		}
@@ -2650,7 +2650,7 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	vector<string> scan_names;
 	for (int64_t i = 0; i < sch.n_children; i++) {
 		scan_names.push_back(sch.children[i]->name ? string(sch.children[i]->name) : "column" + to_string(i));
-		gstate->scan_types.push_back(gstate->scan_arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
+		gstate->scan_types.push_back(gstate->scan_arrow_table.GetColumns().at((idx_t)i)->GetDuckType(true));
 	}
 
 	BuildProjectionMapping(bind_data, scan_names, *gstate);
@@ -2857,7 +2857,7 @@ ArrowStreamReader::ArrowStreamReader(ClientContext &context, ArrowArrayStream st
 	ArrowTableFunction::PopulateArrowTableSchema(context_, arrow_table_, schema_root_.arrow_schema);
 	auto &arrow_schema = schema_root_.arrow_schema;
 	for (int64_t i = 0; i < arrow_schema.n_children; i++) {
-		types_.push_back(arrow_table_.GetColumns().at((idx_t)i)->GetDuckType());
+		types_.push_back(arrow_table_.GetColumns().at((idx_t)i)->GetDuckType(true));
 		// The Arrow field name, captured beside the type. It always arrived here; nothing read it until
 		// host_query grew named parameter binding, which is why that path bound positionally.
 		auto *child = arrow_schema.children[i];
