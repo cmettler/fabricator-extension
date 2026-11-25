@@ -74,14 +74,6 @@ internal sealed class AdbcCatalog : IProviderCatalog
                     : throw new ArgumentException($"adbc: max_in_list must be a positive integer, not '{text}'");
             }
             if (attach.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
-                && attach.RootElement.TryGetProperty("dialect", out var dialect))
-            {
-                string text = dialect.ValueKind == System.Text.Json.JsonValueKind.String ? dialect.GetString()! : dialect.GetRawText();
-                _duckDbDialect = text.Equals("duckdb", StringComparison.OrdinalIgnoreCase) ? true
-                    : text.Equals("substrait", StringComparison.OrdinalIgnoreCase) || text.Length == 0 ? false
-                    : throw new ArgumentException($"adbc: dialect must be 'substrait' or 'duckdb', not '{text}'");
-            }
-            if (attach.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
                 && attach.RootElement.TryGetProperty("consistent_reads", out var consistent))
             {
                 string text = consistent.ValueKind == System.Text.Json.JsonValueKind.String
@@ -113,48 +105,85 @@ internal sealed class AdbcCatalog : IProviderCatalog
         using var connection = Connect();
         _catalogName = Option(connection, "adbc.connection.catalog");
         _defaultSchema = Option(connection, "adbc.connection.db_schema");
-        if (_duckDbDialect)
+        _duckDbServer = VendorName(connection) == "DuckDB";
+        if (_duckDbServer)
             _duckDbSettings = ReadDuckDbSettings(connection);
     }
 
-    // ATTACH option `dialect 'duckdb'`: the driver takes DuckDB SQL, not Substrait (quack); every plan is written as
-    // DuckDB SQL here (DuckDbSubstrait), refusals happen here, before anything reaches the server.
-    private readonly bool _duckDbDialect;
-    private readonly DuckDbSettings _duckDbSettings = DuckDbSettings.Default;
+    // The driver's server is DuckDB (GetInfo vendor_name; quack-net's driver for a quack server): its driver writes our
+    // plans as DuckDB SQL, so DuckDB's own functions may go by name (capability substrait_native_functions), and the
+    // same text means the same thing there only while the two sessions agree on the settings it depends on - checked
+    // here, since only this side knows the calling session.
+    private readonly bool _duckDbServer;
+    private readonly DuckDbSessionSettings _duckDbSettings = DuckDbSessionSettings.Default;
 
-    /// <summary>The server's settings that decide a division by zero and a float outside its domain.</summary>
-    private static DuckDbSettings ReadDuckDbSettings(AdbcConnection connection)
+    /// <summary>The driver's GetInfo vendor_name; null when it has none.</summary>
+    private static string? VendorName(AdbcConnection connection)
+    {
+        try
+        {
+            using var stream = connection.GetInfo(new List<AdbcInfoCode> { AdbcInfoCode.VendorName });
+            while (stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+            {
+                using (batch)
+                {
+                    if (batch.Length == 0 || batch.Column(1) is not UnionArray values)
+                        continue;
+                    int offset = values is DenseUnionArray dense ? dense.ValueOffsets[0] : 0;
+                    var child = values.Fields[values.TypeIds[0]];
+                    return child is StringArray text ? text.GetString(offset) : null;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is AdbcException or NotImplementedException or NotSupportedException)
+        {
+        }
+        return null;
+    }
+
+    /// <summary>The server's settings and version (DuckDbSettings.Compared), read once at ATTACH.</summary>
+    private static DuckDbSessionSettings ReadDuckDbSettings(AdbcConnection connection)
     {
         using var statement = connection.CreateStatement();
-        statement.SqlQuery = "SELECT CAST(current_setting('ieee_floating_point_ops') AS VARCHAR), "
-                             + "CAST(current_setting('error_on_division_by_zero') AS VARCHAR)";
+        statement.SqlQuery = DuckDbSessionSettings.Query;
         using var stream = statement.ExecuteQuery().Stream!;
-        using var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()
-            ?? throw new InvalidOperationException("adbc: the server returned no settings");
-        static bool Flag(IArrowArray column) =>
-            string.Equals(((StringArray)column).GetString(0), "true", StringComparison.OrdinalIgnoreCase);
-        return new DuckDbSettings(Flag(batch.Column(0)), Flag(batch.Column(1)));
+        return DuckDbSessionSettings.Read(stream);
     }
 
-    /// <summary>Puts a plan on a statement: as Substrait, or written as DuckDB SQL (throws when it cannot be).</summary>
-    private void SetPlan(AdbcStatement statement, byte[] plan)
+    /// <summary>
+    /// The calling session's settings, read through the host (as that session, so its SETs count). A plan is written
+    /// for the server only when they match the server's: the same text means the same thing only then.
+    /// </summary>
+    private void CheckSessionSettings()
     {
-        if (_duckDbDialect)
-            statement.SqlQuery = DuckDbSubstrait.ToSql(plan, _duckDbSettings);
-        else
-            statement.SubstraitPlan = plan;
+        var host = FabricatorServices.Get<IHostQuery>()
+            ?? throw new NotSupportedException(
+                "adbc: the host's settings cannot be read here (no IHostQuery), so the server's cannot be compared");
+        DuckDbSessionSettings local;
+        using (var stream = host.Query(DuckDbSessionSettings.Query, inheritSession: true))
+            local = DuckDbSessionSettings.Read(stream);
+        if (_duckDbSettings.Difference(local) is { } difference)
+            throw new NotSupportedException("adbc: DuckDB server: " + difference);
     }
 
-    /// <summary>Whether the plan translates: the driver's Prepare, or the DuckDB dialect here.</summary>
+    /// <summary>Puts a plan on a statement.</summary>
+    private static void SetPlan(AdbcStatement statement, byte[] plan) => statement.SubstraitPlan = plan;
+
+    /// <summary>
+    /// Whether the plan may go: the driver's Prepare refuses one it cannot run, before anything executes; and for a
+    /// DuckDB server the sessions' settings must agree. Every plan carrying expressions passes here first (a pushed
+    /// query, a scan's filters); what goes without it is a plain read, which no setting changes.
+    /// </summary>
     private void CheckPlan(AdbcStatement statement, byte[] plan)
     {
+        if (_duckDbServer)
+            CheckSessionSettings();
         SetPlan(statement, plan);
-        if (!_duckDbDialect)
-            statement.Prepare();
+        statement.Prepare();
     }
 
     private static bool IsRefusal(Exception ex) =>
-        ex is AdbcException or NotImplementedException or NotSupportedException or Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException;
+        ex is AdbcException or NotImplementedException or NotSupportedException;
 
     private AdbcConnection Connect()
     {
@@ -178,7 +207,7 @@ internal sealed class AdbcCatalog : IProviderCatalog
     // among them, and re-applies them, so the driver may return more rows than they select.
     public string CapabilitiesJson =>
         "{\"remote_select\":true,\"superset_filter_pushdown\":true"
-        + (_duckDbDialect ? ",\"substrait_native_functions\":true" : "") + (_defaultSchema is null ? "" : ",\"default_schema\":" +
+        + (_duckDbServer ? ",\"substrait_native_functions\":true" : "") + (_defaultSchema is null ? "" : ",\"default_schema\":" +
             System.Text.Json.JsonSerializer.Serialize(_defaultSchema)) + "}";
 
     // ── discovery ────────────────────────────────────────────────────────────────────────────────────────────
@@ -493,13 +522,13 @@ internal sealed class AdbcCatalog : IProviderCatalog
     public RemoteQuery? TranslateRemotePlan(byte[] substraitPlan)
     {
         // hints the plan needs honoured and a driver does not read: DuckDB computes such a query itself
-        // the DuckDB dialect honours both hints itself: one DuckDB statement reads one snapshot, and the emitter
-        // writes the any-row single join
+        // a DuckDB server honours both hints itself: one DuckDB statement reads one snapshot, and its driver writes
+        // the any-row single join
         var hints = SubstraitPlanFilter.Optimizations(substraitPlan);
-        if (!_duckDbDialect && hints.Contains("fabricator.repeated_reads") && !ConsistentReads)
+        if (!_duckDbServer && hints.Contains("fabricator.repeated_reads") && !ConsistentReads)
             return RemoteQuery.Declined("adbc: the query reads the same rows more than once, and the driver cannot "
                                         + "promise one statement reads them alike (ATTACH option consistent_reads)");
-        if (!_duckDbDialect && hints.Contains("fabricator.single_join_any_row"))
+        if (!_duckDbServer && hints.Contains("fabricator.single_join_any_row"))
             return RemoteQuery.Declined("adbc: a scalar subquery may take any of several rows here, which the driver "
                                         + "would refuse instead");
         Schema schema;
