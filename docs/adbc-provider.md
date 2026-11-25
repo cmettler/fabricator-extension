@@ -181,7 +181,7 @@ ATTACH 'driver=…/quack_adbc.dll;uri="quack://127.0.0.1:9494/?token=…&tls=fal
   - passes both plan hints on: one DuckDB statement reads one snapshot (`repeated_reads`), and the driver writes the
     any-row single join with `LIMIT 1` (one column) or refuses it.
 
-**Measured** (`scratchpad` harness: a DuckDB 2.0.1 CLI serving quack with the edge-case tables in DuckDB types,
+**Measured** (the scripts in `scripts/adbc_quack/`, run by hand: a DuckDB 2.0.1 CLI serving quack with the edge-case tables in DuckDB types,
 compared with the same rows in the local DuckDB): the 142 SQL Server edge cases plus 17 DuckDB-only ones (unsigned /
 HUGEINT columns, `list`, QUALIFY, DISTINCT ON, median, arg_max, intervals …): **159 cases, 0 wrong, 69 pushed as whole
 queries** (the rest run as scans with their filters; local: aggregates with ORDER BY and RANGE offset frames, both
