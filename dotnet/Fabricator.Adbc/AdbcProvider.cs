@@ -363,6 +363,36 @@ internal sealed class AdbcCatalog : IProviderCatalog
     /// the driver has none. Without it DuckDB takes the table for one row and builds a join's hash table over it, so a
     /// local table's join keys never reach the driver.
     /// </summary>
+    /// <summary>
+    /// A DuckDB server's table key — its PRIMARY KEY, else its first UNIQUE constraint — as the row identity a MERGE
+    /// matches by; empty for any other server, or a table with neither.
+    /// </summary>
+    internal IReadOnlyList<string> KeyColumns(string schemaName, string tableName)
+    {
+        if (!_duckDbServer)
+            return System.Array.Empty<string>();
+        static string Text(string value) => "'" + value.Replace("'", "''") + "'";
+        string sql = "SELECT CAST(unnest(constraint_column_names) AS VARCHAR) FROM (SELECT constraint_column_names "
+                     + "FROM duckdb_constraints() WHERE database_name = current_database() AND schema_name = "
+                     + Text(schemaName) + " AND table_name = " + Text(tableName)
+                     + " AND constraint_type IN ('PRIMARY KEY', 'UNIQUE') "
+                     + "ORDER BY constraint_type <> 'PRIMARY KEY', constraint_index LIMIT 1)";
+        var columns = new List<string>();
+        using (var stream = RunSql(sql))
+        {
+            while (stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+            {
+                using (batch)
+                {
+                    var names = (StringArray)batch.Column(0);
+                    for (int i = 0; i < batch.Length; i++)
+                        columns.Add(names.GetString(i)!);
+                }
+            }
+        }
+        return columns;
+    }
+
     internal long? RowCount(string schemaName, string tableName)
     {
         try
@@ -759,7 +789,17 @@ internal sealed class AdbcCatalog : IProviderCatalog
         ExecuteDdl("DROP SCHEMA " + (ifExists ? "IF EXISTS " : "") + DuckDbDdl.Quote(schemaName));
     }
 
-    public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column) => throw ReadOnly("ALTER TABLE");
+    public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column)
+    {
+        RequireDuckDb("ALTER TABLE");
+        if (spec.Kind == AlterTableKind.SetDefault && column is null && spec.Column is { } name)
+        {
+            // SET DEFAULT carries no type: the column's own, so a number is written as one (DuckDB stores it as given)
+            var schema = TableSchema(schemaName, tableName);
+            column = schema.FieldsList.FirstOrDefault(f => string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase));
+        }
+        ExecuteDdl(DuckDbDdl.Alter(spec, schemaName, tableName, column));
+    }
 
     private void RequireDuckDb(string what)
     {
@@ -849,8 +889,32 @@ internal sealed class AdbcCatalog : IProviderCatalog
         }
     }
 
-    public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows) =>
-        throw ReadOnly("INSERT");
+    public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows)
+    {
+        RequireDuckDb("INSERT … RETURNING");
+        var txn = WriteTransaction();
+        if (txn is null)
+        {
+            using var own = Connect();
+            return InsertReturning(own, schemaName, tableName, rows);
+        }
+        lock (txn.Gate)
+            return InsertReturning(txn.Connection!, schemaName, tableName, rows);
+    }
+
+    /// <summary>
+    /// The rows go to a temporary table of the session (ADBC ingest), and from there into the target with
+    /// <c>INSERT … RETURNING *</c>, read whole; the temporary table is dropped after.
+    /// </summary>
+    private static IArrowArrayStream InsertReturning(AdbcConnection connection, string schemaName, string tableName,
+                                                     IArrowArrayStream rows) =>
+        ThroughTemporary(connection, rows, (temp, columns) =>
+        {
+            using var insert = connection.CreateStatement();
+            insert.SqlQuery = "INSERT INTO " + DuckDbDdl.Table(schemaName, tableName) + " (" + columns + ") SELECT "
+                              + columns + " FROM " + temp + " RETURNING *";
+            return Drained(insert.ExecuteQuery().Stream!);
+        });
 
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId,
@@ -883,6 +947,18 @@ internal sealed class AdbcCatalog : IProviderCatalog
                                                     primaryKey: null, uniques: null);
             create.ExecuteUpdate();
         }
+        else
+        {
+            // the rows may name only some of the target's columns (the rest take their defaults), which an ingest
+            // into the table cannot express: they go to a temporary table first, then INSERT … SELECT by name
+            return ThroughTemporary(connection, data, (temp, columns) =>
+            {
+                using var insert = connection.CreateStatement();
+                insert.SqlQuery = "INSERT INTO " + DuckDbDdl.Table(schemaName, tableName) + " (" + columns + ") SELECT "
+                                  + columns + " FROM " + temp;
+                return insert.ExecuteUpdate().AffectedRows;
+            });
+        }
         using var ingest = connection.CreateStatement();
         ingest.SetOption("adbc.ingest.target_table", tableName);
         if (!string.IsNullOrEmpty(schemaName))
@@ -890,6 +966,32 @@ internal sealed class AdbcCatalog : IProviderCatalog
         ingest.SetOption("adbc.ingest.mode", "adbc.ingest.mode.append");
         ingest.BindStream(data);
         return ingest.ExecuteUpdate().AffectedRows;
+    }
+
+    /// <summary>Ingests the rows into a temporary table of the session, runs <paramref name="use"/> with its name and
+    /// the quoted column list, and drops it.</summary>
+    private static T ThroughTemporary<T>(AdbcConnection connection, IArrowArrayStream rows, Func<string, string, T> use)
+    {
+        string name = "__fabricator_rows_" + Guid.NewGuid().ToString("N");
+        string columns = string.Join(", ", rows.Schema.FieldsList.Select(f => DuckDbDdl.Quote(f.Name)));
+        using (var ingest = connection.CreateStatement())
+        {
+            ingest.SetOption("adbc.ingest.target_table", name);
+            ingest.SetOption("adbc.ingest.temporary", "true");
+            ingest.SetOption("adbc.ingest.mode", "adbc.ingest.mode.create");
+            ingest.BindStream(rows);
+            ingest.ExecuteUpdate();
+        }
+        try
+        {
+            return use("temp." + DuckDbDdl.Quote(name), columns);
+        }
+        finally
+        {
+            using var drop = connection.CreateStatement();
+            drop.SqlQuery = "DROP TABLE IF EXISTS temp." + DuckDbDdl.Quote(name);
+            drop.ExecuteUpdate();
+        }
     }
 
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => throw ReadOnly("DELETE");
@@ -979,7 +1081,7 @@ internal sealed class AdbcTableBinding : ITableBinding
     }
 
     public Schema Schema { get; }
-    public IReadOnlyList<string> RowIdColumns() => System.Array.Empty<string>();
+    public IReadOnlyList<string> RowIdColumns() => _catalog.KeyColumns(_table.SchemaName, _table.TableName);
     public IReadOnlyList<VirtualColumn> VirtualColumns() => System.Array.Empty<VirtualColumn>();
     public long? ApproximateRowCount() => _catalog.RowCount(_table.SchemaName, _table.TableName);
     public IReadOnlyList<NdvEntry> ColumnNdv() => System.Array.Empty<NdvEntry>();

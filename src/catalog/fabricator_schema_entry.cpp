@@ -5203,7 +5203,9 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	auto carry_type = [&](const LogicalType &type, const string &column_name) {
 		vector<LogicalType> types {type};
 		vector<string> names {column_name};
-		column_type = make_uniq<fabricator::ArrowProducer>(types, names, fabricator::BoundaryClientProperties(context));
+		column_type = make_uniq<fabricator::ArrowProducer>(
+		    types, names,
+		    fabricator::BoundaryClientProperties(context, ParentCatalog().Cast<FabricatorCatalog>().LosslessArrowBoundary()));
 		column_type->Finish();
 	};
 

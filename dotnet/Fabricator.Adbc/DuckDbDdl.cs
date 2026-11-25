@@ -42,6 +42,60 @@ internal static class DuckDbDdl
         return sql.Append(')').ToString();
     }
 
+    /// <summary>ALTER TABLE / COMMENT ON. <paramref name="column"/> is the new column or field type (ADD, TYPE).</summary>
+    public static string Alter(Fabricator.Bridge.AlterTableSpec spec, string schema, string table, Field? column)
+    {
+        string target = Table(schema, table);
+        string alter = "ALTER TABLE " + target + " ";
+        string Path(IReadOnlyList<string> path) => string.Join(".", path.Select(Quote));
+        string Type() => TypeName(column ?? throw new InvalidOperationException("adbc: ALTER without the new type"));
+        string Literal(string? text) => text is null ? "NULL" : "'" + text.Replace("'", "''") + "'";
+        return spec.Kind switch
+        {
+            Fabricator.Bridge.AlterTableKind.RenameTable => alter + "RENAME TO " + Quote(spec.RequireNewName()),
+            Fabricator.Bridge.AlterTableKind.RenameColumn =>
+                alter + "RENAME COLUMN " + Quote(spec.RequireColumn()) + " TO " + Quote(spec.RequireNewName()),
+            Fabricator.Bridge.AlterTableKind.AddColumn =>
+                alter + "ADD COLUMN " + (spec.Guard ? "IF NOT EXISTS " : "") + Quote(spec.RequireColumn()) + " " + Type()
+                + (spec.HasDefault ? " DEFAULT " + TypedLiteral(spec.DefaultLiteral, column) : ""),
+            Fabricator.Bridge.AlterTableKind.DropColumn =>
+                alter + "DROP COLUMN " + (spec.Guard ? "IF EXISTS " : "") + Quote(spec.RequireColumn()),
+            Fabricator.Bridge.AlterTableKind.ColumnType =>
+                alter + "ALTER COLUMN " + Quote(spec.RequireColumn()) + " TYPE " + Type(),
+            Fabricator.Bridge.AlterTableKind.SetNotNull => alter + "ALTER COLUMN " + Quote(spec.RequireColumn()) + " SET NOT NULL",
+            Fabricator.Bridge.AlterTableKind.DropNotNull => alter + "ALTER COLUMN " + Quote(spec.RequireColumn()) + " DROP NOT NULL",
+            Fabricator.Bridge.AlterTableKind.SetDefault =>
+                alter + "ALTER COLUMN " + Quote(spec.RequireColumn()) + " SET DEFAULT " + TypedLiteral(spec.DefaultLiteral, column),
+            Fabricator.Bridge.AlterTableKind.DropDefault => alter + "ALTER COLUMN " + Quote(spec.RequireColumn()) + " DROP DEFAULT",
+            Fabricator.Bridge.AlterTableKind.AddField =>
+                alter + "ADD COLUMN " + (spec.Guard ? "IF NOT EXISTS " : "") + Path(spec.RequirePath()) + "." + Quote(column!.Name) + " " + Type(),
+            Fabricator.Bridge.AlterTableKind.DropField =>
+                alter + "DROP COLUMN " + (spec.Guard ? "IF EXISTS " : "") + Path(spec.RequirePath()),
+            Fabricator.Bridge.AlterTableKind.RenameField =>
+                alter + "RENAME COLUMN " + Path(spec.RequirePath()) + " TO " + Quote(spec.RequireNewName()),
+            Fabricator.Bridge.AlterTableKind.SetComment => "COMMENT ON TABLE " + target + " IS " + Literal(spec.Comment),
+            Fabricator.Bridge.AlterTableKind.SetColumnComment =>
+                "COMMENT ON COLUMN " + target + "." + Quote(spec.RequireColumn()) + " IS " + Literal(spec.Comment),
+            _ => throw new NotSupportedException($"adbc: ALTER TABLE {spec.Kind} is not supported"),
+        };
+    }
+
+    /// <summary>A default's text as a literal: a number or a boolean as itself when the column's type is one (DuckDB
+    /// then stores the default as the client does), anything else as a string DuckDB casts to the column type.</summary>
+    private static string TypedLiteral(string? text, Field? column)
+    {
+        if (text is null)
+            return "NULL";
+        string type = column is null ? "" : TypeName(column);
+        bool numeric = type is "TINYINT" or "SMALLINT" or "INTEGER" or "BIGINT" or "HUGEINT" or "UTINYINT" or "USMALLINT"
+            or "UINTEGER" or "UBIGINT" or "UHUGEINT" or "FLOAT" or "DOUBLE" || type.StartsWith("DECIMAL", StringComparison.Ordinal);
+        if (numeric && decimal.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+            return text;
+        if (type == "BOOLEAN" && (text == "true" || text == "false"))
+            return text;
+        return "'" + text.Replace("'", "''") + "'";
+    }
+
     private static string ColumnList(Schema columns, string indexes) =>
         string.Join(", ", indexes.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(i => Quote(columns.FieldsList[int.Parse(i, CultureInfo.InvariantCulture)].Name)));
