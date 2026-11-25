@@ -62,6 +62,9 @@ internal sealed class AdbcCatalog : IProviderCatalog
     /// </summary>
     internal bool ConsistentReads { get; }
 
+    /// <summary>The driver reads a scan's columns by name (a DuckDB server).</summary>
+    internal bool ReadsByName => _duckDbServer;
+
     public AdbcCatalog(string connectionString, string? optionsJson = null)
     {
         if (!string.IsNullOrWhiteSpace(optionsJson))
@@ -190,8 +193,24 @@ internal sealed class AdbcCatalog : IProviderCatalog
 
     private AdbcConnection Connect()
     {
+        AdbcConnection connection;
         lock (_connectGate)
-            return _database.Connect(new Dictionary<string, string>());
+            connection = _database.Connect(new Dictionary<string, string>());
+        if (_duckDbServer)
+        {
+            // results and table schemas in DuckDB's lossless Arrow forms: the default ones read a HUGEINT column as
+            // DECIMAL(38,0), a UUID as VARCHAR, a TIMETZ as TIME
+            try
+            {
+                connection.SetOption("quack.arrow_lossless_conversion", "true");
+            }
+            catch
+            {
+                connection.Dispose();
+                throw;
+            }
+        }
+        return connection;
     }
 
     private static string? Option(AdbcConnection connection, string key)
@@ -210,7 +229,7 @@ internal sealed class AdbcCatalog : IProviderCatalog
     // among them, and re-applies them, so the driver may return more rows than they select.
     public string CapabilitiesJson =>
         "{\"remote_select\":true,\"superset_filter_pushdown\":true"
-        + (_duckDbServer ? ",\"substrait_native_functions\":true" : "") + (_defaultSchema is null ? "" : ",\"default_schema\":" +
+        + (_duckDbServer ? ",\"substrait_native_functions\":true,\"lossless_arrow_boundary\":true" : "") + (_defaultSchema is null ? "" : ",\"default_schema\":" +
             System.Text.Json.JsonSerializer.Serialize(_defaultSchema)) + "}";
 
     // ── discovery ────────────────────────────────────────────────────────────────────────────────────────────
@@ -319,9 +338,14 @@ internal sealed class AdbcCatalog : IProviderCatalog
 
     internal Schema TableSchema(string schemaName, string tableName)
     {
-        using var connection = Connect();
         try
         {
+            if (Pinned() is { } txn)
+            {
+                lock (txn.Gate)
+                    return txn.Connection!.GetTableSchema(_catalogName, schemaName, tableName);
+            }
+            using var connection = Connect();
             return connection.GetTableSchema(_catalogName, schemaName, tableName);
         }
         catch (AdbcException ex) when (ex.Status == AdbcStatusCode.NotFound)
@@ -706,15 +730,62 @@ internal sealed class AdbcCatalog : IProviderCatalog
     private static NotSupportedException ReadOnly(string what) =>
         new($"adbc: {what} is not supported yet (the adbc provider is read-only)");
 
-    public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
-                            string? primaryKey, string? uniques, string? defaults,
-                            IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
-                            IReadOnlyList<string>? identityColumns, string? optionsJson) => throw ReadOnly("CREATE TABLE");
+    public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists, string? primaryKey,
+                            string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
+                            IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns, string? optionsJson)
+    {
+        RequireDuckDb("CREATE TABLE");
+        if (!string.IsNullOrEmpty(defaults) || partitionColumns is { Count: > 0 } || sortColumns is { Count: > 0 }
+            || identityColumns is { Count: > 0 } || !string.IsNullOrEmpty(optionsJson))
+            throw new NotSupportedException("adbc: CREATE TABLE with DEFAULT, PARTITIONED BY, SORTED BY, an identity or WITH options is not supported");
+        ExecuteDdl(DuckDbDdl.CreateTable(schemaName, tableName, columns, ifNotExists, replace: false, primaryKey, uniques));
+    }
 
-    public void DropTable(string schemaName, string tableName, bool ifExists) => throw ReadOnly("DROP TABLE");
-    public void CreateSchema(string schemaName, bool ifNotExists) => throw ReadOnly("CREATE SCHEMA");
-    public void DropSchema(string schemaName, bool ifExists) => throw ReadOnly("DROP SCHEMA");
+    public void DropTable(string schemaName, string tableName, bool ifExists)
+    {
+        RequireDuckDb("DROP TABLE");
+        ExecuteDdl("DROP TABLE " + (ifExists ? "IF EXISTS " : "") + DuckDbDdl.Table(schemaName, tableName));
+    }
+
+    public void CreateSchema(string schemaName, bool ifNotExists)
+    {
+        RequireDuckDb("CREATE SCHEMA");
+        ExecuteDdl("CREATE SCHEMA " + (ifNotExists ? "IF NOT EXISTS " : "") + DuckDbDdl.Quote(schemaName));
+    }
+
+    public void DropSchema(string schemaName, bool ifExists)
+    {
+        RequireDuckDb("DROP SCHEMA");
+        ExecuteDdl("DROP SCHEMA " + (ifExists ? "IF EXISTS " : "") + DuckDbDdl.Quote(schemaName));
+    }
+
     public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column) => throw ReadOnly("ALTER TABLE");
+
+    private void RequireDuckDb(string what)
+    {
+        if (!_duckDbServer)
+            throw ReadOnly(what);
+    }
+
+    /// <summary>DDL in the DuckDB transaction (its pinned connection), so it commits or rolls back with it.</summary>
+    private void ExecuteDdl(string sql)
+    {
+        var txn = WriteTransaction();
+        if (txn is null)
+        {
+            using var own = Connect();
+            using var statement = own.CreateStatement();
+            statement.SqlQuery = sql;
+            statement.ExecuteUpdate();
+            return;
+        }
+        lock (txn.Gate)
+        {
+            using var statement = txn.Connection!.CreateStatement();
+            statement.SqlQuery = sql;
+            statement.ExecuteUpdate();
+        }
+    }
 
     public void BeginTransaction(bool isExplicit)
     {
@@ -738,9 +809,11 @@ internal sealed class AdbcCatalog : IProviderCatalog
         AmbientTransaction.Current is var id and not 0 && _txns.TryGet(id) is { Connection: not null } txn ? txn : null;
 
     /// <summary>The transaction a write runs in, its connection opened (autocommit off) by the first write.</summary>
-    private AdbcTransaction? WriteTransaction()
+    private AdbcTransaction? WriteTransaction() => WriteTransaction(AmbientTransaction.Current);
+
+    /// <param name="id">The DuckDB transaction (a bulk load runs on its own thread and is handed the id).</param>
+    private AdbcTransaction? WriteTransaction(long id)
     {
-        long id = AmbientTransaction.Current;
         if (id == 0)
             return null;
         var txn = _txns.GetOrCreate(id);
@@ -783,7 +856,41 @@ internal sealed class AdbcCatalog : IProviderCatalog
                            bool replace, bool checkConstraints, long txnId,
                            IReadOnlyList<string>? partitionColumns,
                            IReadOnlyList<string>? sortColumns, string? schemaMode,
-                           bool partitionOverwrite, string? optionsJson) => throw ReadOnly("INSERT");
+                           bool partitionOverwrite, string? optionsJson)
+    {
+        RequireDuckDb("INSERT");
+        if (partitionColumns is { Count: > 0 } || sortColumns is { Count: > 0 } || !string.IsNullOrEmpty(schemaMode)
+            || partitionOverwrite || !string.IsNullOrEmpty(optionsJson))
+            throw new NotSupportedException("adbc: a load with partitions, sorting, a schema mode or WITH options is not supported");
+        // the rows arrive in DuckDB's lossless Arrow forms; the driver's ingest maps them back to the same types
+        var txn = WriteTransaction(txnId);
+        if (txn is null)
+        {
+            using var own = Connect();
+            return Load(own, schemaName, tableName, data, createTable, replace);
+        }
+        lock (txn.Gate)
+            return Load(txn.Connection!, schemaName, tableName, data, createTable, replace);
+    }
+
+    private static long Load(AdbcConnection connection, string schemaName, string tableName, IArrowArrayStream data,
+                             bool createTable, bool replace)
+    {
+        if (createTable)
+        {
+            using var create = connection.CreateStatement();
+            create.SqlQuery = DuckDbDdl.CreateTable(schemaName, tableName, data.Schema, ifNotExists: false, replace,
+                                                    primaryKey: null, uniques: null);
+            create.ExecuteUpdate();
+        }
+        using var ingest = connection.CreateStatement();
+        ingest.SetOption("adbc.ingest.target_table", tableName);
+        if (!string.IsNullOrEmpty(schemaName))
+            ingest.SetOption("adbc.ingest.target_db_schema", schemaName);
+        ingest.SetOption("adbc.ingest.mode", "adbc.ingest.mode.append");
+        ingest.BindStream(data);
+        return ingest.ExecuteUpdate().AffectedRows;
+    }
 
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) => throw ReadOnly("DELETE");
 
@@ -897,7 +1004,8 @@ internal sealed class AdbcTableBinding : ITableBinding
             ? SubstraitFilter.Conjuncts(filter, name => AdbcCatalog.IndexOf(columnNames, name), values, functions, _catalog.MaxInList)
             : new List<ProtoWriter>();
         var path = new[] { _table.SchemaName, _table.TableName };
-        return _catalog.RunFiltered(condition => SubstraitReadPlan.Build(path, Schema, projection, condition, functions),
+        return _catalog.RunFiltered(condition => SubstraitReadPlan.Build(path, Schema, projection, condition, functions,
+                                                                          _catalog.ReadsByName),
             conjuncts, functions, projection.Select(i => Schema.FieldsList[i].Name).ToList());
     }
 

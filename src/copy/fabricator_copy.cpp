@@ -36,6 +36,7 @@ struct FabricatorCopyBindData : public FunctionData {
 	vector<string> column_names;
 	vector<LogicalType> column_types;
 	bool create_table = true;
+	bool lossless_arrow = false; // capability lossless_arrow_boundary
 	bool replace = false;
 	string schema_mode; // SCHEMA_MODE COPY option: "" | "merge" | "overwrite" (Delta provider)
 	// PARTITION_OVERWRITE COPY option: dynamic partition overwrite — the partitions present in the input are
@@ -65,7 +66,7 @@ struct FabricatorCopyBindData : public FunctionData {
 
 struct FabricatorCopyGlobalState : public GlobalFunctionData {
 	FabricatorCopyGlobalState(ClientContext &context, const FabricatorCopyBindData &bind_data)
-	    : properties(fabricator::BoundaryClientProperties(context)),
+	    : properties(fabricator::BoundaryClientProperties(context, bind_data.lossless_arrow)),
 	      extension_types(ArrowTypeExtensionData::GetExtensionTypes(context, bind_data.column_types)) {
 		// The producer also builds the Arrow schema handed to begin_bulk.
 		producer = make_uniq<fabricator::ArrowProducer>(bind_data.column_types, bind_data.column_names, properties);
@@ -182,6 +183,7 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 		throw BinderException("mssql COPY: catalog '%s' is not a fabricator catalog", bind_data->catalog_name);
 	}
 	bind_data->handle = catalog.Cast<FabricatorCatalog>().GetHandle();
+	bind_data->lossless_arrow = catalog.Cast<FabricatorCatalog>().LosslessArrowBoundary();
 	// names arrive as Identifiers in 2.0; our bind data works in strings.
 	bind_data->column_names.clear();
 	for (auto &n : names) {

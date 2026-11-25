@@ -244,6 +244,7 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 		caps.supports_nested_schemas = yyjson_get_bool(yyjson_obj_get(root, "supports_nested_schemas"));
 		caps.remote_select = yyjson_get_bool(yyjson_obj_get(root, "remote_select"));
 		caps.substrait_native_functions = yyjson_get_bool(yyjson_obj_get(root, "substrait_native_functions"));
+		caps.lossless_arrow_boundary = yyjson_get_bool(yyjson_obj_get(root, "lossless_arrow_boundary"));
 		caps.bind_schema_cacheable = yyjson_get_bool(yyjson_obj_get(root, "bind_schema_cacheable"));
 		caps.parallel_table_open = yyjson_get_bool(yyjson_obj_get(root, "parallel_table_open"));
 		caps.dml_returning = yyjson_get_bool(yyjson_obj_get(root, "dml_returning"));

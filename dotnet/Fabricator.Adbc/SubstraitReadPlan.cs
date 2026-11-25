@@ -17,15 +17,29 @@ internal static class SubstraitReadPlan
     /// <param name="filter">A condition over the BASE schema's columns (field i = column i), or null. It goes as the
     /// best-effort filter: the host re-applies every filter, so the driver may return more rows than it selects.</param>
     /// <param name="functions">The functions <paramref name="filter"/> calls.</param>
+    /// <param name="byName">The driver reads columns by name and ignores their declared types (a DuckDB server): a
+    /// column with no Substrait type is declared as binary even when it is read. Otherwise only an unread one is.</param>
     public static byte[] Build(IReadOnlyList<string> tablePath, Schema schema, IReadOnlyList<int> projection,
-                               ProtoWriter? filter = null, SubstraitFunctions? functions = null)
+                               ProtoWriter? filter = null, SubstraitFunctions? functions = null, bool byName = false)
     {
         var namedStruct = new ProtoWriter();
         foreach (var field in schema.FieldsList)
             namedStruct.String(1, field.Name);
         var types = new ProtoWriter();
-        foreach (var field in schema.FieldsList)
-            types.Message(1, Type(field.DataType, field.IsNullable));
+        for (int i = 0; i < schema.FieldsList.Count; i++)
+        {
+            var field = schema.FieldsList[i];
+            ProtoWriter type;
+            try
+            {
+                type = Type(field.DataType, field.IsNullable);
+            }
+            catch (NotSupportedException) when (byName || !projection.Contains(i))
+            {
+                type = Type(BinaryType.Default, field.IsNullable);
+            }
+            types.Message(1, type);
+        }
         types.Varint(3, Required);
         namedStruct.Message(2, types);
 

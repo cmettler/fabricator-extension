@@ -109,6 +109,7 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 
 		FabricatorInsertTarget target;
 		target.returning = op.return_chunk;
+		target.lossless_arrow = catalog.LosslessArrowBoundary();
 		// ⚠⚠ THE PATH, NOT ONLY THE LEAF (ABI v92). The UPDATE/DELETE legs above get this from
 		// FabricatorBuildModifyTarget; this leg hand-builds its target and was missed when paths landed, so
 		// `schema_path` stayed EMPTY -- and an empty path is not a loud failure: the managed contract's

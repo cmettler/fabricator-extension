@@ -33,6 +33,10 @@ namespace fabricator {
 // `SET arrow_lossless_conversion = true` otherwise exports BOOLEAN as Arrow Int8, which our type mapping then
 // turns into SQL SMALLINT (1/0) instead of BIT (true/false). Use this wherever an ArrowProducer is built.
 duckdb::ClientProperties BoundaryClientProperties(duckdb::ClientContext &context);
+//! The same, LOSSLESS when `lossless` (DuckDB's arrow_lossless_conversion forms: HUGEINT, UUID, TIME_TZ, BIT …
+//! as extension types, BOOLEAN as arrow.bool8) — for a catalog that writes into a DuckDB server (capability
+//! lossless_arrow_boundary), where the standard forms would change a column's type. Write paths only.
+duckdb::ClientProperties BoundaryClientProperties(duckdb::ClientContext &context, bool lossless);
 
 //===----------------------------------------------------------------------===//
 // ArrowLiveness — an OUT-OF-BAND registry that answers "who freed this batch, and when?"

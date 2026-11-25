@@ -165,6 +165,16 @@ ClientProperties BoundaryClientProperties(ClientContext &context) {
 	                        p.arrow_output_version, p.client_context);
 }
 
+ClientProperties BoundaryClientProperties(ClientContext &context, bool lossless) {
+	if (!lossless) {
+		return BoundaryClientProperties(context);
+	}
+	auto p = context.GetClientProperties();
+	return ClientProperties(p.time_zone, ArrowOffsetSize::REGULAR, /*arrow_use_list_view=*/false,
+	                        /*produce_arrow_string_view=*/false, /*lossless_conversion=*/true,
+	                        p.arrow_output_version, p.client_context);
+}
+
 ArrowProducer::ArrowProducer(vector<LogicalType> types, vector<string> names, ClientProperties properties)
     : types_(std::move(types)), names_(std::move(names)), properties_(std::move(properties)) {
 	std::memset(&stream_, 0, sizeof(stream_));

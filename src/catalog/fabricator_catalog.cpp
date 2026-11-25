@@ -260,6 +260,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = caps.supports_nested_schemas;
 		remote_select_ = caps.remote_select;
 		substrait_native_functions_ = caps.substrait_native_functions;
+		lossless_arrow_boundary_ = caps.lossless_arrow_boundary;
 		bind_schema_cacheable_ = caps.bind_schema_cacheable;
 		parallel_table_open_ = caps.parallel_table_open;
 		dml_returning_ = caps.dml_returning;
@@ -279,6 +280,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		supports_nested_schemas_ = false;
 		remote_select_ = false;
 		substrait_native_functions_ = false;
+		lossless_arrow_boundary_ = false;
 		bind_schema_cacheable_ = false;
 		parallel_table_open_ = false;
 		dml_returning_ = false;
@@ -673,6 +675,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 
 	FabricatorCtasInfo info;
 	info.schema_path = op.info->schema.Cast<FabricatorSchemaEntry>().SchemaPathStrings();
+	info.lossless_arrow = lossless_arrow_boundary_;
 	info.schema_name = create_info.GetQualifiedName().Schema().GetIdentifierName();
 	info.table_name = create_info.GetQualifiedName().Name().GetIdentifierName();
 	for (auto &col : create_info.columns.Logical()) {
@@ -717,6 +720,7 @@ PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, Physical
 	}
 	FabricatorInsertTarget target;
 	target.returning = op.return_chunk;
+	target.lossless_arrow = lossless_arrow_boundary_;
 	target.schema_path = op.table.schema.Cast<FabricatorSchemaEntry>().SchemaPathStrings();
 	target.schema_name = op.table.schema.name.GetIdentifierName();
 	target.table_name = op.table.name.GetIdentifierName();

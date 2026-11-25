@@ -24,6 +24,8 @@ struct FabricatorCtasInfo {
 	vector<string> column_names;
 	vector<LogicalType> column_types;
 	bool replace = false;
+	//! Cross in DuckDB's lossless Arrow forms (capability lossless_arrow_boundary).
+	bool lossless_arrow = false;
 	//! Comma-separated column names from a native PARTITIONED BY clause (empty if none). Passed to begin_bulk so
 	//! a partitioning provider (Delta) lays out the CTAS result by partition; SQL Server / DAX ignore it.
 	string partition_columns;

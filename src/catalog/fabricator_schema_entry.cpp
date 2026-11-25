@@ -4978,7 +4978,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	// A schema-only Arrow stream carries the column definitions to the backend. The text-column SQL type
 	// (mssql_ctas_text_type / mssql_default_varchar_length) is read C#-side from the provider settings store
 	// (see docs/settings-architecture.md), not passed here.
-	fabricator::ArrowProducer producer(types, names, fabricator::BoundaryClientProperties(context));
+	fabricator::ArrowProducer producer(
+	    types, names,
+	    fabricator::BoundaryClientProperties(context, ParentCatalog().Cast<FabricatorCatalog>().LosslessArrowBoundary()));
 	producer.SetNullability(nullable);
 	producer.Finish();
 	fabricator::CreateTable(handle_, SchemaPathStrings(), base.GetQualifiedName().Name().GetIdentifierName(), *producer.Stream(), if_not_exists, pk_arg, unique_arg,

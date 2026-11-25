@@ -24,7 +24,7 @@ namespace duckdb {
 class FabricatorCtasGlobalState : public GlobalSinkState {
 public:
 	FabricatorCtasGlobalState(ClientContext &context, const FabricatorCtasInfo &info)
-	    : properties(fabricator::BoundaryClientProperties(context)),
+	    : properties(fabricator::BoundaryClientProperties(context, info.lossless_arrow)),
 	      extension_types(ArrowTypeExtensionData::GetExtensionTypes(context, info.column_types)) {
 		// The producer also builds the Arrow schema handed to begin_bulk.
 		producer = make_uniq<fabricator::ArrowProducer>(info.column_types, info.column_names, properties);
@@ -163,7 +163,7 @@ SourceResultType FabricatorPhysicalRemoteCreateTableAs::GetDataInternal(Executio
 	auto &client = context.client;
 	// 1. the table, exactly as the regular CTAS creates it: the bulk path with create_table and no rows
 	fabricator::ArrowProducer producer(info_.column_types, info_.column_names,
-	                                   fabricator::BoundaryClientProperties(client));
+	                                   fabricator::BoundaryClientProperties(client, info_.lossless_arrow));
 	ArrowSchema schema;
 	std::memset(&schema, 0, sizeof(schema));
 	auto *stream = producer.Stream();

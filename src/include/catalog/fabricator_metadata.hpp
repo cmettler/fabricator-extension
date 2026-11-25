@@ -104,6 +104,10 @@ struct FabricatorCapabilities {
 	//! speaks DuckDB: the adbc provider's `dialect 'duckdb'`), so the producer runs non-strict and declares such a
 	//! function by that name instead of refusing the plan. Never for a provider whose dialect is not DuckDB's.
 	bool substrait_native_functions = false;
+	//! The provider writes into a DuckDB server and wants the rows and table definitions of INSERT / CTAS / COPY /
+	//! CREATE TABLE in DuckDB's LOSSLESS Arrow forms (BoundaryClientProperties(context, true)): the standard forms
+	//! turn HUGEINT into decimal(38,0), UUID into a string, TIME_TZ into a time — a different column type there.
+	bool lossless_arrow_boundary = false;
 
 	//! The schema an unqualified name resolves to (FabricatorCatalog::GetDefaultSchema). Empty = the provider
 	//! names none and DuckDB's `main` stands (Delta, DAX). SQL Server reports the login's SCHEMA_NAME().

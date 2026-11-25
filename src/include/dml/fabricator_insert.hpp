@@ -23,6 +23,8 @@ struct FabricatorInsertTarget {
 	string table_name;
 	vector<string> columns;
 	vector<LogicalType> column_types;
+	//! Cross in DuckDB's lossless Arrow forms (capability lossless_arrow_boundary).
+	bool lossless_arrow = false;
 	//! The CHILD CHUNK column each of `columns` reads, when the two differ.
 	//! ⚠⚠ THEY DIFFER SINCE DuckDB 2.0, and an empty vector here means "identity" (the common case).
 	//! 2.0's binder hands every insert a FULL-WIDTH child — a column the statement omitted arrives

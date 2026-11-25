@@ -28,7 +28,7 @@ namespace duckdb {
 class FabricatorInsertGlobalSinkState : public GlobalSinkState {
 public:
 	FabricatorInsertGlobalSinkState(ClientContext &context, const FabricatorInsertTarget &target)
-	    : properties(fabricator::BoundaryClientProperties(context)),
+	    : properties(fabricator::BoundaryClientProperties(context, target.lossless_arrow)),
 	      extension_types(ArrowTypeExtensionData::GetExtensionTypes(context, target.column_types)) {
 		// The Arrow schema field names = the insert column names, so the provider
 		// can map columns by name (SqlBulkCopy column mappings). The producer also

@@ -116,6 +116,10 @@ public:
 	bool SubstraitNativeFunctions() const {
 		return substrait_native_functions_;
 	}
+	//! Whether writes cross to the provider in DuckDB's lossless Arrow forms (capability lossless_arrow_boundary).
+	bool LosslessArrowBoundary() const {
+		return lossless_arrow_boundary_;
+	}
 
 	//! DuckDB 2.0 nested schemas: whether a dotted schema string may denote a PATH (`a.b` = schema `b`
 	//! inside schema `a`) rather than a literal schema named "a.b". Provider-declared through the
@@ -286,6 +290,8 @@ private:
 	bool remote_select_ = false;
 	//! Capability `substrait_native_functions`; see SubstraitNativeFunctions().
 	bool substrait_native_functions_ = false;
+	//! Capability `lossless_arrow_boundary`; see LosslessArrowBoundary().
+	bool lossless_arrow_boundary_ = false;
 	mutex remote_plans_lock_;
 	unordered_map<string, string> remote_plans_;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
