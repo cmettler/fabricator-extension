@@ -206,6 +206,35 @@ at the same time, writes included. Read from the diff:
 
 ⇒ At most an OPT-IN read-your-writes inside `BEGIN`, for queries without temp staging. Never a default.
 
+### The better fit: a connection that INHERITS the caller's transaction (duckdb/duckdb#29485, noted 2026-11-27)
+
+Merged on DuckDB `main` the same day, not in v2.0.1: `Connection::CreateInTransaction(ClientContext &)` (v2 C
+API `duckdb_v2_connection_create_in_transaction`). Our host connection would be created from the caller's
+context instead of as a fresh `Connection(db)`. Read from the PR, not run. Against the list above:
+
+- **It works in AUTOCOMMIT too** (a running statement's transaction), so the common `SELECT fluid_query(...)`
+  case is covered — the `BEGIN`-only limit is gone.
+- **Destroying it is NO vote**, and it cannot `BEGIN`/`COMMIT`/`ROLLBACK` (refused, which itself invalidates the
+  transaction) — the close-is-a-rollback trap is gone. It follows the caller's interrupts and deadline.
+- What it gives: `fabricator_host_query` and a template's `query()` see the statement's own uncommitted writes,
+  and `fabricator_host_exec` / `exec()` become ATOMIC with the user's statement (rolled back when it fails).
+- Still there: temp objects are the CALLER's (Fluid's per-render `CREATE TEMP TABLE` and the TEMPORARY views
+  of named Arrow inputs land in the user's temp catalog: unique names + cleanup needed); a failing host
+  statement invalidates the caller's transaction (in autocommit the statement then rolls back instead of
+  committing); our per-transaction state is shared by the same `global_transaction_id` (a pinned provider
+  connection used from two threads in an explicit transaction after its first write).
+- New: an inherited transaction counts as SHARED and is **planned without table statistics** — check whether
+  that also hits the caller's later statements in the same transaction (a plan-quality risk). An inheriting
+  connection still open when the statement or `COMMIT` ends forces a ROLLBACK ("a connection that inherited the
+  transaction is still open"), so no host connection may outlive the call that created it (per-render pinned
+  connections fit; a pool across statements does not).
+- **Concurrency is untested upstream** (the PR: "no concurrent test covers the inheriting path; the intended use
+  is synchronous, inside a callback"), while our scalar/table callbacks run on several DuckDB threads at once.
+
+⇒ This, not `JOIN TRANSACTION`, is the mechanism for read-your-writes in host queries. When the line moves to
+DuckDB 2.1: an opt-in per host connection, after measuring the statistics effect, parallel callbacks, and our
+own per-transaction state.
+
 ### The surface
 
 - C++: `host_query`'s new `connection` parameter (0 = fresh), `host_connection_open` /
