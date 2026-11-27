@@ -176,6 +176,36 @@ uncommitted rows are invisible to it, and what it writes is invisible to the sur
 snapshot predates the commit — fluid-templating.md §11.1b). What changed is only that the CALLER's own
 earlier statements are visible to its later ones.
 
+### A way it COULD join: `JOIN TRANSACTION` on DuckDB `main` (noted 2026-11-27, nothing built, nothing measured)
+
+DuckDB `main` (2.1; duckdb/duckdb#29429, commit `6c51e09`, NOT in v2.0.1 or on `v2.0-cyanoptera`) lets a second
+connection join another connection's transaction: `SELECT share_transaction()` in a `BEGIN` block returns a random
+UUID, and `JOIN TRANSACTION '<uuid>'` on a connection outside a transaction adopts it. The WHOLE transaction is
+shared (uncommitted rows, temp objects of the creator), not only the snapshot; the participants may run statements
+at the same time, writes included. Read from the diff:
+
+- C++ can share from inside a running statement: `context.transaction.ShareTransaction()` is what the scalar
+  `share_transaction()` calls. A fresh host connection would then join, which gives read-your-writes WITHOUT
+  reusing the caller's context (the path ruled out above).
+- **Only inside an explicit `BEGIN`.** `ShareTransaction` throws in autocommit, so the common case — a render or
+  host query inside one autocommit `SELECT` — cannot use it.
+- **Temporary objects are the CREATOR's.** A joined connection does not see its own temp catalog, so Fluid's
+  per-render `CREATE TEMP TABLE` staging and the TEMPORARY views of named Arrow inputs would land in the USER's
+  temp catalog, and concurrent renders would collide on names there.
+- **A failing statement invalidates the transaction for every participant** — a failing template query would
+  abort the user's transaction (today it is isolated).
+- **`COMMIT` is a vote; the last participant to leave ends the transaction, and CLOSING a connection counts as a
+  ROLLBACK vote.** A host connection must `COMMIT` before it is disposed, or the user's later `COMMIT` fails
+  ("a connection sharing the transaction rolled it back").
+- Reads can see the partial effect of a write still running on another participant (e.g. the outer
+  `INSERT … SELECT` that called the render).
+- **Our own catalogs:** a joined connection has the same `global_transaction_id` and the same per-database
+  `Transaction` objects, so fabricator's per-transaction state (the pinned provider connection keyed by txn id,
+  the Delta transaction buffer) would be reached from two DuckDB connections at once. It was built for one
+  context per transaction; check that before any use.
+
+⇒ At most an OPT-IN read-your-writes inside `BEGIN`, for queries without temp staging. Never a default.
+
 ### The surface
 
 - C++: `host_query`'s new `connection` parameter (0 = fresh), `host_connection_open` /
