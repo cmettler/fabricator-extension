@@ -1601,6 +1601,22 @@ where a row id of `file_row_number` alone fails the differential against the pro
   the scan reads the whole column. Expected to be lifted by a DuckDB 2.0 patch release.
 - **Parallelism is per row group**, DuckDB's reader's unit, where the provider's scan splits into 2048-row morsels:
   a one-row-group table is read by one thread.
+- **Deleted rows travel as a sorted `int64` list** (`plan->deleted`), and `DeletedRowsFilter` walks it per row. A
+  dense deletion vector (millions of deletes) is big on the ABI and slow to walk. Candidate, nothing built: ranges
+  plus 64-row word windows, the form duckdb/duckdb#29441 uses (below) — possible on our side without that PR.
+
+**Watched: duckdb/duckdb#29441 (`TableFunctionQueryFilter`, OPEN on `main` as of 2026-11-27, not merged).**
+`read_parquet([{filename: …, filter_query: '<SELECT>'}])`: a SQL query in a file's open options returns the rows to
+scan as `(row_start BIGINT, row_end BIGINT, bits BIT)` — `bits` NULL = a range, else a bitmap window from
+`row_start`. It runs once per file at open, on its own connection in the scan's transaction; one SELECT, no writes,
+interrupted with the scan; only the Parquet reader applies it; such a file loses the metadata `count(*)` shortcut.
+Its purpose is formats WITHOUT a C++ `MultiFileReader` (DuckLake). For this file scan it adds nothing functional —
+our reader already sets a deletion filter per file. Where it would matter: (1) the representation above; (2) an
+Iceberg provider, where v2 position-delete files ARE parquet `(file_path, pos)` that DuckDB could read itself
+([iceberg-provider.md](iceberg-provider.md)); (3) a provider without a C++ core (C API v2 / Teal) could get a
+native read with deletes from a file list alone; (4) the SQL forms of `DeltaNativeReader` (the `(filename, pos)`
+anti-join) when the file scan declines — rare now, small gain. ⚠ `filter_query` is code run with the caller's
+rights: fine when we generate it, a trust boundary for a file list from elsewhere.
 
 ### Inversion pass before the default flip (2026-11-10)
 

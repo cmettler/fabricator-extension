@@ -81,6 +81,12 @@ Points to establish before any of it (none measured):
   measurement there found the native Parquet read about 3x faster than our Arrow boundary for the same scan.
 - EW's projection by NESTED field id is a listed gap in Parquet (only top-level today); a reader needs it for
   schema evolution of nested columns.
+- Deletes on the read path. Our file scan (`src/fabricator/fabricator_file_scan.cpp`, the duckdb-iceberg shape) takes
+  deleted positions per file from the provider; it "knows nothing about Delta", so an EW Iceberg plan can feed it.
+  v3 deletion vectors are byte-identical to Delta's and fit that path. v2 POSITION-DELETE files are parquet
+  `(file_path, pos)`: instead of EW decoding them into a position list, duckdb/duckdb#29441 (`filter_query` in a
+  file's open options, OPEN on `main` as of 2026-11-27) would let DuckDB read them itself, in parallel — its own
+  example is exactly that query. Watch it; see [delta-read-path.md](delta-read-path.md) §The file scan / Limits.
 
 ## 4. When to look again
 
@@ -88,6 +94,7 @@ Points to establish before any of it (none measured):
   `iceberg` extension on the same tables.
 - EW #955 merged (writer, append, REST): writes and catalogs.
 - EW #490 (UniForm): option 2 above.
+- duckdb/duckdb#29441 merged (and the line on 2.1): the position-delete route above.
 - Each EW bump: read `doc/known-issues.md` (its Iceberg section is where EW lists what is still wrong) and
   re-check the README's "Do not use it to write tables other engines will read" line.
 
