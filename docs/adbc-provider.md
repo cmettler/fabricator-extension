@@ -256,6 +256,18 @@ tables did not buffer either (DuckDB finishes the build side before the probe si
 load into the server while a scan of the same connection feeds it (an `INSERT … SELECT` that is not pushed whole) —
 the rest of the scan, once the load's first chunk is sent.
 
+**Later, with a DuckDB 2.1 server: `JOIN TRANSACTION` (duckdb/duckdb#29429 on `main`, noted 2026-11-27, nothing
+built).** A connection in an explicit transaction can `SELECT share_transaction()` and other connections of the
+same server can `JOIN TRANSACTION '<uuid>'`; all of them then run in ONE transaction, also at the same time. The
+pinned connection is already in `BEGIN`, so the driver could open further server connections that join it and
+let overlapping scans stream in parallel in the same snapshot instead of buffering (`PinnedStream`), with no
+protocol change (it is SQL). Rules from the diff: every extra connection votes (`COMMIT`, or `ROLLBACK` on a
+rollback) before it is released, because closing it counts as a rollback vote, and the real `COMMIT` on the
+pinned connection comes last; a scan of a table that the same statement writes stays on the pinned connection
+(a participant can see the partial effect of another's running write); a failure still aborts the whole
+transaction, as today. Detect it by `share_transaction` in `duckdb_functions()`; a 2.0.x server keeps
+`PinnedStream`.
+
 **Loads never hold the connection while waiting for their input.** Before this, a load held the connection for its
 whole ingest; if its input came from a scan of the same connection that DuckDB opened only later, both waited for
 ever — MEASURED: `BEGIN; INSERT …; INSERT INTO rp.t SELECT … FROM local UNION ALL SELECT … FROM rp.s` hung (the
